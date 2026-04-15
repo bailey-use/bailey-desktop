@@ -334,10 +334,11 @@ fn print_summary(entry: &LogEntry) {
         }
         _ => entry.title.clone().unwrap_or_else(|| entry.kind.clone()),
     };
+    // Column order matches `aivo context`: age first, id second, then detail.
     println!(
         "{} {} {} {}",
-        style::cyan(display_id),
         style::dim(format!("{:>5}", time_ago)),
+        style::cyan(display_id),
         style::yellow(format!("[{}]", entry.source)),
         detail
     );

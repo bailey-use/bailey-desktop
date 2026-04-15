@@ -53,8 +53,11 @@ pub(crate) use chat_tui_format::format_time_ago_short;
 
 #[path = "chat_tui.rs"]
 mod chat_tui;
-#[path = "chat_tui_format.rs"]
-mod chat_tui_format;
+// `chat_tui_format` is now declared at the parent (`commands/mod.rs`) so other
+// commands (notably `aivo context` / `--context`) can reuse its time/text
+// formatters. Re-export at this scope so the chat module still references it
+// without `super::`.
+use super::chat_tui_format;
 
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).

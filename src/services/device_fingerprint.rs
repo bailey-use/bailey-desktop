@@ -58,7 +58,7 @@ pub fn with_starter_headers(builder: reqwest::RequestBuilder) -> reqwest::Reques
         .header("X-Aivo-Version", VERSION)
 }
 
-fn hex_sha256(data: &[u8]) -> String {
+pub(crate) fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())

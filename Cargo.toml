@@ -38,7 +38,7 @@ base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Utils
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 anyhow = "1.0"
 unicode-width = "0.2"
 tempfile = "3.0"

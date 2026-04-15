@@ -11,6 +11,18 @@ pub(crate) fn normalize_base_url(url: &str) -> &str {
     url.strip_suffix("/v1").unwrap_or(url)
 }
 
+/// Truncates `text` to its first line, then to `max_chars` with an ellipsis.
+/// Used by `aivo context` and `--context` for one-line topic previews.
+pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
+    let one_line: String = text.lines().next().unwrap_or("").chars().collect();
+    if one_line.chars().count() > max_chars {
+        let prefix: String = one_line.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{}…", prefix)
+    } else {
+        one_line
+    }
+}
+
 /// Truncates a URL for display while preserving both the prefix and suffix.
 pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     let char_count = url.chars().count();
@@ -28,6 +40,8 @@ pub mod alias;
 pub mod chat;
 pub(crate) mod chat_request_builder;
 pub(crate) mod chat_response_parser;
+pub(crate) mod chat_tui_format;
+pub mod context;
 pub mod info;
 pub mod keys;
 pub(crate) mod keys_ui;
@@ -41,6 +55,7 @@ pub mod update;
 
 pub use alias::AliasCommand;
 pub use chat::ChatCommand;
+pub use context::ContextCommand;
 pub use info::InfoCommand;
 pub use keys::KeysCommand;
 pub use logs::LogsCommand;

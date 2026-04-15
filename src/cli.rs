@@ -66,6 +66,9 @@ pub enum Commands {
 
     /// Update the CLI tool to the latest version
     Update(UpdateArgs),
+
+    /// Cross-CLI context — auto-extracted from your sessions; bare command shows your last activity
+    Context(ContextArgs),
 }
 
 /// Arguments for the alias command
@@ -162,6 +165,12 @@ pub struct RunArgs {
     /// Print the resolved command and environment without launching
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Inject cross-CLI context for this launch. Bare flag opens an
+    /// interactive picker; `--context=<session-id>` picks a specific session
+    /// (prefix match; see `aivo context` for available ids).
+    #[arg(short = 'c', long, value_name = "SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+    pub context: Option<String>,
 
     /// Inject environment variable (KEY=VALUE)
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
@@ -275,6 +284,26 @@ pub struct StatsArgs {
     /// Output stats as JSON (always uses exact numbers; includes all models)
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for the context command
+#[derive(Args, Debug, Clone)]
+pub struct ContextArgs {
+    /// Subcommand slot (removed actions still caught to give a helpful error)
+    #[arg(value_name = "ACTION")]
+    pub action: Option<String>,
+
+    /// Dump all available threads as JSON (bare command only)
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show all sessions, bypassing the default age and count caps
+    #[arg(short = 'a', long)]
+    pub all: bool,
+
+    /// Override the age cap (default 14 days)
+    #[arg(long, value_name = "DAYS")]
+    pub last_days: Option<i64>,
 }
 
 /// Arguments for the update command

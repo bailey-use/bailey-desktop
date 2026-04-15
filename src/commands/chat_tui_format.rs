@@ -6,7 +6,8 @@ use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{ChatMessage, TokenUsage};
+use crate::commands::chat::ChatMessage;
+use crate::commands::chat_response_parser::TokenUsage;
 
 pub(super) fn format_request_elapsed(elapsed: Duration) -> String {
     format!("{}s", elapsed.as_secs())
@@ -189,7 +190,14 @@ pub fn format_time_ago_short(updated_at: &str) -> String {
     let Some(parsed) = parsed else {
         return updated_at.to_string();
     };
-    let seconds = (Utc::now() - parsed).num_seconds().max(0);
+    format_time_ago_short_dt(parsed)
+}
+
+/// Same compact "now/5m/6h/2d/3w/4mo/5y" output as `format_time_ago_short`,
+/// but takes a parsed `DateTime` so callers that already have one don't need
+/// to round-trip through RFC-3339.
+pub fn format_time_ago_short_dt(updated_at: DateTime<Utc>) -> String {
+    let seconds = (Utc::now() - updated_at).num_seconds().max(0);
     match seconds {
         0..=59 => "now".to_string(),
         60..=3599 => format!("{}m", seconds / 60),

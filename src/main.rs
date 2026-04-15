@@ -18,8 +18,9 @@ mod version;
 
 use cli::{Cli, Commands};
 use commands::{
-    AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand, RunCommand,
-    ServeCommand, ServeParams, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    AliasCommand, ChatCommand, ContextCommand, InfoCommand, KeysCommand, LogsCommand,
+    ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand, StartFlowArgs,
+    StatsCommand, UpdateCommand,
 };
 use errors::ExitCode;
 use key_resolution::{KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override};
@@ -46,9 +47,37 @@ fn collect_known_short_flags() -> Vec<char> {
     flags
 }
 
+/// Refuses to run a `test-fast-crypto`-built binary against real user config.
+///
+/// `test-fast-crypto` (documented in CLAUDE.md) uses reduced PBKDF2 iterations
+/// so the test suite runs fast. A binary built with that feature derives a
+/// different encryption key than a normal release binary, so it silently fails
+/// to decrypt any real API key stored in `~/.config/aivo/config.json`. Shipping
+/// or running such a binary as a CLI is always a mistake. Tests run library
+/// code directly in tempdirs and don't hit this guard.
+///
+/// Override for intentional manual testing: `AIVO_TEST_FAST_CRYPTO_OK=1`.
+#[cfg(feature = "test-fast-crypto")]
+fn fast_crypto_guard() {
+    if std::env::var_os("AIVO_TEST_FAST_CRYPTO_OK").is_some() {
+        return;
+    }
+    eprintln!(
+        "{} This aivo binary was built with the `test-fast-crypto` feature,\n       which uses reduced PBKDF2 iterations for fast tests.\n       It cannot decrypt keys encrypted by a normal aivo binary.\n\n       Rebuild without the feature: {}\n       Or, to override intentionally, set {}",
+        style::red("error:"),
+        style::cyan("cargo build"),
+        style::dim("AIVO_TEST_FAST_CRYPTO_OK=1"),
+    );
+    process::exit(ExitCode::UserError.code());
+}
+
+#[cfg(not(feature = "test-fast-crypto"))]
+fn fast_crypto_guard() {}
+
 /// Main entry point for the CLI
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    fast_crypto_guard();
     let raw_args: Vec<String> = std::env::args().collect();
     let args = Cli::parse_from(rewrite_cli_args(expand_combined_short_flags(raw_args)));
 
@@ -72,6 +101,7 @@ async fn main() {
             Commands::Logs(_) => LogsCommand::print_help(),
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
+            Commands::Context(_) => ContextCommand::print_help(),
         }
         process::exit(0);
     }
@@ -169,6 +199,8 @@ async fn main() {
             let debug = extracted.debug;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
+            // Context selector: prefer clap-parsed value, fall back to passthrough-recovered.
+            let context_selector = run_args.context.or(extracted.context);
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
@@ -261,6 +293,7 @@ async fn main() {
                         model,
                         env,
                         key_override,
+                        context_selector,
                     )
                     .await
             }
@@ -343,6 +376,11 @@ async fn main() {
         Commands::Stats(stats_args) => {
             let command = StatsCommand::new(session_store);
             command.execute(stats_args).await
+        }
+
+        Commands::Context(context_args) => {
+            let command = ContextCommand::new();
+            command.execute(context_args).await
         }
 
         Commands::Update(update_args) if update_args.rollback => {
@@ -462,6 +500,10 @@ fn print_help() {
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
+    print_cmd(
+        "context",
+        "Cross-CLI context — recent activity shared between tools",
+    );
     print_cmd("update", "Update to the latest version");
     println!();
     println!("{}", style::bold("Shortcuts:"));
@@ -560,6 +602,9 @@ struct ExtractedFlags {
     refresh: bool,
     env_strings: Vec<String>,
     remaining_args: Vec<String>,
+    /// `None` = flag absent. `Some("")` = bare flag (interactive picker).
+    /// `Some("id")` = explicit session id prefix.
+    context: Option<String>,
 }
 
 /// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--dry-run`, `--refresh`/`-r`, `--env`/`-e`) from
@@ -596,6 +641,7 @@ fn extract_aivo_flags(
     let mut debug = initial_debug;
     let mut dry_run = initial_dry_run;
     let mut refresh = initial_refresh;
+    let mut context: Option<String> = None;
     let mut env_strings = initial_envs;
     let mut remaining_args: Vec<String> = Vec::new();
 
@@ -649,6 +695,16 @@ fn extract_aivo_flags(
         } else if arg == "--refresh" || arg == "-r" {
             refresh = true;
         } else if let Some(value) = arg
+            .strip_prefix("--context=")
+            .or_else(|| arg.strip_prefix("-c="))
+        {
+            if context.is_none() {
+                context = Some(value.to_string());
+            }
+        } else if (arg == "--context" || arg == "-c") && context.is_none() {
+            // Bare flag (no value): open the interactive picker.
+            context = Some(String::new());
+        } else if let Some(value) = arg
             .strip_prefix("--env=")
             .or_else(|| arg.strip_prefix("-e="))
         {
@@ -672,6 +728,7 @@ fn extract_aivo_flags(
         refresh,
         env_strings,
         remaining_args,
+        context,
     }
 }
 

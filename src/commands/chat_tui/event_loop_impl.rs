@@ -245,9 +245,22 @@ impl ChatTuiApp {
             tokio::time::sleep(Duration::from_millis(16)).await;
         };
 
-        self.discard_resume_state();
-        if let Some(task) = self.response_task.take() {
+        // Abort in-flight tasks and await them so their futures are actually
+        // dropped (closing any open HTTP connections) before we return. On the
+        // current-thread runtime, `abort()` alone only schedules cancellation;
+        // without the explicit `await` the task stays alive until the runtime
+        // itself shuts down at process exit.
+        let response_task = self.response_task.take();
+        let resume_task = self.resume_task.take();
+        self.loading_resume = None;
+        self.resume_restore_state = None;
+        if let Some(task) = response_task {
             task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = resume_task {
+            task.abort();
+            let _ = task.await;
         }
         restore_terminal(terminal)?;
         run_result

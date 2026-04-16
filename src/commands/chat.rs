@@ -307,43 +307,56 @@ impl ChatCommand {
                 .await?;
             let (spinning, spinner_handle) = style::start_spinner(None);
             let mut current_section: Option<&'static str> = None;
-            let result = send_message_turn(
-                &client,
-                &key,
-                copilot_tm.as_deref(),
-                &model,
-                &history,
-                &mut format,
-                &spinning,
-                json,
-                &mut |chunk| {
-                    if json {
-                        return Ok(());
-                    }
-                    match chunk {
-                        ChatResponseChunk::Reasoning(text) => {
-                            if current_section != Some("thinking") {
-                                if current_section.is_some() {
-                                    print!("\n\n");
-                                }
-                                println!("Thinking:");
-                                current_section = Some("thinking");
+            let mut on_chunk = |chunk| {
+                if json {
+                    return Ok(());
+                }
+                match chunk {
+                    ChatResponseChunk::Reasoning(text) => {
+                        if current_section != Some("thinking") {
+                            if current_section.is_some() {
+                                print!("\n\n");
                             }
-                            print!("{text}");
+                            println!("Thinking:");
+                            current_section = Some("thinking");
                         }
-                        ChatResponseChunk::Content(text) => {
-                            if current_section == Some("thinking") {
-                                print!("\n\nAnswer:\n");
-                            }
-                            current_section = Some("answer");
-                            print!("{text}");
-                        }
+                        print!("{text}");
                     }
-                    io::stdout().flush()?;
-                    Ok(())
-                },
-            )
-            .await;
+                    ChatResponseChunk::Content(text) => {
+                        if current_section == Some("thinking") {
+                            print!("\n\nAnswer:\n");
+                        }
+                        current_section = Some("answer");
+                        print!("{text}");
+                    }
+                }
+                io::stdout().flush()?;
+                Ok(())
+            };
+            // Install a Ctrl+C handler so SIGINT cancels the in-flight request
+            // cleanly: dropping the `send_message_turn` future closes the HTTP
+            // connection before the process exits. Without this branch the
+            // default SIGINT terminates the process abruptly, leaving the
+            // server to keep generating.
+            let result = tokio::select! {
+                res = send_message_turn(
+                    &client,
+                    &key,
+                    copilot_tm.as_deref(),
+                    &model,
+                    &history,
+                    &mut format,
+                    &spinning,
+                    json,
+                    &mut on_chunk,
+                ) => res,
+                _ = tokio::signal::ctrl_c() => {
+                    style::stop_spinner(&spinning);
+                    let _ = spinner_handle.await;
+                    eprintln!();
+                    return Ok(ExitCode::ToolExit(130));
+                }
+            };
             style::stop_spinner(&spinning);
             let _ = spinner_handle.await;
 

@@ -202,33 +202,44 @@ impl RunCommand {
             args
         };
 
-        // --as wiring: expose aivo's MCP server to the tool so it can
-        // call list_sessions / get_session on its peer mid-session. Nothing
-        // is persisted — Claude gets an ephemeral temp config file, Codex
-        // gets `-c` CLI overrides. Safe to run under --dry-run too.
-        let (args, _share_cleanup) = if let Some(ref nickname) = as_name {
+        // Cross-tool MCP wiring: always enabled. Each tool gets a nickname
+        // (explicit via `--as reviewer`, or auto-derived from the tool name)
+        // and an aivo MCP server so peers can call list_sessions / get_session.
+        let (args, _share_cleanup) = {
             let cwd = system_env::current_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-
-            // Register the nickname in the shared registry
             let registry_root = nickname_registry::registry_dir_for_cwd(&cwd);
-            let registry_guard = if let Some(ref root) = registry_root {
-                match nickname_registry::register(nickname, ai_tool.as_str(), root).await {
-                    Ok(guard) => Some(guard),
-                    Err(e) => {
-                        eprintln!(
-                            "  {} --as: {}; launching without nickname.",
-                            style::yellow("!"),
-                            e
-                        );
-                        None
+
+            // Register: explicit --as name, or auto-name from tool (claude, codex, …)
+            let (nickname, registry_guard) = if let Some(ref root) = registry_root {
+                if let Some(ref explicit) = as_name {
+                    match nickname_registry::register(explicit, ai_tool.as_str(), root).await {
+                        Ok(guard) => (explicit.clone(), Some(guard)),
+                        Err(e) => {
+                            eprintln!(
+                                "  {} --as: {}; launching without nickname.",
+                                style::yellow("!"),
+                                e
+                            );
+                            (explicit.clone(), None)
+                        }
+                    }
+                } else {
+                    match nickname_registry::register_auto(ai_tool.as_str(), root).await {
+                        Ok((name, guard)) => (name, Some(guard)),
+                        Err(_) => (ai_tool.as_str().to_string(), None),
                     }
                 }
             } else {
-                None
+                (
+                    as_name
+                        .clone()
+                        .unwrap_or_else(|| ai_tool.as_str().to_string()),
+                    None,
+                )
             };
 
             let fallback = args.clone();
-            match maybe_enable_share(ai_tool, args, &cwd, nickname).await {
+            match maybe_enable_share(ai_tool, args, &cwd, &nickname).await {
                 Ok((new_args, mut cleanup)) => {
                     if let Some(guard) = registry_guard {
                         cleanup.set_registry_guard(guard);
@@ -237,15 +248,13 @@ impl RunCommand {
                 }
                 Err(e) => {
                     eprintln!(
-                        "  {} --as: {}; launching without MCP wiring.",
+                        "  {} MCP wiring failed: {}; launching without cross-tool context.",
                         style::yellow("!"),
                         e
                     );
                     (fallback, ShareCleanup::empty())
                 }
             }
-        } else {
-            (args, ShareCleanup::empty())
         };
 
         // Launch the AI tool

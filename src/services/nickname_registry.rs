@@ -82,6 +82,28 @@ pub async fn register(nickname: &str, cli: &str, registry_root: &Path) -> Result
     Ok(RegistryGuard { path: file_path })
 }
 
+/// Auto-register with a name derived from the CLI tool name. Tries the
+/// base name first (`claude`), then appends `-2`, `-3`, … if taken.
+/// Returns `(chosen_nickname, guard)`.
+pub async fn register_auto(cli: &str, registry_root: &Path) -> Result<(String, RegistryGuard)> {
+    tokio::fs::create_dir_all(registry_root).await?;
+
+    // Try the base name first, then numbered suffixes.
+    let base = cli.to_string();
+    for i in 0u32..100 {
+        let candidate = if i == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", i + 1)
+        };
+        match register(&candidate, cli, registry_root).await {
+            Ok(guard) => return Ok((candidate, guard)),
+            Err(_) => continue,
+        }
+    }
+    bail!("could not find a free nickname for '{cli}' after 100 attempts")
+}
+
 /// List all active (live-PID) entries in the registry directory.
 ///
 /// Stale entries (dead PIDs) are pruned (deleted) automatically.

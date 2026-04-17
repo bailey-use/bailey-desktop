@@ -26,14 +26,14 @@ impl ChatTuiApp {
         let cache = self.cache.clone();
 
         tokio::spawn(async move {
-            let models = fetch_models_for_select(&client, &key, &cache).await;
-            if models.is_empty() {
+            let choices = load_model_choices(&client, &key, &cache).await;
+            if choices.is_empty() {
                 tx.send(RuntimeEvent::ModelsLoaded(Err(
                     "No models available for this provider".to_string(),
                 )))
                 .ok();
             } else {
-                tx.send(RuntimeEvent::ModelsLoaded(Ok(models))).ok();
+                tx.send(RuntimeEvent::ModelsLoaded(Ok(choices))).ok();
             }
         });
     }
@@ -413,5 +413,36 @@ impl ChatTuiApp {
     pub(super) fn max_scroll(&self) -> usize {
         let total = self.estimated_transcript_height(self.transcript_width);
         total.saturating_sub(usize::from(self.transcript_view_height))
+    }
+}
+
+/// Fetch model metadata for the picker, falling back to cached IDs on error.
+/// On a successful detailed fetch we also seed the IDs cache so other commands
+/// stay warm.
+async fn load_model_choices(
+    client: &reqwest::Client,
+    key: &ApiKey,
+    cache: &crate::services::ModelsCache,
+) -> Vec<ModelChoice> {
+    match crate::commands::models::fetch_models_detailed(client, key).await {
+        Ok(infos) => {
+            let ids: Vec<String> = infos.iter().map(|m| m.id.clone()).collect();
+            cache.set(&key.base_url, ids).await;
+            infos
+                .into_iter()
+                .map(|m| ModelChoice {
+                    label: crate::commands::models::picker_label(&m),
+                    id: m.id,
+                })
+                .collect()
+        }
+        Err(_) => fetch_models_for_select(client, key, cache)
+            .await
+            .into_iter()
+            .map(|id| ModelChoice {
+                label: id.clone(),
+                id,
+            })
+            .collect(),
     }
 }

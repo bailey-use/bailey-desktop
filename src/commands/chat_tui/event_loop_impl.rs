@@ -145,7 +145,7 @@ impl ChatTuiApp {
 
     async fn apply_loaded_models(
         &mut self,
-        result: std::result::Result<Vec<String>, String>,
+        result: std::result::Result<Vec<ModelChoice>, String>,
     ) -> Result<()> {
         match result {
             Ok(models) => {
@@ -161,7 +161,7 @@ impl ChatTuiApp {
         Ok(())
     }
 
-    fn populate_model_picker(&mut self, models: Vec<String>) -> Option<usize> {
+    fn populate_model_picker(&mut self, models: Vec<ModelChoice>) -> Option<usize> {
         let Overlay::Picker(picker) = &mut self.overlay else {
             return None;
         };
@@ -171,10 +171,10 @@ impl ChatTuiApp {
 
         picker.items = models
             .into_iter()
-            .map(|model| PickerEntry {
-                search_text: model.clone(),
-                label: model.clone(),
-                value: PickerValue::Model(model),
+            .map(|m| PickerEntry {
+                search_text: m.id.clone(),
+                label: m.label,
+                value: PickerValue::Model(m.id),
             })
             .collect();
         picker.loading = false;

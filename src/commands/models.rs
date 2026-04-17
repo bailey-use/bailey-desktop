@@ -42,6 +42,8 @@ pub(crate) struct ModelInfo {
     pub input_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<f64>,
 }
 
 impl ModelInfo {
@@ -52,6 +54,7 @@ impl ModelInfo {
             max_output: None,
             input_price: None,
             output_price: None,
+            multiplier: None,
         }
     }
 }
@@ -76,13 +79,21 @@ impl OpenAIModel {
         let context = self.find_context().map(format_token_count);
         let max_output = self.find_max_output().map(format_token_count);
         let (input_price, output_price) = self.find_pricing();
+        let multiplier = self.find_multiplier();
         ModelInfo {
             id: self.id,
             context,
             max_output,
             input_price,
             output_price,
+            multiplier,
         }
+    }
+
+    /// Search for a Copilot-style billing multiplier (`billing.multiplier`).
+    fn find_multiplier(&self) -> Option<f64> {
+        let billing = self.extra.get("billing")?.as_object()?;
+        billing.get("multiplier").and_then(|v| v.as_f64())
     }
 
     /// Search for a context-window field: context_length, context_window,
@@ -482,26 +493,49 @@ fn format_price_per_million(per_token: &str) -> Option<String> {
 }
 
 fn format_model_line(model: &ModelInfo, name_width: usize) -> String {
-    let has_info = model.context.is_some() || model.max_output.is_some();
+    let has_info =
+        model.context.is_some() || model.max_output.is_some() || model.multiplier.is_some();
     if !has_info {
         return model.id.clone();
     }
 
-    let ctx = model.context.as_deref().unwrap_or("?");
-    let out = model.max_output.as_deref().unwrap_or("?");
-    let mut line = format!(
-        "{:<width$}  {}",
-        model.id,
-        style::dim(format!("{} ctx \u{00b7} {} out", ctx, out)),
-        width = name_width,
-    );
+    let mut line = format!("{:<width$}", model.id, width = name_width);
+    if model.context.is_some() || model.max_output.is_some() {
+        let ctx = model.context.as_deref().unwrap_or("?");
+        let out = model.max_output.as_deref().unwrap_or("?");
+        line.push_str(&format!(
+            "  {}",
+            style::dim(format!("{} ctx \u{00b7} {} out", ctx, out))
+        ));
+    }
     if let (Some(input), Some(output)) = (&model.input_price, &model.output_price) {
         line.push_str(&format!(
             "  {}",
             style::dim(format!("{}/{}", input, output))
         ));
     }
+    if let Some(mult) = model.multiplier {
+        line.push_str(&format!("  {}", style::dim(format_multiplier(mult))));
+    }
     line
+}
+
+/// Build a compact picker label (id plus `Nx` suffix when a multiplier is known).
+pub(crate) fn picker_label(model: &ModelInfo) -> String {
+    match model.multiplier {
+        Some(mult) => format!("{}  {}", model.id, format_multiplier(mult)),
+        None => model.id.clone(),
+    }
+}
+
+/// Format a Copilot premium-request multiplier as e.g. `1x`, `0.33x`, `7.5x`.
+fn format_multiplier(m: f64) -> String {
+    if m == m.trunc() {
+        format!("{}x", m as i64)
+    } else {
+        let s = format!("{:.2}", m);
+        format!("{}x", s.trim_end_matches('0').trim_end_matches('.'))
+    }
 }
 
 pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<String>> {
@@ -514,7 +548,7 @@ pub(crate) async fn fetch_models(client: &Client, key: &ApiKey) -> Result<Vec<St
 /// Providers like OpenRouter/Vercel return context window, pricing, and max output.
 /// Google returns inputTokenLimit and outputTokenLimit.
 /// Other providers return just IDs.
-async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>> {
+pub(crate) async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<ModelInfo>> {
     let base = normalize_base_url(&key.base_url);
     let profile = provider_profile_for_key(key);
 
@@ -557,6 +591,7 @@ async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<Mode
                 .header("Authorization", format!("Bearer {}", copilot_token))
                 .header("Editor-Version", COPILOT_EDITOR_VERSION)
                 .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
+                .header("X-GitHub-Api-Version", "2025-10-01")
                 .send()
                 .await?;
 
@@ -608,6 +643,7 @@ async fn fetch_models_detailed(client: &Client, key: &ApiKey) -> Result<Vec<Mode
                         max_output: m.output_token_limit.map(format_token_count),
                         input_price: None,
                         output_price: None,
+                        multiplier: None,
                         id,
                     }
                 })

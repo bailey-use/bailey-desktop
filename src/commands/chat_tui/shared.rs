@@ -209,6 +209,13 @@ pub(super) enum PickerValue {
     Session(SessionPreview),
 }
 
+/// A model option ready for the picker: stable id and display label.
+#[derive(Clone, Debug)]
+pub(super) struct ModelChoice {
+    pub(super) id: String,
+    pub(super) label: String,
+}
+
 #[derive(Clone)]
 pub(super) struct PickerEntry {
     pub(super) label: String,
@@ -578,7 +585,7 @@ pub(super) enum RuntimeEvent {
         result: std::result::Result<ChatTurnResult, String>,
         format: ChatFormat,
     },
-    ModelsLoaded(std::result::Result<Vec<String>, String>),
+    ModelsLoaded(std::result::Result<Vec<ModelChoice>, String>),
     ResumeLoaded {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,

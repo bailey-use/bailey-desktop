@@ -12,6 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::services::system_env;
+
 static OLLAMA_CHILD: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -57,7 +59,7 @@ fn unregister_pid() -> bool {
         let name = entry.file_name();
         // Only numeric filenames are aivo PID files; skip server.pid etc.
         if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
-            if is_process_alive(pid) {
+            if system_env::is_pid_alive(pid) {
                 live_count += 1;
             } else {
                 let _ = std::fs::remove_file(entry.path());
@@ -83,18 +85,6 @@ fn kill_server_by_pid_file() {
     }
     #[cfg(not(unix))]
     let _ = pid;
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
 }
 
 /// Returns the Ollama host from `OLLAMA_HOST` or the default `http://localhost:11434`.

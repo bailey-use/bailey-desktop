@@ -63,6 +63,47 @@ pub fn username() -> Option<String> {
     }
 }
 
+/// Returns true if a process with `pid` is still alive on this system. Used
+/// to prune stale registry entries and detect orphaned helper processes.
+pub fn is_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(pid, 0)` sends no signal; it only checks whether the
+        // process exists and we have permission to signal it.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+        };
+
+        // SAFETY: OpenProcess/WaitForSingleObject/CloseHandle take integer or
+        // handle values only; no memory is dereferenced here. Returned handles
+        // are always closed before returning.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                // Open failure is almost always "no such process" for PIDs we
+                // own; treat it as dead so stale entries get pruned instead
+                // of latching on.
+                return false;
+            }
+            // 0 timeout: returns WAIT_OBJECT_0 once the process has exited,
+            // WAIT_TIMEOUT while it is still alive.
+            let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+            CloseHandle(handle);
+            alive
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Expands a leading `~` to the user's home directory.
 /// Returns the path unchanged (as a `PathBuf`) if expansion is not needed or not possible.
 pub fn expand_tilde(path: &str) -> PathBuf {

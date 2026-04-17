@@ -59,7 +59,7 @@ pub async fn register(nickname: &str, cli: &str, registry_root: &Path) -> Result
     if file_path.exists()
         && let Ok(contents) = tokio::fs::read_to_string(&file_path).await
         && let Ok(existing) = serde_json::from_str::<RegistryEntry>(&contents)
-        && is_pid_alive(existing.pid)
+        && system_env::is_pid_alive(existing.pid)
     {
         bail!(
             "nickname '{}' already in use by {} (pid {})",
@@ -132,7 +132,7 @@ pub async fn list_active(registry_root: &Path) -> Vec<RegistryEntry> {
             Err(_) => continue,
         };
 
-        if is_pid_alive(entry.pid) {
+        if system_env::is_pid_alive(entry.pid) {
             entries.push(entry);
         } else {
             // Prune stale entry.
@@ -150,31 +150,12 @@ pub async fn resolve_nickname(nickname: &str, registry_root: &Path) -> Option<Re
     let contents = tokio::fs::read_to_string(&file_path).await.ok()?;
     let entry: RegistryEntry = serde_json::from_str(&contents).ok()?;
 
-    if is_pid_alive(entry.pid) {
+    if system_env::is_pid_alive(entry.pid) {
         Some(entry)
     } else {
         // Prune stale entry.
         let _ = tokio::fs::remove_file(&file_path).await;
         None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Check whether a process with the given PID is still alive.
-fn is_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: `kill(pid, 0)` sends no signal; it only checks whether the
-        // process exists and we have permission to signal it.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
     }
 }
 

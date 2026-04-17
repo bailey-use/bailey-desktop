@@ -269,12 +269,10 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
         tokio::fs::write(dir.join("settings.json"), "{}"),
     )?;
 
-    // Symlink the real pi agent's bin/ directory (contains managed fd, rg binaries)
-    // so pi doesn't re-download them into the temp dir.
-    #[cfg(unix)]
+    // Reuse pi's managed bin/ (fd, rg) so pi doesn't re-download on each launch.
     if let Some(home) = crate::services::system_env::home_dir() {
         let real_bin = home.join(".pi").join("agent").join("bin");
-        let _ = tokio::fs::symlink(&real_bin, dir.join("bin")).await;
+        populate_pi_bin_dir(&real_bin, &dir.join("bin")).await;
     }
 
     env.insert(
@@ -283,6 +281,51 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
     );
     Ok(())
 }
+
+/// Populate `dest_bin` with pi's managed binaries from `real_bin`. Best
+/// effort: any single failure is silently skipped so pi falls back to
+/// re-downloading just that binary.
+#[cfg(unix)]
+async fn populate_pi_bin_dir(real_bin: &std::path::Path, dest_bin: &std::path::Path) {
+    // A single symlink covers the whole directory — cheap and keeps pi's
+    // post-launch writes (if any) pointing at the managed copy.
+    let _ = tokio::fs::symlink(real_bin, dest_bin).await;
+}
+
+#[cfg(windows)]
+async fn populate_pi_bin_dir(real_bin: &std::path::Path, dest_bin: &std::path::Path) {
+    // Windows symlinks / junctions need elevation or developer mode; fall
+    // back to per-file hard links, then copies. Works for the common case
+    // where HOME and the temp dir share a filesystem.
+    if tokio::fs::create_dir_all(dest_bin).await.is_err() {
+        return;
+    }
+    let mut entries = match tokio::fs::read_dir(real_bin).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let src = entry.path();
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dst = dest_bin.join(name);
+        if tokio::fs::hard_link(&src, &dst).await.is_ok() {
+            continue;
+        }
+        // hard_link fails across filesystems or on directories; try a
+        // plain copy for regular files before giving up. entry.file_type()
+        // reuses readdir metadata so we skip a redundant stat syscall.
+        if let Ok(ft) = entry.file_type().await
+            && ft.is_file()
+        {
+            let _ = tokio::fs::copy(&src, &dst).await;
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn populate_pi_bin_dir(_real_bin: &std::path::Path, _dest_bin: &std::path::Path) {}
 
 fn set_local_base_url(env: &mut HashMap<String, String>, key: &str, port: u16) {
     env.insert(key.to_string(), format!("http://127.0.0.1:{port}"));

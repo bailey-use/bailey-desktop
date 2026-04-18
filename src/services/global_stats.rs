@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs;
@@ -121,11 +123,11 @@ pub async fn top_sessions(
 
     let current_paths: HashSet<&str> = all_files
         .iter()
-        .map(|(p, _)| p.to_str().unwrap_or(""))
+        .map(|(p, _, _)| p.to_str().unwrap_or(""))
         .collect();
 
     let mut stale: Vec<(&Path, u64)> = Vec::new();
-    for (path, size) in &all_files {
+    for (path, size, _) in &all_files {
         let key = path.to_string_lossy();
         match cache.files.get(key.as_ref()) {
             Some(cached) if cached.size == *size => {}
@@ -186,6 +188,16 @@ async fn collect_with_step(
     refresh: bool,
     step: Option<(usize, usize)>,
 ) -> Result<Option<GlobalToolStats>> {
+    // Prefer Claude Code's own ~/.claude/stats-cache.json — it's the same
+    // data source its `/stats` UI uses, so totals match exactly. The cache
+    // persists across JSONL pruning, which a raw walk of ~/.claude/projects
+    // cannot reproduce.
+    if tool == "claude"
+        && let Some(stats) = collect_claude_from_cache().await
+    {
+        return Ok(Some(stats));
+    }
+
     if !matches!(tool, "claude" | "codex" | "gemini") {
         return match tool {
             "opencode" => collect_opencode().await,
@@ -216,11 +228,11 @@ async fn collect_with_step(
     // Find stale files (new or size changed)
     let current_paths: HashSet<&str> = all_files
         .iter()
-        .map(|(p, _)| p.to_str().unwrap_or(""))
+        .map(|(p, _, _)| p.to_str().unwrap_or(""))
         .collect();
 
     let mut stale: Vec<(&Path, u64)> = Vec::new();
-    for (path, size) in &all_files {
+    for (path, size, _) in &all_files {
         let key = path.to_string_lossy();
         match cache.files.get(key.as_ref()) {
             Some(cached) if cached.size == *size => {} // unchanged
@@ -333,15 +345,19 @@ type FileParser =
 
 fn tool_file_parser(tool: &str) -> FileParser {
     match tool {
-        "claude" => |p| Box::pin(parse_claude_file(p)),
+        "claude" => |p| Box::pin(parse_claude_file(p, None)),
         "codex" => |p| Box::pin(parse_codex_file(p)),
         "gemini" => |p| Box::pin(parse_gemini_file(p)),
         _ => |_| Box::pin(async { None }),
     }
 }
 
-/// Walk directory recursively, returning matching files with their sizes.
-async fn walk_files_with_size(root: &Path, filter: fn(&str) -> bool) -> Vec<(PathBuf, u64)> {
+/// Walk directory recursively, returning matching files with their size and
+/// last-modified time (both may be `0`/`None` when metadata is unreadable).
+async fn walk_files_with_size(
+    root: &Path,
+    filter: fn(&str) -> bool,
+) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
     let mut result = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
 
@@ -357,8 +373,10 @@ async fn walk_files_with_size(root: &Path, filter: fn(&str) -> bool) -> Vec<(Pat
             } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
                 && filter(name)
             {
-                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
-                result.push((path, size));
+                let meta = entry.metadata().await.ok();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = meta.and_then(|m| m.modified().ok());
+                result.push((path, size, mtime));
             }
         }
     }
@@ -401,8 +419,120 @@ async fn write_cache(path: &Path, cache: &StatsCache) -> Result<()> {
 // Per-file parsers — return FileEntry for a single file
 // ---------------------------------------------------------------------------
 
+/// Read Claude Code's own persistent stats cache at
+/// `~/.claude/stats-cache.json`. Returns `None` when the file is missing
+/// or malformed; callers fall back to walking the JSONL files directly.
+///
+/// Claude Code merges historical session totals into this cache even after
+/// the underlying JSONL files are pruned, so reading it directly is the
+/// only way to reproduce the totals shown in Claude Code's `/stats` UI.
+async fn collect_claude_from_cache() -> Option<GlobalToolStats> {
+    let home = system_env::home_dir()?;
+    let cache_path = home.join(".claude").join("stats-cache.json");
+    let data = fs::read_to_string(&cache_path).await.ok()?;
+    let v: Value = serde_json::from_str(&data).ok()?;
+    let mut stats = parse_claude_stats_cache(&v)?;
+
+    // Claude Code stamps the cache with `lastComputedDate` (YYYY-MM-DD) and
+    // processes any JSONL activity beyond that live when rendering `/stats`.
+    // Replay the same merge so aivo shows the same live total.
+    if let Some(cutoff) = v.get("lastComputedDate").and_then(|s| s.as_str()) {
+        let projects_dir = home.join(".claude").join("projects");
+        merge_claude_jsonl_deltas(&projects_dir, cutoff, &mut stats).await;
+    }
+
+    Some(stats)
+}
+
+/// Walk `dir`/**/*.jsonl and fold any assistant activity dated after
+/// `cutoff_date` (YYYY-MM-DD, UTC) into `stats`. Files whose mtime is
+/// strictly before the day after `cutoff_date` are skipped without being
+/// opened — this turns a full-history rescan (thousands of files) into
+/// O(files touched today) work on the interactive `aivo stats` path.
+async fn merge_claude_jsonl_deltas(dir: &Path, cutoff_date: &str, stats: &mut GlobalToolStats) {
+    let mtime_threshold = day_after_start_utc(cutoff_date);
+    let files = walk_files_with_size(dir, |name| name.ends_with(".jsonl")).await;
+
+    for (path, _, mtime) in &files {
+        if let (Some(t), Some(m)) = (mtime_threshold, mtime)
+            && *m < t
+        {
+            continue;
+        }
+        let Some(entry) = parse_claude_file(path, Some(cutoff_date)).await else {
+            continue;
+        };
+        stats.input_tokens += entry.input_tokens;
+        stats.output_tokens += entry.output_tokens;
+        stats.cache_read_tokens += entry.cache_read_tokens;
+        stats.cache_write_tokens += entry.cache_write_tokens;
+        if entry.has_session {
+            stats.sessions += 1;
+        }
+        for (model, (inp, out)) in entry.models {
+            let m = stats.models.entry(model).or_default();
+            m.input_tokens += inp;
+            m.output_tokens += out;
+        }
+    }
+}
+
+/// Start-of-day UTC for the day *after* `date` (YYYY-MM-DD). Used as an
+/// mtime threshold: any file modified strictly before this can't contain
+/// activity newer than `date`.
+fn day_after_start_utc(date: &str) -> Option<SystemTime> {
+    let next = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()?
+        .succ_opt()?;
+    let ts = next.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(ts).ok()?))
+}
+
+/// Pure parser for Claude Code's `stats-cache.json` schema. Split out for
+/// unit testing without filesystem IO.
+fn parse_claude_stats_cache(v: &Value) -> Option<GlobalToolStats> {
+    let model_usage = v.get("modelUsage").and_then(|m| m.as_object())?;
+
+    let mut stats = GlobalToolStats {
+        sessions: v.get("totalSessions").and_then(|s| s.as_u64()).unwrap_or(0),
+        ..Default::default()
+    };
+
+    for (model_name, mu) in model_usage {
+        let input = mu.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let output = mu.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = mu
+            .get("cacheReadInputTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_create = mu
+            .get("cacheCreationInputTokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        stats.input_tokens += input;
+        stats.output_tokens += output;
+        stats.cache_read_tokens += cache_read;
+        stats.cache_write_tokens += cache_create;
+
+        let key = normalize_model_for_display(model_name);
+        let m = stats.models.entry(key).or_default();
+        m.input_tokens += input;
+        m.output_tokens += output;
+    }
+
+    if stats.sessions == 0 && stats.total_tokens() == 0 {
+        return None;
+    }
+    Some(stats)
+}
+
 /// Parse a single Claude Code JSONL file.
-async fn parse_claude_file(path: &Path) -> Option<FileEntry> {
+///
+/// When `cutoff_date` is `Some("YYYY-MM-DD")`, assistant lines whose ISO
+/// timestamp's date portion is on or before that date are skipped. Used by
+/// the stats-cache delta merge to accumulate only post-cutoff activity.
+async fn parse_claude_file(path: &Path, cutoff_date: Option<&str>) -> Option<FileEntry> {
     let file = fs::File::open(path).await.ok()?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
@@ -419,6 +549,12 @@ async fn parse_claude_file(path: &Path) -> Option<FileEntry> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        if let Some(cutoff) = cutoff_date {
+            let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+            if ts.len() < 10 || &ts[..10] <= cutoff {
+                continue;
+            }
+        }
         let usage = match v.get("message").and_then(|m| m.get("usage")) {
             Some(u) => u,
             None => continue,
@@ -709,7 +845,7 @@ async fn collect_pi() -> Result<Option<GlobalToolStats>> {
     let mut stats = GlobalToolStats::default();
     let mut session_ids: HashSet<String> = HashSet::new();
 
-    for (path, _) in &files {
+    for (path, _, _) in &files {
         if let Some((entry, ids)) = parse_pi_file(path).await {
             stats.input_tokens += entry.input_tokens;
             stats.output_tokens += entry.output_tokens;
@@ -901,7 +1037,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "main.jsonl", &[line]).await;
-        let entry = parse_claude_file(&path).await.unwrap();
+        let entry = parse_claude_file(&path, None).await.unwrap();
         assert!(
             entry.has_session,
             "main assistant line should register a session"
@@ -915,7 +1051,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let line = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":10,"output_tokens":5}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "agent-xxx.jsonl", &[line]).await;
-        let entry = parse_claude_file(&path).await.unwrap();
+        let entry = parse_claude_file(&path, None).await.unwrap();
         assert!(
             !entry.has_session,
             "a file containing only sidechain assistant lines must not count as a session"
@@ -1026,7 +1162,7 @@ mod tests {
         let sidechain = r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":2}},"sessionId":"abc"}"#;
         let main = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":3,"output_tokens":4}},"sessionId":"abc"}"#;
         let path = write_jsonl(&dir, "mixed.jsonl", &[sidechain, main]).await;
-        let entry = parse_claude_file(&path).await.unwrap();
+        let entry = parse_claude_file(&path, None).await.unwrap();
         assert!(entry.has_session);
         assert_eq!(entry.input_tokens, 4);
         assert_eq!(entry.output_tokens, 6);
@@ -1139,5 +1275,75 @@ mod tests {
         assert_eq!(tool_display_name("pi"), "Pi");
         assert_eq!(tool_display_name("chat"), "Chat");
         assert_eq!(tool_display_name("unknown"), "unknown");
+    }
+
+    #[test]
+    fn parse_claude_stats_cache_aggregates_per_model() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "version": 3,
+                "totalSessions": 3812,
+                "modelUsage": {
+                    "claude-opus-4-6": {
+                        "inputTokens": 11157776,
+                        "outputTokens": 17954156,
+                        "cacheReadInputTokens": 5692730263,
+                        "cacheCreationInputTokens": 312040660
+                    },
+                    "claude-sonnet-4-6": {
+                        "inputTokens": 39314566,
+                        "outputTokens": 2838025,
+                        "cacheReadInputTokens": 639032928,
+                        "cacheCreationInputTokens": 40982361
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let stats = parse_claude_stats_cache(&v).expect("cache should parse");
+        assert_eq!(stats.sessions, 3812);
+        assert_eq!(stats.input_tokens, 11157776 + 39314566);
+        assert_eq!(stats.output_tokens, 17954156 + 2838025);
+        assert_eq!(stats.cache_read_tokens, 5692730263 + 639032928);
+        assert_eq!(stats.cache_write_tokens, 312040660 + 40982361);
+        // total_tokens matches Claude's /stats UI convention (input + output).
+        assert_eq!(
+            stats.total_tokens(),
+            (11157776 + 39314566) + (17954156 + 2838025)
+        );
+        // Per-model entries go through normalize_model_for_display — version
+        // separators collapse (4-6 → 4.6).
+        let opus = stats.models.get("claude-opus-4.6").expect("opus present");
+        assert_eq!(opus.input_tokens, 11157776);
+        assert_eq!(opus.output_tokens, 17954156);
+    }
+
+    #[test]
+    fn parse_claude_stats_cache_rejects_missing_model_usage() {
+        let v: Value = serde_json::from_str(r#"{"version": 3}"#).unwrap();
+        assert!(parse_claude_stats_cache(&v).is_none());
+    }
+
+    #[test]
+    fn parse_claude_stats_cache_rejects_empty_payload() {
+        // modelUsage present but empty, no sessions, no tokens → None so the
+        // caller can fall back to walking JSONL files.
+        let v: Value = serde_json::from_str(r#"{"totalSessions": 0, "modelUsage": {}}"#).unwrap();
+        assert!(parse_claude_stats_cache(&v).is_none());
+    }
+
+    #[test]
+    fn day_after_start_utc_advances_by_one_day() {
+        let t0 = day_after_start_utc("2026-04-17").expect("valid date");
+        let t1 = day_after_start_utc("2026-04-18").expect("valid date");
+        // Consecutive dates should differ by exactly 86,400 seconds.
+        assert_eq!(t1.duration_since(t0).unwrap().as_secs(), 86_400);
+    }
+
+    #[test]
+    fn day_after_start_utc_rejects_bad_input() {
+        assert!(day_after_start_utc("not-a-date").is_none());
+        assert!(day_after_start_utc("").is_none());
     }
 }

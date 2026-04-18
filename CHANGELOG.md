@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.18.0
+
+### Features
+
+- **Cross-tool MCP communication via `--as <name>`**: Run a tool under a custom identity so peers can query it live
+- **`aivo context` and `--context` injection**: Export recent session context as Markdown and inject it into any launched CLI for cross-tool handoffs
+- **Copilot premium-request multiplier**: Surfaced in `aivo models` so you can see which Copilot models cost more
+- **Chat TUI keybinding swap**: `Ctrl+C` and `Ctrl+L` swapped to match other agents
+
+### Bug Fixes
+
+- Bypass HTTP proxy for the loopback router when launching CLIs
+- Cancel in-flight chat requests when the user exits
+- Close tool-calling parity gaps in the serve bridge layer
+- Plug correctness gaps across crypto, bridges, and TUI
+- Tighten bridge-layer fragility across serve, launch, and `cache_control`
+- Make Windows first-class in PID liveness checks and Pi binary reuse
+- Preserve `tool_result` images through Anthropic-to-OpenAI conversion and the typed OpenAI round-trip
+- Extend multimodal preservation through the Responses API and recover sniffed `media_type`
+- Close post-review gaps across serve auth, `tool_result` images, and the OpenAI round-trip
+- Surface unreadable session files in debug builds during `--context` ingestion
+- Align `aivo stats` Claude totals with Claude Code's `/stats` UI
+- Prevent update download from timing out on slow connections
+
 ## v0.17.0
 
 ### Features

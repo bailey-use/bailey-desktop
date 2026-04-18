@@ -1119,12 +1119,13 @@ mod tests {
         let project_root = dir.path().join("proj");
         fs::create_dir_all(&project_root).await.unwrap();
         let proj_str = project_root.to_string_lossy().to_string();
+        let proj_json = proj_str.replace('\\', "\\\\");
 
         let path = dir.path().join("rollout.jsonl");
         let lines = [
             format!(
                 r#"{{"type":"session_meta","timestamp":"2026-04-01T10:00:00Z","payload":{{"id":"codex-1","cwd":"{}","timestamp":"2026-04-01T10:00:00Z"}}}}"#,
-                proj_str
+                proj_json
             ),
             r#"{"type":"response_item","timestamp":"2026-04-01T10:01:00Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review the pagination patch I made in handlers/users.go please."}]}}"#.to_string(),
             r#"{"type":"response_item","timestamp":"2026-04-01T10:02:00Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Looks good overall. Consider handling empty cursor by returning the first page explicitly."}]}}"#.to_string(),

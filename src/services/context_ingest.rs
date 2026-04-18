@@ -276,8 +276,20 @@ pub(crate) async fn gemini_matching_session_files(canonical_root: &str) -> Vec<P
 }
 
 async fn extract_gemini_thread(path: &Path) -> Option<Thread> {
-    let content = fs::read_to_string(path).await.ok()?;
-    let v: Value = serde_json::from_str(&content).ok()?;
+    let content = match fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
+    let v: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
 
     let session_id = v.get("sessionId").and_then(|s| s.as_str())?.to_string();
     let messages = v.get("messages")?.as_array()?;
@@ -434,7 +446,13 @@ async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
 }
 
 async fn extract_pi_thread(path: &Path) -> Option<Thread> {
-    let file = fs::File::open(path).await.ok()?;
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
     let mut lines = BufReader::new(file).lines();
 
     let mut session_id: Option<String> = None;
@@ -549,7 +567,10 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64) -> Vec<Thread> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(err) => {
+            warn_unreadable_session(db_path, &err.to_string());
+            return Vec::new();
+        }
     };
 
     // Find the project id for this worktree. Most common case is an exact
@@ -716,12 +737,33 @@ pub fn encode_claude_dir(canonical_path: &str) -> String {
     canonical_path.replace('/', "-")
 }
 
+/// Log when a session file/DB that was discoverable cannot be read or
+/// parsed. Release builds stay silent (per-line JSONL churn and mid-write
+/// files are routine); debug builds surface it so developers chasing a
+/// "--context doesn't see my session" report have a breadcrumb.
+fn warn_unreadable_session(path: &Path, reason: &str) {
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "aivo: skipping unreadable session {}: {}",
+        path.display(),
+        reason
+    );
+    #[cfg(not(debug_assertions))]
+    let _ = (path, reason);
+}
+
 // ---------------------------------------------------------------------------
 // Per-file JSONL extractors
 // ---------------------------------------------------------------------------
 
 async fn extract_claude_thread(path: &Path) -> Option<Thread> {
-    let file = fs::File::open(path).await.ok()?;
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
     let mut lines = BufReader::new(file).lines();
 
     let mut first_user: Option<String> = None;
@@ -793,7 +835,13 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
 
 /// Returns Some iff the session's session_meta.cwd matches the project root.
 async fn extract_codex_thread(path: &Path, project_root: &str) -> Option<Thread> {
-    let file = fs::File::open(path).await.ok()?;
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
     let mut lines = BufReader::new(file).lines();
 
     let mut session_id: Option<String> = None;

@@ -97,6 +97,10 @@ fn spawn_server(
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
+)]
 fn initialize_tools_list_and_get_session_end_to_end() {
     // Skip if the binary isn't available (e.g. `cargo test --no-run`).
     let exe = aivo_exe();
@@ -213,6 +217,10 @@ fn initialize_tools_list_and_get_session_end_to_end() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
+)]
 fn mcp_serve_list_sessions_filters_by_cli() {
     let exe = aivo_exe();
     if !exe.exists() {
@@ -292,6 +300,10 @@ fn mcp_serve_exits_on_parse_error_then_continues() {
 /// `get_session(cli="claude", exclude_session_ids=[my_id])` returns the
 /// *other* Claude session, not the caller's own.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
+)]
 fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
     let exe = aivo_exe();
     if !exe.exists() {
@@ -437,6 +449,10 @@ fn write_registry_entry(
 /// 3-window nickname scenario: reviewer (claude), architect (claude), coder (codex).
 /// Verifies nickname-based peer lookup works end-to-end via the MCP protocol.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
+)]
 fn nickname_based_peer_lookup() {
     let exe = aivo_exe();
     if !exe.exists() {

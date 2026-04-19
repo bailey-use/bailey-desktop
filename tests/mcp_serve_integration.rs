@@ -417,7 +417,7 @@ fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
 }
 
 /// Writes a nickname registry file into the shared directory for the given cwd.
-/// Registry dir: `home/.config/aivo/share/<cwd.replace('/', '-')>/`
+/// Registry dir: `home/.config/aivo/share/<encode_claude_dir(cwd)>/`
 fn write_registry_entry(
     home: &Path,
     cwd: &str,
@@ -426,7 +426,7 @@ fn write_registry_entry(
     pid: u32,
     started_at: &str,
 ) {
-    let encoded = cwd.replace('/', "-");
+    let encoded = encode_claude_dir(cwd);
     let dir = home.join(".config/aivo/share").join(encoded);
     std::fs::create_dir_all(&dir).unwrap();
     let entry = json!({

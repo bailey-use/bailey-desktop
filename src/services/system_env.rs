@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 pub fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var_os("USERPROFILE")
+        std::env::var_os("HOME")
             .map(PathBuf::from)
+            .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
             .or_else(|| {
                 let drive = std::env::var_os("HOMEDRIVE")?;
                 let path = std::env::var_os("HOMEPATH")?;

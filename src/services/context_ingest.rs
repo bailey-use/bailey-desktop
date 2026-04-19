@@ -724,11 +724,27 @@ pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Encodes an absolute directory path using Claude Code's convention:
-/// `/` → `-`. `/Users/alice/foo` → `-Users-alice-foo`. Caller must pass an
-/// already-canonicalized path; we don't canonicalize here so this is a pure
-/// string transform suitable for sharing the canonical computation.
+/// path separators and the Windows drive-letter colon collapse to `-`.
+/// `/Users/alice/foo` → `-Users-alice-foo`, `C:\Users\alice\foo` → `C--Users-alice-foo`.
+/// Caller must pass an already-canonicalized path; we don't canonicalize
+/// here so this is a pure string transform suitable for sharing the
+/// canonical computation.
 pub fn encode_claude_dir(canonical_path: &str) -> String {
-    canonical_path.replace('/', "-")
+    // `std::fs::canonicalize` on Windows returns the extended-length form
+    // (`\\?\C:\…` or `\\?\UNC\server\share\…`), but Claude Code encodes the
+    // user-visible cwd. Strip the prefix so both sides agree.
+    let stripped = canonical_path
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| canonical_path.strip_prefix(r"\\?\"))
+        .unwrap_or(canonical_path);
+
+    stripped
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect()
 }
 
 /// Log when a session file/DB that was discoverable cannot be read or
@@ -1012,6 +1028,24 @@ mod tests {
         assert_eq!(
             encode_claude_dir("/Users/alice/project/aivo"),
             "-Users-alice-project-aivo"
+        );
+    }
+
+    #[test]
+    fn encode_claude_dir_handles_windows_paths() {
+        assert_eq!(
+            encode_claude_dir(r"C:\Users\alice\repo"),
+            "C--Users-alice-repo"
+        );
+        // Rust's canonicalize emits the extended-length form on Windows;
+        // strip it so we match what Claude Code actually writes.
+        assert_eq!(
+            encode_claude_dir(r"\\?\C:\Users\alice\repo"),
+            "C--Users-alice-repo"
+        );
+        assert_eq!(
+            encode_claude_dir(r"\\?\UNC\server\share\repo"),
+            "server-share-repo"
         );
     }
 

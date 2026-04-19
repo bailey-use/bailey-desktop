@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use aivo::services::context_ingest::encode_claude_dir;
 use serde_json::{Value, json};
 
 /// Returns the path to the aivo binary to test against. Prefers the current
@@ -28,8 +29,10 @@ fn aivo_exe() -> PathBuf {
 
 /// Writes a fixture Claude session JSONL for the given encoded-cwd dir.
 fn seed_claude(home: &Path, cwd: &str, session_id: &str, lines: &[&str]) {
-    let encoded = cwd.replace('/', "-");
-    let dir = home.join(".claude").join("projects").join(encoded);
+    let dir = home
+        .join(".claude")
+        .join("projects")
+        .join(encode_claude_dir(cwd));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{session_id}.jsonl"));
     std::fs::write(path, lines.join("\n")).unwrap();
@@ -45,11 +48,13 @@ fn seed_codex(home: &Path, cwd: &str, session_id: &str, extra_lines: &[&str]) {
         .join("15");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("rollout-{session_id}.jsonl"));
+    // Escape backslashes so Windows-style paths stay valid JSON.
+    let cwd_json = cwd.replace('\\', "\\\\");
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!(
         r#"{{"type":"session_meta","timestamp":"2026-04-15T10:00:00Z","payload":{{"id":"{sid}","cwd":"{cwd}"}}}}"#,
         sid = session_id,
-        cwd = cwd
+        cwd = cwd_json
     ));
     lines.extend(extra_lines.iter().map(|s| s.to_string()));
     std::fs::write(path, lines.join("\n")).unwrap();
@@ -97,10 +102,6 @@ fn spawn_server(
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
-)]
 fn initialize_tools_list_and_get_session_end_to_end() {
     // Skip if the binary isn't available (e.g. `cargo test --no-run`).
     let exe = aivo_exe();
@@ -217,10 +218,6 @@ fn initialize_tools_list_and_get_session_end_to_end() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
-)]
 fn mcp_serve_list_sessions_filters_by_cli() {
     let exe = aivo_exe();
     if !exe.exists() {
@@ -300,10 +297,6 @@ fn mcp_serve_exits_on_parse_error_then_continues() {
 /// `get_session(cli="claude", exclude_session_ids=[my_id])` returns the
 /// *other* Claude session, not the caller's own.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
-)]
 fn three_window_same_cli_peer_lookup_via_exclude_session_ids() {
     let exe = aivo_exe();
     if !exe.exists() {
@@ -449,10 +442,6 @@ fn write_registry_entry(
 /// 3-window nickname scenario: reviewer (claude), architect (claude), coder (codex).
 /// Verifies nickname-based peer lookup works end-to-end via the MCP protocol.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "encode_claude_dir and seed helpers assume Unix-style paths; Windows Claude session layout is unresolved"
-)]
 fn nickname_based_peer_lookup() {
     let exe = aivo_exe();
     if !exe.exists() {

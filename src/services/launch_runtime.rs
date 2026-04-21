@@ -5,16 +5,27 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
+use crate::services::codex_home_shadow::{CodexHomeShadow, tokens_changed};
+use crate::services::codex_oauth::{CodexOAuthCredential, REFRESH_SKEW_SECS, ensure_fresh};
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
 };
+
+/// Holds the shadow `CODEX_HOME` dir + metadata needed to sync refreshed
+/// tokens back into aivo's store after codex exits.
+pub(crate) struct CodexOAuthSync {
+    pub(crate) key_id: String,
+    pub(crate) shadow: CodexHomeShadow,
+    pub(crate) original: CodexOAuthCredential,
+}
 
 pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
     pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
     pub(crate) pi_agent_dir: Option<String>,
+    pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -89,12 +100,129 @@ pub(crate) async fn prepare_runtime_env(
 
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
 
+    let codex_oauth_sync =
+        if tool == AIToolType::Codex && env.contains_key("AIVO_CODEX_OAUTH_CREDS") {
+            Some(prepare_codex_oauth_shadow(&mut env).await?)
+        } else {
+            None
+        };
+
     Ok(LaunchRuntimeState {
         env,
         router_protocol,
         responses_api_support,
         pi_agent_dir,
+        codex_oauth_sync,
     })
+}
+
+/// Parses `AIVO_CODEX_OAUTH_CREDS` (set by `environment_injector::for_codex`
+/// for ChatGPT OAuth keys), refreshes the access token if near expiry, and
+/// writes a shadow `CODEX_HOME` temp dir containing a native `auth.json`.
+///
+/// The placeholder env vars are stripped before codex is spawned; all codex
+/// sees is `CODEX_HOME=<shadow>` and the standard model overrides.
+async fn prepare_codex_oauth_shadow(env: &mut HashMap<String, String>) -> Result<CodexOAuthSync> {
+    let raw = env
+        .remove("AIVO_CODEX_OAUTH_CREDS")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_OAUTH_CREDS"))?;
+    let key_id = env
+        .remove("AIVO_CODEX_KEY_ID")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_CODEX_KEY_ID"))?;
+    let mut creds = CodexOAuthCredential::from_json(&raw)?;
+
+    // Refresh pre-launch so codex starts with a valid access token. If this
+    // succeeds we DON'T persist here — the post-exit sync path will handle
+    // it, picking up any further rotations codex may perform during the
+    // session. If refresh fails the error surfaces to the user who must
+    // re-run `aivo keys add codex`.
+    let _refreshed = ensure_fresh(&mut creds, REFRESH_SKEW_SECS).await?;
+
+    let shadow = CodexHomeShadow::create(&creds).await?;
+    env.insert(
+        "CODEX_HOME".to_string(),
+        shadow.path().to_string_lossy().to_string(),
+    );
+
+    Ok(CodexOAuthSync {
+        key_id,
+        shadow,
+        original: creds,
+    })
+}
+
+/// Reads the shadow `auth.json` back after codex exits and, if any token
+/// changed, persists the rotated credential into aivo's store. Errors are
+/// logged but never propagated — the user's codex session has already
+/// completed, and a failed sync just means the next launch will refresh
+/// again.
+pub(crate) async fn finalize_codex_oauth(
+    session_store: &SessionStore,
+    sync: Option<CodexOAuthSync>,
+) {
+    let Some(sync) = sync else {
+        return;
+    };
+
+    let disk = match sync.shadow.read_back().await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            // File missing/truncated — codex probably crashed. Keep the
+            // pre-launch credential intact. (It was refreshed before
+            // launch, so the refresh_token is already up-to-date on disk.)
+            persist_refreshed_if_needed(
+                session_store,
+                &sync.key_id,
+                &sync.original,
+                &sync.original,
+            )
+            .await;
+            return;
+        }
+        Err(_) => return,
+    };
+
+    let updated = disk.into_credential(sync.original.email.clone(), sync.original.expires_at);
+    persist_refreshed_if_needed(session_store, &sync.key_id, &sync.original, &updated).await;
+}
+
+async fn persist_refreshed_if_needed(
+    session_store: &SessionStore,
+    key_id: &str,
+    original: &CodexOAuthCredential,
+    updated: &CodexOAuthCredential,
+) {
+    if original == updated {
+        return;
+    }
+    let json = match updated.to_json() {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    // base_url / name / protocols are preserved by passing the same values
+    // as the existing entry. Pull the current entry first so we don't
+    // clobber name changes made mid-session.
+    if let Ok(Some(existing)) = session_store.get_key_by_id(key_id).await {
+        let _ = session_store
+            .update_key(
+                key_id,
+                &existing.name,
+                &existing.base_url,
+                existing.claude_protocol,
+                &json,
+            )
+            .await;
+    }
+}
+
+/// Convenience for the crash-path: delegates to `tokens_changed` via the
+/// read-back value. Exposed so tests don't need to touch disk.
+#[allow(dead_code)]
+pub(crate) fn detect_token_rotation(
+    original: &CodexOAuthCredential,
+    disk: &crate::services::codex_home_shadow::AuthDotJson,
+) -> bool {
+    tokens_changed(original, disk)
 }
 
 pub(crate) async fn record_launch_state(

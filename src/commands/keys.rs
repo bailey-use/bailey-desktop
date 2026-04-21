@@ -199,6 +199,10 @@ const PICKER_URL_MAX_LEN: usize = 50;
 /// Provider info lines shown after picker selection / during shortcut flows.
 /// Defined once so the interactive and shortcut paths stay in sync.
 const COPILOT_INFO: (&str, &str) = ("GitHub Copilot", "device login: github.com/login/device");
+const CODEX_OAUTH_INFO: (&str, &str) = (
+    "OpenAI Codex (ChatGPT)",
+    "sign in to your ChatGPT account — multiple accounts supported",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -378,6 +382,14 @@ async fn ping_with_retries(key: &ApiKey) -> PingStatus {
 
 async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
     use crate::services::provider_profile::{ModelListingStrategy, provider_profile_for_key};
+
+    // Codex ChatGPT OAuth keys have no reachable REST endpoint (the token
+    // is consumed by native codex at launch-time against a private ChatGPT
+    // backend). Report "Ok" so the list doesn't look scary — the real
+    // health check is `aivo run codex` succeeding.
+    if key.is_codex_oauth() {
+        return Ok(PingStatus::Ok);
+    }
 
     let profile = provider_profile_for_key(key);
     let client = reqwest::Client::builder()
@@ -907,6 +919,50 @@ impl KeysCommand {
             term_read_line(prompt)
         }
 
+        // Codex ChatGPT OAuth entries hold a serialized credential bundle in
+        // the encrypted key slot — there is no meaningful base URL or
+        // user-editable "API key" to change. Only the display name is
+        // safe to edit; everything else is preserved verbatim.
+        if key.is_codex_oauth() {
+            let current_name = if key.name.is_empty() {
+                format!("unnamed; shown as {}", key.short_id())
+            } else {
+                key.name.clone()
+            };
+            let name = {
+                let input = read_line_with_default(&format!("Name [{}]: ", current_name))?;
+                if input.is_empty() {
+                    key.name.clone()
+                } else {
+                    input
+                }
+            };
+
+            if name == key.name {
+                println!("{}", style::dim("No changes."));
+                return Ok(ExitCode::Success);
+            }
+
+            let updated = self
+                .session_store
+                .update_key(
+                    &key.id,
+                    &name,
+                    &key.base_url,
+                    key.claude_protocol,
+                    key.key.as_str(),
+                )
+                .await?;
+            if updated {
+                println!(
+                    "  {} renamed to {}",
+                    style::success_symbol(),
+                    style::cyan(&name)
+                );
+            }
+            return Ok(ExitCode::Success);
+        }
+
         // Name
         let current_name = if key.name.is_empty() {
             format!("unnamed; shown as {}", key.short_id())
@@ -1018,6 +1074,7 @@ impl KeysCommand {
         enum ProviderChoice {
             Known(usize),
             Copilot,
+            CodexOAuth,
             Ollama,
             Starter,
             Custom,
@@ -1070,6 +1127,12 @@ impl KeysCommand {
         labels.push(format_picker_choice("GitHub Copilot", "device login"));
         choices.push(ProviderChoice::Copilot);
 
+        labels.push(format_picker_choice(
+            "OpenAI Codex (ChatGPT)",
+            "browser login — multi-account",
+        ));
+        choices.push(ProviderChoice::CodexOAuth);
+
         // Starter is a singleton — hide the picker entry once one is already set up.
         if !has_starter {
             labels.push(format_picker_choice("aivo starter", "free"));
@@ -1097,6 +1160,7 @@ impl KeysCommand {
                 Some(providers[*i].base_url.clone()),
             ),
             ProviderChoice::Copilot => ("GitHub Copilot", None),
+            ProviderChoice::CodexOAuth => ("OpenAI Codex (ChatGPT)", None),
             ProviderChoice::Ollama => ("Ollama", Some(ollama_base_url.clone())),
             ProviderChoice::Starter => ("aivo starter", None),
             ProviderChoice::Custom => ("Custom URL", None),
@@ -1114,6 +1178,7 @@ impl KeysCommand {
         match &choices[idx] {
             ProviderChoice::Known(i) => self.add_known_provider(name, &providers[*i]).await,
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
+            ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
@@ -1206,6 +1271,44 @@ impl KeysCommand {
         )
         .await?;
         sync_models_in_background(&id, "copilot");
+        Ok(ExitCode::Success)
+    }
+
+    /// Interactive Codex ChatGPT OAuth sign-in. Unlike Copilot we allow
+    /// MULTIPLE accounts — each login produces a fresh key entry. The name
+    /// defaults to the account's email claim on the id_token.
+    async fn add_codex_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
+        use crate::services::codex_oauth::{CODEX_OAUTH_SENTINEL, interactive_login};
+
+        keys_ui::provider_info(CODEX_OAUTH_INFO.0, CODEX_OAUTH_INFO.1);
+        keys_ui::step_header(
+            3,
+            3,
+            "Sign in",
+            "follow the URL below — the browser opens automatically if possible",
+        );
+
+        let creds = interactive_login().await?;
+        let derived_name = creds.email.clone().unwrap_or_else(|| "codex".to_string());
+        let final_name = if name.is_empty() { &derived_name } else { name };
+        let creds_json = creds.to_json()?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, CODEX_OAUTH_SENTINEL, None, &creds_json)
+            .await?;
+
+        let email_line = match creds.email.as_deref() {
+            Some(email) => format!("Signed in as {}", email),
+            None => "Signed in to Codex".to_string(),
+        };
+        self.finalize_add(
+            &id,
+            final_name,
+            &email_line,
+            Some(("aivo run codex", "(launches codex with this account)")),
+        )
+        .await?;
         Ok(ExitCode::Success)
     }
 
@@ -1359,7 +1462,7 @@ impl KeysCommand {
 
         let is_name_shortcut = matches!(
             name.as_str(),
-            "copilot" | "ollama" | "aivo-starter" | "aivo starter"
+            "copilot" | "codex" | "ollama" | "aivo-starter" | "aivo starter"
         );
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
@@ -1396,6 +1499,24 @@ impl KeysCommand {
                     return Ok(ExitCode::UserError);
                 }
             }
+        } else if name == "codex" {
+            // `aivo keys add codex` shortcut → ChatGPT OAuth flow. Takes no
+            // flags; any --base-url / --key is rejected.
+            if add_options.base_url.is_some() {
+                eprintln!(
+                    "{} Name 'codex' is reserved for the OpenAI Codex OAuth shortcut. Use a different name or omit --base-url.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            if add_options.key.is_some() {
+                eprintln!(
+                    "{} Do not pass --key for Codex OAuth. Use 'aivo keys add codex' to start browser login.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            return self.add_codex_oauth_interactive("").await;
         } else if name == "aivo-starter" || name == "aivo starter" {
             crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
@@ -1439,6 +1560,16 @@ impl KeysCommand {
                 if value == "aivo-starter" || value == "aivo starter" {
                     eprintln!(
                         "{} Use 'aivo keys add aivo-starter' instead.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
+                if value == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL {
+                    eprintln!(
+                        "{} Codex ChatGPT login requires the explicit shortcut 'aivo keys add codex'.",
                         style::red("Error:")
                     );
                     if add_options.base_url.is_some() {

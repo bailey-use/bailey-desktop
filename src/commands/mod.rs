@@ -5,6 +5,11 @@ use crate::services::ai_launcher::PreparedLaunch;
 use crate::services::environment_injector::redact_env_value;
 use crate::style;
 
+/// Shown (only on explicit picker requests) when the selected key has no
+/// fetchable model list. The tool still launches with its own default.
+pub(crate) const NO_MODEL_LIST_HINT: &str =
+    "No model list available; launching with the tool's default. Use --model <name> to override.";
+
 /// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
 pub(crate) fn normalize_base_url(url: &str) -> &str {
     let url = url.trim_end_matches('/');

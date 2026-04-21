@@ -255,6 +255,7 @@ async fn main() {
 
                 // Resolve model using last selection when no explicit flags given.
                 // When -k is used without -m, always force the model picker.
+                let model_flag_explicit = model.is_some();
                 let model = if model.is_some() {
                     // -m was explicitly provided → use it
                     model
@@ -301,6 +302,7 @@ async fn main() {
                         dry_run,
                         refresh,
                         model,
+                        model_flag_explicit,
                         env,
                         key_override,
                         context_selector,

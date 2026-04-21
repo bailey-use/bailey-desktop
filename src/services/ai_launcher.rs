@@ -17,8 +17,8 @@ use crate::services::launch_args::{
     preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
-    cleanup_runtime_artifacts, persist_runtime_discoveries, prepare_runtime_env,
-    process_pi_sessions, record_launch_state,
+    cleanup_runtime_artifacts, finalize_codex_oauth, persist_runtime_discoveries,
+    prepare_runtime_env, process_pi_sessions, record_launch_state,
 };
 use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::models_cache::ModelsCache;
@@ -372,6 +372,8 @@ impl AILauncher {
             runtime.responses_api_support,
         )
         .await;
+
+        finalize_codex_oauth(&self.session_store, runtime.codex_oauth_sync).await;
 
         cleanup_runtime_artifacts(
             runtime_args.codex_model_catalog_path.as_deref(),

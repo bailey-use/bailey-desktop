@@ -208,6 +208,23 @@ impl ChatCommand {
             },
         };
 
+        // Chat needs a direct chat-completions endpoint; Codex ChatGPT OAuth
+        // keys talk to a private ChatGPT backend only the native codex CLI
+        // knows how to address. Refuse early with a pointer to `aivo run
+        // codex`.
+        if key.is_codex_oauth() {
+            eprintln!(
+                "{} Key '{}' is a Codex ChatGPT OAuth account — `aivo chat` can't use it.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Use `aivo run codex` to start an interactive Codex session, or select a regular API key first.",
+                style::dim("hint:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let client = crate::services::http_utils::router_http_client();
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());

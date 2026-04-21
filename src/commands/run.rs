@@ -24,6 +24,20 @@ use crate::services::share_config::{ShareCleanup, maybe_enable_share};
 use crate::services::system_env;
 use crate::style;
 
+/// Outcome of picker-style model resolution. Distinguishes "user cancelled
+/// the picker" (exit success, don't launch) from "no fetchable model list,
+/// fall back to the tool's default" (launch anyway, no model flag).
+enum ModelOutcome {
+    /// User picked a model, or `--model <value>` was passed.
+    Model(String),
+    /// No `--model` flag, or the picker fetched an empty list. Launch the
+    /// tool with its own default model.
+    UseDefault,
+    /// Picker was shown and the user cancelled (Ctrl-C / Esc). Caller
+    /// should exit without launching.
+    Cancelled,
+}
+
 /// RunCommand provides a unified interface to launch AI tools
 pub struct RunCommand {
     session_store: SessionStore,
@@ -49,14 +63,15 @@ impl RunCommand {
         client: &Client,
         key: &ApiKey,
         flag_model: Option<String>,
+        explicit_model_flag: bool,
         refresh: bool,
         tool: AIToolType,
-    ) -> Result<Option<String>> {
+    ) -> Result<ModelOutcome> {
         match flag_model {
             // No --model flag → don't override, let the tool use its default
-            None => return Ok(None),
+            None => return Ok(ModelOutcome::UseDefault),
             // --model <value> → use it as-is
-            Some(ref m) if !m.is_empty() => return Ok(Some(m.clone())),
+            Some(ref m) if !m.is_empty() => return Ok(ModelOutcome::Model(m.clone())),
             // --model with no value → show picker
             Some(_) => {}
         }
@@ -70,12 +85,26 @@ impl RunCommand {
         };
 
         if models_list.is_empty() {
-            anyhow::bail!(
-                "No model configured and could not fetch model list. Use --model <name> to specify one."
-            );
+            // No fetchable model list (common for providers without a public
+            // /v1/models endpoint — e.g. Codex ChatGPT OAuth). Skip the
+            // picker and let the tool use its own default rather than
+            // blocking the launch. Only explain this when the user
+            // explicitly asked for a picker; the implicit picker on first
+            // launch falls through silently.
+            if explicit_model_flag {
+                eprintln!(
+                    "  {} {}",
+                    style::dim("note:"),
+                    crate::commands::NO_MODEL_LIST_HINT
+                );
+            }
+            return Ok(ModelOutcome::UseDefault);
         }
 
-        Ok(prompt_model_picker(models_list, Some(tool)))
+        match prompt_model_picker(models_list, Some(tool)) {
+            Some(m) => Ok(ModelOutcome::Model(m)),
+            None => Ok(ModelOutcome::Cancelled),
+        }
     }
 
     /// Executes the run command with the specified AI tool
@@ -88,6 +117,7 @@ impl RunCommand {
         dry_run: bool,
         refresh: bool,
         model: Option<String>,
+        explicit_model_flag: bool,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -101,6 +131,7 @@ impl RunCommand {
                 dry_run,
                 refresh,
                 model,
+                explicit_model_flag,
                 env,
                 key_override,
                 context_selector,
@@ -125,6 +156,7 @@ impl RunCommand {
         dry_run: bool,
         refresh: bool,
         model: Option<String>,
+        explicit_model_flag: bool,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -169,16 +201,37 @@ impl RunCommand {
             }
         };
 
-        let picker_was_requested = model.as_ref().is_some_and(|m| m.is_empty());
+        // Codex ChatGPT OAuth keys carry serialized tokens — only `aivo run
+        // codex` knows how to project them into a shadow CODEX_HOME. For
+        // every other tool, refuse early with a clear message instead of
+        // sending a JSON blob as an API key.
+        if let Some(ref key) = key_override
+            && key.is_codex_oauth()
+            && ai_tool != AIToolType::Codex
+        {
+            eprintln!(
+                "{} Key '{}' is a Codex ChatGPT OAuth account and can only be used with 'aivo run codex'.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Add or select a regular API key for {}.",
+                style::dim("hint:"),
+                tool
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
-            let result = self
-                .resolve_model(&client, key, model, refresh, ai_tool)
+            let outcome = self
+                .resolve_model(&client, key, model, explicit_model_flag, refresh, ai_tool)
                 .await?;
-            if picker_was_requested && result.is_none() {
-                return Ok(ExitCode::Success);
+            match outcome {
+                ModelOutcome::Cancelled => return Ok(ExitCode::Success),
+                ModelOutcome::Model(m) => Some(m),
+                ModelOutcome::UseDefault => None,
             }
-            result
         } else {
             // key_override is always resolved in main.rs before reaching here; this
             // branch is unreachable in normal operation. Bail defensively rather than

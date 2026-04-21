@@ -139,6 +139,12 @@ impl ApiKey {
             &self.name
         }
     }
+
+    /// True when this entry stores a Codex ChatGPT OAuth credential bundle
+    /// (encrypted JSON in `key`) rather than a plain API key.
+    pub fn is_codex_oauth(&self) -> bool {
+        self.base_url == crate::services::codex_oauth::CODEX_OAUTH_SENTINEL
+    }
 }
 
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.

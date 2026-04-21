@@ -293,6 +293,28 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Codex CLI
     pub fn for_codex(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        // ChatGPT OAuth path: the credential lives encrypted in `key.key` as
+        // serialized `CodexOAuthCredential` JSON. Pass it through to
+        // launch_runtime via a private env var; launch_runtime writes a
+        // shadow `CODEX_HOME` and spawns codex against that. We don't set
+        // OPENAI_BASE_URL / OPENAI_API_KEY here — native codex will read
+        // `auth.json` from the shadow dir.
+        if key.is_codex_oauth() {
+            let mut env = HashMap::new();
+            env.insert(
+                "AIVO_CODEX_OAUTH_CREDS".to_string(),
+                key.key.as_str().to_string(),
+            );
+            env.insert("AIVO_CODEX_KEY_ID".to_string(), key.id.clone());
+            if let Some(model) = model {
+                let codex_model = map_model_for_codex_cli(model);
+                env.insert("CODEX_MODEL".to_string(), codex_model.clone());
+                env.insert("OPENAI_DEFAULT_MODEL".to_string(), codex_model.clone());
+                env.insert("CODEX_MODEL_DEFAULT".to_string(), codex_model);
+            }
+            return env;
+        }
+
         let profile = provider_profile_for_key(key);
         let mode = if profile.kind == ProviderKind::Ollama {
             ConnectionMode::Ollama

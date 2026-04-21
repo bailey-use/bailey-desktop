@@ -307,11 +307,13 @@ impl StartCommand {
     ) -> Result<Resolved<Option<String>>> {
         // Only use last_sel model when the key matches
         let matching_sel = last_sel.filter(|sel| sel.key_id == key.value.id);
-        let should_prompt = model_arg.as_ref().is_some_and(|value| value.is_empty())
-            || (model_arg.is_none() && matching_sel.is_none());
+        let explicit_picker = model_arg.as_ref().is_some_and(|value| value.is_empty());
+        let should_prompt = explicit_picker || (model_arg.is_none() && matching_sel.is_none());
 
         if should_prompt {
-            return self.prompt_select_model(&key.value, refresh, tool).await;
+            return self
+                .prompt_select_model(&key.value, refresh, tool, explicit_picker)
+                .await;
         }
 
         match model_arg {
@@ -331,6 +333,7 @@ impl StartCommand {
         key: &ApiKey,
         refresh: bool,
         tool: AIToolType,
+        explicit_picker: bool,
     ) -> Result<Resolved<Option<String>>> {
         let client = http_utils::router_http_client();
         let models = if refresh {
@@ -341,9 +344,23 @@ impl StartCommand {
             fetch_models_for_select(&client, key, &self.cache).await
         };
         if models.is_empty() {
-            anyhow::bail!(
-                "No models found for this key. Use 'aivo models --refresh' or specify one with --model <name>."
-            );
+            // No fetchable model list (common for providers without a public
+            // /v1/models endpoint — e.g. Codex ChatGPT OAuth). Skip the
+            // picker and let the tool use its own default rather than
+            // blocking the launch. Only explain this when the user
+            // explicitly asked for a picker; on the implicit "no prior
+            // selection" path the launch just proceeds silently.
+            if explicit_picker {
+                eprintln!(
+                    "  {} {}",
+                    style::dim("note:"),
+                    crate::commands::NO_MODEL_LIST_HINT
+                );
+            }
+            return Ok(Resolved {
+                value: None,
+                interactive: false,
+            });
         }
 
         match prompt_model_picker(models, Some(tool)) {

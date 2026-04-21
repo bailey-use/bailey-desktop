@@ -276,22 +276,8 @@ impl ApiKeyStore {
     }
 
     pub(crate) async fn resolve_key_by_id_or_name(&self, id_or_name: &str) -> Result<ApiKey> {
-        let keys = self.get_keys().await?;
-
-        // Try exact ID match first, then short (first-3) ID match
-        if let Some(mut key) = keys
-            .iter()
-            .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
-            .cloned()
-        {
-            Self::decrypt_key_secret(&mut key)?;
-            return Ok(key);
-        }
-
-        // Try name match
-        let name_matches: Vec<_> = keys.iter().filter(|k| k.name == id_or_name).collect();
-
-        match name_matches.len() {
+        let matches = self.find_keys_by_id_or_name(id_or_name).await?;
+        match matches.len() {
             0 => Err(CLIError::new(
                 format!("API key \"{}\" not found", id_or_name),
                 ErrorCategory::User,
@@ -299,11 +285,7 @@ impl ApiKeyStore {
                 Some("Run 'aivo keys' to see available keys"),
             )
             .into()),
-            1 => {
-                let mut key = name_matches[0].clone();
-                Self::decrypt_key_secret(&mut key)?;
-                Ok(key)
-            }
+            1 => Ok(matches.into_iter().next().unwrap()),
             _ => Err(CLIError::new(
                 format!(
                     "Multiple keys found with name \"{}\". Use the key ID instead.",
@@ -315,6 +297,31 @@ impl ApiKeyStore {
             )
             .into()),
         }
+    }
+
+    /// Returns all keys matching `id_or_name` (decrypted). Exact/short ID
+    /// always produces 0 or 1 matches; name matches may produce any number.
+    /// Callers that want picker-on-ambiguity use this and branch on
+    /// `matches.len()`.
+    pub(crate) async fn find_keys_by_id_or_name(&self, id_or_name: &str) -> Result<Vec<ApiKey>> {
+        let keys = self.get_keys().await?;
+
+        if let Some(mut key) = keys
+            .iter()
+            .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
+            .cloned()
+        {
+            Self::decrypt_key_secret(&mut key)?;
+            return Ok(vec![key]);
+        }
+
+        keys.into_iter()
+            .filter(|k| k.name == id_or_name)
+            .map(|mut k| {
+                Self::decrypt_key_secret(&mut k)?;
+                Ok(k)
+            })
+            .collect()
     }
 
     pub(crate) async fn get_active_key(&self) -> Result<Option<ApiKey>> {

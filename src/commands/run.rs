@@ -233,6 +233,19 @@ impl RunCommand {
                 );
                 return Ok(ExitCode::UserError);
             }
+            if key.is_gemini_oauth() && ai_tool != AIToolType::Gemini {
+                eprintln!(
+                    "{} Key '{}' is a Gemini OAuth account and can only be used with 'aivo run gemini'.",
+                    style::red("Error:"),
+                    key.display_name()
+                );
+                eprintln!(
+                    "  {} Add or select a regular API key for {}.",
+                    style::dim("hint:"),
+                    tool
+                );
+                return Ok(ExitCode::UserError);
+            }
         }
 
         let client = http_utils::router_http_client();

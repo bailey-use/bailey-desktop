@@ -207,6 +207,10 @@ const CLAUDE_OAUTH_INFO: (&str, &str) = (
     "Claude Code (Anthropic)",
     "sign in to your Anthropic account — multiple accounts supported",
 );
+const GEMINI_OAUTH_INFO: (&str, &str) = (
+    "Gemini (Google)",
+    "sign in with Google — multiple accounts supported",
+);
 const OLLAMA_INFO: (&str, &str) = ("Ollama", "install: ollama.com/download");
 const STARTER_INFO: (&str, &str) = ("aivo starter", "free shared key, no signup needed");
 
@@ -387,11 +391,10 @@ async fn ping_with_retries(key: &ApiKey) -> PingStatus {
 async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
     use crate::services::provider_profile::{ModelListingStrategy, provider_profile_for_key};
 
-    // Codex ChatGPT OAuth keys have no reachable REST endpoint. Same for
-    // Claude Code OAuth keys — the token is consumed by the native `claude`
-    // CLI against Anthropic's subscription backend. Report "Ok" so the list
-    // doesn't look scary; the real health check is `aivo run claude`.
-    if key.is_codex_oauth() || key.is_claude_oauth() {
+    // OAuth keys have no reachable REST endpoint; tokens are consumed by the
+    // native CLI against the provider's subscription backend. Report "Ok" so
+    // the list doesn't look scary; the real health check is `aivo run <tool>`.
+    if key.is_any_oauth() {
         return Ok(PingStatus::Ok);
     }
 
@@ -923,11 +926,11 @@ impl KeysCommand {
             term_read_line(prompt)
         }
 
-        // Codex ChatGPT and Claude Code OAuth entries hold a serialized
-        // credential bundle in the encrypted key slot — there is no meaningful
-        // base URL or user-editable "API key" to change. Only the display name
-        // is safe to edit; everything else is preserved verbatim.
-        if key.is_codex_oauth() || key.is_claude_oauth() {
+        // OAuth entries hold a serialized credential bundle in the encrypted
+        // key slot — there is no meaningful base URL or user-editable "API
+        // key" to change. Only the display name is safe to edit; everything
+        // else is preserved verbatim.
+        if key.is_any_oauth() {
             let current_name = if key.name.is_empty() {
                 format!("unnamed; shown as {}", key.short_id())
             } else {
@@ -1080,6 +1083,7 @@ impl KeysCommand {
             Copilot,
             CodexOAuth,
             ClaudeOAuth,
+            GeminiOAuth,
             Ollama,
             Starter,
             Custom,
@@ -1144,6 +1148,12 @@ impl KeysCommand {
         ));
         choices.push(ProviderChoice::ClaudeOAuth);
 
+        labels.push(format_picker_choice(
+            "Gemini (Google)",
+            "browser login — multi-account",
+        ));
+        choices.push(ProviderChoice::GeminiOAuth);
+
         // Starter is a singleton — hide the picker entry once one is already set up.
         if !has_starter {
             labels.push(format_picker_choice("aivo starter", "free"));
@@ -1173,6 +1183,7 @@ impl KeysCommand {
             ProviderChoice::Copilot => ("GitHub Copilot", None),
             ProviderChoice::CodexOAuth => ("OpenAI Codex (ChatGPT)", None),
             ProviderChoice::ClaudeOAuth => ("Claude Code (Anthropic)", None),
+            ProviderChoice::GeminiOAuth => ("Gemini (Google)", None),
             ProviderChoice::Ollama => ("Ollama", Some(ollama_base_url.clone())),
             ProviderChoice::Starter => ("aivo starter", None),
             ProviderChoice::Custom => ("Custom URL", None),
@@ -1192,6 +1203,7 @@ impl KeysCommand {
             ProviderChoice::Copilot => self.add_copilot_interactive(name).await,
             ProviderChoice::CodexOAuth => self.add_codex_oauth_interactive(name).await,
             ProviderChoice::ClaudeOAuth => self.add_claude_oauth_interactive(name).await,
+            ProviderChoice::GeminiOAuth => self.add_gemini_oauth_interactive(name).await,
             ProviderChoice::Ollama => self.add_ollama_interactive(name).await,
             ProviderChoice::Starter => self.add_starter_interactive(name).await,
             ProviderChoice::Custom => self.add_custom_interactive(name).await,
@@ -1396,6 +1408,47 @@ impl KeysCommand {
         Ok(ExitCode::Success)
     }
 
+    /// Interactive Google OAuth sign-in for the `gemini` CLI. Multiple
+    /// accounts supported — each login produces a fresh key entry named
+    /// after the account's email. Tokens are stored encrypted; at launch
+    /// time aivo projects them into a shadow `GEMINI_CLI_HOME` so the
+    /// native `gemini` CLI reads them without touching the user's real
+    /// `~/.gemini/`.
+    async fn add_gemini_oauth_interactive(&self, name: &str) -> Result<ExitCode> {
+        use crate::services::gemini_oauth::{GEMINI_OAUTH_SENTINEL, interactive_login};
+
+        keys_ui::provider_info(GEMINI_OAUTH_INFO.0, GEMINI_OAUTH_INFO.1);
+        keys_ui::step_header(
+            3,
+            3,
+            "Sign in",
+            "follow the URL below — the browser opens automatically if possible",
+        );
+
+        let creds = interactive_login().await?;
+        let derived_name = creds.email.clone().unwrap_or_else(|| "gemini".to_string());
+        let final_name = if name.is_empty() { &derived_name } else { name };
+        let creds_json = creds.to_json()?;
+
+        let id = self
+            .session_store
+            .add_key_with_protocol(final_name, GEMINI_OAUTH_SENTINEL, None, &creds_json)
+            .await?;
+
+        let email_line = match creds.email.as_deref() {
+            Some(email) => format!("Signed in as {}", email),
+            None => "Signed in to Gemini".to_string(),
+        };
+        self.finalize_add(
+            &id,
+            final_name,
+            &email_line,
+            Some(("aivo run gemini", "(launches gemini with this account)")),
+        )
+        .await?;
+        Ok(ExitCode::Success)
+    }
+
     async fn add_ollama_interactive(&self, name: &str) -> Result<ExitCode> {
         keys_ui::provider_info(OLLAMA_INFO.0, OLLAMA_INFO.1);
 
@@ -1546,7 +1599,7 @@ impl KeysCommand {
 
         let is_name_shortcut = matches!(
             name.as_str(),
-            "copilot" | "codex" | "claude" | "ollama" | "aivo-starter" | "aivo starter"
+            "copilot" | "codex" | "claude" | "gemini" | "ollama" | "aivo-starter" | "aivo starter"
         );
         let interactive =
             add_options.base_url.is_none() && add_options.key.is_none() && !is_name_shortcut;
@@ -1619,6 +1672,24 @@ impl KeysCommand {
                 return Ok(ExitCode::UserError);
             }
             return self.add_claude_oauth_interactive("").await;
+        } else if name == "gemini" {
+            // `aivo keys add gemini` shortcut → Google OAuth flow. Takes no
+            // flags; any --base-url / --key is rejected.
+            if add_options.base_url.is_some() {
+                eprintln!(
+                    "{} Name 'gemini' is reserved for the Gemini OAuth shortcut. Use a different name or omit --base-url.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            if add_options.key.is_some() {
+                eprintln!(
+                    "{} Do not pass --key for Gemini OAuth. Use 'aivo keys add gemini' to start browser login.",
+                    style::red("Error:")
+                );
+                return Ok(ExitCode::UserError);
+            }
+            return self.add_gemini_oauth_interactive("").await;
         } else if name == "aivo-starter" || name == "aivo starter" {
             crate::constants::AIVO_STARTER_SENTINEL.to_string()
         } else {
@@ -1682,6 +1753,16 @@ impl KeysCommand {
                 if value == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL {
                     eprintln!(
                         "{} Claude Code login requires the explicit shortcut 'aivo keys add claude'.",
+                        style::red("Error:")
+                    );
+                    if add_options.base_url.is_some() {
+                        return Ok(ExitCode::UserError);
+                    }
+                    continue;
+                }
+                if value == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL {
+                    eprintln!(
+                        "{} Gemini login requires the explicit shortcut 'aivo keys add gemini'.",
                         style::red("Error:")
                     );
                     if add_options.base_url.is_some() {

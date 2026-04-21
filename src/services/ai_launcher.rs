@@ -17,8 +17,8 @@ use crate::services::launch_args::{
     preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
-    cleanup_runtime_artifacts, finalize_codex_oauth, persist_runtime_discoveries,
-    prepare_runtime_env, process_pi_sessions, record_launch_state,
+    cleanup_runtime_artifacts, finalize_codex_oauth, finalize_gemini_oauth,
+    persist_runtime_discoveries, prepare_runtime_env, process_pi_sessions, record_launch_state,
 };
 use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::models_cache::ModelsCache;
@@ -374,6 +374,7 @@ impl AILauncher {
         .await;
 
         finalize_codex_oauth(&self.session_store, runtime.codex_oauth_sync).await;
+        finalize_gemini_oauth(&self.session_store, runtime.gemini_oauth_sync).await;
 
         cleanup_runtime_artifacts(
             runtime_args.codex_model_catalog_path.as_deref(),
@@ -551,6 +552,12 @@ impl AILauncher {
 
     async fn resolve_gemini_protocol(&self, mut key: ApiKey, persist: bool) -> Result<ApiKey> {
         if is_copilot_base(&key.base_url) {
+            return Ok(key);
+        }
+        // OAuth entries are pinned to the native Google endpoint (handled by
+        // the shadow GEMINI_CLI_HOME in launch_runtime). No router protocol
+        // applies.
+        if key.is_gemini_oauth() {
             return Ok(key);
         }
         if key.gemini_protocol.is_none() {

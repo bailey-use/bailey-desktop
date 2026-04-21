@@ -7,6 +7,11 @@ use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
 use crate::services::codex_home_shadow::{CodexHomeShadow, tokens_changed};
 use crate::services::codex_oauth::{CodexOAuthCredential, REFRESH_SKEW_SECS, ensure_fresh};
+use crate::services::gemini_home_shadow::GeminiHomeShadow;
+use crate::services::gemini_oauth::{
+    GeminiOAuthCredential, REFRESH_SKEW_SECS as GEMINI_REFRESH_SKEW_SECS,
+    ensure_fresh as gemini_ensure_fresh,
+};
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
@@ -20,12 +25,21 @@ pub(crate) struct CodexOAuthSync {
     pub(crate) original: CodexOAuthCredential,
 }
 
+/// Holds the shadow `GEMINI_CLI_HOME` dir + metadata needed to sync
+/// refreshed tokens back into aivo's store after gemini exits.
+pub(crate) struct GeminiOAuthSync {
+    pub(crate) key_id: String,
+    pub(crate) shadow: GeminiHomeShadow,
+    pub(crate) original: GeminiOAuthCredential,
+}
+
 pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
     pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
     pub(crate) pi_agent_dir: Option<String>,
     pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
+    pub(crate) gemini_oauth_sync: Option<GeminiOAuthSync>,
 }
 
 pub(crate) async fn prepare_runtime_env(
@@ -107,12 +121,20 @@ pub(crate) async fn prepare_runtime_env(
             None
         };
 
+    let gemini_oauth_sync =
+        if tool == AIToolType::Gemini && env.contains_key("AIVO_GEMINI_OAUTH_CREDS") {
+            Some(prepare_gemini_oauth_shadow(&mut env).await?)
+        } else {
+            None
+        };
+
     Ok(LaunchRuntimeState {
         env,
         router_protocol,
         responses_api_support,
         pi_agent_dir,
         codex_oauth_sync,
+        gemini_oauth_sync,
     })
 }
 
@@ -223,6 +245,103 @@ pub(crate) fn detect_token_rotation(
     disk: &crate::services::codex_home_shadow::AuthDotJson,
 ) -> bool {
     tokens_changed(original, disk)
+}
+
+/// Parses `AIVO_GEMINI_OAUTH_CREDS` (set by `environment_injector::for_gemini`
+/// for Google OAuth keys), refreshes the access token if near expiry, and
+/// writes a shadow `GEMINI_CLI_HOME` temp dir containing `.gemini/
+/// oauth_creds.json` + `google_accounts.json`.
+///
+/// The `AIVO_*` placeholder vars are stripped before gemini is spawned; all
+/// gemini sees is `GEMINI_CLI_HOME=<shadow>`, `GOOGLE_GENAI_USE_GCA=true`,
+/// and `GEMINI_MODEL=<model>`.
+async fn prepare_gemini_oauth_shadow(env: &mut HashMap<String, String>) -> Result<GeminiOAuthSync> {
+    let raw = env
+        .remove("AIVO_GEMINI_OAUTH_CREDS")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_GEMINI_OAUTH_CREDS"))?;
+    let key_id = env
+        .remove("AIVO_GEMINI_KEY_ID")
+        .ok_or_else(|| anyhow::anyhow!("missing AIVO_GEMINI_KEY_ID"))?;
+    let mut creds = GeminiOAuthCredential::from_json(&raw)?;
+
+    // Refresh pre-launch so gemini starts with a valid access token. The
+    // post-exit sync path persists both this refresh and any further
+    // rotations gemini performs during the session, so we don't persist
+    // here.
+    let _refreshed = gemini_ensure_fresh(&mut creds, GEMINI_REFRESH_SKEW_SECS).await?;
+
+    let shadow = GeminiHomeShadow::create(&creds).await?;
+    env.insert(
+        "GEMINI_CLI_HOME".to_string(),
+        shadow.path().to_string_lossy().to_string(),
+    );
+
+    Ok(GeminiOAuthSync {
+        key_id,
+        shadow,
+        original: creds,
+    })
+}
+
+/// Reads the shadow `oauth_creds.json` back after gemini exits and, if any
+/// token changed, persists the rotated credential into aivo's store.
+/// Errors are logged but never propagated — the user's gemini session has
+/// already completed, and a failed sync just means the next launch refreshes
+/// again.
+pub(crate) async fn finalize_gemini_oauth(
+    session_store: &SessionStore,
+    sync: Option<GeminiOAuthSync>,
+) {
+    let Some(sync) = sync else {
+        return;
+    };
+
+    let disk = match sync.shadow.read_back().await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            // File missing/truncated — gemini probably crashed before
+            // writing. Persist the pre-launch (freshly refreshed) creds so
+            // the refresh_token rotation isn't lost.
+            persist_refreshed_gemini_if_needed(
+                session_store,
+                &sync.key_id,
+                &sync.original,
+                &sync.original,
+            )
+            .await;
+            return;
+        }
+        Err(_) => return,
+    };
+
+    let updated = disk.into_credential(sync.original.email.clone(), sync.original.last_refresh);
+    persist_refreshed_gemini_if_needed(session_store, &sync.key_id, &sync.original, &updated).await;
+}
+
+async fn persist_refreshed_gemini_if_needed(
+    session_store: &SessionStore,
+    key_id: &str,
+    original: &GeminiOAuthCredential,
+    updated: &GeminiOAuthCredential,
+) {
+    if original == updated {
+        return;
+    }
+    let json = match updated.to_json() {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    if let Ok(Some(existing)) = session_store.get_key_by_id(key_id).await {
+        let _ = session_store
+            .update_key(
+                key_id,
+                &existing.name,
+                &existing.base_url,
+                existing.claude_protocol,
+                &json,
+            )
+            .await;
+    }
 }
 
 pub(crate) async fn record_launch_state(

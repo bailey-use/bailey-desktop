@@ -37,11 +37,7 @@ pub(crate) async fn resolve_key_override(
 ) -> anyhow::Result<KeyResolution> {
     match key_flag {
         Some("") => prompt_temporary_key_override(session_store).await,
-        Some(key_id_or_name) => Ok(KeyResolution::Selected(
-            session_store
-                .resolve_key_by_id_or_name(key_id_or_name)
-                .await?,
-        )),
+        Some(key_id_or_name) => resolve_by_id_or_name_or_pick(session_store, key_id_or_name).await,
         None => match mode {
             KeyLookupMode::RequireActiveOrPrompt => {
                 match resolve_active_key_or_prompt(session_store).await {
@@ -62,6 +58,46 @@ pub(crate) async fn resolve_key_override(
                 }
             }
         },
+    }
+}
+
+/// Resolves `key_id_or_name` to a single key. Shows a picker on ambiguous
+/// name matches when a terminal is available; falls back to the low-level
+/// error otherwise so scripts/CI still get a clear failure.
+pub(crate) async fn resolve_by_id_or_name_or_pick(
+    session_store: &SessionStore,
+    key_id_or_name: &str,
+) -> anyhow::Result<KeyResolution> {
+    let matches = session_store
+        .find_keys_by_id_or_name(key_id_or_name)
+        .await?;
+    match matches.len() {
+        0 => {
+            // Delegate to the existing error path for consistent messaging.
+            Err(session_store
+                .resolve_key_by_id_or_name(key_id_or_name)
+                .await
+                .expect_err("empty matches must produce a not-found error"))
+        }
+        1 => Ok(KeyResolution::Selected(matches.into_iter().next().unwrap())),
+        _ => {
+            if !io::stderr().is_terminal() {
+                return Err(session_store
+                    .resolve_key_by_id_or_name(key_id_or_name)
+                    .await
+                    .expect_err("ambiguous matches must produce an error"));
+            }
+            eprintln!(
+                "{} Multiple keys match {}:",
+                style::yellow("Note:"),
+                style::cyan(key_id_or_name)
+            );
+            let prompt = format!("Select key '{}'", key_id_or_name);
+            match commands::keys::prompt_pick_key_without_activation(&matches, &prompt, 0)? {
+                Some(key) => Ok(KeyResolution::Selected(key)),
+                None => Ok(KeyResolution::Cancelled),
+            }
+        }
     }
 }
 

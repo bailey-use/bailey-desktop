@@ -152,6 +152,21 @@ impl ApiKey {
     pub fn is_claude_oauth(&self) -> bool {
         self.base_url == crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL
     }
+
+    /// True when this entry stores a Google OAuth credential bundle for the
+    /// `gemini` CLI (encrypted `GeminiOAuthCredential` JSON in `key`) rather
+    /// than a plain API key.
+    pub fn is_gemini_oauth(&self) -> bool {
+        self.base_url == crate::services::gemini_oauth::GEMINI_OAUTH_SENTINEL
+    }
+
+    /// True when this entry is any of the multi-account OAuth variants
+    /// (Codex/Claude/Gemini) — used by callers that share the same
+    /// "OAuth entries lack a REST endpoint / are tied to a specific CLI"
+    /// semantics.
+    pub fn is_any_oauth(&self) -> bool {
+        self.is_codex_oauth() || self.is_claude_oauth() || self.is_gemini_oauth()
+    }
 }
 
 /// Per-directory, per-tool start records. Outer key = cwd, inner key = tool name.
@@ -916,6 +931,11 @@ impl SessionStore {
         self.api_keys.resolve_key_by_id_or_name(id_or_name).await
     }
 
+    /// See `ApiKeyStore::find_keys_by_id_or_name`.
+    pub async fn find_keys_by_id_or_name(&self, id_or_name: &str) -> Result<Vec<ApiKey>> {
+        self.api_keys.find_keys_by_id_or_name(id_or_name).await
+    }
+
     /// Gets the currently active API key with its secret decrypted.
     pub async fn get_active_key(&self) -> Result<Option<ApiKey>> {
         self.api_keys.get_active_key().await
@@ -1305,6 +1325,46 @@ mod tests {
         let result = store.resolve_key_by_id_or_name("nonexistent").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_find_keys_by_id_or_name_returns_all_matches() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let id1 = store
+            .add_key_with_protocol("dup", "http://localhost:8080", None, "sk-1")
+            .await
+            .unwrap();
+        let id2 = store
+            .add_key_with_protocol("dup", "http://localhost:9090", None, "sk-2")
+            .await
+            .unwrap();
+        store
+            .add_key_with_protocol("unique", "http://localhost:7070", None, "sk-3")
+            .await
+            .unwrap();
+
+        // Name with multiple matches → all returned, decrypted.
+        let dup_matches = store.find_keys_by_id_or_name("dup").await.unwrap();
+        assert_eq!(dup_matches.len(), 2);
+        let ids: Vec<_> = dup_matches.iter().map(|k| k.id.as_str()).collect();
+        assert!(ids.contains(&id1.as_str()) && ids.contains(&id2.as_str()));
+        assert!(dup_matches.iter().all(|k| !k.key.as_str().is_empty()));
+
+        // Unique name → single match.
+        let unique_matches = store.find_keys_by_id_or_name("unique").await.unwrap();
+        assert_eq!(unique_matches.len(), 1);
+
+        // Exact ID → single match regardless of name collisions.
+        let by_id = store.find_keys_by_id_or_name(&id1).await.unwrap();
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, id1);
+
+        // Missing → empty Vec, not an error.
+        let none = store.find_keys_by_id_or_name("nope").await.unwrap();
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

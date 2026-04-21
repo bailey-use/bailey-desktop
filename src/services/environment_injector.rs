@@ -51,6 +51,17 @@ fn strip_google_version_suffix(base_url: &str) -> &str {
         .unwrap_or(base)
 }
 
+/// Persistent aivo-managed path for the gemini CLI's folder-trust store.
+/// Kept outside the shadow `GEMINI_CLI_HOME` so trust choices survive the
+/// tempdir being recreated on every launch.
+fn aivo_gemini_trusted_folders_path() -> Option<std::path::PathBuf> {
+    crate::services::system_env::home_dir().map(|home| {
+        home.join(".config")
+            .join("aivo")
+            .join("gemini-trusted-folders.json")
+    })
+}
+
 /// Ensures the Google base URL ends with `/v1beta`.  Tools that set
 /// `apiVersion = ""` when a custom base URL is provided (Pi) expect the
 /// version to already be part of the URL.
@@ -401,6 +412,48 @@ impl EnvironmentInjector {
 
     /// Prepares environment variables for Gemini CLI
     pub fn for_gemini(&self, key: &ApiKey, model: Option<&str>) -> HashMap<String, String> {
+        // Google OAuth path: the credential lives encrypted in `key.key` as
+        // serialized `GeminiOAuthCredential` JSON. Pass it through to
+        // launch_runtime via a private env var; launch_runtime writes a
+        // shadow `GEMINI_CLI_HOME` and spawns gemini against that. We don't
+        // set GEMINI_API_KEY / GOOGLE_GEMINI_BASE_URL here — native gemini
+        // will read `oauth_creds.json` from the shadow dir.
+        if key.is_gemini_oauth() {
+            let mut env = HashMap::new();
+            env.insert(
+                "AIVO_GEMINI_OAUTH_CREDS".to_string(),
+                key.key.as_str().to_string(),
+            );
+            env.insert("AIVO_GEMINI_KEY_ID".to_string(), key.id.clone());
+            if let Some(m) = model {
+                env.insert(
+                    "GEMINI_MODEL".to_string(),
+                    google_native_model_name(m).to_string(),
+                );
+            }
+            // `GOOGLE_GENAI_USE_GCA=true` is the gemini-cli's explicit signal
+            // to use the personal Google OAuth auth path, bypassing the
+            // first-run TUI auth-type picker. Without it the CLI would prompt
+            // even though `oauth_creds.json` is already present.
+            env.insert("GOOGLE_GENAI_USE_GCA".to_string(), "true".to_string());
+            // Point folder-trust storage at a persistent aivo-managed file
+            // (the shadow HOME is recreated each launch, so
+            // `.gemini/trustedFolders.json` inside it would reset the user's
+            // trust choices every run).
+            if let Some(path) = aivo_gemini_trusted_folders_path() {
+                env.insert(
+                    "GEMINI_CLI_TRUSTED_FOLDERS_PATH".to_string(),
+                    path.to_string_lossy().to_string(),
+                );
+            }
+            // Clear direct-auth env vars so a caller export can't override
+            // the shadow HOME's OAuth credentials.
+            env.insert("GEMINI_API_KEY".to_string(), String::new());
+            env.insert("GOOGLE_API_KEY".to_string(), String::new());
+            env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), String::new());
+            return env;
+        }
+
         let profile = provider_profile_for_key(key);
         let mode = if profile.kind == ProviderKind::Ollama {
             ConnectionMode::Ollama
@@ -1880,5 +1933,86 @@ mod tests {
         assert_eq!(parsed["providers"]["aivo"]["api"], "openai-completions");
         assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
         assert!(!env.contains_key("AIVO_USE_PI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn for_gemini_oauth_sets_placeholder_vars_and_clears_direct_env() {
+        use crate::services::gemini_oauth::{GEMINI_OAUTH_SENTINEL, GeminiOAuthCredential};
+        let creds = GeminiOAuthCredential {
+            access_token: "ya29.TEST".into(),
+            refresh_token: "1//TEST".into(),
+            id_token: None,
+            scope: "https://www.googleapis.com/auth/cloud-platform".into(),
+            token_type: "Bearer".into(),
+            expiry_date: 1_700_000_000_000,
+            email: Some("alice@example.com".into()),
+            last_refresh: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "gid".into(),
+            "alice".into(),
+            GEMINI_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_gemini(&key, Some("gemini-2.5-pro"));
+
+        // Placeholder vars consumed by launch_runtime::prepare_gemini_oauth_shadow.
+        assert_eq!(
+            env.get("AIVO_GEMINI_OAUTH_CREDS"),
+            Some(&key.key.as_str().to_string())
+        );
+        assert_eq!(env.get("AIVO_GEMINI_KEY_ID"), Some(&"gid".to_string()));
+
+        // Bypass the TUI auth-type picker in the native CLI.
+        assert_eq!(env.get("GOOGLE_GENAI_USE_GCA"), Some(&"true".to_string()));
+
+        // Folder-trust store is pointed at a persistent aivo path so trust
+        // choices survive the shadow HOME being recreated each launch.
+        let trust_path = env
+            .get("GEMINI_CLI_TRUSTED_FOLDERS_PATH")
+            .expect("trust path env var");
+        assert!(trust_path.ends_with("gemini-trusted-folders.json"));
+        assert!(trust_path.replace('\\', "/").contains(".config/aivo"));
+
+        // Model passes through (with google_native_model_name mapping).
+        assert!(env.contains_key("GEMINI_MODEL"));
+
+        // Direct-mode env vars must be empty so a caller export can't shadow
+        // the OAuth creds inside the shadow HOME.
+        assert_eq!(env.get("GEMINI_API_KEY"), Some(&String::new()));
+        assert_eq!(env.get("GOOGLE_API_KEY"), Some(&String::new()));
+        assert_eq!(env.get("GOOGLE_GEMINI_BASE_URL"), Some(&String::new()));
+
+        // No router-mode indicators — OAuth is always native Google.
+        assert!(!env.contains_key("AIVO_USE_GEMINI_ROUTER"));
+        assert!(!env.contains_key("AIVO_USE_GEMINI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn for_gemini_oauth_without_model_omits_gemini_model() {
+        use crate::services::gemini_oauth::{GEMINI_OAUTH_SENTINEL, GeminiOAuthCredential};
+        let creds = GeminiOAuthCredential {
+            access_token: "ya29.TEST".into(),
+            refresh_token: "1//TEST".into(),
+            id_token: None,
+            scope: "s".into(),
+            token_type: "Bearer".into(),
+            expiry_date: 0,
+            email: None,
+            last_refresh: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "gid".into(),
+            "anon".into(),
+            GEMINI_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let injector = EnvironmentInjector::new();
+        let env = injector.for_gemini(&key, None);
+        assert!(!env.contains_key("GEMINI_MODEL"));
+        assert_eq!(env.get("GOOGLE_GENAI_USE_GCA"), Some(&"true".to_string()));
     }
 }

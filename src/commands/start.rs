@@ -168,11 +168,38 @@ impl StartCommand {
         }
 
         if let Some(key_id_or_name) = key_arg {
+            let matches = self
+                .session_store
+                .find_keys_by_id_or_name(key_id_or_name)
+                .await?;
+            let key = match matches.len() {
+                0 | 1 => {
+                    self.session_store
+                        .resolve_key_by_id_or_name(key_id_or_name)
+                        .await?
+                }
+                _ => {
+                    use std::io::IsTerminal;
+                    if !std::io::stderr().is_terminal() {
+                        self.session_store
+                            .resolve_key_by_id_or_name(key_id_or_name)
+                            .await?
+                    } else {
+                        eprintln!(
+                            "{} Multiple keys match {}:",
+                            crate::style::yellow("Note:"),
+                            crate::style::cyan(key_id_or_name)
+                        );
+                        let prompt = format!("Select key '{}'", key_id_or_name);
+                        match prompt_pick_key_without_activation(&matches, &prompt, 0)? {
+                            Some(key) => key,
+                            None => anyhow::bail!("Cancelled."),
+                        }
+                    }
+                }
+            };
             return Ok(Resolved {
-                value: self
-                    .session_store
-                    .resolve_key_by_id_or_name(key_id_or_name)
-                    .await?,
+                value: key,
                 interactive: false,
             });
         }

@@ -243,6 +243,22 @@ impl ChatCommand {
             return Ok(ExitCode::UserError);
         }
 
+        // Gemini OAuth credentials target Google's code-assist backend via a
+        // shadow GEMINI_CLI_HOME the native `gemini` CLI reads — not the
+        // generateContent endpoints aivo chat speaks.
+        if key.is_gemini_oauth() {
+            eprintln!(
+                "{} Key '{}' is a Gemini OAuth account — `aivo chat` can't use it.",
+                style::red("Error:"),
+                key.display_name()
+            );
+            eprintln!(
+                "  {} Use `aivo run gemini` to start an interactive Gemini session, or select a regular API key first.",
+                style::dim("hint:")
+            );
+            return Ok(ExitCode::UserError);
+        }
+
         let client = crate::services::http_utils::router_http_client();
         let cwd =
             crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());

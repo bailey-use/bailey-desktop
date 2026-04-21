@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.19.0
+
+### Features
+
+- Multi-account OAuth for Codex, Gemini and Claude Code
+
+### Bug Fixes
+
+- Align `ctx`, `out`, and price columns in `aivo models`
+
+### Refactors
+
+- Drop reserved-name shortcuts in `aivo keys`; preselect in the picker instead
+- Rework `Ctrl+C` / `Ctrl+L` handling and drop the `/clear` command
+
 ## v0.18.1
 
 - Fix build on windows.

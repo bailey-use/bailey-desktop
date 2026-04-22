@@ -353,7 +353,7 @@ async fn main() {
                 let mut all_keys = session_store.get_keys().await.unwrap_or_default();
                 // Decrypt and exclude the primary key
                 let primary_id = key_override.as_ref().map(|k| k.id.clone());
-                all_keys.retain(|k| primary_id.as_deref() != Some(&k.id));
+                all_keys.retain(|k| primary_id.as_deref() != Some(&k.id) && !k.is_any_oauth());
                 all_keys.iter_mut().for_each(|k| {
                     let _ = SessionStore::decrypt_key_secret(k);
                 });

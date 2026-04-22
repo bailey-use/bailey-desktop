@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.19.1
+
+### UX
+
+- Improve key pickers and status prints for `--as`.
+
+### Bug Fixes
+
+- Preserve Codex trust settings across launches
+- Reject for disable OAuth keys for `models` and `serve` instead of error
+
 ## v0.19.0
 
 ### Features

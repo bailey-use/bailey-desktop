@@ -216,12 +216,6 @@ async fn main() {
         }
 
         Commands::Image(image_args) => {
-            // Bare `aivo image` with no prompt and no flags on a TTY should
-            // show help rather than lurch through key/model pickers.
-            if ImageCommand::is_bare_invocation(&image_args) {
-                ImageCommand::print_help();
-                process::exit(ExitCode::Success.code());
-            }
             let key_override = key_or_exit(
                 resolve_key_override(
                     &session_store,

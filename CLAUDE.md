@@ -51,3 +51,8 @@ src/main.rs → SessionStore → EnvironmentInjector → AILauncher → Command 
 **Cross-platform**: Platform-specific code gated behind `cfg(unix)` / `cfg(windows)`.
 
 **Exit codes**: 0 = success, 1 = user error, 2 = network, 3 = auth.
+
+## Instructions
+
+Restate the question in fully concrete terms, making every implicit detail explicit. Then answer.
+

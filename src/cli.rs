@@ -466,7 +466,7 @@ pub struct ChatArgs {
 /// Arguments for the image command
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageArgs {
-    /// Text prompt (read from stdin if absent and stdin is piped)
+    /// Text prompt, or read from stdin when omitted
     #[arg(value_name = "PROMPT", value_parser = non_empty())]
     pub prompt: Option<String>,
 

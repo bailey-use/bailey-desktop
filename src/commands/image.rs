@@ -35,19 +35,6 @@ impl ImageCommand {
         }
     }
 
-    /// Returns true when the invocation has no prompt and no meaningful flags,
-    /// i.e. `aivo image` with nothing else. Used by main.rs to show help
-    /// instead of dispatching through key resolution.
-    pub fn is_bare_invocation(args: &ImageArgs) -> bool {
-        has_no_user_intent(args) && std::io::stdin().is_terminal()
-    }
-}
-
-fn has_no_user_intent(args: &ImageArgs) -> bool {
-    *args == ImageArgs::default()
-}
-
-impl ImageCommand {
     pub fn print_help() {
         println!(
             "{} {}",
@@ -61,7 +48,7 @@ impl ImageCommand {
         println!(
             "  {}{}",
             style::cyan(format!("{:<24}", "PROMPT")),
-            style::dim("Text prompt (reads stdin if omitted and piped)")
+            style::dim("Text prompt, or read from stdin when omitted")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -100,20 +87,24 @@ impl ImageCommand {
     }
 
     pub async fn execute(self, args: ImageArgs, key: ApiKey) -> ExitCode {
-        let prompt = match resolve_prompt(args.prompt.as_deref()) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
-                return ExitCode::UserError;
-            }
-        };
-
+        // Resolve the model BEFORE reading stdin for the prompt. The fuzzy
+        // picker reads keystrokes from stdin, so consuming stdin first (for
+        // a piped prompt) would leave the picker at EOF. Matches
+        // `aivo chat -x` which picks the model before reading stdin.
         let model = match resolve_image_model(&self.session_store, &self.cache, &args, &key).await {
             Ok(Some(m)) => m,
             Ok(None) => {
                 // Picker cancelled (ESC) — treat as clean exit, no error.
                 return ExitCode::Success;
             }
+            Err(e) => {
+                eprintln!("{} {}", style::red("Error:"), e);
+                return ExitCode::UserError;
+            }
+        };
+
+        let prompt = match resolve_prompt(args.prompt.as_deref()) {
+            Ok(p) => p,
             Err(e) => {
                 eprintln!("{} {}", style::red("Error:"), e);
                 return ExitCode::UserError;
@@ -154,7 +145,14 @@ impl ImageCommand {
 
         let spinner = start_spinner_if_tty(&model);
         let start = std::time::Instant::now();
-        let result = image_gen::generate(&key, &request, final_path.as_deref(), args.url).await;
+        let result = image_gen::generate(
+            &key,
+            &request,
+            final_path.as_deref(),
+            target.pins_extension(),
+            args.url,
+        )
+        .await;
         let elapsed = start.elapsed();
         stop_spinner(spinner);
 
@@ -188,8 +186,11 @@ fn resolve_prompt(arg: Option<&str>) -> anyhow::Result<String> {
             return Ok(trimmed.to_string());
         }
     }
+    // Mirrors `aivo chat -x`: on a TTY, show a hint and read until EOF;
+    // on a pipe, read silently. Either way, fall through to stdin when
+    // no positional prompt was supplied.
     if std::io::stdin().is_terminal() {
-        anyhow::bail!("prompt required (pass as an argument or pipe via stdin)");
+        eprintln!("{}", style::dim("Enter prompt, then press Ctrl-D to send."));
     }
     let stdin = image_gen::read_stdin_prompt()?;
     if stdin.is_empty() {
@@ -350,32 +351,6 @@ fn human_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn has_no_user_intent_for_default_args() {
-        assert!(has_no_user_intent(&ImageArgs::default()));
-    }
-
-    #[test]
-    fn has_no_user_intent_detects_each_flag() {
-        let cases: Vec<Box<dyn Fn(&mut ImageArgs)>> = vec![
-            Box::new(|a| a.prompt = Some("cat".into())),
-            Box::new(|a| a.model = Some("m".into())),
-            Box::new(|a| a.key = Some("k".into())),
-            Box::new(|a| a.output = Some("o.png".into())),
-            Box::new(|a| a.size = Some("1024x1024".into())),
-            Box::new(|a| a.quality = Some("hd".into())),
-            Box::new(|a| a.force = true),
-            Box::new(|a| a.refresh = true),
-            Box::new(|a| a.url = true),
-            Box::new(|a| a.json = true),
-        ];
-        for mutate in cases {
-            let mut a = ImageArgs::default();
-            mutate(&mut a);
-            assert!(!has_no_user_intent(&a), "expected not-bare for {a:?}");
-        }
-    }
 
     #[test]
     fn human_bytes_formats_ranges() {

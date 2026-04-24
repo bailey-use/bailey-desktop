@@ -73,6 +73,17 @@ impl OutputTarget {
             Self::File(path)
         }
     }
+
+    /// True when the user's `-o` value pins a file extension. For Default
+    /// and Directory the extension was chosen by us (currently "png"), so
+    /// the caller is free to swap in the server's actual content-type.
+    pub fn pins_extension(&self) -> bool {
+        match self {
+            Self::Default | Self::Directory(_) => false,
+            Self::File(p) => p.extension().is_some(),
+            Self::Template(s) => Path::new(s).extension().is_some(),
+        }
+    }
 }
 
 /// Resolves the concrete output path before any API call is made. Collision
@@ -326,7 +337,10 @@ struct OpenAIImageItem {
 
 /// Top-level generation entry point. Picks the protocol from `key.base_url`
 /// and dispatches accordingly. `path` is the pre-resolved, overwrite-applied
-/// target path (or `None` when `url_only` is set).
+/// target path (or `None` when `url_only` is set). When `pinned_extension`
+/// is false, the caller chose the extension (e.g. the default `.png` for
+/// `OutputTarget::Default`) and we may swap it to the server's actual
+/// content-type suffix silently. When true, the user's extension is honored.
 ///
 /// When `url_only` is true, skips the download step and only returns the URL
 /// (fails for base64-only responses).
@@ -334,12 +348,13 @@ pub async fn generate(
     key: &ApiKey,
     request: &ImageRequest,
     path: Option<&Path>,
+    pinned_extension: bool,
     url_only: bool,
 ) -> Result<ImageArtifact> {
     let protocol = detect_provider_protocol(&key.base_url);
     match protocol {
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-            generate_openai(key, request, path, url_only).await
+            generate_openai(key, request, path, pinned_extension, url_only).await
         }
         ProviderProtocol::Google => {
             bail!(
@@ -357,6 +372,7 @@ async fn generate_openai(
     key: &ApiKey,
     request: &ImageRequest,
     path: Option<&Path>,
+    pinned_extension: bool,
     url_only: bool,
 ) -> Result<ImageArtifact> {
     let base = key.base_url.trim_end_matches('/');
@@ -461,35 +477,35 @@ async fn generate_openai(
         });
     };
 
-    warn_extension_mismatch(target_path, ext_hint.as_deref());
-    let written = atomic_write(target_path, &bytes)?;
+    let final_path = align_extension(target_path, ext_hint.as_deref(), pinned_extension);
+    let written = atomic_write(&final_path, &bytes)?;
     Ok(ImageArtifact {
-        path: Some(target_path.to_path_buf()),
+        path: Some(final_path),
         url: maybe_url,
         bytes: written,
     })
 }
 
-/// If the server's `Content-Type` disagrees with the user's chosen extension,
-/// emit a note so they know why the bytes may not match the suffix. The file
-/// is saved at the user's chosen path regardless; this is side-effect only
-/// (prints to stderr).
-fn warn_extension_mismatch(path: &Path, content_type: Option<&str>) {
+/// When the user didn't pin an extension, silently swap to the server's
+/// actual content-type. When they did, honor their choice. Falls through
+/// unchanged when the server didn't report a content-type.
+fn align_extension(path: &Path, content_type: Option<&str>, pinned: bool) -> PathBuf {
+    if pinned {
+        return path.to_path_buf();
+    }
     let Some(ct) = content_type else {
-        return;
+        return path.to_path_buf();
     };
     let server_ext = ext_from_content_type(Some(ct));
-    let user_ext = path
+    let current_ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if !user_ext.is_empty() && user_ext != server_ext {
-        eprintln!(
-            "note: server returned image/{server_ext}; saved as {} anyway (use -o *.{server_ext} to match)",
-            path.display()
-        );
+    if current_ext == server_ext {
+        return path.to_path_buf();
     }
+    path.with_extension(server_ext)
 }
 
 fn extract_error_message(body: &str) -> Option<String> {
@@ -616,6 +632,48 @@ mod tests {
         assert_eq!(sanitize_model("org/model"), "org_model");
         assert_eq!(sanitize_model("name:tag"), "name_tag");
         assert_eq!(sanitize_model("normal-name_1"), "normal-name_1");
+    }
+
+    #[test]
+    fn pins_extension_distinguishes_user_vs_auto() {
+        assert!(!OutputTarget::Default.pins_extension());
+        assert!(!OutputTarget::Directory(PathBuf::from("out")).pins_extension());
+        assert!(OutputTarget::File(PathBuf::from("cat.png")).pins_extension());
+        assert!(!OutputTarget::File(PathBuf::from("cat")).pins_extension());
+        assert!(OutputTarget::Template("{model}-{ts}.png".into()).pins_extension());
+        assert!(!OutputTarget::Template("{model}-{ts}".into()).pins_extension());
+    }
+
+    #[test]
+    fn align_extension_swaps_when_unpinned_and_mismatched() {
+        assert_eq!(
+            align_extension(Path::new("aivo.png"), Some("image/jpeg"), false),
+            PathBuf::from("aivo.jpg")
+        );
+        assert_eq!(
+            align_extension(Path::new("out/aivo.png"), Some("image/webp"), false),
+            PathBuf::from("out/aivo.webp")
+        );
+    }
+
+    #[test]
+    fn align_extension_keeps_user_pinned_path() {
+        assert_eq!(
+            align_extension(Path::new("cat.png"), Some("image/jpeg"), true),
+            PathBuf::from("cat.png")
+        );
+    }
+
+    #[test]
+    fn align_extension_noop_when_matched_or_unknown_ct() {
+        assert_eq!(
+            align_extension(Path::new("aivo.png"), Some("image/png"), false),
+            PathBuf::from("aivo.png")
+        );
+        assert_eq!(
+            align_extension(Path::new("aivo.png"), None, false),
+            PathBuf::from("aivo.png")
+        );
     }
 
     #[test]

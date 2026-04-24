@@ -94,15 +94,11 @@ pub fn detect_provider_protocol(base_url: &str) -> ProviderProtocol {
     }
 }
 
-/// Returns true if the HTTP status suggests the endpoint path doesn't exist
-/// (wrong protocol), as opposed to auth/model/rate errors.
-///
-/// 400/422 are deliberately excluded even though some gateways return them
-/// for unknown endpoints — they also commonly signal legitimate request
-/// validation errors, and misclassifying those as mismatches would mask
-/// real user errors and trigger unwanted protocol switches.
+/// Any 4xx/5xx on an unpinned protocol triggers fallback. Safe because the
+/// winning protocol is pinned after the first success via
+/// `commit_protocol_switch`, so subsequent errors surface directly.
 pub fn is_protocol_mismatch(status: u16) -> bool {
-    matches!(status, 404 | 405 | 415 | 501)
+    status >= 400
 }
 
 /// Returns fallback protocol candidates to try after `current` fails.
@@ -161,28 +157,18 @@ mod tests {
     }
 
     #[test]
-    fn is_protocol_mismatch_returns_true_for_404_405_415() {
-        assert!(is_protocol_mismatch(404));
-        assert!(is_protocol_mismatch(405));
-        assert!(is_protocol_mismatch(415));
+    fn is_protocol_mismatch_returns_true_for_any_error_status() {
+        for status in [400, 401, 403, 404, 405, 415, 422, 429, 500, 501, 502, 503] {
+            assert!(is_protocol_mismatch(status), "status {status}");
+        }
     }
 
     #[test]
-    fn is_protocol_mismatch_returns_true_for_501() {
-        // 501 Not Implemented is the spec-correct code for an unsupported
-        // endpoint — some gateways (e.g. routed proxies that recognize the
-        // path but can't serve it) return it instead of 404.
-        assert!(is_protocol_mismatch(501));
-    }
-
-    #[test]
-    fn is_protocol_mismatch_returns_false_for_other_codes() {
+    fn is_protocol_mismatch_returns_false_for_success_codes() {
         assert!(!is_protocol_mismatch(200));
-        assert!(!is_protocol_mismatch(401));
-        // 400 is ambiguous (could be bad request body, beta header, etc.) —
-        // handled separately by the body-inspection paths.
-        assert!(!is_protocol_mismatch(400));
-        assert!(!is_protocol_mismatch(500));
+        assert!(!is_protocol_mismatch(204));
+        assert!(!is_protocol_mismatch(301));
+        assert!(!is_protocol_mismatch(399));
     }
 
     #[test]

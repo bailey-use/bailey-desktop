@@ -544,9 +544,6 @@ async fn forward_openai_chat_request(
                 commit_protocol_switch(active_protocol, protocol, attempt);
                 return Ok(ForwardedChatResponse::Success(value));
             }
-            AttemptOutcome::ProviderError { status, body } => {
-                return Ok(ForwardedChatResponse::HttpError { status, body });
-            }
             AttemptOutcome::Mismatch { status, body } => {
                 last_status = status;
                 last_body = body;
@@ -614,7 +611,7 @@ async fn forward_openai_protocol(
     // If Copilot rejected the model specifically because /chat/completions
     // is unsupported for it, fall back to /responses.
     if config.copilot_token_manager.is_some()
-        && let AttemptOutcome::ProviderError {
+        && let AttemptOutcome::Mismatch {
             body: ref error_body,
             ..
         } = result
@@ -660,7 +657,7 @@ async fn try_copilot_responses_fallback(
         let chat_value = responses_chat_conversion::convert_responses_json_to_chat(&resp_value);
         Ok(AttemptOutcome::Success(chat_value))
     } else {
-        Ok(AttemptOutcome::ProviderError {
+        Ok(AttemptOutcome::Mismatch {
             status,
             body: body_text,
         })

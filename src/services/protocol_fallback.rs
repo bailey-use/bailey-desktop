@@ -1,15 +1,16 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use super::provider_protocol::{ProviderProtocol, fallback_protocols, is_protocol_mismatch};
+use super::provider_protocol::{ProviderProtocol, fallback_protocols};
 
 /// Outcome of a single protocol attempt in the fallback loop.
 pub enum AttemptOutcome<T> {
-    /// Protocol matched and returned a usable result.
     Success(T),
-    /// Protocol responded with a non-mismatch error — stop trying other protocols.
-    ProviderError { status: u16, body: String },
-    /// Protocol mismatch (wrong endpoint) — try the next candidate.
-    Mismatch { status: u16, body: String },
+    /// Non-success HTTP status — try the next candidate. Body is preserved so
+    /// the router can surface the real upstream error after exhaustion.
+    Mismatch {
+        status: u16,
+        body: String,
+    },
 }
 
 /// Returns the ordered list of protocol candidates: active first, then fallbacks.
@@ -33,9 +34,6 @@ pub fn commit_protocol_switch(
 }
 
 /// Classify an HTTP response into an attempt outcome.
-///
-/// 401 with a non-JSON body is a mismatch: CDN/governor layers reject unknown
-/// paths with plaintext, while real protocol-aware auth failures return JSON.
 pub fn classify_attempt<T>(
     status: u16,
     response_text: String,
@@ -43,23 +41,11 @@ pub fn classify_attempt<T>(
 ) -> AttemptOutcome<T> {
     match success {
         Some(val) => AttemptOutcome::Success(val),
-        None if is_protocol_mismatch(status) => AttemptOutcome::Mismatch {
-            status,
-            body: response_text,
-        },
-        None if status == 401 && !body_is_json(&response_text) => AttemptOutcome::Mismatch {
-            status,
-            body: response_text,
-        },
-        None => AttemptOutcome::ProviderError {
+        None => AttemptOutcome::Mismatch {
             status,
             body: response_text,
         },
     }
-}
-
-fn body_is_json(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body).is_ok()
 }
 
 #[cfg(test)]
@@ -75,27 +61,33 @@ mod tests {
     }
 
     #[test]
-    fn classify_attempt_mismatch() {
-        match classify_attempt::<()>(404, "not found".into(), None) {
-            AttemptOutcome::Mismatch { status, .. } => assert_eq!(status, 404),
+    fn classify_attempt_any_error_is_mismatch() {
+        for status in [400, 401, 403, 404, 405, 415, 422, 429, 500, 501, 502, 503] {
+            match classify_attempt::<()>(status, "err".into(), None) {
+                AttemptOutcome::Mismatch { status: s, .. } => assert_eq!(s, status),
+                _ => panic!("expected Mismatch for {status}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_attempt_preserves_body() {
+        let body = r#"{"error":{"code":"invalid_api_key","message":"Bad key"}}"#;
+        match classify_attempt::<()>(401, body.into(), None) {
+            AttemptOutcome::Mismatch { status, body: b } => {
+                assert_eq!(status, 401);
+                assert_eq!(b, body);
+            }
             _ => panic!("expected Mismatch"),
         }
     }
 
     #[test]
-    fn classify_attempt_401_non_json_is_mismatch() {
-        match classify_attempt::<()>(401, "Authentication Fails (governor)".into(), None) {
-            AttemptOutcome::Mismatch { status, .. } => assert_eq!(status, 401),
-            _ => panic!("expected Mismatch for 401 with non-JSON body"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_401_json_stays_provider_error() {
-        let body = r#"{"error":{"code":"invalid_api_key","message":"Bad key"}}"#;
-        match classify_attempt::<()>(401, body.into(), None) {
-            AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 401),
-            _ => panic!("expected ProviderError for 401 with JSON body"),
+    fn classify_attempt_success_ignores_status() {
+        // When success is Some, status is irrelevant
+        match classify_attempt(500, "error body".into(), Some("ok")) {
+            AttemptOutcome::Success(v) => assert_eq!(v, "ok"),
+            _ => panic!("expected Success even with error status"),
         }
     }
 
@@ -126,74 +118,6 @@ mod tests {
             ProviderProtocol::from_u8(active.load(Ordering::Relaxed)),
             ProviderProtocol::Openai
         );
-    }
-
-    #[test]
-    fn classify_attempt_mismatch_405() {
-        match classify_attempt::<()>(405, "method not allowed".into(), None) {
-            AttemptOutcome::Mismatch { status, .. } => assert_eq!(status, 405),
-            _ => panic!("expected Mismatch for 405"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_mismatch_415() {
-        match classify_attempt::<()>(415, "unsupported media type".into(), None) {
-            AttemptOutcome::Mismatch { status, .. } => assert_eq!(status, 415),
-            _ => panic!("expected Mismatch for 415"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_provider_error_400() {
-        match classify_attempt::<()>(400, "bad request".into(), None) {
-            AttemptOutcome::ProviderError { status, body } => {
-                assert_eq!(status, 400);
-                assert_eq!(body, "bad request");
-            }
-            _ => panic!("expected ProviderError for 400"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_provider_error_403() {
-        match classify_attempt::<()>(403, "forbidden".into(), None) {
-            AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 403),
-            _ => panic!("expected ProviderError for 403"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_provider_error_500() {
-        match classify_attempt::<()>(500, "server error".into(), None) {
-            AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 500),
-            _ => panic!("expected ProviderError for 500"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_provider_error_502() {
-        match classify_attempt::<()>(502, "bad gateway".into(), None) {
-            AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 502),
-            _ => panic!("expected ProviderError for 502"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_provider_error_503() {
-        match classify_attempt::<()>(503, "unavailable".into(), None) {
-            AttemptOutcome::ProviderError { status, .. } => assert_eq!(status, 503),
-            _ => panic!("expected ProviderError for 503"),
-        }
-    }
-
-    #[test]
-    fn classify_attempt_success_ignores_status() {
-        // When success is Some, status is irrelevant
-        match classify_attempt(500, "error body".into(), Some("ok")) {
-            AttemptOutcome::Success(v) => assert_eq!(v, "ok"),
-            _ => panic!("expected Success even with error status"),
-        }
     }
 
     #[test]

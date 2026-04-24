@@ -44,7 +44,7 @@ use crate::services::openai_models::{
     stringify_message_content as stringify_typed_message_content,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{ProviderProtocol, is_protocol_mismatch};
 
@@ -330,14 +330,10 @@ async fn send_native_anthropic(
     .await?;
 
     let status_code = response.status().as_u16();
-    if native_probe_is_mismatch(status_code) {
-        return Ok(None);
-    }
 
-    // Detect beta header rejection: if a 400 mentions beta-related terms,
-    // learn to strip anthropic-beta and retry immediately.
+    // Beta-header learning runs before the generic mismatch check so a
+    // correctable native response isn't discarded in favor of OpenAI.
     if status_code == 400 && !beta_header_rejected.load(Ordering::Relaxed) {
-        let content_type = http_utils::response_content_type(&response);
         let response_body = response.bytes().await?;
         let body_str = String::from_utf8_lossy(&response_body);
 
@@ -357,7 +353,7 @@ async fn send_native_anthropic(
             .await?;
 
             let retry_status = retry_response.status().as_u16();
-            if native_probe_is_mismatch(retry_status) {
+            if is_protocol_mismatch(retry_status) {
                 return Ok(None);
             }
 
@@ -370,11 +366,11 @@ async fn send_native_anthropic(
             }));
         }
 
-        return Ok(Some(RouterResponse::Buffered {
-            status: status_code,
-            content_type,
-            body: response_body.to_vec(),
-        }));
+        return Ok(None);
+    }
+
+    if is_protocol_mismatch(status_code) {
+        return Ok(None);
     }
 
     let content_type = http_utils::response_content_type(&response);
@@ -440,13 +436,6 @@ async fn try_native_anthropic(
 /// host speaks Openai.
 fn should_try_native_anthropic(target_protocol: ProviderProtocol) -> bool {
     target_protocol == ProviderProtocol::Anthropic
-}
-
-/// Permissive variant of [`is_protocol_mismatch`] for the speculative native
-/// probe: OpenAI-only gateways (e.g. Cloudflare Workers AI) return 401/403
-/// for unknown paths. Bad creds still surface via the OpenAI fallback.
-fn native_probe_is_mismatch(status: u16) -> bool {
-    is_protocol_mismatch(status) || matches!(status, 401 | 403)
 }
 
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
@@ -545,39 +534,18 @@ async fn handle_anthropic_to_upstream(
 
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
-                if is_protocol_mismatch(status_code) {
-                    AttemptOutcome::Mismatch {
-                        status: status_code,
-                        body: response_body,
-                    }
-                } else if status_code >= 400 {
-                    AttemptOutcome::Success(RouterResponse::Buffered {
-                        status: status_code,
-                        content_type: CONTENT_TYPE_JSON.to_string(),
-                        body: response_body.into_bytes(),
-                    })
+                let parsed = if is_protocol_mismatch(status_code) {
+                    None
                 } else {
                     let google_response: Value = serde_json::from_str(&response_body)?;
                     let openai_response =
                         convert_gemini_to_openai_chat_response(&google_response, &model);
-                    let r = if requested_stream {
-                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response)?;
-                        let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: "text/event-stream".to_string(),
-                            body: anthropic_sse.into_bytes(),
-                        }
-                    } else {
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: CONTENT_TYPE_JSON.to_string(),
-                            body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
-                                .into_bytes(),
-                        }
-                    };
-                    AttemptOutcome::Success(r)
-                }
+                    Some(openai_chat_response_to_anthropic_router(
+                        &openai_response,
+                        requested_stream,
+                    )?)
+                };
+                classify_attempt(status_code, response_body, parsed)
             }
             ProviderProtocol::ResponsesApi => {
                 let mut responses_body = convert_chat_to_responses_request(&req_body)?;
@@ -597,38 +565,17 @@ async fn handle_anthropic_to_upstream(
 
                 let status_code = response.status().as_u16();
                 let response_body = response.text().await?;
-                if is_protocol_mismatch(status_code) || status_code == 400 {
-                    AttemptOutcome::Mismatch {
-                        status: status_code,
-                        body: response_body,
-                    }
-                } else if status_code >= 400 {
-                    AttemptOutcome::Success(RouterResponse::Buffered {
-                        status: status_code,
-                        content_type: CONTENT_TYPE_JSON.to_string(),
-                        body: response_body.into_bytes(),
-                    })
+                let parsed = if is_protocol_mismatch(status_code) {
+                    None
                 } else {
                     let resp: Value = serde_json::from_str(&response_body)?;
                     let openai_response = convert_responses_to_chat_response(&resp)?;
-                    let r = if requested_stream {
-                        let openai_sse = convert_openai_chat_response_to_sse(&openai_response)?;
-                        let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: "text/event-stream".to_string(),
-                            body: anthropic_sse.into_bytes(),
-                        }
-                    } else {
-                        RouterResponse::Buffered {
-                            status: 200,
-                            content_type: CONTENT_TYPE_JSON.to_string(),
-                            body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?
-                                .into_bytes(),
-                        }
-                    };
-                    AttemptOutcome::Success(r)
-                }
+                    Some(openai_chat_response_to_anthropic_router(
+                        &openai_response,
+                        requested_stream,
+                    )?)
+                };
+                classify_attempt(status_code, response_body, parsed)
             }
             _ => {
                 // OpenAI or Anthropic — use chat completions endpoint
@@ -647,9 +594,10 @@ async fn handle_anthropic_to_upstream(
 
                 let status_code = response.status().as_u16();
                 if is_protocol_mismatch(status_code) {
+                    let body = response.text().await.unwrap_or_default();
                     AttemptOutcome::Mismatch {
                         status: status_code,
-                        body: String::new(),
+                        body,
                     }
                 } else {
                     let is_streaming = response
@@ -684,34 +632,24 @@ async fn handle_anthropic_to_upstream(
                     }
 
                     let response_body = response.text().await?;
-                    // Detect Responses API validation errors leaking through
-                    // Chat Completions — treat as protocol mismatch so the
-                    // ResponsesApi candidate gets a chance.
-                    if status_code == 400 && is_responses_api_error(&response_body) {
-                        AttemptOutcome::Mismatch {
-                            status: status_code,
-                            body: response_body,
+                    let r = if status_code == 200 && response_body.starts_with("data:") {
+                        let anthropic_sse =
+                            convert_openai_sse_to_anthropic(&response_body, status_code)?;
+                        RouterResponse::Buffered {
+                            status: 200,
+                            content_type: "text/event-stream".to_string(),
+                            body: anthropic_sse.into_bytes(),
                         }
                     } else {
-                        let r = if status_code == 200 && response_body.starts_with("data:") {
-                            let anthropic_sse =
-                                convert_openai_sse_to_anthropic(&response_body, status_code)?;
-                            RouterResponse::Buffered {
-                                status: 200,
-                                content_type: "text/event-stream".to_string(),
-                                body: anthropic_sse.into_bytes(),
-                            }
-                        } else {
-                            let anthropic_response =
-                                convert_openai_to_anthropic(&response_body, status_code)?;
-                            RouterResponse::Buffered {
-                                status: status_code,
-                                content_type: CONTENT_TYPE_JSON.to_string(),
-                                body: anthropic_response.into_bytes(),
-                            }
-                        };
-                        AttemptOutcome::Success(r)
-                    }
+                        let anthropic_response =
+                            convert_openai_to_anthropic(&response_body, status_code)?;
+                        RouterResponse::Buffered {
+                            status: status_code,
+                            content_type: CONTENT_TYPE_JSON.to_string(),
+                            body: anthropic_response.into_bytes(),
+                        }
+                    };
+                    AttemptOutcome::Success(r)
                 }
             }
         };
@@ -721,18 +659,17 @@ async fn handle_anthropic_to_upstream(
                 commit_protocol_switch(active_protocol, protocol, attempt);
                 return Ok(r);
             }
-            AttemptOutcome::ProviderError { status, .. }
-            | AttemptOutcome::Mismatch { status, .. } => {
+            AttemptOutcome::Mismatch { status, body } => {
                 last_response = Some(RouterResponse::Buffered {
                     status,
                     content_type: CONTENT_TYPE_JSON.to_string(),
-                    body: format!("{{\"error\":\"Protocol mismatch ({})\"}}", status).into_bytes(),
+                    body: body.into_bytes(),
                 });
             }
         }
     }
 
-    // All candidates exhausted — return last error
+    // All candidates exhausted — surface the real last upstream error.
     Ok(last_response.unwrap_or(RouterResponse::Buffered {
         status: 503,
         content_type: CONTENT_TYPE_JSON.to_string(),
@@ -783,9 +720,27 @@ fn build_responses_url(base_url: &str) -> String {
     }
 }
 
-/// Detect 400 errors that indicate the provider speaks Responses API, not Chat Completions.
-fn is_responses_api_error(body: &str) -> bool {
-    body.contains("\"input[") || body.contains("begins with 'fc")
+/// Wrap an OpenAI Chat Completions response as a buffered Anthropic-format
+/// `RouterResponse`, emitting SSE when `streaming` is true and JSON otherwise.
+fn openai_chat_response_to_anthropic_router(
+    openai_response: &Value,
+    streaming: bool,
+) -> Result<RouterResponse> {
+    if streaming {
+        let openai_sse = convert_openai_chat_response_to_sse(openai_response)?;
+        let anthropic_sse = convert_openai_sse_to_anthropic(&openai_sse, 200)?;
+        Ok(RouterResponse::Buffered {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            body: anthropic_sse.into_bytes(),
+        })
+    } else {
+        Ok(RouterResponse::Buffered {
+            status: 200,
+            content_type: CONTENT_TYPE_JSON.to_string(),
+            body: convert_openai_to_anthropic(&openai_response.to_string(), 200)?.into_bytes(),
+        })
+    }
 }
 
 /// Convert OpenAI Chat Completions request → Responses API request.
@@ -1478,27 +1433,6 @@ mod tests {
     }
 
     #[test]
-    fn native_probe_mismatch_includes_auth_statuses_for_openai_only_providers() {
-        assert!(native_probe_is_mismatch(401));
-        assert!(native_probe_is_mismatch(403));
-    }
-
-    #[test]
-    fn native_probe_mismatch_covers_standard_mismatch_statuses() {
-        for code in [404, 405, 415, 501] {
-            assert!(native_probe_is_mismatch(code), "{code}");
-        }
-    }
-
-    #[test]
-    fn native_probe_mismatch_rejects_success_and_ambiguous_statuses() {
-        // 400 is excluded: the probe has a separate beta-header-rejection branch for it.
-        for code in [200, 201, 400, 500, 502, 503] {
-            assert!(!native_probe_is_mismatch(code), "{code}");
-        }
-    }
-
-    #[test]
     fn build_anthropic_messages_url_without_prefix() {
         assert_eq!(
             build_anthropic_messages_url("https://api.deepseek.com", None),
@@ -2008,27 +1942,6 @@ data: [DONE]\n";
         // null content should remain unchanged (not crash)
         let messages = req["messages"].as_array().unwrap();
         assert!(messages[0]["content"].is_null());
-    }
-
-    #[test]
-    fn is_responses_api_error_detects_input_bracket() {
-        // The detector looks for literal `"input[` in the raw body string,
-        // matching how OpenAI formats Responses API validation errors.
-        assert!(is_responses_api_error(
-            r#"{"error":{"message":"Invalid value for \"input[0].content\""}}"#
-        ));
-    }
-
-    #[test]
-    fn is_responses_api_error_detects_fc_prefix() {
-        assert!(is_responses_api_error(
-            r#"{"error":"tool call id begins with 'fc' which is reserved"}"#
-        ));
-    }
-
-    #[test]
-    fn is_responses_api_error_false_for_normal_error() {
-        assert!(!is_responses_api_error(r#"{"error":"rate limited"}"#));
     }
 
     #[test]

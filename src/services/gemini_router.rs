@@ -48,7 +48,11 @@ pub struct GeminiRouter {
 
 enum ForwardResult {
     Success(Value),
-    ProviderError { status: u16, body: String },
+    /// All protocol candidates failed; carries the last upstream error.
+    Exhausted {
+        status: u16,
+        body: String,
+    },
 }
 
 struct GeminiRouterState {
@@ -126,7 +130,7 @@ async fn handle_request(
                         Ok(http_utils::http_json_response(200, &json))
                     }
                 }
-                ForwardResult::ProviderError { status, body } => {
+                ForwardResult::Exhausted { status, body } => {
                     let wrapped = wrap_upstream_error_as_json(status, &body);
                     Ok(http_utils::http_response(
                         status,
@@ -318,25 +322,10 @@ async fn forward_to_provider(
             }
         };
 
-        let outcome = classify_attempt(status, body_text, parsed);
-        // A 400 "unsupported_api_for_model" means this model isn't available on
-        // the current endpoint — treat as mismatch so fallback tries the other.
-        // Must apply to both directions: ResponsesApi→Openai and Openai→ResponsesApi.
-        let outcome = match outcome {
-            AttemptOutcome::ProviderError { status: s, body: b }
-                if s == 400 && b.contains("unsupported_api_for_model") =>
-            {
-                AttemptOutcome::Mismatch { status: s, body: b }
-            }
-            other => other,
-        };
-        match outcome {
+        match classify_attempt(status, body_text, parsed) {
             AttemptOutcome::Success(result) => {
                 commit_protocol_switch(active_protocol, protocol, attempt);
                 return Ok(ForwardResult::Success(result));
-            }
-            AttemptOutcome::ProviderError { status, body } => {
-                return Ok(ForwardResult::ProviderError { status, body });
             }
             AttemptOutcome::Mismatch { status, body } => {
                 last_status = status;
@@ -345,7 +334,7 @@ async fn forward_to_provider(
         }
     }
 
-    Ok(ForwardResult::ProviderError {
+    Ok(ForwardResult::Exhausted {
         status: last_status,
         body: last_body,
     })

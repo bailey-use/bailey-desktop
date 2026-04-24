@@ -72,6 +72,10 @@ pub(crate) struct ChatTurnResult {
     pub content: String,
     pub reasoning_content: Option<String>,
     pub usage: Option<TokenUsage>,
+    /// Raw upstream response body, populated for non-streaming handlers.
+    /// Surfaced by `aivo chat --json` so scripts can consume the
+    /// provider-native shape.
+    pub raw_body: Option<serde_json::Value>,
 }
 
 impl ChatTurnResult {

@@ -16,7 +16,6 @@ use anyhow::Result;
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use crate::commands::normalize_base_url;
 use crate::errors::ExitCode;
@@ -182,12 +181,6 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         json: bool,
     ) -> Result<ExitCode> {
-        if json && one_shot.is_none() {
-            anyhow::bail!(
-                "--json requires -x/--execute (JSON output is only produced in one-shot mode)"
-            );
-        }
-
         let mut key = match key_override {
             Some(k) => k,
             None => match self.session_store.get_active_key().await? {
@@ -279,10 +272,6 @@ impl ChatCommand {
 
         let model = Self::transform_model_for_provider(&key.base_url, &raw_model);
         let pending_attachments = build_pending_attachments(&attachments)?;
-
-        // Snapshot before sentinel URLs are resolved, so JSON output shows
-        // "ollama"/"copilot"/etc. rather than the resolved endpoint URL.
-        let provider_label = key.base_url.clone();
 
         // Resolve sentinel base URLs to actual URLs before any HTTP calls.
         if key.base_url == "ollama" {
@@ -404,15 +393,12 @@ impl ChatCommand {
                     )
                     .await;
                     if json {
-                        let payload = json!({
-                            "provider": provider_label,
-                            "model": raw_model,
-                            "prompt": history[0].content,
-                            "reasoning": turn.reasoning_content,
-                            "response": turn.content,
-                            "usage": usage,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&payload)?);
+                        let body = turn.raw_body.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "provider did not return a non-streaming body; --json cannot serialize partial streaming output"
+                            )
+                        })?;
+                        println!("{}", serde_json::to_string_pretty(&body)?);
                     } else {
                         println!();
                     }
@@ -508,7 +494,7 @@ impl ChatCommand {
         );
         print_opt(
             "--json",
-            "Print result as JSON (requires -x; useful for scripting)",
+            "Print upstream provider's raw JSON response (requires -x; useful for scripting)",
         );
         println!();
         println!("{}", style::bold("Slash Commands:"));
@@ -1137,18 +1123,13 @@ where
 {
     let base = normalize_base_url(&key.base_url);
     let url = format!("{}/v1/chat/completions", base);
-    let max_tokens = crate::services::provider_profile::ProviderQuirks::for_base_url(&key.base_url)
-        .max_tokens_cap;
 
     if non_streaming {
-        return send_non_streaming(
-            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
-        )
-        .await;
+        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     // Try streaming first; fall back to non-streaming on server errors
-    let request = build_openai_chat_request(model, messages, true, max_tokens)?;
+    let request = build_openai_chat_request(model, messages, true, None)?;
 
     let mut response = send_with_retry(|| {
         with_auth(client.post(&url), key)
@@ -1161,10 +1142,7 @@ where
     // Note: 404 is NOT included here — it means wrong endpoint, not streaming unsupported.
     // The caller detects 404 and switches to a different API format instead.
     if response.status().is_server_error() {
-        return send_non_streaming(
-            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
-        )
-        .await;
+        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     if !response.status().is_success() {
@@ -1256,35 +1234,31 @@ where
     }
 
     if full_content.is_empty() && full_reasoning.is_empty() {
-        return send_non_streaming(
-            client, &url, key, model, messages, max_tokens, spinning, on_chunk,
-        )
-        .await;
+        return send_non_streaming(client, &url, key, model, messages, spinning, on_chunk).await;
     }
 
     Ok(ChatTurnResult {
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        raw_body: None,
     })
 }
 
 /// Non-streaming fallback for gateways that don't support SSE streaming.
-#[allow(clippy::too_many_arguments)]
 async fn send_non_streaming<F>(
     client: &Client,
     url: &str,
     key: &ApiKey,
     model: &str,
     messages: &[ChatMessage],
-    max_tokens: Option<u64>,
     spinning: &Arc<AtomicBool>,
     on_chunk: &mut F,
 ) -> Result<ChatTurnResult>
 where
     F: FnMut(ChatResponseChunk) -> Result<()>,
 {
-    let request = build_openai_chat_request(model, messages, false, max_tokens)?;
+    let request = build_openai_chat_request(model, messages, false, None)?;
 
     let response = send_with_retry(|| {
         with_auth(client.post(url), key)
@@ -1321,6 +1295,7 @@ where
         content: response.content,
         reasoning_content: response.reasoning_content,
         usage,
+        raw_body: Some(body),
     })
 }
 
@@ -1488,6 +1463,7 @@ where
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        raw_body: None,
     })
 }
 
@@ -1547,6 +1523,7 @@ where
         content: response.content,
         reasoning_content: response.reasoning_content,
         usage,
+        raw_body: Some(body),
     })
 }
 
@@ -1674,6 +1651,7 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        raw_body: None,
     })
 }
 
@@ -1727,6 +1705,7 @@ where
         content: response.content,
         reasoning_content: None,
         usage,
+        raw_body: Some(body),
     })
 }
 
@@ -1879,6 +1858,7 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        raw_body: None,
     })
 }
 
@@ -1927,6 +1907,7 @@ where
         content: response.content,
         reasoning_content: None,
         usage,
+        raw_body: Some(body),
     })
 }
 
@@ -2039,6 +2020,7 @@ where
         content: full_content,
         reasoning_content: normalize_reasoning_content(full_reasoning),
         usage,
+        raw_body: None,
     })
 }
 
@@ -2117,6 +2099,7 @@ where
         content,
         reasoning_content,
         usage,
+        raw_body: Some(body),
     })
 }
 
@@ -2218,6 +2201,7 @@ where
         content: full_content,
         reasoning_content: None,
         usage,
+        raw_body: None,
     })
 }
 
@@ -2271,6 +2255,7 @@ where
         content: google_response.content,
         reasoning_content: None,
         usage,
+        raw_body: Some(body),
     })
 }
 

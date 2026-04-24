@@ -177,6 +177,16 @@ fn chat_empty_model_triggers_picker() {
 }
 
 #[test]
+fn chat_json_flag_parses() {
+    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hi", "--json"]).unwrap();
+    if let Some(Commands::Chat(args)) = cli.command {
+        assert!(args.json);
+    } else {
+        panic!("Expected Chat command");
+    }
+}
+
+#[test]
 fn serve_default_port() {
     let cli = Cli::try_parse_from(["aivo", "serve"]).unwrap();
     if let Some(Commands::Serve(args)) = cli.command {

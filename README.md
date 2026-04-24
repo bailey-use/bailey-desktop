@@ -367,10 +367,10 @@ aivo chat -r
 
 #### `--json`
 
-In one-shot mode (`-x`), print the result as JSON for scripting:
+With `-x`, print the provider's raw response body (same shape as `curl`).
 
 ```bash
-aivo chat -x "hello" --json
+aivo chat -x "hello" --json | jq -r '.choices[0].message.content'
 ```
 
 #### Slash commands

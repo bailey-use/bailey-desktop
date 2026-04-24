@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- `aivo chat --json` now prints the provider's raw response body instead of aivo's envelope. Scripts must switch to the provider-native shape (e.g. `.choices[0].message.content`).
+
+### Fixes
+
+- `aivo chat` no longer injects `max_tokens: 8192` for DeepSeek / aivo-starter; matches `curl`.
+
 ## v0.19.1
 
 ### UX

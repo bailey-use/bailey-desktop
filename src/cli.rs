@@ -454,8 +454,8 @@ pub struct ChatArgs {
     )]
     pub execute: Option<String>,
 
-    /// Print result as JSON (requires -x; useful for scripting)
-    #[arg(long)]
+    /// Print the upstream provider's raw JSON response (requires -x; useful for scripting)
+    #[arg(long, requires = "execute")]
     pub json: bool,
 
     /// Attach a file or image to the next chat message (repeatable)

@@ -32,7 +32,9 @@ use crate::services::openai_gemini_bridge::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
-use crate::services::provider_protocol::{PathVariant, ProviderProtocol, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch,
+};
 use crate::services::responses_chat_conversion;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -220,9 +222,10 @@ async fn handle_api_request(
     if is_responses_api_format(&body) {
         // When the upstream supports the Responses API natively, forward directly
         // to preserve IDs and avoid lossy Chat Completions round-trip conversion.
-        let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
+        let (current, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
         if current == ProviderProtocol::Openai
             && let Some(result) = try_responses_api_passthrough(
+                variant,
                 &body,
                 config,
                 client,
@@ -286,6 +289,7 @@ async fn handle_api_request(
 /// `None` if the upstream doesn't support the Responses API (404/405/415), allowing
 /// fallback to Chat Completions conversion.
 async fn try_responses_api_passthrough(
+    variant: PathVariant,
     body: &Value,
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
@@ -313,7 +317,7 @@ async fn try_responses_api_passthrough(
     apply_max_tokens_cap_to_fields(&mut body, config.max_tokens_cap, &["max_output_tokens"]);
     apply_selected_model(&mut body, config.as_ref(), ProviderProtocol::Openai);
 
-    let target_url = build_target_url(&config.target_base_url, "/v1/responses");
+    let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/responses"));
     let req = http_utils::authorized_openai_post(
         client,
         &target_url,
@@ -456,14 +460,17 @@ async fn stream_chat_completions(
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
-    let protocol = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
+    let (protocol, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
     if protocol != ProviderProtocol::Openai {
         anyhow::bail!("streaming passthrough only for OpenAI protocol");
     }
 
     let body = prepare_chat_completions_body(body, config, protocol);
 
-    let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
+    let target_url = build_target_url(
+        &config.target_base_url,
+        variant.apply("/v1/chat/completions"),
+    );
     let initiator = if config.copilot_token_manager.is_some() {
         Some(http_utils::copilot_initiator_from_openai(&body))
     } else {

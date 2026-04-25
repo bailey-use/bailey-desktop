@@ -74,6 +74,19 @@ impl RunCommand {
             Some(_) => {}
         }
 
+        // The picker reads keys via console::Term; on a non-TTY (pipe,
+        // /dev/null) `read_key_raw` returns immediately with values that
+        // match no key handler, spinning the loop at 100% CPU. Bail before
+        // the network fetch so piped invocations don't pay for a catalog
+        // they can't show.
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            if explicit_model_flag {
+                crate::commands::print_no_model_list_hint();
+            }
+            return Ok(ModelOutcome::UseDefault);
+        }
+
         // Fetch the full catalog and annotate non-chat models as disabled
         // instead of hiding them. Users running `aivo run claude` see image /
         // audio / embedding entries with a dim reason, not silently filtered.
@@ -90,11 +103,7 @@ impl RunCommand {
             // explicitly asked for a picker; the implicit picker on first
             // launch falls through silently.
             if explicit_model_flag {
-                eprintln!(
-                    "  {} {}",
-                    style::dim("note:"),
-                    crate::commands::NO_MODEL_LIST_HINT
-                );
+                crate::commands::print_no_model_list_hint();
             }
             return Ok(ModelOutcome::UseDefault);
         }

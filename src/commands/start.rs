@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use console::{Key, Term};
 
@@ -177,7 +179,6 @@ impl StartCommand {
                         .await?
                 }
                 _ => {
-                    use std::io::IsTerminal;
                     if !std::io::stderr().is_terminal() {
                         self.session_store
                             .resolve_key_by_id_or_name(key_id_or_name)
@@ -360,6 +361,18 @@ impl StartCommand {
         tool: AIToolType,
         explicit_picker: bool,
     ) -> Result<Resolved<Option<String>>> {
+        // Same rationale as run.rs `resolve_model`: the picker spins on a
+        // non-TTY. Bail before the network fetch.
+        if !std::io::stderr().is_terminal() {
+            if explicit_picker {
+                crate::commands::print_no_model_list_hint();
+            }
+            return Ok(Resolved {
+                value: None,
+                interactive: false,
+            });
+        }
+
         let client = http_utils::router_http_client();
         // Full catalog + per-row annotations: non-chat models show as
         // disabled with a reason, rather than being silently stripped.
@@ -375,11 +388,7 @@ impl StartCommand {
             // explicitly asked for a picker; on the implicit "no prior
             // selection" path the launch just proceeds silently.
             if explicit_picker {
-                eprintln!(
-                    "  {} {}",
-                    style::dim("note:"),
-                    crate::commands::NO_MODEL_LIST_HINT
-                );
+                crate::commands::print_no_model_list_hint();
             }
             return Ok(Resolved {
                 value: None,

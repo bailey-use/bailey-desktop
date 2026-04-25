@@ -323,26 +323,32 @@ async fn main() {
                 );
 
                 // Resolve model using last selection when no explicit flags given.
-                // When -k is used without -m, always force the model picker.
+                // When -k is used without -m, normally force the model picker —
+                // except under --dry-run, where the user just wants to see what
+                // would launch without being forced into an interactive prompt.
                 let model_flag_explicit = model.is_some();
+                let last_sel_for_key = session_store
+                    .get_last_selection()
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|sel| key_override.as_ref().is_some_and(|k| k.id == sel.key_id));
                 let model = if model.is_some() {
-                    // -m was explicitly provided → use it
                     model
+                } else if dry_run {
+                    // --dry-run never opens a picker. Reuse last selection for
+                    // this key if any; otherwise let the tool's default surface
+                    // in the dry-run output.
+                    last_sel_for_key.and_then(|sel| sel.model)
                 } else if key_explicit {
                     // -k used without -m → force model picker
                     Some(String::new())
                 } else {
-                    // No -k, no -m → check last_selection for saved model
-                    let last_sel = session_store.get_last_selection().await.ok().flatten();
-                    match last_sel {
-                        Some(ref sel)
-                            if key_override.as_ref().is_some_and(|k| k.id == sel.key_id) =>
-                        {
-                            // Same key as last time — reuse saved model (could be __default__)
-                            sel.model.clone().or(Some(String::new()))
-                        }
-                        _ => Some(String::new()), // no matching selection → trigger picker
-                    }
+                    // Same key as last time → reuse saved model (could be
+                    // __default__); otherwise empty string triggers the picker.
+                    last_sel_for_key
+                        .and_then(|sel| sel.model)
+                        .or(Some(String::new()))
                 };
 
                 let env = if !env_strings.is_empty() {

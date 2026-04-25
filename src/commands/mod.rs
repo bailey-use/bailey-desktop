@@ -10,6 +10,12 @@ use crate::style;
 pub(crate) const NO_MODEL_LIST_HINT: &str =
     "No model list available; launching with the tool's default. Use --model <name> to override.";
 
+/// Prints `NO_MODEL_LIST_HINT` to stderr when an explicit picker request
+/// can't actually open a picker (no model list, or no TTY).
+pub(crate) fn print_no_model_list_hint() {
+    eprintln!("  {} {}", style::dim("note:"), NO_MODEL_LIST_HINT);
+}
+
 /// Strips trailing slashes and a bare `/v1` suffix from a provider base URL.
 pub(crate) fn normalize_base_url(url: &str) -> &str {
     let url = url.trim_end_matches('/');

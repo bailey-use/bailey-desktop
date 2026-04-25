@@ -384,6 +384,7 @@ impl AILauncher {
             options.key_override.is_some(),
             runtime.router_protocol,
             runtime.responses_api_support,
+            runtime.request_succeeded,
         )
         .await;
 

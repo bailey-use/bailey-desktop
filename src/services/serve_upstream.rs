@@ -151,7 +151,7 @@ pub(crate) async fn send_openai_chat(
 ) -> Result<RouterResponse> {
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
 
-    let url = http_utils::build_chat_completions_url(&context.upstream_base_url);
+    let url = http_utils::build_target_url(&context.upstream_base_url, "/v1/chat/completions");
     let initiator = if context.is_copilot {
         Some(http_utils::copilot_initiator_from_openai(body))
     } else {

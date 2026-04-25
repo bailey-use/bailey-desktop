@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::constants::PLACEHOLDER_LOOPBACK_URL;
 use crate::services::ai_launcher::AIToolType;
@@ -37,6 +37,11 @@ pub(crate) struct LaunchRuntimeState {
     pub(crate) env: HashMap<String, String>,
     pub(crate) router_protocol: Option<Arc<AtomicU8>>,
     pub(crate) responses_api_support: Option<Arc<AtomicU8>>,
+    /// Set to `true` by a router after any non-error upstream response. Read
+    /// by `persist_runtime_discoveries` to skip protocol pinning when no
+    /// request actually succeeded — prevents bad keys / transient errors from
+    /// silently rewriting `claude_protocol` to the wrong value.
+    pub(crate) request_succeeded: Option<Arc<AtomicBool>>,
     pub(crate) pi_agent_dir: Option<String>,
     pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
     pub(crate) gemini_oauth_sync: Option<GeminiOAuthSync>,
@@ -53,6 +58,7 @@ pub(crate) async fn prepare_runtime_env(
 ) -> Result<LaunchRuntimeState> {
     let mut router_protocol = None;
     let mut responses_api_support = None;
+    let mut request_succeeded: Option<Arc<AtomicBool>> = None;
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ROUTER") {
         let port = start_anthropic_router(&env).await?;
@@ -60,8 +66,9 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Claude && env.contains_key("AIVO_USE_ANTHROPIC_TO_OPENAI_ROUTER") {
-        let (port, active) = start_anthropic_to_openai_router(&env).await?;
+        let (port, active, success) = start_anthropic_to_openai_router(&env).await?;
         router_protocol = Some(active);
+        request_succeeded = Some(success);
         set_local_base_url(&mut env, "ANTHROPIC_BASE_URL", port);
     }
 
@@ -71,8 +78,9 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
-        let (port, _active, responses_api) = start_responses_to_chat_router(&env).await?;
+        let (port, _active, responses_api, success) = start_responses_to_chat_router(&env).await?;
         responses_api_support = Some(responses_api);
+        request_succeeded = Some(success);
         set_local_base_url(&mut env, "OPENAI_BASE_URL", port);
     }
 
@@ -82,8 +90,9 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Gemini && env.contains_key("AIVO_USE_GEMINI_ROUTER") {
-        let (port, active) = start_gemini_router(&env).await?;
+        let (port, active, success) = start_gemini_router(&env).await?;
         router_protocol = Some(active);
+        request_succeeded = Some(success);
         set_local_base_url(&mut env, "GOOGLE_GEMINI_BASE_URL", port);
         clear_node_proxy_env(&mut env);
     }
@@ -100,7 +109,8 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Opencode && env.contains_key("AIVO_USE_OPENCODE_ROUTER") {
-        let (port, _active, _responses_api) = start_responses_to_chat_router(&env).await?;
+        let (port, _active, _responses_api, _success) =
+            start_responses_to_chat_router(&env).await?;
         patch_opencode_config_content(&mut env, port);
     }
 
@@ -115,7 +125,8 @@ pub(crate) async fn prepare_runtime_env(
     }
 
     if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_STARTER_ROUTER") {
-        let (port, _active, _responses_api) = start_responses_to_chat_router(&env).await?;
+        let (port, _active, _responses_api, _success) =
+            start_responses_to_chat_router(&env).await?;
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
@@ -146,6 +157,7 @@ pub(crate) async fn prepare_runtime_env(
         env,
         router_protocol,
         responses_api_support,
+        request_succeeded,
         pi_agent_dir,
         codex_oauth_sync,
         gemini_oauth_sync,
@@ -419,8 +431,22 @@ pub(crate) async fn persist_runtime_discoveries(
     key_override_used: bool,
     router_protocol: Option<Arc<AtomicU8>>,
     responses_api_support: Option<Arc<AtomicU8>>,
+    request_succeeded: Option<Arc<AtomicBool>>,
 ) {
     if key_override_used {
+        return;
+    }
+
+    // Gate protocol/responses-api persistence on at least one successful
+    // upstream response. Without this, a session that only saw failures (bad
+    // API key, transient 5xx, rate limits) could silently rewrite the
+    // persisted protocol to whatever the runtime *guessed* — and lock the
+    // user into a permanently broken configuration.
+    let saw_success = request_succeeded
+        .as_ref()
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(true);
+    if !saw_success {
         return;
     }
 
@@ -730,7 +756,7 @@ async fn start_anthropic_router(env: &HashMap<String, String>) -> Result<u16> {
 
 async fn start_anthropic_to_openai_router(
     env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>)> {
+) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{AnthropicToOpenAIRouter, AnthropicToOpenAIRouterConfig};
 
@@ -776,18 +802,18 @@ async fn start_anthropic_to_openai_router(
     };
 
     let router = AnthropicToOpenAIRouter::new(config);
-    let (port, active_protocol, handle) = router.start_background().await?;
+    let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: anthropic-to-openai router exited unexpectedly: {e}");
         }
     });
-    Ok((port, active_protocol))
+    Ok((port, active_protocol, request_succeeded))
 }
 
 async fn start_responses_to_chat_router(
     env: &HashMap<String, String>,
-) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>)> {
+) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicU8>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{ResponsesToChatRouter, ResponsesToChatRouterConfig};
 
@@ -842,16 +868,19 @@ async fn start_responses_to_chat_router(
             .map(|v| v == "1")
             .unwrap_or(false),
     });
-    let (port, active_protocol, responses_api, handle) = router.start_background().await?;
+    let (port, active_protocol, responses_api, request_succeeded, handle) =
+        router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: responses-to-chat router exited unexpectedly: {e}");
         }
     });
-    Ok((port, active_protocol, responses_api))
+    Ok((port, active_protocol, responses_api, request_succeeded))
 }
 
-async fn start_gemini_router(env: &HashMap<String, String>) -> Result<(u16, Arc<AtomicU8>)> {
+async fn start_gemini_router(
+    env: &HashMap<String, String>,
+) -> Result<(u16, Arc<AtomicU8>, Arc<AtomicBool>)> {
     use crate::services::provider_protocol::detect_provider_protocol;
     use crate::services::{GeminiRouter, GeminiRouterConfig};
 
@@ -889,13 +918,13 @@ async fn start_gemini_router(env: &HashMap<String, String>) -> Result<(u16, Arc<
             .map(|v| v == "1")
             .unwrap_or(false),
     });
-    let (port, active_protocol, handle) = router.start_background().await?;
+    let (port, active_protocol, request_succeeded, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini router exited unexpectedly: {e}");
         }
     });
-    Ok((port, active_protocol))
+    Ok((port, active_protocol, request_succeeded))
 }
 
 async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
@@ -927,7 +956,7 @@ async fn start_gemini_copilot_router(env: &HashMap<String, String>) -> Result<u1
         max_tokens_cap: None,
         is_starter: false,
     });
-    let (port, _active_protocol, handle) = router.start_background().await?;
+    let (port, _active_protocol, _request_succeeded, handle) = router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: gemini copilot router exited unexpectedly: {e}");
@@ -975,7 +1004,8 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         responses_api_supported: None,
         is_starter: false,
     });
-    let (port, _active_protocol, _responses_api, handle) = router.start_background().await?;
+    let (port, _active_protocol, _responses_api, _request_succeeded, handle) =
+        router.start_background().await?;
     tokio::spawn(async move {
         if let Ok(Err(e)) = handle.await {
             eprintln!("aivo: responses-to-chat copilot router exited unexpectedly: {e}");
@@ -1203,6 +1233,100 @@ mod tests {
             env.get("PATH"),
             Some(&"/usr/bin".to_string()),
             "unrelated vars untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_runtime_discoveries_skips_protocol_write_when_no_request_succeeded() {
+        // Reproduces the bug where a real-Anthropic endpoint with a bad API
+        // key would flip `claude_protocol` to Openai because the failed native
+        // probe poisoned the active_protocol atomic before exit. With the
+        // success gate, the persisted protocol must remain Anthropic.
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::provider_protocol::ProviderProtocol;
+        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol(
+                "test",
+                "https://api.anthropic.com",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-bad",
+            )
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        // Simulate the post-probe state: active_protocol got optimistically
+        // flipped to Openai (legacy behavior) but no request ever succeeded.
+        let active = Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8()));
+        let succeeded = Arc::new(AtomicBool::new(false));
+
+        super::persist_runtime_discoveries(
+            &store,
+            AIToolType::Claude,
+            &key,
+            false,
+            Some(active),
+            None,
+            Some(succeeded),
+        )
+        .await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.claude_protocol,
+            Some(ClaudeProviderProtocol::Anthropic),
+            "claude_protocol must NOT be rewritten to Openai when no request succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_runtime_discoveries_writes_protocol_when_request_succeeded() {
+        // Counterpart: when a request did succeed, the learned protocol
+        // change must persist normally.
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::provider_protocol::ProviderProtocol;
+        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol(
+                "test",
+                "https://gateway.example.com/v1",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-good",
+            )
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+        let active = Arc::new(AtomicU8::new(ProviderProtocol::Openai.to_u8()));
+        let succeeded = Arc::new(AtomicBool::new(true));
+
+        super::persist_runtime_discoveries(
+            &store,
+            AIToolType::Claude,
+            &key,
+            false,
+            Some(active),
+            None,
+            Some(succeeded),
+        )
+        .await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.claude_protocol,
+            Some(ClaudeProviderProtocol::Openai),
+            "claude_protocol must be rewritten to the learned protocol after a successful request"
         );
     }
 

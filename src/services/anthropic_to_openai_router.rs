@@ -46,7 +46,9 @@ use crate::services::openai_models::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
-use crate::services::provider_protocol::{ProviderProtocol, is_protocol_mismatch};
+use crate::services::provider_protocol::{
+    PathVariant, ProviderProtocol, is_endpoint_missing, is_protocol_mismatch,
+};
 
 #[derive(Clone)]
 pub struct AnthropicToOpenAIRouterConfig {
@@ -80,6 +82,10 @@ struct AnthropicToOpenAIRouterState {
     client: reqwest::Client,
     active_protocol: Arc<AtomicU8>,
     probe: ProbeState,
+    /// Flipped to `true` once any request returns a non-error response. Read by
+    /// `persist_runtime_discoveries` to gate protocol pinning so a session that
+    /// only saw failures (e.g., bad API key) can't poison the persisted route.
+    request_succeeded: Arc<AtomicBool>,
 }
 
 /// Learned state for the native Anthropic probe, cloned into each request
@@ -155,6 +161,25 @@ enum RouterResponse {
     AlreadyStreamed,
 }
 
+/// Outcome of a single native `/v1/messages` send attempt. Distinguishes
+/// "endpoint truly missing" (safe to flip the protocol pin to Openai) from
+/// "endpoint exists but errored" (auth/rate/5xx — don't poison the pin).
+enum SendNativeOutcome {
+    Success(RouterResponse),
+    EndpointMissing,
+    UpstreamError,
+}
+
+/// Aggregated outcome across all candidate paths in `try_native_anthropic`.
+/// `EndpointMissing` is reported only when *every* candidate produced an
+/// endpoint-missing status; a single `UpstreamError` upgrades the aggregate
+/// to `UpstreamError` because we can't conclude the endpoint is absent.
+enum NativeAnthropicResult {
+    Success(RouterResponse),
+    EndpointMissing,
+    UpstreamError,
+}
+
 impl AnthropicToOpenAIRouter {
     pub fn new(config: AnthropicToOpenAIRouterConfig) -> Self {
         Self { config }
@@ -164,17 +189,24 @@ impl AnthropicToOpenAIRouter {
     /// Returns the actual port number so callers can set ANTHROPIC_BASE_URL.
     pub async fn start_background(
         &self,
-    ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<(
+        u16,
+        Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
+        let request_succeeded = Arc::new(AtomicBool::new(false));
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
             client: router_http_client(),
             active_protocol: active_protocol.clone(),
             probe: ProbeState::new(),
+            request_succeeded: request_succeeded.clone(),
         };
         let handle = tokio::spawn(async move { run_router(listener, state).await });
-        Ok((port, active_protocol, handle))
+        Ok((port, active_protocol, request_succeeded, handle))
     }
 }
 
@@ -188,6 +220,7 @@ async fn run_router(
         let client = state.client.clone();
         let active_protocol = state.active_protocol.clone();
         let probe = state.probe.clone();
+        let request_succeeded = state.request_succeeded.clone();
 
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -215,6 +248,7 @@ async fn run_router(
                 &client,
                 &active_protocol,
                 &probe,
+                &request_succeeded,
                 &mut socket,
             )
             .await
@@ -270,18 +304,20 @@ fn build_native_anthropic_headers(
 }
 
 /// Build the native `/v1/messages` URL, optionally under a sub-path prefix
-/// (e.g. `/anthropic` for DeepSeek). Strips a trailing `/v1` from the base so
-/// the prefix can slot in before the version segment, producing
-/// `{base}{prefix}/v1/messages`.
+/// (e.g. `/anthropic` for DeepSeek). With a prefix, strips a trailing `/v1`
+/// from the base so the prefix can slot in before the version segment,
+/// producing `{base}{prefix}/v1/messages`.
 fn build_anthropic_messages_url(base_url: &str, prefix: Option<&str>) -> String {
-    let base = base_url.trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base);
     let prefix = prefix
         .map(|p| p.trim_end_matches('/').trim_start_matches('/'))
         .filter(|p| !p.is_empty());
     match prefix {
-        Some(p) => format!("{}/{}/v1/messages", base, p),
-        None => format!("{}/v1/messages", base),
+        Some(p) => {
+            let base = base_url.trim_end_matches('/');
+            let base = base.strip_suffix("/v1").unwrap_or(base);
+            format!("{}/{}/v1/messages", base, p)
+        }
+        None => http_utils::build_target_url(base_url, "/v1/messages"),
     }
 }
 
@@ -309,9 +345,10 @@ fn probe_paths(
     }
 }
 
-/// Send a single native `/v1/messages` attempt. Returns `Ok(None)` on
-/// mismatch (so the caller can try the next candidate), `Ok(Some(response))`
-/// on success or non-mismatch error.
+/// Send a single native `/v1/messages` attempt. Distinguishes
+/// `EndpointMissing` (404/405/415/501 — safe to conclude the path doesn't
+/// exist) from `UpstreamError` (any other 4xx/5xx — endpoint may exist, error
+/// is auth/rate/transient).
 async fn send_native_anthropic(
     url: &str,
     native_body: &Value,
@@ -319,7 +356,7 @@ async fn send_native_anthropic(
     client: &reqwest::Client,
     passthrough_headers: &HeaderMap,
     beta_header_rejected: &AtomicBool,
-) -> Result<Option<RouterResponse>> {
+) -> Result<SendNativeOutcome> {
     let headers = build_native_anthropic_headers(passthrough_headers, &config.target_api_key)?;
     let is_starter = config.is_starter;
     let response = device_fingerprint::maybe_with_starter_headers(
@@ -354,49 +391,62 @@ async fn send_native_anthropic(
 
             let retry_status = retry_response.status().as_u16();
             if is_protocol_mismatch(retry_status) {
-                return Ok(None);
+                return Ok(classify_native_failure(retry_status));
             }
 
             let retry_ct = http_utils::response_content_type(&retry_response);
             let retry_body = retry_response.bytes().await?;
-            return Ok(Some(RouterResponse::Buffered {
+            return Ok(SendNativeOutcome::Success(RouterResponse::Buffered {
                 status: retry_status,
                 content_type: retry_ct,
                 body: retry_body.to_vec(),
             }));
         }
 
-        return Ok(None);
+        // 400 with a non-beta-rejection body is a real validation failure.
+        return Ok(SendNativeOutcome::UpstreamError);
     }
 
     if is_protocol_mismatch(status_code) {
-        return Ok(None);
+        return Ok(classify_native_failure(status_code));
     }
 
     let content_type = http_utils::response_content_type(&response);
     let response_body = response.bytes().await?;
-    Ok(Some(RouterResponse::Buffered {
+    Ok(SendNativeOutcome::Success(RouterResponse::Buffered {
         status: status_code,
         content_type,
         body: response_body.to_vec(),
     }))
 }
 
+fn classify_native_failure(status: u16) -> SendNativeOutcome {
+    if is_endpoint_missing(status) {
+        SendNativeOutcome::EndpointMissing
+    } else {
+        SendNativeOutcome::UpstreamError
+    }
+}
+
 /// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
 /// Iterates candidate paths (`/v1/messages`, `{prefix}/v1/messages`) based on
-/// the configured prefix and the path learned on earlier requests.
-/// Returns `Some(response)` on success or non-mismatch error, `None` when every
-/// candidate returned a mismatch.
+/// the configured prefix and the path learned on earlier requests. Aggregates
+/// per-path outcomes: `EndpointMissing` only when every candidate path
+/// returned 404-style; a single `UpstreamError` (auth/rate/transient) prevents
+/// the aggregate from being EndpointMissing so the caller doesn't poison the
+/// protocol pin.
 async fn try_native_anthropic(
     body: &Value,
     config: &AnthropicToOpenAIRouterConfig,
     client: &reqwest::Client,
     passthrough_headers: &HeaderMap,
     probe: &ProbeState,
-) -> Result<Option<RouterResponse>> {
+) -> Result<NativeAnthropicResult> {
     let configured = config.anthropic_path_prefix.as_deref();
     let Some(candidates) = probe_paths(probe.outcome(), configured) else {
-        return Ok(None);
+        // Probe was previously marked Failed (all paths confirmed missing);
+        // surface that as EndpointMissing so the caller flips to Openai.
+        return Ok(NativeAnthropicResult::EndpointMissing);
     };
 
     let mut native_body = body.clone();
@@ -405,6 +455,7 @@ async fn try_native_anthropic(
     };
     CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
 
+    let mut saw_upstream_error = false;
     for &path in candidates {
         let sub_path = match path {
             AnthropicProbePath::Root => None,
@@ -412,7 +463,7 @@ async fn try_native_anthropic(
         };
         let url = build_anthropic_messages_url(&config.target_base_url, sub_path);
 
-        if let Some(response) = send_native_anthropic(
+        match send_native_anthropic(
             &url,
             &native_body,
             config,
@@ -422,13 +473,27 @@ async fn try_native_anthropic(
         )
         .await?
         {
-            probe.set_outcome(path.to_outcome());
-            return Ok(Some(response));
+            SendNativeOutcome::Success(response) => {
+                probe.set_outcome(path.to_outcome());
+                return Ok(NativeAnthropicResult::Success(response));
+            }
+            SendNativeOutcome::EndpointMissing => continue,
+            SendNativeOutcome::UpstreamError => {
+                saw_upstream_error = true;
+                continue;
+            }
         }
     }
 
-    probe.set_outcome(ProbeOutcome::Failed);
-    Ok(None)
+    if saw_upstream_error {
+        // Endpoint may exist but errored — leave probe state Unlearned so
+        // future requests can re-try without permanently disabling the probe.
+        Ok(NativeAnthropicResult::UpstreamError)
+    } else {
+        // Every candidate confirmed the path doesn't exist.
+        probe.set_outcome(ProbeOutcome::Failed);
+        Ok(NativeAnthropicResult::EndpointMissing)
+    }
 }
 
 /// Gate the speculative native `/v1/messages` probe on the pin. Sniffing the
@@ -445,6 +510,7 @@ async fn handle_anthropic_to_upstream(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     probe: &ProbeState,
+    request_succeeded: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<RouterResponse> {
     let mut passthrough_headers = http_utils::extract_passthrough_headers(request)?;
@@ -461,15 +527,21 @@ async fn handle_anthropic_to_upstream(
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
     if should_try_native_anthropic(config.target_protocol) {
-        if let Some(response) =
-            try_native_anthropic(&body, config, client, &passthrough_headers, probe).await?
-        {
-            return Ok(response);
+        match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
+            NativeAnthropicResult::Success(response) => {
+                request_succeeded.store(true, Ordering::Relaxed);
+                return Ok(response);
+            }
+            NativeAnthropicResult::EndpointMissing => {
+                // Endpoint truly missing — pre-pin Openai so a fallback success
+                // at attempt==0 (where `commit_protocol_switch` is a no-op)
+                // still gets persisted.
+                active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
+            }
+            NativeAnthropicResult::UpstreamError => {
+                // Endpoint may exist; don't flip the pin on auth/rate/5xx.
+            }
         }
-        // Native probe failed — advance the atomic past Anthropic so
-        // `persist_runtime_discoveries` sees the learned Openai pin.
-        // (`commit_protocol_switch` is a no-op on attempt==0.)
-        active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
     }
 
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
@@ -491,9 +563,9 @@ async fn handle_anthropic_to_upstream(
         .unwrap_or(false);
 
     let candidates = protocol_candidates(active_protocol);
-    let mut last_response: Option<RouterResponse> = None;
+    let mut first_error: Option<RouterResponse> = None;
 
-    for (attempt, protocol) in candidates.into_iter().enumerate() {
+    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         let mut req_body = simplified.clone();
         let mut attempt_headers = passthrough_headers.clone();
         prepare_gateway_model_metadata(&mut req_body, &mut attempt_headers, config, protocol);
@@ -550,7 +622,7 @@ async fn handle_anthropic_to_upstream(
             ProviderProtocol::ResponsesApi => {
                 let mut responses_body = convert_chat_to_responses_request(&req_body)?;
                 responses_body["stream"] = json!(false);
-                let url = build_responses_url(&config.target_base_url);
+                let url = build_responses_url(&config.target_base_url, variant);
                 let response = device_fingerprint::maybe_with_starter_headers(
                     client
                         .post(&url)
@@ -579,7 +651,10 @@ async fn handle_anthropic_to_upstream(
             }
             _ => {
                 // OpenAI or Anthropic — use chat completions endpoint
-                let url = http_utils::build_chat_completions_url(&config.target_base_url);
+                let url = http_utils::build_target_url(
+                    &config.target_base_url,
+                    variant.apply("/v1/chat/completions"),
+                );
                 let mut response = device_fingerprint::maybe_with_starter_headers(
                     client
                         .post(&url)
@@ -627,7 +702,8 @@ async fn handle_anthropic_to_upstream(
                             socket.write_all(&formatted).await?;
                         }
                         socket.write_all(b"0\r\n\r\n").await?;
-                        commit_protocol_switch(active_protocol, protocol, attempt);
+                        commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                        request_succeeded.store(true, Ordering::Relaxed);
                         return Ok(RouterResponse::AlreadyStreamed);
                     }
 
@@ -656,11 +732,12 @@ async fn handle_anthropic_to_upstream(
 
         match outcome {
             AttemptOutcome::Success(r) => {
-                commit_protocol_switch(active_protocol, protocol, attempt);
+                commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                request_succeeded.store(true, Ordering::Relaxed);
                 return Ok(r);
             }
             AttemptOutcome::Mismatch { status, body } => {
-                last_response = Some(RouterResponse::Buffered {
+                first_error.get_or_insert(RouterResponse::Buffered {
                     status,
                     content_type: CONTENT_TYPE_JSON.to_string(),
                     body: body.into_bytes(),
@@ -669,8 +746,7 @@ async fn handle_anthropic_to_upstream(
         }
     }
 
-    // All candidates exhausted — surface the real last upstream error.
-    Ok(last_response.unwrap_or(RouterResponse::Buffered {
+    Ok(first_error.unwrap_or(RouterResponse::Buffered {
         status: 503,
         content_type: CONTENT_TYPE_JSON.to_string(),
         body: b"{\"error\":\"No compatible protocol found\"}".to_vec(),
@@ -710,14 +786,9 @@ fn stringify_message_content(req: &mut Value) {
     *req = serde_json::to_value(typed_req).expect("typed openai request should serialize");
 }
 
-/// Build /v1/responses URL from a base URL.
-fn build_responses_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{}/responses", base)
-    } else {
-        format!("{}/v1/responses", base)
-    }
+/// Build /v1/responses (or /responses, when stripped) URL from a base URL.
+fn build_responses_url(base_url: &str, variant: PathVariant) -> String {
+    http_utils::build_target_url(base_url, variant.apply("/v1/responses"))
 }
 
 /// Wrap an OpenAI Chat Completions response as a buffered Anthropic-format
@@ -1946,7 +2017,7 @@ data: [DONE]\n";
 
     #[test]
     fn build_responses_url_with_v1_suffix() {
-        let url = build_responses_url("https://api.openai.com/v1");
+        let url = build_responses_url("https://api.openai.com/v1", PathVariant::Default);
         assert_eq!(url, "https://api.openai.com/v1/responses");
         // Must not produce /v1/v1/responses
         assert!(!url.contains("/v1/v1"));
@@ -1954,8 +2025,14 @@ data: [DONE]\n";
 
     #[test]
     fn build_responses_url_without_v1_suffix() {
-        let url = build_responses_url("https://api.example.com");
+        let url = build_responses_url("https://api.example.com", PathVariant::Default);
         assert_eq!(url, "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn build_responses_url_stripped_variant() {
+        let url = build_responses_url("https://api.example.com", PathVariant::Stripped);
+        assert_eq!(url, "https://api.example.com/responses");
     }
 
     #[test]

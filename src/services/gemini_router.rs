@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;
@@ -59,6 +59,7 @@ struct GeminiRouterState {
     config: Arc<GeminiRouterConfig>,
     client: Arc<reqwest::Client>,
     active_protocol: Arc<AtomicU8>,
+    request_succeeded: Arc<AtomicBool>,
 }
 
 impl GeminiRouter {
@@ -68,18 +69,25 @@ impl GeminiRouter {
 
     pub async fn start_background(
         &self,
-    ) -> Result<(u16, Arc<AtomicU8>, tokio::task::JoinHandle<Result<()>>)> {
+    ) -> Result<(
+        u16,
+        Arc<AtomicU8>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<Result<()>>,
+    )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
         let active_protocol = Arc::new(AtomicU8::new(self.config.upstream_protocol.to_u8()));
+        let request_succeeded = Arc::new(AtomicBool::new(false));
         let state = GeminiRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
+            request_succeeded: request_succeeded.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_text_router(listener, Arc::new(state), handle_router_request).await
         });
-        Ok((port, active_protocol, handle))
+        Ok((port, active_protocol, request_succeeded, handle))
     }
 }
 
@@ -89,6 +97,7 @@ async fn handle_router_request(request: String, state: Arc<GeminiRouterState>) -
         &state.config,
         &state.client,
         &state.active_protocol,
+        &state.request_succeeded,
     )
     .await
     {
@@ -102,6 +111,7 @@ async fn handle_request(
     config: &std::sync::Arc<GeminiRouterConfig>,
     client: &Arc<reqwest::Client>,
     active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
 ) -> Result<String> {
     let path = http_utils::extract_request_path(request);
 
@@ -120,6 +130,7 @@ async fn handle_request(
             // select_model_for_protocol is applied per-attempt inside forward_to_provider.
             match forward_to_provider(openai_req, config, client, active_protocol).await? {
                 ForwardResult::Success(openai_response) => {
+                    request_succeeded.store(true, Ordering::Relaxed);
                     let openai_response = repair_tool_call_args(openai_response, &tool_schemas);
                     if is_streaming {
                         let sse = convert_openai_to_gemini_sse(&openai_response);
@@ -167,11 +178,9 @@ async fn forward_to_provider(
     active_protocol: &Arc<AtomicU8>,
 ) -> Result<ForwardResult> {
     let candidates = protocol_candidates(active_protocol);
+    let mut first_error: Option<(u16, String)> = None;
 
-    let mut last_status = 0u16;
-    let mut last_body = String::new();
-
-    for (attempt, protocol) in candidates.into_iter().enumerate() {
+    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         // Select the right model name for this protocol attempt.
         let mut req_body = openai_req.clone();
         let selected_model = select_model_for_provider_attempt(
@@ -206,8 +215,10 @@ async fn forward_to_provider(
                     },
                 );
                 anthropic_req["stream"] = serde_json::json!(false);
-                let target_url =
-                    http_utils::build_target_url(&config.target_base_url, "/v1/messages");
+                let target_url = http_utils::build_target_url(
+                    &config.target_base_url,
+                    variant.apply("/v1/messages"),
+                );
                 let response = device_fingerprint::maybe_with_starter_headers(
                     client
                         .post(&target_url)
@@ -269,7 +280,10 @@ async fn forward_to_provider(
                 (status, body_text, parsed)
             }
             ProviderProtocol::Openai => {
-                let target_url = http_utils::build_chat_completions_url(&config.target_base_url);
+                let target_url = http_utils::build_target_url(
+                    &config.target_base_url,
+                    variant.apply("/v1/chat/completions"),
+                );
                 let req = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
@@ -295,8 +309,10 @@ async fn forward_to_provider(
             }
             ProviderProtocol::ResponsesApi => {
                 let responses_body = chat_to_responses_request(&req_body)?;
-                let target_url =
-                    http_utils::build_target_url(&config.target_base_url, "/v1/responses");
+                let target_url = http_utils::build_target_url(
+                    &config.target_base_url,
+                    variant.apply("/v1/responses"),
+                );
                 let req = http_utils::authorized_openai_post(
                     client.as_ref(),
                     &target_url,
@@ -324,20 +340,17 @@ async fn forward_to_provider(
 
         match classify_attempt(status, body_text, parsed) {
             AttemptOutcome::Success(result) => {
-                commit_protocol_switch(active_protocol, protocol, attempt);
+                commit_protocol_switch(active_protocol, protocol, variant, attempt);
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
-                last_status = status;
-                last_body = body;
+                first_error.get_or_insert((status, body));
             }
         }
     }
 
-    Ok(ForwardResult::Exhausted {
-        status: last_status,
-        body: last_body,
-    })
+    let (status, body) = first_error.unwrap_or_default();
+    Ok(ForwardResult::Exhausted { status, body })
 }
 
 /// Parses a Gemini API request path and extracts (model_name, is_streaming).
@@ -1262,22 +1275,6 @@ mod tests {
         assert!(sse.contains("STOP"));
         // Must end with \n\n for SDK regex
         assert!(sse.ends_with("\n\n"));
-    }
-
-    #[test]
-    fn test_build_chat_completions_url_with_v1() {
-        assert_eq!(
-            http_utils::build_chat_completions_url("https://ai-gateway.vercel.sh/v1"),
-            "https://ai-gateway.vercel.sh/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn test_build_chat_completions_url_without_v1() {
-        assert_eq!(
-            http_utils::build_chat_completions_url("https://example.com"),
-            "https://example.com/v1/chat/completions"
-        );
     }
 
     #[test]

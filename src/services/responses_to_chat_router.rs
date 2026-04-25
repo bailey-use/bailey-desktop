@@ -32,12 +32,12 @@ use crate::services::openai_gemini_bridge::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
-use crate::services::provider_protocol::{ProviderProtocol, is_protocol_mismatch};
+use crate::services::provider_protocol::{PathVariant, ProviderProtocol, is_protocol_mismatch};
 use crate::services::responses_chat_conversion;
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 // Re-export public conversion functions used by other modules
 pub use responses_chat_conversion::{
@@ -90,6 +90,9 @@ struct ResponsesToChatRouterState {
     active_protocol: Arc<AtomicU8>,
     /// Tri-state: 0 = unknown, 1 = supported, 2 = not supported
     responses_api_supported: Arc<AtomicU8>,
+    /// Flipped to `true` once any request returns a non-error response. Read
+    /// by `persist_runtime_discoveries` to gate protocol pinning.
+    request_succeeded: Arc<AtomicBool>,
 }
 
 impl ResponsesToChatRouter {
@@ -105,6 +108,7 @@ impl ResponsesToChatRouter {
         u16,
         Arc<AtomicU8>,
         Arc<AtomicU8>,
+        Arc<AtomicBool>,
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
@@ -115,11 +119,13 @@ impl ResponsesToChatRouter {
             None => 0,
         };
         let responses_api_supported = Arc::new(AtomicU8::new(initial_responses));
+        let request_succeeded = Arc::new(AtomicBool::new(false));
         let state = ResponsesToChatRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
             responses_api_supported: responses_api_supported.clone(),
+            request_succeeded: request_succeeded.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_streaming_router(
@@ -129,7 +135,13 @@ impl ResponsesToChatRouter {
             )
             .await
         });
-        Ok((port, active_protocol, responses_api_supported, handle))
+        Ok((
+            port,
+            active_protocol,
+            responses_api_supported,
+            request_succeeded,
+            handle,
+        ))
     }
 }
 
@@ -167,6 +179,7 @@ async fn handle_router_request(
             state.client.as_ref(),
             &state.active_protocol,
             &state.responses_api_supported,
+            &state.request_succeeded,
             socket,
         )
         .await
@@ -190,6 +203,7 @@ async fn handle_router_request(
 /// - Chat Completions format: filter non-function tools and forward
 ///
 /// Returns `None` if the response was streamed directly to the socket.
+#[allow(clippy::too_many_arguments)]
 async fn handle_api_request(
     path: &str,
     request: &str,
@@ -197,6 +211,7 @@ async fn handle_api_request(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     responses_api_supported: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<Option<String>> {
     let body_str = http_utils::extract_request_body(request)?;
@@ -207,13 +222,27 @@ async fn handle_api_request(
         // to preserve IDs and avoid lossy Chat Completions round-trip conversion.
         let current = ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed));
         if current == ProviderProtocol::Openai
-            && let Some(result) =
-                try_responses_api_passthrough(&body, config, client, responses_api_supported).await
+            && let Some(result) = try_responses_api_passthrough(
+                &body,
+                config,
+                client,
+                responses_api_supported,
+                request_succeeded,
+            )
+            .await
         {
             return Ok(Some(result?));
         }
         Ok(Some(
-            handle_responses_api_via_chat(path, &body, config, client, active_protocol).await?,
+            handle_responses_api_via_chat(
+                path,
+                &body,
+                config,
+                client,
+                active_protocol,
+                request_succeeded,
+            )
+            .await?,
         ))
     } else {
         // For streaming Chat Completions, stream directly from upstream to client
@@ -221,15 +250,29 @@ async fn handle_api_request(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
-            && stream_chat_completions(&body, config, client, active_protocol, socket)
-                .await
-                .is_ok()
+            && stream_chat_completions(
+                &body,
+                config,
+                client,
+                active_protocol,
+                request_succeeded,
+                socket,
+            )
+            .await
+            .is_ok()
         {
             return Ok(None); // already streamed to socket
         }
         Ok(Some(
-            handle_chat_completions_with_filter(path, &body, config, client, active_protocol)
-                .await?,
+            handle_chat_completions_with_filter(
+                path,
+                &body,
+                config,
+                client,
+                active_protocol,
+                request_succeeded,
+            )
+            .await?,
         ))
     }
 }
@@ -247,6 +290,7 @@ async fn try_responses_api_passthrough(
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
     responses_api_supported: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
 ) -> Option<Result<String>> {
     if responses_api_supported.load(Ordering::Relaxed) == 2 {
         return None;
@@ -325,6 +369,7 @@ async fn try_responses_api_passthrough(
 
         responses_api_supported.store(1, Ordering::Relaxed);
     }
+    request_succeeded.store(true, Ordering::Relaxed);
     Some(Ok(http_utils::http_response(
         status,
         &content_type,
@@ -341,6 +386,7 @@ async fn handle_responses_api_via_chat(
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
 ) -> Result<String> {
     // Extract original model before conversion
     let original_model = body
@@ -354,15 +400,21 @@ async fn handle_responses_api_via_chat(
     let mut chat_config = (**config).clone();
     chat_config.actual_model = Some(original_model.clone());
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
-    let chat_response =
-        match forward_openai_chat_request(&chat_body, config, client, false, active_protocol)
-            .await?
-        {
-            ForwardedChatResponse::Success(value) => value,
-            ForwardedChatResponse::HttpError { status, body } => {
-                return Ok(http_utils::http_json_response(status, &body));
-            }
-        };
+    let chat_response = match forward_openai_chat_request(
+        &chat_body,
+        config,
+        client,
+        false,
+        active_protocol,
+        request_succeeded,
+    )
+    .await?
+    {
+        ForwardedChatResponse::Success(value) => value,
+        ForwardedChatResponse::HttpError { status, body } => {
+            return Ok(http_utils::http_json_response(status, &body));
+        }
+    };
     let sse = convert_chat_response_to_responses_sse(
         &chat_response,
         config.requires_reasoning_content,
@@ -400,6 +452,7 @@ async fn stream_chat_completions(
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
@@ -441,6 +494,7 @@ async fn stream_chat_completions(
         .unwrap_or("text/event-stream")
         .to_string();
 
+    request_succeeded.store(true, Ordering::Relaxed);
     http_utils::write_streaming_response(socket, 200, &content_type, response).await
 }
 
@@ -454,6 +508,7 @@ async fn handle_chat_completions_with_filter(
     config: &Arc<ResponsesToChatRouterConfig>,
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
 ) -> Result<String> {
     let body = prepare_chat_completions_body(
         body,
@@ -465,15 +520,21 @@ async fn handle_chat_completions_with_filter(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let chat_response =
-        match forward_openai_chat_request(&body, config, client, requested_stream, active_protocol)
-            .await?
-        {
-            ForwardedChatResponse::Success(value) => value,
-            ForwardedChatResponse::HttpError { status, body } => {
-                return Ok(http_utils::http_json_response(status, &body));
-            }
-        };
+    let chat_response = match forward_openai_chat_request(
+        &body,
+        config,
+        client,
+        requested_stream,
+        active_protocol,
+        request_succeeded,
+    )
+    .await?
+    {
+        ForwardedChatResponse::Success(value) => value,
+        ForwardedChatResponse::HttpError { status, body } => {
+            return Ok(http_utils::http_json_response(status, &body));
+        }
+    };
     if requested_stream {
         let sse = convert_openai_chat_response_to_sse(&chat_response)?;
         Ok(http_utils::http_response(200, "text/event-stream", &sse))
@@ -525,14 +586,15 @@ async fn forward_openai_chat_request(
     client: &reqwest::Client,
     force_non_streaming: bool,
     active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
 ) -> Result<ForwardedChatResponse> {
     let candidates = protocol_candidates(active_protocol);
-    let mut last_status = 0u16;
-    let mut last_body = String::new();
+    let mut first_error: Option<(u16, String)> = None;
 
-    for (attempt, protocol) in candidates.into_iter().enumerate() {
+    for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         match forward_chat_for_protocol(
             protocol,
+            variant,
             body,
             config.as_ref(),
             client,
@@ -541,24 +603,23 @@ async fn forward_openai_chat_request(
         .await?
         {
             AttemptOutcome::Success(value) => {
-                commit_protocol_switch(active_protocol, protocol, attempt);
+                commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                request_succeeded.store(true, Ordering::Relaxed);
                 return Ok(ForwardedChatResponse::Success(value));
             }
             AttemptOutcome::Mismatch { status, body } => {
-                last_status = status;
-                last_body = body;
+                first_error.get_or_insert((status, body));
             }
         }
     }
 
-    Ok(ForwardedChatResponse::HttpError {
-        status: last_status,
-        body: last_body,
-    })
+    let (status, body) = first_error.unwrap_or_default();
+    Ok(ForwardedChatResponse::HttpError { status, body })
 }
 
 async fn forward_chat_for_protocol(
     protocol: ProviderProtocol,
+    variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
@@ -566,21 +627,25 @@ async fn forward_chat_for_protocol(
 ) -> Result<AttemptOutcome<Value>> {
     match protocol {
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-            forward_openai_protocol(body, config, client).await
+            forward_openai_protocol(variant, body, config, client).await
         }
         ProviderProtocol::Anthropic => {
-            forward_anthropic_protocol(body, config, client, force_non_streaming).await
+            forward_anthropic_protocol(variant, body, config, client, force_non_streaming).await
         }
         ProviderProtocol::Google => forward_google_protocol(body, config, client).await,
     }
 }
 
 async fn forward_openai_protocol(
+    variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
 ) -> Result<AttemptOutcome<Value>> {
-    let target_url = build_target_url(&config.target_base_url, "/v1/chat/completions");
+    let target_url = build_target_url(
+        &config.target_base_url,
+        variant.apply("/v1/chat/completions"),
+    );
     let initiator = if config.copilot_token_manager.is_some() {
         Some(http_utils::copilot_initiator_from_openai(body))
     } else {
@@ -617,7 +682,7 @@ async fn forward_openai_protocol(
         } = result
         && (error_body.contains("unsupported_api_for_model")
             || (error_body.contains("not support") && error_body.contains("chat/completions")))
-        && let Ok(fallback) = try_copilot_responses_fallback(body, config, client).await
+        && let Ok(fallback) = try_copilot_responses_fallback(variant, body, config, client).await
     {
         return Ok(fallback);
     }
@@ -629,12 +694,13 @@ async fn forward_openai_protocol(
 /// Copilot's /responses endpoint. Returns the response converted back to Chat
 /// Completions format.
 async fn try_copilot_responses_fallback(
+    variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
 ) -> Result<AttemptOutcome<Value>> {
     let responses_body = responses_chat_conversion::convert_chat_to_responses_request(body);
-    let target_url = build_target_url(&config.target_base_url, "/v1/responses");
+    let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/responses"));
     let req = http_utils::authorized_openai_post(
         client,
         &target_url,
@@ -665,6 +731,7 @@ async fn try_copilot_responses_fallback(
 }
 
 async fn forward_anthropic_protocol(
+    variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
@@ -692,7 +759,7 @@ async fn forward_anthropic_protocol(
         anthropic_body["stream"] = json!(false);
     }
 
-    let target_url = build_target_url(&config.target_base_url, "/v1/messages");
+    let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/messages"));
     let response = device_fingerprint::maybe_with_starter_headers(
         client
             .post(&target_url)

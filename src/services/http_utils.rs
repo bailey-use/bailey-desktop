@@ -611,25 +611,46 @@ fn copilot_path_from_target(target_url: &str) -> &str {
     path.strip_prefix("/v1").unwrap_or(path)
 }
 
-/// Constructs a target URL, avoiding `/v1` duplication when base already ends with `/v1`.
+/// Constructs a target URL, collapsing any path segments that the base URL already
+/// includes. If the base path ends with the same N segments that the target path
+/// begins with (longest match), those duplicated leading segments are stripped from
+/// the path. Handles `/v1`, `/v1beta`, `/anthropic`, `/openai/v1`, etc.
 pub fn build_target_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let effective_path = if base.ends_with("/v1") && path.starts_with("/v1/") {
-        &path[3..]
+    let stripped_path = path.trim_start_matches('/');
+
+    // Walk path segment boundaries left-to-right; for each cumulative prefix
+    // (e.g. "v1", then "v1/messages"), check whether `base` already ends with
+    // a `/<prefix>` segment boundary. The longest such match is the overlap
+    // we strip. Zero allocations, single pass.
+    let mut overlap_end = 0usize;
+    let bytes = stripped_path.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' && base_ends_with_segment(base, &stripped_path[..i]) {
+            overlap_end = i + 1;
+        }
+    }
+    if base_ends_with_segment(base, stripped_path) {
+        overlap_end = stripped_path.len();
+    }
+
+    let trimmed = &stripped_path[overlap_end..];
+    if trimmed.is_empty() {
+        base.to_string()
     } else {
-        path
-    };
-    format!("{}/{}", base, effective_path.trim_start_matches('/'))
+        format!("{}/{}", base, trimmed)
+    }
 }
 
-/// Constructs a /v1/chat/completions URL, avoiding /v1/v1 duplication.
-pub fn build_chat_completions_url(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{}/chat/completions", base)
-    } else {
-        format!("{}/v1/chat/completions", base)
+/// True iff `base` ends with `/<seg>` on a segment boundary (i.e. preceded by
+/// a `/`). Pure substring check — no allocations.
+fn base_ends_with_segment(base: &str, seg: &str) -> bool {
+    if seg.is_empty() || !base.ends_with(seg) {
+        return false;
     }
+    base.len()
+        .checked_sub(seg.len() + 1)
+        .is_some_and(|idx| base.as_bytes()[idx] == b'/')
 }
 
 /// Returns the current Unix timestamp in seconds.
@@ -955,18 +976,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chat_completions_url() {
-        assert_eq!(
-            build_chat_completions_url("https://ai-gateway.vercel.sh/v1"),
-            "https://ai-gateway.vercel.sh/v1/chat/completions"
-        );
-        assert_eq!(
-            build_chat_completions_url("https://example.com"),
-            "https://example.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn test_build_target_url_trailing_slash() {
         assert_eq!(
             build_target_url("https://example.com/v1/", "/chat/completions"),
@@ -975,10 +984,56 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chat_completions_url_trailing_slash() {
+    fn test_build_target_url_collapses_v1beta() {
         assert_eq!(
-            build_chat_completions_url("https://example.com/v1/"),
-            "https://example.com/v1/chat/completions"
+            build_target_url(
+                "https://generativelanguage.googleapis.com/v1beta",
+                "/v1beta/models/gemini:generateContent"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini:generateContent"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_collapses_anthropic_namespace() {
+        assert_eq!(
+            build_target_url("https://api.minimax.io/anthropic", "/anthropic/v1/messages"),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_collapses_openai_v1_namespace() {
+        assert_eq!(
+            build_target_url("https://gateway.example/openai/v1", "/v1/chat/completions"),
+            "https://gateway.example/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_collapses_multi_segment_overlap() {
+        assert_eq!(
+            build_target_url(
+                "https://api.example.com/anthropic/v1",
+                "/anthropic/v1/messages"
+            ),
+            "https://api.example.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_no_overlap_keeps_path() {
+        assert_eq!(
+            build_target_url("https://api.example.com", "/v1/messages"),
+            "https://api.example.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn test_build_target_url_preserves_disjoint_segments() {
+        assert_eq!(
+            build_target_url("https://api.example.com/foo", "/v1/messages"),
+            "https://api.example.com/foo/v1/messages"
         );
     }
 

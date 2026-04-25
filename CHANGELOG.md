@@ -1,14 +1,20 @@
 # Changelog
 
-## Unreleased
+## v0.19.2
 
-### Breaking
+### Features
 
-- `aivo chat --json` now prints the provider's raw response body instead of aivo's envelope. Scripts must switch to the provider-native shape (e.g. `.choices[0].message.content`).
+- `aivo image`: experimental image generation command
 
 ### Fixes
 
-- `aivo chat` no longer injects `max_tokens: 8192` for DeepSeek / aivo-starter; matches `curl`.
+- Router: try native `/v1/messages` when `target_protocol` is anthropic; respect learned `PathVariant` on fast paths
+- Router: prefer CLI-native protocol and force aivo-starter through the router
+- Fix Linux ETXTBSY flake in Claude `setup-token` spawn tests
+- `aivo chat --json` now prints the provider's raw response body instead of aivo's envelope
+- `aivo run`: skip the model picker on non-TTY and under `--dry-run`
+- `aivo chat` no longer injects `max_tokens: 8192` for DeepSeek / aivo-starter; matches `curl`
+- `opencode`: default to an OpenAI-style model instead of `claude-sonnet`
 
 ## v0.19.1
 

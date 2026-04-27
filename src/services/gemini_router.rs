@@ -21,9 +21,10 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model, sanitize_schema_for_gemini,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, AttemptRecord, classify_attempt, commit_protocol_switch,
+    log_exhausted_fallback, protocol_candidates,
 };
-use crate::services::provider_protocol::ProviderProtocol;
+use crate::services::provider_protocol::{ProviderProtocol, is_terminal_upstream_error};
 
 #[derive(Clone)]
 pub struct GeminiRouterConfig {
@@ -180,6 +181,7 @@ async fn forward_to_provider(
 ) -> Result<ForwardResult> {
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<(u16, String)> = None;
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         // Select the right model name for this protocol attempt.
@@ -345,10 +347,16 @@ async fn forward_to_provider(
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
+                attempts.push(AttemptRecord::new(protocol, variant, status, &body));
                 first_error.get_or_insert((status, body));
+                if is_terminal_upstream_error(status) {
+                    break;
+                }
             }
         }
     }
+
+    log_exhausted_fallback("gemini", &attempts);
 
     let (status, body) = first_error.unwrap_or_default();
     Ok(ForwardResult::Exhausted { status, body })

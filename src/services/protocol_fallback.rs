@@ -5,6 +5,71 @@ use super::provider_protocol::{
     fallback_protocols,
 };
 
+/// Per-candidate record captured during a fallback loop. The router uses it
+/// only for diagnostic logging when every candidate fails — the real upstream
+/// response that gets returned to the client is built separately from the
+/// first attempt's body.
+#[derive(Debug, Clone)]
+pub struct AttemptRecord {
+    pub protocol: ProviderProtocol,
+    pub variant: PathVariant,
+    pub status: u16,
+    pub body_preview: String,
+}
+
+impl AttemptRecord {
+    pub fn new(protocol: ProviderProtocol, variant: PathVariant, status: u16, body: &str) -> Self {
+        Self {
+            protocol,
+            variant,
+            status,
+            body_preview: truncate_body_for_log(body),
+        }
+    }
+}
+
+fn truncate_body_for_log(body: &str) -> String {
+    const LIMIT: usize = 200;
+    let trimmed = body.trim();
+    let mut iter = trimmed.chars();
+    let head: String = iter.by_ref().take(LIMIT).collect();
+    if iter.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+fn variant_label(v: PathVariant) -> &'static str {
+    match v {
+        PathVariant::Default => "default",
+        PathVariant::Stripped => "stripped",
+    }
+}
+
+/// Emit a multi-line diagnostic to stderr listing every fallback attempt and
+/// the status it returned. Skipped when fewer than 2 attempts were tried (a
+/// single failure is its own diagnostic — surfacing it in the response body
+/// is enough). `context` is a short label for the router (e.g. `"claude"`).
+pub fn log_exhausted_fallback(context: &str, attempts: &[AttemptRecord]) {
+    if attempts.len() < 2 {
+        return;
+    }
+    eprintln!(
+        "  • {context} fallback exhausted, tried {} routes:",
+        attempts.len()
+    );
+    for record in attempts {
+        eprintln!(
+            "      {:9} {:8} → {} {}",
+            record.protocol.as_str(),
+            variant_label(record.variant),
+            record.status,
+            record.body_preview,
+        );
+    }
+}
+
 /// Outcome of a single protocol attempt in the fallback loop.
 pub enum AttemptOutcome<T> {
     Success(T),
@@ -194,5 +259,45 @@ mod tests {
             let (_, variant) = decode_route(raw);
             assert_eq!(variant, PathVariant::Default, "raw byte {raw}");
         }
+    }
+
+    #[test]
+    fn attempt_record_preserves_short_body() {
+        let r = AttemptRecord::new(
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            401,
+            "bad key",
+        );
+        assert_eq!(r.body_preview, "bad key");
+    }
+
+    #[test]
+    fn attempt_record_truncates_long_body() {
+        let body: String = "x".repeat(500);
+        let r = AttemptRecord::new(ProviderProtocol::Openai, PathVariant::Default, 502, &body);
+        // Truncated to 200 chars + ellipsis
+        assert_eq!(r.body_preview.chars().count(), 201);
+        assert!(r.body_preview.ends_with('…'));
+    }
+
+    #[test]
+    fn attempt_record_handles_multibyte_truncation() {
+        let body: String = "日本語テスト".repeat(100);
+        let r = AttemptRecord::new(ProviderProtocol::Openai, PathVariant::Default, 500, &body);
+        // Must not panic on char-boundary truncation (would have on byte slice)
+        assert!(r.body_preview.ends_with('…'));
+        assert!(r.body_preview.is_char_boundary(r.body_preview.len()));
+    }
+
+    #[test]
+    fn attempt_record_trims_whitespace() {
+        let r = AttemptRecord::new(
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            400,
+            "  oops  \n",
+        );
+        assert_eq!(r.body_preview, "oops");
     }
 }

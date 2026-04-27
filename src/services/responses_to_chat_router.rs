@@ -31,10 +31,11 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, AttemptRecord, classify_attempt, commit_protocol_switch,
+    log_exhausted_fallback, protocol_candidates,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch,
+    PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch, is_terminal_upstream_error,
 };
 use crate::services::responses_chat_conversion;
 use anyhow::Result;
@@ -598,6 +599,7 @@ async fn forward_openai_chat_request(
 ) -> Result<ForwardedChatResponse> {
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<(u16, String)> = None;
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         match forward_chat_for_protocol(
@@ -616,10 +618,16 @@ async fn forward_openai_chat_request(
                 return Ok(ForwardedChatResponse::Success(value));
             }
             AttemptOutcome::Mismatch { status, body } => {
+                attempts.push(AttemptRecord::new(protocol, variant, status, &body));
                 first_error.get_or_insert((status, body));
+                if is_terminal_upstream_error(status) {
+                    break;
+                }
             }
         }
     }
+
+    log_exhausted_fallback("codex", &attempts);
 
     let (status, body) = first_error.unwrap_or_default();
     Ok(ForwardedChatResponse::HttpError { status, body })

@@ -312,7 +312,53 @@ pub(crate) fn key_metadata_json(key: &ApiKey, selected_id: Option<&str>) -> Valu
         "base_url": key.base_url,
         "active": selected_id == Some(key.id.as_str()),
         "created_at": key.created_at,
+        "learned": learned_routing_json(key),
     })
+}
+
+/// Per-tool routing the runtime has discovered for this key (`null` when not
+/// yet learned). Surfacing these in `aivo info` is the only way users can see
+/// what protocol/path was pinned after fallback resolved — otherwise the
+/// pin is invisible until something breaks.
+fn learned_routing_json(key: &ApiKey) -> Value {
+    json!({
+        "claude_protocol": key.claude_protocol.map(|p| p.as_str()),
+        "gemini_protocol": key.gemini_protocol.map(|p| p.as_str()),
+        "codex_mode": key.codex_mode.map(|m| m.as_str()),
+        "opencode_mode": key.opencode_mode.map(|m| m.as_str()),
+        "pi_mode": key.pi_mode.map(|m| m.as_str()),
+        "responses_api_supported": key.responses_api_supported,
+    })
+}
+
+pub(crate) fn learned_routing_summary(key: &ApiKey) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = key.claude_protocol {
+        parts.push(format!("claude={}", p.as_str()));
+    }
+    if let Some(p) = key.gemini_protocol {
+        parts.push(format!("gemini={}", p.as_str()));
+    }
+    if let Some(m) = key.codex_mode {
+        parts.push(format!("codex={}", m.as_str()));
+    }
+    if let Some(m) = key.opencode_mode {
+        parts.push(format!("opencode={}", m.as_str()));
+    }
+    if let Some(m) = key.pi_mode {
+        parts.push(format!("pi={}", m.as_str()));
+    }
+    if let Some(supported) = key.responses_api_supported {
+        parts.push(format!(
+            "responses_api={}",
+            if supported { "yes" } else { "no" }
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 /// Converts a PingResult into a JSON object for structured output.
@@ -2656,6 +2702,67 @@ mod tests {
         assert_eq!(payload["active"], false);
         let payload = key_metadata_json(&key, None);
         assert_eq!(payload["active"], false);
+    }
+
+    #[test]
+    fn key_metadata_json_learned_routing_null_when_unset() {
+        let key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            None,
+            "sk".to_string(),
+        );
+        let payload = key_metadata_json(&key, None);
+        let learned = &payload["learned"];
+        assert_eq!(learned["claude_protocol"], serde_json::Value::Null);
+        assert_eq!(learned["gemini_protocol"], serde_json::Value::Null);
+        assert_eq!(learned["codex_mode"], serde_json::Value::Null);
+        assert_eq!(learned["responses_api_supported"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn key_metadata_json_learned_routing_populated() {
+        let mut key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            Some(crate::services::session_store::ClaudeProviderProtocol::Anthropic),
+            "sk".to_string(),
+        );
+        key.codex_mode = Some(crate::services::session_store::OpenAICompatibilityMode::Router);
+        key.responses_api_supported = Some(true);
+        let payload = key_metadata_json(&key, None);
+        assert_eq!(payload["learned"]["claude_protocol"], "anthropic");
+        assert_eq!(payload["learned"]["codex_mode"], "router");
+        assert_eq!(payload["learned"]["responses_api_supported"], true);
+    }
+
+    #[test]
+    fn learned_routing_summary_returns_none_when_empty() {
+        let key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            None,
+            "sk".to_string(),
+        );
+        assert!(learned_routing_summary(&key).is_none());
+    }
+
+    #[test]
+    fn learned_routing_summary_joins_set_fields() {
+        let mut key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "test".to_string(),
+            "https://api.example.com".to_string(),
+            Some(crate::services::session_store::ClaudeProviderProtocol::Openai),
+            "sk".to_string(),
+        );
+        key.gemini_protocol = Some(crate::services::session_store::GeminiProviderProtocol::Google);
+        let summary = learned_routing_summary(&key).expect("summary expected");
+        assert!(summary.contains("claude=openai"), "got: {summary}");
+        assert!(summary.contains("gemini=google"), "got: {summary}");
     }
 
     #[test]

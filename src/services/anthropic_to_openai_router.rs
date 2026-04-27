@@ -45,10 +45,12 @@ use crate::services::openai_models::{
     stringify_message_content as stringify_typed_message_content,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    AttemptOutcome, AttemptRecord, classify_attempt, commit_protocol_switch,
+    log_exhausted_fallback, protocol_candidates,
 };
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, is_endpoint_missing, is_protocol_mismatch,
+    is_terminal_upstream_error,
 };
 
 #[derive(Clone)]
@@ -565,6 +567,7 @@ async fn handle_anthropic_to_upstream(
 
     let candidates = protocol_candidates(active_protocol);
     let mut first_error: Option<RouterResponse> = None;
+    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         let mut req_body = simplified.clone();
@@ -738,14 +741,20 @@ async fn handle_anthropic_to_upstream(
                 return Ok(r);
             }
             AttemptOutcome::Mismatch { status, body } => {
+                attempts.push(AttemptRecord::new(protocol, variant, status, &body));
                 first_error.get_or_insert(RouterResponse::Buffered {
                     status,
                     content_type: CONTENT_TYPE_JSON.to_string(),
                     body: body.into_bytes(),
                 });
+                if is_terminal_upstream_error(status) {
+                    break;
+                }
             }
         }
     }
+
+    log_exhausted_fallback("claude", &attempts);
 
     Ok(first_error.unwrap_or(RouterResponse::Buffered {
         status: 503,

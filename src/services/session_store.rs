@@ -49,6 +49,16 @@ pub enum ClaudeProviderProtocol {
     Google,
 }
 
+impl ClaudeProviderProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+            Self::Google => "google",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum GeminiProviderProtocol {
@@ -57,11 +67,30 @@ pub enum GeminiProviderProtocol {
     Anthropic,
 }
 
+impl GeminiProviderProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenAICompatibilityMode {
     Direct,
     Router,
+}
+
+impl OpenAICompatibilityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Router => "router",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -172,6 +172,23 @@ pub fn is_endpoint_missing(status: u16) -> bool {
     matches!(status, 404 | 405 | 415 | 501)
 }
 
+/// True for statuses where falling back to a different protocol/path cannot
+/// help: the upstream answered authoritatively (auth, rate limit, server
+/// error) — not "wrong path". Routers should bail out of the fallback loop
+/// on these so users see the real error fast instead of paying for 6 more
+/// requests that will surface the same rejection.
+///
+/// 501 (Not Implemented) is excluded from the 5xx range because in practice
+/// it signals "this path/method isn't served" — same family as 404/405/415.
+pub fn is_terminal_upstream_error(status: u16) -> bool {
+    match status {
+        401 | 403 | 429 => true,
+        501 => false,
+        500..=599 => true,
+        _ => false,
+    }
+}
+
 /// Returns fallback protocol candidates to try after `current` fails.
 /// Google is always included as the last fallback so generic gateways can still
 /// auto-switch to Google-native routing if they expose it.
@@ -311,6 +328,20 @@ mod tests {
         }
         for status in [200, 301, 400, 401, 403, 422, 429, 500, 502, 503] {
             assert!(!is_endpoint_missing(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn is_terminal_upstream_error_matches_auth_rate_and_5xx() {
+        for status in [401, 403, 429, 500, 502, 503, 504, 505, 511] {
+            assert!(is_terminal_upstream_error(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn is_terminal_upstream_error_excludes_path_mismatch_codes() {
+        for status in [200, 301, 400, 404, 405, 415, 422, 501] {
+            assert!(!is_terminal_upstream_error(status), "status {status}");
         }
     }
 

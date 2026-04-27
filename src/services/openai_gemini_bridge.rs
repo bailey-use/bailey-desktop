@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,22 +13,40 @@ use crate::services::model_names::google_native_model_name;
 /// Source: https://ai.google.dev/gemini-api/docs/thought-signatures
 pub(crate) const SKIP_THOUGHT_SIGNATURE_PLACEHOLDER: &str = "skip_thought_signature_validator";
 
-/// Process-wide cache of `tool_call_id -> thoughtSignature`. Gemini-3 returns
-/// a `thoughtSignature` on functionCall response parts and rejects subsequent
-/// turns whose history doesn't echo it back. Claude Code (the upstream) drops
-/// unknown fields on tool blocks, so we maintain the mapping here and re-attach
-/// signatures by call_id when the request flows back through the bridge.
+/// How long a captured signature stays usable. Gemini's strict validation
+/// only covers the *current* assistant turn, so signatures older than this
+/// have very low odds of being needed and are pruned to bound disk growth.
+const SIGNATURE_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SignatureEntry {
+    signature: String,
+    captured_at: u64,
+}
+
+fn cache_key(model: &str, call_id: &str) -> String {
+    // Keying by (model, call_id) prevents cross-model contamination — a stale
+    // signature captured against `gemini-2.5-pro` would otherwise be replayed
+    // against `gemini-3.1-pro-preview` and trigger a 400.
+    format!("{}|{}", model, call_id)
+}
+
+/// Process-wide cache of `(model, call_id) -> thoughtSignature`. Gemini-3
+/// returns a `thoughtSignature` on functionCall response parts and rejects
+/// subsequent turns whose history doesn't echo it back. Claude Code (the
+/// upstream) drops unknown fields on tool blocks, so we maintain the mapping
+/// here and re-attach signatures when the request flows back through.
 ///
-/// Persisted to disk on every write so that a process restart between turns
-/// (e.g., re-launching `aivo run gemini`) doesn't lose the signatures and
-/// trigger a "missing thought_signature" 400 from Gemini.
-fn signature_cache() -> &'static Mutex<HashMap<String, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Persisted to disk so that a process restart between turns
+/// (e.g., re-launching `aivo run gemini`) doesn't lose the signatures.
+fn signature_cache() -> &'static Mutex<HashMap<String, SignatureEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, SignatureEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut map = HashMap::new();
         if let Some(disk) = read_signature_store_from_disk() {
             map.extend(disk);
         }
+        prune_expired(&mut map, current_unix_ts());
         Mutex::new(map)
     })
 }
@@ -40,27 +59,42 @@ fn signature_store_path() -> Option<PathBuf> {
     })
 }
 
-fn read_signature_store_from_disk() -> Option<HashMap<String, String>> {
+fn read_signature_store_from_disk() -> Option<HashMap<String, SignatureEntry>> {
     let path = signature_store_path()?;
     let contents = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str::<HashMap<String, String>>(&contents).ok()
+    serde_json::from_str::<HashMap<String, SignatureEntry>>(&contents).ok()
 }
 
-/// Best-effort write of the cache to disk. Errors are swallowed: losing a
-/// signature falls back to the documented `skip_thought_signature_validator`
-/// placeholder rather than failing the request outright.
-///
-/// Uses a synchronous tempfile-rename so the call site doesn't need an async
-/// runtime; signatures are written from the inside of conversion paths that
-/// are sometimes called outside tokio (tests, CLI utilities).
-fn persist_signature_store(map: &HashMap<String, String>) {
+fn prune_expired(map: &mut HashMap<String, SignatureEntry>, now: u64) {
+    map.retain(|_, entry| now.saturating_sub(entry.captured_at) < SIGNATURE_TTL_SECS);
+}
+
+/// Best-effort write of the cache to disk. Reads the current disk state and
+/// merges the in-memory cache on top before writing back, so concurrent
+/// `aivo` processes preserve each other's recently-captured entries instead
+/// of last-writer-wins clobbering them. Errors are swallowed: a missing
+/// signature degrades to `SKIP_THOUGHT_SIGNATURE_PLACEHOLDER` rather than
+/// failing the request outright.
+fn persist_signature_store(map: &HashMap<String, SignatureEntry>) {
     let Some(path) = signature_store_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(json) = serde_json::to_string(map) else {
+    let mut merged = read_signature_store_from_disk().unwrap_or_default();
+    // Newer in-memory entries override older on-disk entries for the same key.
+    for (key, entry) in map {
+        let keep_existing = merged
+            .get(key)
+            .map(|existing| existing.captured_at > entry.captured_at)
+            .unwrap_or(false);
+        if !keep_existing {
+            merged.insert(key.clone(), entry.clone());
+        }
+    }
+    prune_expired(&mut merged, current_unix_ts());
+    let Ok(json) = serde_json::to_string(&merged) else {
         return;
     };
     write_string_atomic(&path, &json);
@@ -94,12 +128,17 @@ fn write_string_atomic(path: &PathBuf, contents: &str) {
     let _ = std::fs::rename(&temp_path, path);
 }
 
-fn remember_signature(call_id: &str, signature: &str) {
-    if call_id.is_empty() || signature.is_empty() {
+fn remember_signature(model: &str, call_id: &str, signature: &str) {
+    if model.is_empty() || call_id.is_empty() || signature.is_empty() {
         return;
     }
+    let key = cache_key(model, call_id);
+    let entry = SignatureEntry {
+        signature: signature.to_string(),
+        captured_at: current_unix_ts(),
+    };
     let snapshot = if let Ok(mut cache) = signature_cache().lock() {
-        cache.insert(call_id.to_string(), signature.to_string());
+        cache.insert(key, entry);
         Some(cache.clone())
     } else {
         None
@@ -109,14 +148,17 @@ fn remember_signature(call_id: &str, signature: &str) {
     }
 }
 
-fn lookup_signature(call_id: &str) -> Option<String> {
-    if call_id.is_empty() {
+fn lookup_signature(model: &str, call_id: &str) -> Option<String> {
+    if model.is_empty() || call_id.is_empty() {
         return None;
     }
-    signature_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(call_id).cloned())
+    let key = cache_key(model, call_id);
+    let now = current_unix_ts();
+    let cache = signature_cache().lock().ok()?;
+    cache
+        .get(&key)
+        .filter(|entry| now.saturating_sub(entry.captured_at) < SIGNATURE_TTL_SECS)
+        .map(|entry| entry.signature.clone())
 }
 
 /// Gemini's `functionDeclarations` only accepts a subset of JSON Schema fields.
@@ -230,6 +272,7 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_names_by_call_id: HashMap<String, String> = HashMap::new();
+    let request_model = openai_chat_model(body, config.default_model);
 
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
         let mut iter = messages.iter().peekable();
@@ -286,9 +329,10 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                             // missing thought_signature. See:
                             // https://ai.google.dev/gemini-api/docs/thought-signatures
                             if tc_index == 0 {
-                                let sig = lookup_signature(&call_id).unwrap_or_else(|| {
-                                    SKIP_THOUGHT_SIGNATURE_PLACEHOLDER.to_string()
-                                });
+                                let sig = lookup_signature(&request_model, &call_id)
+                                    .unwrap_or_else(|| {
+                                        SKIP_THOUGHT_SIGNATURE_PLACEHOLDER.to_string()
+                                    });
                                 part["thoughtSignature"] = Value::String(sig);
                             }
                             parts.push(part);
@@ -443,11 +487,23 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    // The first part-position-based signature stands in for any non-functionCall
+    // part (text, inlineData) that needs to be replayed in image-edit / thinking
+    // flows. Per spec, signatures attach to the first emitted part of each
+    // logical step, so we anchor it to the first tool call we see by
+    // synthesizing a stable "turn" call_id.
+    let mut leading_part_signature: Option<String> = None;
     for (index, part) in parts.iter().enumerate() {
         if let Some(text) = part.get("text").and_then(|v| v.as_str())
             && !text.is_empty()
         {
             text_parts.push(text.to_string());
+        }
+        if leading_part_signature.is_none()
+            && let Some(sig) = part.get("thoughtSignature").and_then(|v| v.as_str())
+            && !sig.is_empty()
+        {
+            leading_part_signature = Some(sig.to_string());
         }
         if let Some(function_call) = part.get("functionCall") {
             let args = function_call
@@ -461,7 +517,12 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("call_{index}"));
             if let Some(sig) = part.get("thoughtSignature").and_then(|v| v.as_str()) {
-                remember_signature(&id, sig);
+                remember_signature(fallback_model, &id, sig);
+            } else if let Some(sig) = leading_part_signature.as_deref() {
+                // Tool call without its own signature but a sibling text/inlineData
+                // part carried one for this step — associate it with this call_id
+                // so a subsequent turn replaying the same call_id still has it.
+                remember_signature(fallback_model, &id, sig);
             }
             tool_calls.push(json!({
                 "id": id,
@@ -1722,6 +1783,92 @@ mod tests {
                 .and_then(|g| g.get("responseMimeType"))
                 .is_none(),
             "json_schema response_format should not produce responseMimeType"
+        );
+    }
+
+    #[test]
+    fn signature_cache_is_keyed_by_model_to_prevent_cross_model_contamination() {
+        // A signature captured against gemini-2.5-pro must NOT be replayed
+        // against gemini-3-flash-preview — the two models use different
+        // signature schemas and a stale 2.5 signature triggers a 400 on 3.x.
+        let call_id = "test_xmodel_iso_call_a";
+        super::remember_signature("gemini-2.5-pro", call_id, "sig-25");
+        super::remember_signature("gemini-3-flash-preview", call_id, "sig-30");
+
+        assert_eq!(
+            super::lookup_signature("gemini-2.5-pro", call_id).as_deref(),
+            Some("sig-25")
+        );
+        assert_eq!(
+            super::lookup_signature("gemini-3-flash-preview", call_id).as_deref(),
+            Some("sig-30")
+        );
+        // A model name we never wrote to should miss.
+        assert_eq!(
+            super::lookup_signature("gemini-3-pro-preview", call_id),
+            None
+        );
+    }
+
+    #[test]
+    fn signature_cache_key_combines_model_and_call_id() {
+        assert_eq!(
+            super::cache_key("gemini-3-flash-preview", "call_42"),
+            "gemini-3-flash-preview|call_42"
+        );
+    }
+
+    #[test]
+    fn signature_cache_prune_drops_entries_older_than_ttl() {
+        let mut map = HashMap::new();
+        let now: u64 = 1_000_000;
+        map.insert(
+            "fresh".to_string(),
+            super::SignatureEntry {
+                signature: "ok".to_string(),
+                captured_at: now - 60, // 1 minute ago
+            },
+        );
+        map.insert(
+            "stale".to_string(),
+            super::SignatureEntry {
+                signature: "old".to_string(),
+                captured_at: now - super::SIGNATURE_TTL_SECS - 1, // expired
+            },
+        );
+        super::prune_expired(&mut map, now);
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("stale"));
+    }
+
+    #[test]
+    fn signature_capture_handles_part_signature_without_function_call() {
+        // gemini-3-pro-image-preview attaches thoughtSignature to the FIRST
+        // model-emitted part (text or inlineData) of a step. When a sibling
+        // tool call follows, the signature should still be associated with
+        // the call_id so the next turn can echo it back.
+        let call_id = "test_leading_part_sig_call_b";
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"text": "thinking…", "thoughtSignature": "SIG_LEADING"},
+                        {
+                            "functionCall": {
+                                "id": call_id,
+                                "name": "search",
+                                "args": {"q": "x"}
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+        let _ = convert_gemini_to_openai_chat_response(&resp, "gemini-3-pro-image-preview");
+        assert_eq!(
+            super::lookup_signature("gemini-3-pro-image-preview", call_id).as_deref(),
+            Some("SIG_LEADING"),
+            "leading-part signature must be carried over to the sibling tool call"
         );
     }
 

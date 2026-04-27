@@ -468,7 +468,9 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
     // text/tool_use. Anthropic expects these to come first in the content
     // array of a continued assistant turn — that ordering is what a previous
     // response originally produced, and the signature is validated against it.
+    let mut had_explicit_thinking_ext = false;
     if let Some(thinking_blocks) = msg.get(ANTHROPIC_THINKING_EXT).and_then(|v| v.as_array()) {
+        had_explicit_thinking_ext = true;
         for block in thinking_blocks {
             // Only carry through block shapes we recognize; drop anything else
             // so a malformed extension can't poison the content array.
@@ -477,6 +479,20 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
                 _ => {}
             }
         }
+    }
+    // Fallback: if the OpenAI assistant message lacks the structured
+    // `_anthropic_thinking_blocks` extension but does carry the legacy
+    // `reasoning_content` field (DeepSeek-reasoner / OpenAI o-series shape),
+    // synthesize a `thinking` block. We can't fabricate a signature, but
+    // emitting the block is still a strict improvement: clients that drop
+    // signatures still get visibility into the model's reasoning, and
+    // Anthropic does NOT reject a thinking block that simply lacks the
+    // `signature` field — only a block with a wrong/expired one fails.
+    if !had_explicit_thinking_ext
+        && let Some(reasoning) = msg.get("reasoning_content").and_then(|v| v.as_str())
+        && !reasoning.is_empty()
+    {
+        blocks.push(json!({"type": "thinking", "thinking": reasoning}));
     }
     let text = extract_openai_text(msg.get("content"));
     if !text.is_empty() {
@@ -1204,6 +1220,96 @@ mod tests {
                 .get("_anthropic_thinking_blocks")
                 .is_none(),
             "no thinking blocks → no extension field"
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_content_synthesizes_thinking_block_when_extension_absent() {
+        // OpenAI o-series / DeepSeek-reasoner emit reasoning via the
+        // `reasoning_content` field, not a structured extension. When a
+        // continuation flows OpenAI → Anthropic, that field used to be
+        // silently dropped. Now it surfaces as a `thinking` block (without
+        // signature, since we can't fabricate one — Anthropic accepts
+        // unsigned thinking blocks in continuations).
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "assistant",
+                "content": "Final answer.",
+                "reasoning_content": "I considered three options."
+            }]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I considered three options.");
+        assert!(
+            content[0].get("signature").is_none(),
+            "synthetic thinking has no signature — we can't fabricate Anthropic's"
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "Final answer.");
+    }
+
+    #[test]
+    fn explicit_thinking_extension_takes_precedence_over_reasoning_content() {
+        // When the structured `_anthropic_thinking_blocks` extension is
+        // present, it wins over `reasoning_content` — the extension preserves
+        // the original signatures, and synthesizing a sibling block from
+        // reasoning_content would duplicate the reasoning.
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "assistant",
+                "content": "Done.",
+                "reasoning_content": "stale text",
+                "_anthropic_thinking_blocks": [
+                    {"type": "thinking", "thinking": "real reasoning", "signature": "SIG_X"}
+                ]
+            }]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        let thinking_blocks: Vec<&Value> =
+            content.iter().filter(|b| b["type"] == "thinking").collect();
+        assert_eq!(thinking_blocks.len(), 1);
+        assert_eq!(thinking_blocks[0]["signature"], "SIG_X");
+        assert_eq!(thinking_blocks[0]["thinking"], "real reasoning");
+    }
+
+    #[test]
+    fn empty_thinking_extension_array_suppresses_reasoning_content_synthesis() {
+        // An explicit empty array means "no thinking blocks" — fallback to
+        // reasoning_content would defeat the caller's intent.
+        let body = json!({
+            "model": "claude-opus-4-7",
+            "messages": [{
+                "role": "assistant",
+                "content": "Done.",
+                "reasoning_content": "shouldn't surface",
+                "_anthropic_thinking_blocks": []
+            }]
+        });
+        let req = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-7",
+            },
+        );
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            content.iter().all(|b| b["type"] != "thinking"),
+            "explicit empty extension must suppress reasoning_content fallback"
         );
     }
 

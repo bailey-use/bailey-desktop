@@ -17,6 +17,15 @@ use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::usage_stats_store::UsageStatsStore;
 
+/// Bump when one-shot migrations of routing fields on `ApiKey` are needed.
+/// New keys are stamped with this version on creation; older keys are migrated
+/// at launch by `launch_runtime::migrate_routing_schema_for_key`.
+///
+/// Version history:
+///   1: clear `responses_api_supported = Some(false)` written by pre-fix
+///      builds that latched on any non-200 (incl. transient 429/5xx).
+pub const CURRENT_ROUTING_SCHEMA_VERSION: u32 = 1;
+
 /// Serde module for serializing/deserializing Zeroizing<String> as regular String
 mod zeroizing_string {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -128,10 +137,41 @@ pub struct ApiKey {
     pub opencode_mode: Option<OpenAICompatibilityMode>,
     #[serde(rename = "piMode", default, skip_serializing_if = "Option::is_none")]
     pub pi_mode: Option<OpenAICompatibilityMode>,
+    /// Learned path variant for the Claude/Codex routers ("default" or
+    /// "stripped"). Stripped wins (e.g., gateways serving `/messages`
+    /// instead of `/v1/messages`) used to be relearned every launch because
+    /// only the protocol bits were persisted. Stored as the same string the
+    /// fallback module uses internally so future variants serialise without
+    /// schema churn.
+    #[serde(
+        rename = "claudePathVariant",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_path_variant: Option<String>,
+    #[serde(
+        rename = "geminiPathVariant",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gemini_path_variant: Option<String>,
+    /// Schema version for one-shot migrations of routing-related fields. Bumped
+    /// when older builds may have written values under buggy logic that should
+    /// be cleared on first launch by a newer build. Missing/zero = legacy.
+    #[serde(
+        rename = "routingSchemaVersion",
+        default,
+        skip_serializing_if = "is_zero_u32"
+    )]
+    pub routing_schema_version: u32,
     #[serde(with = "zeroizing_string")]
     pub key: Zeroizing<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 impl ApiKey {
@@ -152,6 +192,9 @@ impl ApiKey {
             codex_mode: None,
             opencode_mode: None,
             pi_mode: None,
+            claude_path_variant: None,
+            gemini_path_variant: None,
+            routing_schema_version: CURRENT_ROUTING_SCHEMA_VERSION,
             key: Zeroizing::new(key),
             created_at: Utc::now().to_rfc3339(),
         }
@@ -1007,6 +1050,36 @@ impl SessionStore {
             .await
     }
 
+    pub async fn set_key_routing_schema_version(
+        &self,
+        id: &str,
+        routing_schema_version: u32,
+    ) -> Result<bool> {
+        self.api_keys
+            .set_key_routing_schema_version(id, routing_schema_version)
+            .await
+    }
+
+    pub async fn set_key_claude_path_variant(
+        &self,
+        id: &str,
+        claude_path_variant: Option<String>,
+    ) -> Result<bool> {
+        self.api_keys
+            .set_key_claude_path_variant(id, claude_path_variant)
+            .await
+    }
+
+    pub async fn set_key_gemini_path_variant(
+        &self,
+        id: &str,
+        gemini_path_variant: Option<String>,
+    ) -> Result<bool> {
+        self.api_keys
+            .set_key_gemini_path_variant(id, gemini_path_variant)
+            .await
+    }
+
     pub async fn set_key_codex_mode(
         &self,
         id: &str,
@@ -1338,6 +1411,9 @@ mod tests {
             codex_mode: None,
             opencode_mode: None,
             pi_mode: None,
+            claude_path_variant: None,
+            gemini_path_variant: None,
+            routing_schema_version: 0,
             key: Zeroizing::new("{}".into()),
             created_at: Utc::now().to_rfc3339(),
         };

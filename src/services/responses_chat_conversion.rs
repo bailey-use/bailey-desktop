@@ -131,7 +131,12 @@ pub fn convert_responses_to_chat_request(
                         .and_then(|v| v.as_str())
                         .filter(|r| matches!(*r, "system" | "user" | "assistant" | "tool"))
                         .unwrap_or("user");
-                    let content = extract_content_text(item.get("content"));
+                    // Vision/file inputs (input_image, input_file) must be
+                    // preserved when bridging to Chat Completions; falling back
+                    // to text-only here silently dropped them. The helper
+                    // collapses to a string when no non-text part is present so
+                    // the wire format is unchanged for the common case.
+                    let content = convert_responses_content_to_chat(item.get("content"));
                     let mut msg = json!({"role": role, "content": content});
                     if role == "assistant" {
                         attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
@@ -257,6 +262,101 @@ fn attach_reasoning_content(msg: &mut Value, source: &Value, requires: bool) {
         .or_else(|| requires.then(|| " ".to_string()));
     if let Some(rc) = rc {
         msg["reasoning_content"] = json!(rc);
+    }
+}
+
+/// Convert a Responses-API content value (string or array of `input_text` /
+/// `input_image` / `input_file` parts, etc.) into a Chat Completions content
+/// value. Returns a `String` when every part is text (preserves the existing
+/// wire format), and an array of `{type: ...}` content parts when any
+/// multimodal part is present.
+///
+/// Recognised Responses-API parts:
+/// - `input_text` / bare text → `{type: "text", text}`
+/// - `input_image` with `image_url` (string or {url}) → `{type: "image_url",
+///   image_url: {url, detail?}}`. Both http(s) URLs and `data:` URIs are
+///   passed through unchanged — Chat Completions accepts both.
+/// - `input_file` → inlined as `{type: "text", text: "[attached file: <name>]"}`
+///   so the model still gets a turn-shaped reference instead of a silent drop.
+///   (Chat Completions has no native file part. Plan default — see review notes.)
+pub fn convert_responses_content_to_chat(content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::String(s)) => Value::String(s.clone()),
+        Some(Value::Array(parts)) => {
+            let converted: Vec<Value> = parts
+                .iter()
+                .filter_map(responses_content_part_to_chat_part)
+                .collect();
+            if converted
+                .iter()
+                .all(|p| p.get("type").and_then(|v| v.as_str()) == Some("text"))
+            {
+                let joined = converted
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Value::String(joined)
+            } else {
+                Value::Array(converted)
+            }
+        }
+        Some(Value::Object(obj)) => Value::String(
+            obj.get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string(),
+        ),
+        _ => Value::String(String::new()),
+    }
+}
+
+fn responses_content_part_to_chat_part(part: &Value) -> Option<Value> {
+    if let Some(s) = part.as_str() {
+        return Some(json!({"type": "text", "text": s}));
+    }
+    let part_type = part.get("type").and_then(|v| v.as_str());
+    match part_type {
+        // Most Responses-API text variants funnel through `text`/`content`.
+        Some("input_text") | Some("text") | Some("output_text") | None => part
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| part.get("content").and_then(|v| v.as_str()))
+            .map(|t| json!({"type": "text", "text": t})),
+        Some("input_image") => {
+            // Responses API: image_url is a string OR { url, detail? }.
+            let (url, detail) = match part.get("image_url") {
+                Some(Value::String(s)) => (Some(s.as_str()), None),
+                Some(Value::Object(o)) => (
+                    o.get("url").and_then(|v| v.as_str()),
+                    o.get("detail").cloned(),
+                ),
+                _ => (None, None),
+            };
+            url.map(|u| {
+                let mut iu = serde_json::Map::new();
+                iu.insert("url".to_string(), Value::String(u.to_string()));
+                if let Some(d) = detail {
+                    iu.insert("detail".to_string(), d);
+                }
+                json!({"type": "image_url", "image_url": Value::Object(iu)})
+            })
+        }
+        Some("input_file") => {
+            // Chat Completions has no native file content part, so inline a
+            // text reference. Default per fix-plan; can be revisited.
+            let name = part
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .or_else(|| part.get("name").and_then(|v| v.as_str()))
+                .unwrap_or("file");
+            Some(json!({"type": "text", "text": format!("[attached file: {name}]")}))
+        }
+        _ => part
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|t| json!({"type": "text", "text": t})),
     }
 }
 
@@ -926,6 +1026,7 @@ mod tests {
                 target_base_url: "https://ai-gateway.vercel.sh/v1".to_string(),
                 api_key: "sk-test".to_string(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -957,6 +1058,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -988,6 +1090,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1022,6 +1125,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1053,6 +1157,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1076,6 +1181,7 @@ mod tests {
                 target_base_url: "https://openrouter.ai/api/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1101,6 +1207,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1126,6 +1233,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1370,6 +1478,7 @@ mod tests {
             target_base_url: String::new(),
             api_key: String::new(),
             target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
             copilot_token_manager: None,
             model_prefix: None,
             requires_reasoning_content: false,
@@ -1407,6 +1516,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1428,6 +1538,7 @@ mod tests {
                 target_base_url: "https://example.com/v1".to_string(),
                 api_key: String::new(),
                 target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
                 copilot_token_manager: None,
                 model_prefix: None,
                 requires_reasoning_content: false,
@@ -1557,6 +1668,7 @@ mod tests {
             target_base_url: "https://example.com/v1".to_string(),
             api_key: String::new(),
             target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
             copilot_token_manager: None,
             model_prefix: None,
             requires_reasoning_content: false,
@@ -1720,5 +1832,65 @@ mod tests {
         let chat = convert_responses_json_to_chat(&resp);
         assert_eq!(chat["id"], "resp_789");
         assert_eq!(chat["choices"][0]["message"]["content"], "Hi");
+    }
+
+    #[test]
+    fn responses_content_to_chat_text_only_collapses_to_string() {
+        let v = convert_responses_content_to_chat(Some(&json!([
+            {"type": "input_text", "text": "hello"},
+            {"type": "input_text", "text": "world"}
+        ])));
+        assert_eq!(v, Value::String("hello\nworld".to_string()));
+    }
+
+    #[test]
+    fn responses_content_to_chat_string_passthrough() {
+        let v = convert_responses_content_to_chat(Some(&json!("plain string")));
+        assert_eq!(v, Value::String("plain string".to_string()));
+    }
+
+    #[test]
+    fn responses_content_to_chat_input_image_data_uri_preserved() {
+        let v = convert_responses_content_to_chat(Some(&json!([
+            {"type": "input_text", "text": "what is this?"},
+            {"type": "input_image", "image_url": {
+                "url": "data:image/png;base64,iVBORw0KGgo=",
+                "detail": "high"
+            }}
+        ])));
+        let arr = v.as_array().expect("array shape when image present");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "what is this?");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(
+            arr[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+        assert_eq!(arr[1]["image_url"]["detail"], "high");
+    }
+
+    #[test]
+    fn responses_content_to_chat_input_image_string_url_accepted() {
+        let v = convert_responses_content_to_chat(Some(&json!([
+            {"type": "input_image", "image_url": "https://example.com/x.jpg"}
+        ])));
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "image_url");
+        assert_eq!(arr[0]["image_url"]["url"], "https://example.com/x.jpg");
+    }
+
+    #[test]
+    fn responses_content_to_chat_input_file_inlined_as_text_reference() {
+        let v = convert_responses_content_to_chat(Some(&json!([
+            {"type": "input_text", "text": "look at this:"},
+            {"type": "input_file", "filename": "report.pdf"}
+        ])));
+        // Both parts are text after conversion (file collapses to a text
+        // reference) so the output collapses to a single string.
+        assert_eq!(
+            v,
+            Value::String("look at this:\n[attached file: report.pdf]".to_string())
+        );
     }
 }

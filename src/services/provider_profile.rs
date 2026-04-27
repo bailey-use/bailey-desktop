@@ -43,6 +43,11 @@ pub struct ProviderQuirks {
     /// `/v1/chat/completions` (OpenAI) and `/anthropic/v1/messages` (Anthropic)
     /// on one base URL.
     pub anthropic_path_prefix: Option<&'static str>,
+    /// Whether to strip Anthropic-specific `cache_control` blocks from the
+    /// converted request before forwarding upstream. Some OpenAI-compat shims
+    /// (Bedrock proxies, custom gateways) reject unknown `cache_control` keys
+    /// inside system / message content with a 400.
+    pub strips_cache_control: bool,
 }
 
 impl ProviderQuirks {
@@ -60,11 +65,20 @@ impl ProviderQuirks {
         } else {
             None
         };
+        // Bedrock-style hosts and the AWS gateway shim reject Anthropic
+        // cache_control fields when they appear on system/message content
+        // converted into the OpenAI Chat shape. Strip them defensively for the
+        // hosts we know reject; other providers accept the pass-through.
+        let strips_cache_control = base_url.contains("bedrock-runtime.")
+            || base_url.contains(".bedrock.")
+            || base_url.contains("/bedrock/")
+            || base_url.contains("aws.com");
         Self {
             model_prefix,
             requires_reasoning_content,
             max_tokens_cap: None,
             anthropic_path_prefix,
+            strips_cache_control,
         }
     }
 
@@ -73,6 +87,7 @@ impl ProviderQuirks {
             || self.requires_reasoning_content
             || self.max_tokens_cap.is_some()
             || self.anthropic_path_prefix.is_some()
+            || self.strips_cache_control
     }
 
     pub fn inject(&self, env: &mut HashMap<String, String>, prefix: &str) {
@@ -87,6 +102,9 @@ impl ProviderQuirks {
         }
         if let Some(sub) = self.anthropic_path_prefix {
             env.insert(format!("{prefix}_ANTHROPIC_PATH_PREFIX"), sub.to_string());
+        }
+        if self.strips_cache_control {
+            env.insert(format!("{prefix}_STRIP_CACHE_CONTROL"), "1".to_string());
         }
     }
 }
@@ -550,6 +568,7 @@ mod tests {
             requires_reasoning_content: true,
             max_tokens_cap: Some(8192),
             anthropic_path_prefix: Some("/anthropic"),
+            strips_cache_control: true,
         };
         let mut env = HashMap::new();
         quirks.inject(&mut env, "TEST");
@@ -558,6 +577,7 @@ mod tests {
         assert_eq!(env.get("TEST_REQUIRE_REASONING").unwrap(), "1");
         assert_eq!(env.get("TEST_MAX_TOKENS_CAP").unwrap(), "8192");
         assert_eq!(env.get("TEST_ANTHROPIC_PATH_PREFIX").unwrap(), "/anthropic");
+        assert_eq!(env.get("TEST_STRIP_CACHE_CONTROL").unwrap(), "1");
     }
 
     #[test]
@@ -570,6 +590,7 @@ mod tests {
             requires_reasoning_content: false,
             max_tokens_cap: None,
             anthropic_path_prefix: None,
+            strips_cache_control: false,
         };
         let mut env = HashMap::new();
         quirks.inject(&mut env, "TEST");

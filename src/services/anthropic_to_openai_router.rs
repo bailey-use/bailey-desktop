@@ -60,6 +60,13 @@ pub struct AnthropicToOpenAIRouterConfig {
     pub target_api_key: String,
     /// The upstream protocol spoken by the provider.
     pub target_protocol: ProviderProtocol,
+    /// Persisted path-variant pin from a prior launch ("default" / "stripped").
+    /// When set, the router skips re-probing the alternate variant.
+    pub target_path_variant: Option<PathVariant>,
+    /// When `true`, strip Anthropic-specific `cache_control` keys from the
+    /// request before forwarding (Bedrock-style shims reject them) and skip
+    /// the inject step that would otherwise add them.
+    pub strip_cache_control: bool,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
     /// Whether the provider requires `reasoning_content` on assistant tool-call turns (e.g., Moonshot)
@@ -225,7 +232,13 @@ impl AnthropicToOpenAIRouter {
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
+        let initial_route = crate::services::provider_protocol::encode_route(
+            self.config.target_protocol,
+            self.config
+                .target_path_variant
+                .unwrap_or(PathVariant::Default),
+        );
+        let active_protocol = Arc::new(AtomicU8::new(initial_route));
         let request_succeeded = Arc::new(AtomicBool::new(false));
         let state = AnthropicToOpenAIRouterState {
             config: Arc::new(self.config.clone()),
@@ -581,6 +594,14 @@ async fn handle_anthropic_to_upstream(
         .and_then(|m| m.as_str())
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
+    // Stashed Terminal response from the native-Anthropic preflight. Some
+    // hosts (e.g., Cloudflare's AI gateway, OpenAI-only proxies) reject
+    // /v1/messages with 401/403 and a host-shaped error envelope rather than
+    // 404, so we can't tell "auth failed" from "endpoint missing in disguise"
+    // until we see whether the OpenAI Chat fallback succeeds. Forwarded as the
+    // surfaced error only if every chat candidate also fails.
+    let mut native_anthropic_terminal: Option<RouterResponse> = None;
+
     if should_try_native_anthropic(config.target_protocol, active_protocol) {
         match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
             NativeAnthropicResult::Success(response) => {
@@ -588,7 +609,18 @@ async fn handle_anthropic_to_upstream(
                 return Ok(response);
             }
             NativeAnthropicResult::Terminal(response) => {
-                return Ok(response);
+                // Don't return immediately: a 401 from /v1/messages on a host
+                // that doesn't actually serve the Anthropic shape (Cloudflare
+                // AI Gateway, etc.) looks identical to a real auth failure.
+                // Pre-pin Openai (same as EndpointMissing) and try chat
+                // fallback. If chat fails too, the chat candidates carry more
+                // diagnostic body shapes, so prefer them over this.
+                native_anthropic_terminal = Some(response);
+                if decode_route(active_protocol.load(Ordering::Relaxed)).0
+                    == ProviderProtocol::Anthropic
+                {
+                    active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
+                }
             }
             NativeAnthropicResult::EndpointMissing => {
                 // Pre-pin Openai so a fallback success at attempt==0 (where
@@ -609,8 +641,13 @@ async fn handle_anthropic_to_upstream(
     let mut simplified = anthropic_to_openai(&body, config.requires_reasoning_content)?;
     // Only inject cache_control for Claude models — other providers don't support it
     // and strict ones (e.g. Cloudflare Workers AI) reject unknown fields / array content.
-    if model_is_claude {
+    if model_is_claude && !config.strip_cache_control {
         inject_chat_completions_cache_control(&mut simplified);
+    }
+    // Bedrock-style shims reject `cache_control` even when it just passes
+    // through from a Claude-shaped client; remove it before forwarding.
+    if config.strip_cache_control {
+        crate::services::anthropic_route_pipeline::strip_cache_control(&mut simplified);
     }
     // Map Anthropic thinking config to OpenAI reasoning_effort
     if let Some(thinking) = body.get("thinking")
@@ -632,7 +669,11 @@ async fn handle_anthropic_to_upstream(
         .into_iter()
         .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
         .collect();
-    let mut first_error: Option<RouterResponse> = None;
+    // Seed first_error with the native-Anthropic Terminal response (if any) so
+    // a chat fallback that also exhausts surfaces *some* error to the client.
+    // The chat-loop's "is_terminal" branch will overwrite this with the more
+    // diagnostic chat-shaped response when one is available.
+    let mut first_error: Option<RouterResponse> = native_anthropic_terminal;
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         let mut req_body = simplified.clone();
@@ -817,7 +858,11 @@ async fn handle_anthropic_to_upstream(
                         body: body.into_bytes(),
                     });
                 }
-                if is_terminal {
+                // Skip the fast-bail at attempt 0: a 401/403 there often means
+                // "this host rejected the protocol's auth header shape" rather
+                // than "your key is bad" (e.g. cross-protocol gateways). Probe
+                // at least one fallback before believing the upstream.
+                if is_terminal && attempt > 0 {
                     // Pin in-memory so retry storms hit this path directly
                     // instead of re-probing the wrong chat/completions paths.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);
@@ -1899,6 +1944,8 @@ mod tests {
             target_base_url: "https://api.ai.example-gateway.net/endpoint".to_string(),
             target_api_key: "test".to_string(),
             target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            strip_cache_control: false,
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,
@@ -1923,6 +1970,8 @@ mod tests {
             target_base_url: "https://api.openai.com/v1".to_string(),
             target_api_key: "test".to_string(),
             target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            strip_cache_control: false,
             model_prefix: None,
             requires_reasoning_content: false,
             max_tokens_cap: None,

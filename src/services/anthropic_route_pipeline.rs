@@ -144,6 +144,27 @@ pub(crate) fn inject_chat_completions_cache_control(body: &mut Value) {
     }
 }
 
+/// Recursively remove `cache_control` keys from any object inside `body`.
+/// Used for upstreams that reject Anthropic-specific cache_control on
+/// system/message content (e.g., Bedrock-style shims). Walks the JSON tree
+/// rather than enumerating known sites so future schema additions stay safe.
+pub(crate) fn strip_cache_control(body: &mut Value) {
+    match body {
+        Value::Object(obj) => {
+            obj.remove("cache_control");
+            for (_k, v) in obj.iter_mut() {
+                strip_cache_control(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_cache_control(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn inject_cache_control_on_last_block(value: &mut Value) {
     match value {
         Value::String(s) => {
@@ -366,6 +387,41 @@ mod tests {
         // User message should also have cache_control
         let user = body["messages"][2]["content"].as_array().unwrap();
         assert_eq!(user[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn strip_cache_control_recursively_removes_nested_keys() {
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "trailing"}
+                ]}
+            ],
+            "system": [
+                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
+            ]
+        });
+        super::strip_cache_control(&mut body);
+        // Top-level system block stripped.
+        assert!(body["system"][0].get("cache_control").is_none());
+        // Nested message-level blocks stripped.
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        // Other fields untouched.
+        assert_eq!(body["messages"][0]["content"][0]["text"], "sys");
+        assert_eq!(body["messages"][1]["content"][1]["text"], "trailing");
     }
 
     #[test]

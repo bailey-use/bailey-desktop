@@ -323,42 +323,14 @@ pub(crate) fn key_metadata_json(key: &ApiKey, selected_id: Option<&str>) -> Valu
 fn learned_routing_json(key: &ApiKey) -> Value {
     json!({
         "claude_protocol": key.claude_protocol.map(|p| p.as_str()),
+        "claude_path_variant": key.claude_path_variant.clone(),
         "gemini_protocol": key.gemini_protocol.map(|p| p.as_str()),
+        "gemini_path_variant": key.gemini_path_variant.clone(),
         "codex_mode": key.codex_mode.map(|m| m.as_str()),
         "opencode_mode": key.opencode_mode.map(|m| m.as_str()),
         "pi_mode": key.pi_mode.map(|m| m.as_str()),
         "responses_api_supported": key.responses_api_supported,
     })
-}
-
-pub(crate) fn learned_routing_summary(key: &ApiKey) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(p) = key.claude_protocol {
-        parts.push(format!("claude={}", p.as_str()));
-    }
-    if let Some(p) = key.gemini_protocol {
-        parts.push(format!("gemini={}", p.as_str()));
-    }
-    if let Some(m) = key.codex_mode {
-        parts.push(format!("codex={}", m.as_str()));
-    }
-    if let Some(m) = key.opencode_mode {
-        parts.push(format!("opencode={}", m.as_str()));
-    }
-    if let Some(m) = key.pi_mode {
-        parts.push(format!("pi={}", m.as_str()));
-    }
-    if let Some(supported) = key.responses_api_supported {
-        parts.push(format!(
-            "responses_api={}",
-            if supported { "yes" } else { "no" }
-        ));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
 }
 
 /// Converts a PingResult into a JSON object for structured output.
@@ -624,6 +596,10 @@ impl KeysCommand {
                 self.ping_keys(args.and_then(|a| a.first().copied()), ping_all)
                     .await
             }
+            Some("reset-route") => {
+                self.reset_route(args.and_then(|a| a.first().copied()))
+                    .await
+            }
             Some(action) => {
                 eprintln!("{} Unknown action '{}'", style::red("Error:"), action);
                 Self::print_help();
@@ -825,6 +801,61 @@ impl KeysCommand {
     }
 
     /// Activates a specific API key by ID or name
+    /// Clears all learned routing state for a key so the next launch re-probes:
+    /// `claude_protocol`, `gemini_protocol`, `claude_path_variant`,
+    /// `gemini_path_variant`, `responses_api_supported`. Useful when an upstream
+    /// provider gains/loses support for a protocol and the cached pin is stale.
+    async fn reset_route(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
+        let selection = self
+            .resolve_key_selection(
+                key_id_or_name,
+                "Select a key to reset routing for",
+                "No API keys found.",
+            )
+            .await?;
+        let key = match selection {
+            KeySelection::Key(k) => k,
+            KeySelection::Cancelled => {
+                println!("{}", style::dim("Cancelled."));
+                return Ok(ExitCode::Success);
+            }
+            KeySelection::Empty => return Ok(ExitCode::Success),
+            KeySelection::NotFound => return Ok(ExitCode::UserError),
+        };
+        // Clear each routing field independently so a partial failure leaves
+        // state predictable. Each setter no-ops if the key has been removed.
+        let _ = self
+            .session_store
+            .set_key_claude_protocol(&key.id, None)
+            .await;
+        let _ = self
+            .session_store
+            .set_key_gemini_protocol(&key.id, None)
+            .await;
+        let _ = self
+            .session_store
+            .set_key_claude_path_variant(&key.id, None)
+            .await;
+        let _ = self
+            .session_store
+            .set_key_gemini_path_variant(&key.id, None)
+            .await;
+        let _ = self
+            .session_store
+            .set_key_responses_api_supported(&key.id, None)
+            .await;
+        println!(
+            "{} Cleared learned routing state for {}.",
+            style::success_symbol(),
+            style::bold(key.display_name())
+        );
+        println!(
+            "{}",
+            style::dim("The next launch will re-probe protocol/path automatically.")
+        );
+        Ok(ExitCode::Success)
+    }
+
     async fn use_key(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
         match self
             .resolve_key_selection(
@@ -2087,6 +2118,10 @@ impl KeysCommand {
         print_row("add [name]", "Add an API key");
         print_row("edit [id|name]", "Edit an API key");
         print_row("ping [id|name]", "Health-check API keys (or: aivo ping)");
+        print_row(
+            "reset-route [id|name]",
+            "Clear learned protocol/path routing so the next launch re-probes",
+        );
         println!();
         println!("{}", style::bold("Add Flags:"));
         print_row("--name <name>", "Set key name");
@@ -2313,6 +2348,57 @@ mod tests {
         let cmd = KeysCommand::new(store);
         let code = cmd.execute(keys_args(Some("rm"), &[])).await;
         assert_eq!(code, crate::errors::ExitCode::Success);
+    }
+
+    #[tokio::test]
+    async fn test_reset_route_clears_all_routing_fields() {
+        use crate::services::session_store::{
+            ClaudeProviderProtocol, GeminiProviderProtocol, SessionStore,
+        };
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        let key_id = store
+            .add_key_with_protocol(
+                "myKey",
+                "https://api.example.com",
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-1",
+            )
+            .await
+            .unwrap();
+        // Populate every routing field that reset-route should clear.
+        store
+            .set_key_gemini_protocol(&key_id, Some(GeminiProviderProtocol::Google))
+            .await
+            .unwrap();
+        store
+            .set_key_claude_path_variant(&key_id, Some("stripped".to_string()))
+            .await
+            .unwrap();
+        store
+            .set_key_gemini_path_variant(&key_id, Some("stripped".to_string()))
+            .await
+            .unwrap();
+        store
+            .set_key_responses_api_supported(&key_id, Some(true))
+            .await
+            .unwrap();
+
+        let cmd = KeysCommand::new(store.clone());
+        let code = cmd
+            .execute(keys_args(Some("reset-route"), &[key_id.as_str()]))
+            .await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.claude_protocol, None);
+        assert_eq!(reloaded.gemini_protocol, None);
+        assert_eq!(reloaded.claude_path_variant, None);
+        assert_eq!(reloaded.gemini_path_variant, None);
+        assert_eq!(reloaded.responses_api_supported, None);
     }
 
     #[tokio::test]
@@ -2736,33 +2822,6 @@ mod tests {
         assert_eq!(payload["learned"]["claude_protocol"], "anthropic");
         assert_eq!(payload["learned"]["codex_mode"], "router");
         assert_eq!(payload["learned"]["responses_api_supported"], true);
-    }
-
-    #[test]
-    fn learned_routing_summary_returns_none_when_empty() {
-        let key = ApiKey::new_with_protocol(
-            "abc".to_string(),
-            "test".to_string(),
-            "https://api.example.com".to_string(),
-            None,
-            "sk".to_string(),
-        );
-        assert!(learned_routing_summary(&key).is_none());
-    }
-
-    #[test]
-    fn learned_routing_summary_joins_set_fields() {
-        let mut key = ApiKey::new_with_protocol(
-            "abc".to_string(),
-            "test".to_string(),
-            "https://api.example.com".to_string(),
-            Some(crate::services::session_store::ClaudeProviderProtocol::Openai),
-            "sk".to_string(),
-        );
-        key.gemini_protocol = Some(crate::services::session_store::GeminiProviderProtocol::Google);
-        let summary = learned_routing_summary(&key).expect("summary expected");
-        assert!(summary.contains("claude=openai"), "got: {summary}");
-        assert!(summary.contains("gemini=google"), "got: {summary}");
     }
 
     #[test]

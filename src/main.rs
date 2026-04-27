@@ -34,9 +34,9 @@ use services::{AILauncher, EnvironmentInjector, SessionStore};
 /// Known AI tool names that can be used as shortcut aliases for `run`.
 const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
-/// Refuses to run a `test-fast-crypto`-built binary against real user config.
+/// Refuses to run a `__internal_test_fast_crypto`-built binary against real user config.
 ///
-/// `test-fast-crypto` (documented in CLAUDE.md) uses reduced PBKDF2 iterations
+/// `__internal_test_fast_crypto` (documented in CLAUDE.md) uses reduced PBKDF2 iterations
 /// so the test suite runs fast. A binary built with that feature derives a
 /// different encryption key than a normal release binary, so it silently fails
 /// to decrypt any real API key stored in `~/.config/aivo/config.json`. Shipping
@@ -44,13 +44,13 @@ const TOOL_ALIASES: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 /// code directly in tempdirs and don't hit this guard.
 ///
 /// Override for intentional manual testing: `AIVO_TEST_FAST_CRYPTO_OK=1`.
-#[cfg(feature = "test-fast-crypto")]
+#[cfg(feature = "__internal_test_fast_crypto")]
 fn fast_crypto_guard() {
     if std::env::var_os("AIVO_TEST_FAST_CRYPTO_OK").is_some() {
         return;
     }
     eprintln!(
-        "{} This aivo binary was built with the `test-fast-crypto` feature,\n       which uses reduced PBKDF2 iterations for fast tests.\n       It cannot decrypt keys encrypted by a normal aivo binary.\n\n       Rebuild without the feature: {}\n       Or, to override intentionally, set {}",
+        "{} This aivo binary was built with the `__internal_test_fast_crypto` feature,\n       which uses reduced PBKDF2 iterations for fast tests.\n       It cannot decrypt keys encrypted by a normal aivo binary.\n\n       Rebuild without the feature: {}\n       Or, to override intentionally, set {}",
         style::red("error:"),
         style::cyan("cargo build"),
         style::dim("AIVO_TEST_FAST_CRYPTO_OK=1"),
@@ -58,7 +58,7 @@ fn fast_crypto_guard() {
     process::exit(ExitCode::UserError.code());
 }
 
-#[cfg(not(feature = "test-fast-crypto"))]
+#[cfg(not(feature = "__internal_test_fast_crypto"))]
 fn fast_crypto_guard() {}
 
 /// If `--debug` was passed on the CLI, resolve its path (default vs explicit)

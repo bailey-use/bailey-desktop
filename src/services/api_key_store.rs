@@ -239,6 +239,35 @@ impl ApiKeyStore {
         .await
     }
 
+    pub(crate) async fn set_key_routing_schema_version(
+        &self,
+        id: &str,
+        routing_schema_version: u32,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| {
+            entry.routing_schema_version = routing_schema_version
+        })
+        .await
+    }
+
+    pub(crate) async fn set_key_claude_path_variant(
+        &self,
+        id: &str,
+        claude_path_variant: Option<String>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.claude_path_variant = claude_path_variant)
+            .await
+    }
+
+    pub(crate) async fn set_key_gemini_path_variant(
+        &self,
+        id: &str,
+        gemini_path_variant: Option<String>,
+    ) -> Result<bool> {
+        self.update_key_field(id, |entry| entry.gemini_path_variant = gemini_path_variant)
+            .await
+    }
+
     pub(crate) async fn set_key_codex_mode(
         &self,
         id: &str,

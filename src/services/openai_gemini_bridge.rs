@@ -1,5 +1,6 @@
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use crate::services::http_utils::current_unix_ts;
@@ -11,22 +12,100 @@ use crate::services::model_names::google_native_model_name;
 /// Source: https://ai.google.dev/gemini-api/docs/thought-signatures
 pub(crate) const SKIP_THOUGHT_SIGNATURE_PLACEHOLDER: &str = "skip_thought_signature_validator";
 
-/// Per-process cache of `tool_call_id -> thoughtSignature`. Gemini-3 returns
+/// Process-wide cache of `tool_call_id -> thoughtSignature`. Gemini-3 returns
 /// a `thoughtSignature` on functionCall response parts and rejects subsequent
 /// turns whose history doesn't echo it back. Claude Code (the upstream) drops
 /// unknown fields on tool blocks, so we maintain the mapping here and re-attach
 /// signatures by call_id when the request flows back through the bridge.
+///
+/// Persisted to disk on every write so that a process restart between turns
+/// (e.g., re-launching `aivo run gemini`) doesn't lose the signatures and
+/// trigger a "missing thought_signature" 400 from Gemini.
 fn signature_cache() -> &'static Mutex<HashMap<String, String>> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    CACHE.get_or_init(|| {
+        let mut map = HashMap::new();
+        if let Some(disk) = read_signature_store_from_disk() {
+            map.extend(disk);
+        }
+        Mutex::new(map)
+    })
+}
+
+fn signature_store_path() -> Option<PathBuf> {
+    crate::services::system_env::home_dir().map(|p| {
+        p.join(".config")
+            .join("aivo")
+            .join("gemini_thought_signatures.json")
+    })
+}
+
+fn read_signature_store_from_disk() -> Option<HashMap<String, String>> {
+    let path = signature_store_path()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<HashMap<String, String>>(&contents).ok()
+}
+
+/// Best-effort write of the cache to disk. Errors are swallowed: losing a
+/// signature falls back to the documented `skip_thought_signature_validator`
+/// placeholder rather than failing the request outright.
+///
+/// Uses a synchronous tempfile-rename so the call site doesn't need an async
+/// runtime; signatures are written from the inside of conversion paths that
+/// are sometimes called outside tokio (tests, CLI utilities).
+fn persist_signature_store(map: &HashMap<String, String>) {
+    let Some(path) = signature_store_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(json) = serde_json::to_string(map) else {
+        return;
+    };
+    write_string_atomic(&path, &json);
+}
+
+/// Synchronous atomic write: temp file under the same dir + rename + 0o600
+/// on Unix. Mirrors `atomic_write::atomic_write_secure` which is async.
+fn write_string_atomic(path: &PathBuf, contents: &str) {
+    use std::io::Write;
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let temp_path = parent.join(format!(
+        ".gemini_thought_signatures.{}.tmp",
+        current_unix_ts()
+    ));
+    let Ok(mut file) = std::fs::File::create(&temp_path) else {
+        return;
+    };
+    if file.write_all(contents.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return;
+    }
+    let _ = file.sync_all();
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600));
+    }
+    let _ = std::fs::rename(&temp_path, path);
 }
 
 fn remember_signature(call_id: &str, signature: &str) {
     if call_id.is_empty() || signature.is_empty() {
         return;
     }
-    if let Ok(mut cache) = signature_cache().lock() {
+    let snapshot = if let Ok(mut cache) = signature_cache().lock() {
         cache.insert(call_id.to_string(), signature.to_string());
+        Some(cache.clone())
+    } else {
+        None
+    };
+    if let Some(snapshot) = snapshot {
+        persist_signature_store(&snapshot);
     }
 }
 
@@ -237,10 +316,10 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
                     contents.push(json!({ "role": "user", "parts": parts }));
                 }
                 _ => {
-                    let text = extract_openai_text(message.get("content"));
+                    let parts = extract_openai_parts_for_gemini(message.get("content"));
                     contents.push(json!({
                         "role": "user",
-                        "parts": [{ "text": text }]
+                        "parts": parts,
                     }));
                 }
             }
@@ -313,6 +392,26 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
     if let Some(v) = body.get("top_p") {
         generation.insert("topP".to_string(), v.clone());
     }
+    if let Some(v) = body.get("top_k") {
+        generation.insert("topK".to_string(), v.clone());
+    }
+    if let Some(v) = body.get("seed") {
+        generation.insert("seed".to_string(), v.clone());
+    }
+    // OpenAI `response_format: {type: "json_object"}` → Gemini
+    // `responseMimeType: application/json`. Other response_format shapes
+    // (json_schema with strict schema) are not converted yet.
+    if let Some(rf) = body.get("response_format")
+        && rf.get("type").and_then(|v| v.as_str()) == Some("json_object")
+    {
+        generation.insert(
+            "responseMimeType".to_string(),
+            Value::String("application/json".to_string()),
+        );
+    }
+    if let Some(v) = body.get("stop") {
+        generation.insert("stopSequences".to_string(), v.clone());
+    }
     if !generation.is_empty() {
         request["generationConfig"] = Value::Object(generation);
     }
@@ -375,13 +474,16 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         }
     }
 
-    let finish_reason = match candidate
+    let raw_finish_reason = candidate
         .get("finishReason")
         .and_then(|v| v.as_str())
-        .unwrap_or("STOP")
-    {
+        .unwrap_or("STOP");
+    let finish_reason = match raw_finish_reason {
         "MAX_TOKENS" => "length",
-        "SAFETY" => "content_filter",
+        // RECITATION = Gemini detected the output verbatim-quotes training
+        // data and blocked the response. Closer to OpenAI's "content_filter"
+        // than to a normal stop.
+        "SAFETY" | "RECITATION" => "content_filter",
         _ if !tool_calls.is_empty() => "tool_calls",
         _ => "stop",
     };
@@ -482,6 +584,111 @@ fn extract_openai_text(content: Option<&Value>) -> String {
             .join("\n"),
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
+    }
+}
+
+/// Convert OpenAI Chat Completions content (string or array of content parts)
+/// into a Vec of Gemini parts. Preserves `image_url` parts as `inlineData`
+/// (for `data:` URIs) or `fileData` (for HTTP URLs). Empty content yields a
+/// single empty-text part so the resulting Gemini turn is still well-formed.
+fn extract_openai_parts_for_gemini(content: Option<&Value>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    match content {
+        Some(Value::String(s)) => {
+            out.push(json!({ "text": s }));
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if let Some(p) = openai_content_part_to_gemini_part(part) {
+                    out.push(p);
+                }
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(other) => {
+            out.push(json!({ "text": other.to_string() }));
+        }
+    }
+    if out.is_empty() {
+        out.push(json!({ "text": "" }));
+    }
+    out
+}
+
+/// Convert a single OpenAI Chat content part to a Gemini part. Returns `None`
+/// for unrecognised types so they are silently dropped (matches the OpenAI →
+/// Anthropic policy for unknown parts).
+fn openai_content_part_to_gemini_part(part: &Value) -> Option<Value> {
+    let part_type = part.get("type").and_then(|v| v.as_str());
+    match part_type {
+        // Bare strings inside a content array — treat as text.
+        None | Some("text") => part
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|t| json!({ "text": t })),
+        Some("image_url") => openai_image_url_part_to_gemini_part(part),
+        _ => part
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|t| json!({ "text": t })),
+    }
+}
+
+/// Map an OpenAI `image_url` content part to a Gemini `inlineData` (data: URI)
+/// or `fileData` (HTTP URL) part. Accepts both string and object shapes for the
+/// `image_url` field.
+fn openai_image_url_part_to_gemini_part(part: &Value) -> Option<Value> {
+    let url = part.get("image_url").and_then(|iu| match iu {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) => o.get("url").and_then(|v| v.as_str()),
+        _ => None,
+    })?;
+
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let mime = meta
+            .split(';')
+            .next()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("image/png");
+        Some(json!({
+            "inlineData": {
+                "mimeType": mime,
+                "data": data,
+            }
+        }))
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        // Best-effort mime sniff from extension; Gemini will reject if wrong
+        // but most clients pair URL parts with correct extensions.
+        let mime = mime_from_url(url);
+        Some(json!({
+            "fileData": {
+                "fileUri": url,
+                "mimeType": mime,
+            }
+        }))
+    } else {
+        None
+    }
+}
+
+fn mime_from_url(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    let path_only = lower.split(['?', '#']).next().unwrap_or(&lower);
+    if path_only.ends_with(".png") {
+        "image/png"
+    } else if path_only.ends_with(".jpg") || path_only.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path_only.ends_with(".webp") {
+        "image/webp"
+    } else if path_only.ends_with(".gif") {
+        "image/gif"
+    } else if path_only.ends_with(".heic") {
+        "image/heic"
+    } else if path_only.ends_with(".heif") {
+        "image/heif"
+    } else {
+        "image/jpeg"
     }
 }
 
@@ -647,6 +854,18 @@ mod tests {
     fn test_convert_gemini_response_safety_finish_reason() {
         let resp = json!({
             "candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini");
+        assert_eq!(converted["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn test_convert_gemini_response_recitation_finish_reason() {
+        // RECITATION = blocked due to verbatim training-data quote. Should map
+        // to OpenAI content_filter (same family as SAFETY) rather than collapse
+        // to "stop" via the catch-all arm.
+        let resp = json!({
+            "candidates": [{"content": {"parts": []}, "finishReason": "RECITATION"}]
         });
         let converted = convert_gemini_to_openai_chat_response(&resp, "gemini");
         assert_eq!(converted["choices"][0]["finish_reason"], "content_filter");
@@ -1399,5 +1618,153 @@ mod tests {
         assert!(!obj.contains_key("propertyNames"));
         assert_eq!(obj["type"], "object");
         assert!(obj.contains_key("properties"));
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_image_url_data_uri_becomes_inline_data() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+                    }}
+                ]
+            }]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let parts = converted["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "what is this?");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert!(
+            parts[1]["inlineData"]["data"]
+                .as_str()
+                .unwrap()
+                .starts_with("iVBORw0KGgo")
+        );
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_image_url_http_becomes_file_data() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+                ]
+            }]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let parts = converted["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0]["fileData"]["fileUri"],
+            "https://example.com/cat.jpg"
+        );
+        assert_eq!(parts[0]["fileData"]["mimeType"], "image/jpeg");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_forwards_top_k_seed_response_format_and_stop() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_k": 32,
+            "seed": 7,
+            "response_format": {"type": "json_object"},
+            "stop": ["END"]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let g = &converted["generationConfig"];
+        assert_eq!(g["topK"], 32);
+        assert_eq!(g["seed"], 7);
+        assert_eq!(g["responseMimeType"], "application/json");
+        assert_eq!(g["stopSequences"][0], "END");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_drops_unsupported_response_format_types() {
+        // json_schema is not converted (yet); ensure we don't accidentally
+        // emit responseMimeType on shapes we haven't validated.
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {}}
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        assert!(
+            converted
+                .get("generationConfig")
+                .and_then(|g| g.get("responseMimeType"))
+                .is_none(),
+            "json_schema response_format should not produce responseMimeType"
+        );
+    }
+
+    #[test]
+    fn write_string_atomic_round_trips_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sigs.json");
+        let payload = serde_json::json!({
+            "call_a": "sig-a",
+            "call_b": "sig-b"
+        })
+        .to_string();
+        super::write_string_atomic(&path, &payload);
+        let read_back = std::fs::read_to_string(&path).unwrap();
+        let parsed: HashMap<String, String> = serde_json::from_str(&read_back).unwrap();
+        assert_eq!(parsed.get("call_a").map(String::as_str), Some("sig-a"));
+        assert_eq!(parsed.get("call_b").map(String::as_str), Some("sig-b"));
+    }
+
+    #[test]
+    fn write_string_atomic_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sigs.json");
+        super::write_string_atomic(&path, "{\"x\":\"1\"}");
+        super::write_string_atomic(&path, "{\"x\":\"2\"}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"x\":\"2\"}");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_text_only_unchanged() {
+        // Regression: pure-text input still produces a single text part.
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        let parts = converted["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "hi");
     }
 }

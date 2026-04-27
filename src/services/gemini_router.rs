@@ -349,7 +349,15 @@ async fn forward_to_provider(
                 if is_terminal || first_error.is_none() {
                     first_error = Some((status, body));
                 }
-                if is_terminal {
+                // Terminal errors (401/403/429/5xx) are usually authoritative,
+                // but attempt 0 is just our best initial guess for this key —
+                // a 401 there can also mean "this upstream doesn't speak that
+                // protocol and rejected the auth header shape" (e.g., DeepSeek
+                // returns 401 on /v1beta/models/...:generateContent because it
+                // doesn't recognize Google's `x-goog-api-key`). Probe at least
+                // one fallback before bailing so genuine cross-protocol hosts
+                // can still be discovered.
+                if is_terminal && attempt > 0 {
                     // Pin in-memory: the path answered authoritatively, so
                     // retry storms hit it directly instead of re-probing.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);

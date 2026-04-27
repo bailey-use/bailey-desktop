@@ -659,6 +659,7 @@ fn responses_router_config(state: &ServeState) -> ResponsesToChatRouterConfig {
         target_base_url: state.config.upstream_base_url.clone(),
         api_key: state.config.upstream_api_key.clone(),
         target_protocol: ProviderProtocol::from_u8(state.active_protocol.load(Ordering::Relaxed)),
+        target_path_variant: None,
         copilot_token_manager: state.copilot_tokens.clone(),
         model_prefix: None,
         requires_reasoning_content: false,

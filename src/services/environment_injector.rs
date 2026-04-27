@@ -383,6 +383,15 @@ impl EnvironmentInjector {
         };
 
         let mut env = Self::inject_connection(&cfg, key, &mode, &profile);
+        // Forward the persisted path variant so the Anthropic-to-OpenAI router
+        // can skip re-probing /v1/chat/completions vs /chat/completions on
+        // every launch. Only meaningful in Routed mode; harmless otherwise.
+        if let Some(variant) = key.claude_path_variant.as_deref() {
+            env.insert(
+                "AIVO_ANTHROPIC_TO_OPENAI_ROUTER_PATH_VARIANT".to_string(),
+                variant.to_string(),
+            );
+        }
         env.insert("ANTHROPIC_API_KEY".to_string(), String::new());
         env.insert(
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),

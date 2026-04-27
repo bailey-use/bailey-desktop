@@ -416,4 +416,62 @@ mod tests {
             "0.0.0.0"
         ));
     }
+
+    #[test]
+    fn host_binds_publicly_handles_127_subnet_loopback() {
+        // The whole 127.0.0.0/8 range is loopback per RFC; std's IpAddr::is_loopback
+        // recognises this. Any address in this range should NOT trigger the warning.
+        for ip in ["127.0.0.1", "127.0.0.2", "127.0.0.255", "127.255.255.254"] {
+            assert!(
+                !host_binds_publicly(ip),
+                "loopback /8 host {ip} should not trigger public-bind warning",
+            );
+        }
+    }
+
+    #[test]
+    fn host_binds_publicly_treats_unparseable_non_localhost_as_public() {
+        // A hostname that isn't "localhost" and doesn't parse as an IP is
+        // treated as public — the warning is best-effort, false positives
+        // are safer than false negatives.
+        assert!(host_binds_publicly("api.internal.example"));
+        assert!(host_binds_publicly("server-1"));
+        assert!(host_binds_publicly("[::ffff:8.8.8.8]"));
+    }
+
+    #[test]
+    fn self_proxy_detects_loopback_v6_link_local_when_bound_to_all() {
+        // `::1` is the canonical IPv6 loopback; verifying both bracketed
+        // and unbracketed forms work alongside is_self_proxy_target's
+        // bracket-stripping.
+        assert!(is_self_proxy_target("http://[::1]:9000/", 9000, "0.0.0.0"));
+        assert!(is_self_proxy_target("http://[::1]:9000/", 9000, "::"));
+    }
+
+    #[test]
+    fn self_proxy_does_not_match_external_hosts() {
+        // Sanity: a real public hostname must never be classified as
+        // self-proxy regardless of bind host.
+        for bind in ["127.0.0.1", "0.0.0.0", "::"] {
+            assert!(
+                !is_self_proxy_target("https://api.openai.com/v1", 9000, bind),
+                "external API must not be self-proxy when bind={bind}",
+            );
+        }
+    }
+
+    #[test]
+    fn self_proxy_ignores_url_path_only() {
+        // Paths must not influence classification — only host+port.
+        assert!(is_self_proxy_target(
+            "http://127.0.0.1:24860/v1/chat/completions",
+            24860,
+            "127.0.0.1"
+        ));
+        assert!(!is_self_proxy_target(
+            "http://127.0.0.1:8080/v1/chat/completions",
+            24860,
+            "127.0.0.1"
+        ));
+    }
 }

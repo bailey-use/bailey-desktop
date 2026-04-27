@@ -56,6 +56,43 @@ pub fn commit_protocol_switch(
     }
 }
 
+/// Number of consecutive request-level failures after which the in-memory
+/// pin is reset to the configured default route, forcing the next request
+/// to re-probe protocols/path variants from scratch. Five is high enough to
+/// avoid thrashing on transient network blips and low enough to recover
+/// promptly when an upstream genuinely changes shape.
+pub const CONSECUTIVE_FAILURES_BEFORE_RESET: u8 = 5;
+
+/// Update the consecutive-failure counter and, if the threshold has been
+/// reached, reset the active route to the default. Returns `true` if the
+/// pin was reset, so callers can log if useful.
+///
+/// Pass `succeeded = true` after any 2xx upstream response; `false` after
+/// any non-2xx (or transport error) that exits the fallback loop.
+pub fn record_request_outcome(
+    active_route: &AtomicU8,
+    consecutive_failures: &AtomicU8,
+    default_protocol: ProviderProtocol,
+    default_variant: PathVariant,
+    succeeded: bool,
+) -> bool {
+    if succeeded {
+        consecutive_failures.store(0, Ordering::Relaxed);
+        return false;
+    }
+    let prev = consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    if prev + 1 >= CONSECUTIVE_FAILURES_BEFORE_RESET {
+        active_route.store(
+            encode_route(default_protocol, default_variant),
+            Ordering::Relaxed,
+        );
+        consecutive_failures.store(0, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// Classify an HTTP response into an attempt outcome.
 pub fn classify_attempt<T>(
     status: u16,
@@ -194,5 +231,94 @@ mod tests {
             let (_, variant) = decode_route(raw);
             assert_eq!(variant, PathVariant::Default, "raw byte {raw}");
         }
+    }
+
+    #[test]
+    fn record_outcome_resets_counter_on_success() {
+        let active = AtomicU8::new(encode_route(
+            ProviderProtocol::Anthropic,
+            PathVariant::Stripped,
+        ));
+        let failures = AtomicU8::new(3);
+        let reset = record_request_outcome(
+            &active,
+            &failures,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            true,
+        );
+        assert!(!reset);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        // Active route untouched on success.
+        assert_eq!(
+            decode_route(active.load(Ordering::Relaxed)),
+            (ProviderProtocol::Anthropic, PathVariant::Stripped)
+        );
+    }
+
+    #[test]
+    fn record_outcome_resets_pin_at_threshold() {
+        let active = AtomicU8::new(encode_route(
+            ProviderProtocol::Anthropic,
+            PathVariant::Stripped,
+        ));
+        let failures = AtomicU8::new(0);
+        // First N-1 failures bump the counter without resetting.
+        for _ in 0..(CONSECUTIVE_FAILURES_BEFORE_RESET - 1) {
+            let reset = record_request_outcome(
+                &active,
+                &failures,
+                ProviderProtocol::Openai,
+                PathVariant::Default,
+                false,
+            );
+            assert!(!reset);
+        }
+        // The Nth failure resets the active route to the default.
+        let reset = record_request_outcome(
+            &active,
+            &failures,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            false,
+        );
+        assert!(reset);
+        assert_eq!(
+            decode_route(active.load(Ordering::Relaxed)),
+            (ProviderProtocol::Openai, PathVariant::Default)
+        );
+        // Counter zeroed so the next failure starts a fresh streak.
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_outcome_success_after_partial_streak_resets_counter() {
+        let active = AtomicU8::new(encode_route(
+            ProviderProtocol::Anthropic,
+            PathVariant::Default,
+        ));
+        let failures = AtomicU8::new(0);
+        for _ in 0..(CONSECUTIVE_FAILURES_BEFORE_RESET - 2) {
+            record_request_outcome(
+                &active,
+                &failures,
+                ProviderProtocol::Openai,
+                PathVariant::Default,
+                false,
+            );
+        }
+        record_request_outcome(
+            &active,
+            &failures,
+            ProviderProtocol::Openai,
+            PathVariant::Default,
+            true,
+        );
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+        // Pin not reset because the streak broke.
+        assert_eq!(
+            decode_route(active.load(Ordering::Relaxed)),
+            (ProviderProtocol::Anthropic, PathVariant::Default)
+        );
     }
 }

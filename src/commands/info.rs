@@ -11,8 +11,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 
 use crate::commands::keys::{
-    PingResult, PingStatus, key_metadata_json, learned_routing_summary, ping_keys_streaming,
-    ping_result_json,
+    PingResult, PingStatus, key_metadata_json, ping_keys_streaming, ping_result_json,
 };
 use crate::commands::truncate_url_for_display;
 use crate::errors::ExitCode;
@@ -86,15 +85,8 @@ impl InfoCommand {
                 .unwrap_or(0);
 
             if check {
-                let keys_by_id: HashMap<String, &_> =
-                    keys.iter().map(|k| (k.id.clone(), k)).collect();
                 ping_keys_streaming(keys.clone(), |id, result| {
                     has_problems |= print_key_result(id, result, selected_key_id, max_name_len);
-                    if let Some(key) = keys_by_id.get(id)
-                        && let Some(learned) = learned_routing_summary(key)
-                    {
-                        println!("        {}", style::dim(format!("learned: {learned}")));
-                    }
                 })
                 .await;
             } else {
@@ -113,9 +105,6 @@ impl InfoCommand {
                         style::dim(truncate_url_for_display(&key.base_url, 50)),
                         width = max_name_len
                     );
-                    if let Some(learned) = learned_routing_summary(key) {
-                        println!("        {}", style::dim(format!("learned: {learned}")));
-                    }
                 }
             }
         }

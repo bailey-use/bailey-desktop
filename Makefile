@@ -17,15 +17,15 @@ build: ## Build debug binary (~1s incremental)
 build-release: ## Build optimized release binary
 	cargo build --release
 
-# Tests use a separate CARGO_TARGET_DIR so `test-fast-crypto` (reduced PBKDF2
+# Tests use a separate CARGO_TARGET_DIR so `__internal_test_fast_crypto` (reduced PBKDF2
 # iterations for fast tests) never contaminates `target/debug/aivo`. Without
 # this, `make test && ./target/debug/aivo keys cat <name>` would fail because
 # keys encrypted by the normal build can't be decrypted by the test binary.
 test: ## Run all tests (isolated target dir; won't clobber target/debug/aivo)
-	CARGO_TARGET_DIR=target/test cargo test --features test-fast-crypto
+	CARGO_TARGET_DIR=target/test cargo test --features __internal_test_fast_crypto
 
 test-release: ## Run tests on release build (isolated target dir)
-	CARGO_TARGET_DIR=target/test cargo test --release --features test-fast-crypto
+	CARGO_TARGET_DIR=target/test cargo test --release --features __internal_test_fast_crypto
 
 check: ## Quick type check
 	cargo check

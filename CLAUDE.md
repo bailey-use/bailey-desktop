@@ -11,13 +11,13 @@
 
 ```bash
 cargo build                             # Debug build (~1s incremental)
-cargo test --features test-fast-crypto  # All tests (~1900, fast crypto)
+cargo test --features __internal_test_fast_crypto  # All tests (~1900, fast crypto)
 cargo test -- test_name                 # Single test
 cargo clippy                            # Lint (fix all warnings before committing)
 cargo fmt                               # Format (run before committing)
 ```
 
-`test-fast-crypto` uses reduced PBKDF2 iterations. A `Makefile` wraps common workflows: `make test`, `make build`, `make clippy`, `make install`, `make release`.
+`__internal_test_fast_crypto` uses reduced PBKDF2 iterations. A `Makefile` wraps common workflows: `make test`, `make build`, `make clippy`, `make install`, `make release`.
 
 ## Git Conventions
 

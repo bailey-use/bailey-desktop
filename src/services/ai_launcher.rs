@@ -24,7 +24,7 @@ use crate::services::log_store::{LogEvent, new_log_id};
 use crate::services::model_names::{is_gpt_chat_model_name, is_openai_style_model_name};
 use crate::services::models_cache::ModelsCache;
 use crate::services::ollama;
-use crate::services::path_search::{collect_path_dirs, find_in_dirs};
+use crate::services::path_search::{collect_path_dirs, collect_path_dirs_from, find_in_dirs};
 use crate::services::provider_profile::{
     is_copilot_base, is_direct_openai_base, is_ollama_base, provider_profile_for_base_url,
 };
@@ -285,7 +285,13 @@ impl AILauncher {
             // profile. Re-read PATH from a login shell so we pick it up.
             refresh_path_from_shell().await;
 
-            let path_dirs = collect_path_dirs();
+            // Use the freshened PATH for the post-install lookup if available,
+            // otherwise fall back to the inherited PATH. Avoids mutating global
+            // env state.
+            let path_dirs = match freshened_path_for_lookup() {
+                Some(fresh) => collect_path_dirs_from(Some(fresh)),
+                None => collect_path_dirs(),
+            };
             if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
                 eprintln!(
                     "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
@@ -467,6 +473,14 @@ impl AILauncher {
                 }
             },
         };
+
+        // One-shot migration of routing fields written under older buggy logic.
+        // Always runs before any router/injection step reads `responses_api_supported`.
+        crate::services::launch_runtime::migrate_routing_schema_for_key(
+            &self.session_store,
+            &mut key,
+        )
+        .await;
 
         if is_ollama_base(&key.base_url) {
             // Ollama is always OpenAI-compatible; no protocol probing needed.
@@ -696,6 +710,10 @@ impl AILauncher {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        // If a tool was just installed and pulled a new dir into PATH via
+        // shell profile, propagate that PATH to the child. Done here rather
+        // than via global set_var so we never race with concurrent tasks.
+        apply_refreshed_path(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -754,11 +772,19 @@ struct ResolvedLaunchContext {
     tool_config: ToolConfig,
 }
 
-/// Re-read PATH from a login shell and update this process's PATH env var.
-/// Unix installers often append to shell profiles (~/.zshrc, ~/.bashrc);
-/// this picks up those changes without requiring a terminal restart.
-/// On Windows, installers use npm global bin which is already on PATH,
-/// so this is a no-op.
+/// Cached fresh PATH read from a login shell after a tool install. Set once
+/// per process by `refresh_path_from_shell`. Read by `apply_refreshed_path` to
+/// thread the value into spawned children without mutating global env state
+/// (which would race with any future `tokio::spawn` near this code).
+static FRESHENED_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Re-read PATH from a login shell and stash it in `FRESHENED_PATH`. Unix
+/// installers often append to shell profiles (~/.zshrc, ~/.bashrc); this picks
+/// up those changes without requiring a terminal restart. On Windows,
+/// installers use npm global bin which is already on PATH, so this is a no-op.
+///
+/// Caller should subsequently use `freshened_path_for_lookup` to find newly
+/// installed binaries and `apply_refreshed_path` when spawning children.
 async fn refresh_path_from_shell() {
     #[cfg(not(unix))]
     return;
@@ -774,10 +800,25 @@ async fn refresh_path_from_shell() {
     {
         let fresh = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !fresh.is_empty() {
-            // SAFETY: no other threads or tasks read PATH concurrently here —
-            // we are in the interactive install flow, blocked on user I/O.
-            unsafe { std::env::set_var("PATH", &fresh) };
+            // OnceLock::set fails (silently) if already populated — earliest
+            // refresh wins for a given process, which matches the intent
+            // (installers run before launches).
+            let _ = FRESHENED_PATH.set(fresh);
         }
+    }
+}
+
+/// Returns the freshened PATH (if any) as an `OsString` suitable for
+/// `collect_path_dirs_from`.
+fn freshened_path_for_lookup() -> Option<std::ffi::OsString> {
+    FRESHENED_PATH.get().map(std::ffi::OsString::from)
+}
+
+/// If a freshened PATH was captured, override the child's PATH with it.
+/// Otherwise the child inherits the parent's PATH unchanged.
+fn apply_refreshed_path(cmd: &mut Command) {
+    if let Some(fresh) = FRESHENED_PATH.get() {
+        cmd.env("PATH", fresh);
     }
 }
 

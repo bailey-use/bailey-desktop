@@ -34,7 +34,7 @@ use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch, is_terminal_upstream_error,
+    PathVariant, ProviderProtocol, decode_route, is_endpoint_missing, is_terminal_upstream_error,
 };
 use crate::services::responses_chat_conversion;
 use anyhow::Result;
@@ -58,6 +58,9 @@ pub struct ResponsesToChatRouterConfig {
     pub target_base_url: String,
     pub api_key: String,
     pub target_protocol: ProviderProtocol,
+    /// Persisted path-variant pin from a prior launch. When set, the router
+    /// skips re-probing the alternate variant.
+    pub target_path_variant: Option<PathVariant>,
     pub copilot_token_manager: Option<Arc<CopilotTokenManager>>,
     /// Optional model prefix to add (e.g., "@cf/" for Cloudflare)
     pub model_prefix: Option<String>,
@@ -96,6 +99,11 @@ struct ResponsesToChatRouterState {
     /// Flipped to `true` once any request returns a non-error response. Read
     /// by `persist_runtime_discoveries` to gate protocol pinning.
     request_succeeded: Arc<AtomicBool>,
+    /// Consecutive non-2xx responses against the active route. After
+    /// `CONSECUTIVE_FAILURES_BEFORE_RESET`, the active route is reset so the
+    /// next request re-probes from the configured default — recovers when an
+    /// upstream changes shape mid-session.
+    consecutive_failures: Arc<AtomicU8>,
 }
 
 impl ResponsesToChatRouter {
@@ -115,7 +123,13 @@ impl ResponsesToChatRouter {
         tokio::task::JoinHandle<Result<()>>,
     )> {
         let (listener, port) = http_utils::bind_local_listener().await?;
-        let active_protocol = Arc::new(AtomicU8::new(self.config.target_protocol.to_u8()));
+        let initial_route = crate::services::provider_protocol::encode_route(
+            self.config.target_protocol,
+            self.config
+                .target_path_variant
+                .unwrap_or(PathVariant::Default),
+        );
+        let active_protocol = Arc::new(AtomicU8::new(initial_route));
         let initial_responses = match self.config.responses_api_supported {
             Some(true) => 1,
             Some(false) => 2,
@@ -123,12 +137,14 @@ impl ResponsesToChatRouter {
         };
         let responses_api_supported = Arc::new(AtomicU8::new(initial_responses));
         let request_succeeded = Arc::new(AtomicBool::new(false));
+        let consecutive_failures = Arc::new(AtomicU8::new(0));
         let state = ResponsesToChatRouterState {
             config: Arc::new(self.config.clone()),
             client: Arc::new(http_utils::router_http_client()),
             active_protocol: active_protocol.clone(),
             responses_api_supported: responses_api_supported.clone(),
             request_succeeded: request_succeeded.clone(),
+            consecutive_failures,
         };
         let handle = tokio::spawn(async move {
             http_utils::run_streaming_router(
@@ -156,8 +172,33 @@ async fn handle_router_request_streaming(
     use tokio::io::AsyncWriteExt;
     let response = handle_router_request(request, &state, &mut socket).await;
     if let Some(response) = response {
+        // Track success/failure for the auto-clear-on-N-failures heuristic.
+        // Streamed responses (where `response` is None) bypass this — they
+        // already updated `request_succeeded` from inside the streamer.
+        let succeeded = response_is_2xx(&response);
+        crate::services::protocol_fallback::record_request_outcome(
+            state.active_protocol.as_ref(),
+            state.consecutive_failures.as_ref(),
+            state.config.target_protocol,
+            state
+                .config
+                .target_path_variant
+                .unwrap_or(PathVariant::Default),
+            succeeded,
+        );
         let _ = socket.write_all(response.as_bytes()).await;
     }
+}
+
+/// Quick check on a buffered HTTP/1.1 response string: status starts at byte
+/// offset 9 (after "HTTP/1.1 "). 2xx → success.
+fn response_is_2xx(http_response: &str) -> bool {
+    http_response
+        .as_bytes()
+        .get(9..12)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|s| s.parse::<u16>().ok())
+        .is_some_and(|status| (200..300).contains(&status))
 }
 
 /// Returns `Some(response)` for buffered responses, `None` if the handler
@@ -285,6 +326,42 @@ async fn handle_api_request(
 // RESPONSES API PATH: passthrough or convert
 // =============================================================================
 
+/// Decision returned by `classify_responses_passthrough_error` for a non-200
+/// response received while probing or using the native Responses API endpoint.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponsesPassthroughDecision {
+    /// Path is genuinely missing — latch `responses_api_supported = 2` and fall
+    /// through to chat conversion.
+    LatchUnsupported,
+    /// Transient error during the unknown-state probe — leave state at 0 so the
+    /// next request re-probes; fall through to chat for this request.
+    Reprobe,
+    /// Already-known supported (or non-mismatch) — surface the error to the client.
+    PassError,
+}
+
+/// Decide what to do with a non-200 response from `/v1/responses` based on the
+/// current `responses_api_supported` state byte. The state encoding is:
+///   0 = unknown (probing)
+///   1 = supported
+///   2 = unsupported
+///
+/// Only `(unknown, endpoint-missing)` should latch unsupported. Every other
+/// non-200 in the unknown state should re-probe — a transient 429/5xx must not
+/// permanently disable Responses API for the key.
+fn classify_responses_passthrough_error(state: u8, status: u16) -> ResponsesPassthroughDecision {
+    let unknown = state == 0;
+    if unknown {
+        if is_endpoint_missing(status) {
+            ResponsesPassthroughDecision::LatchUnsupported
+        } else {
+            ResponsesPassthroughDecision::Reprobe
+        }
+    } else {
+        ResponsesPassthroughDecision::PassError
+    }
+}
+
 /// Tries to forward a Responses API request directly to the upstream `/v1/responses`
 /// endpoint. Returns `Some(Ok(response))` on success or non-protocol HTTP errors,
 /// `None` if the upstream doesn't support the Responses API (404/405/415), allowing
@@ -344,17 +421,23 @@ async fn try_responses_api_passthrough(
     let response_body = response.text().await.ok()?;
 
     if status != 200 {
-        if responses_api_supported.load(Ordering::Relaxed) == 0 || is_protocol_mismatch(status) {
-            // Still probing or clear protocol mismatch — mark unsupported, fall through
-            responses_api_supported.store(2, Ordering::Relaxed);
-            return None;
-        }
-        // Known supported but got an error — return it to the client
-        return Some(Ok(http_utils::http_response(
+        match classify_responses_passthrough_error(
+            responses_api_supported.load(Ordering::Relaxed),
             status,
-            &content_type,
-            &response_body,
-        )));
+        ) {
+            ResponsesPassthroughDecision::LatchUnsupported => {
+                responses_api_supported.store(2, Ordering::Relaxed);
+                return None;
+            }
+            ResponsesPassthroughDecision::Reprobe => return None,
+            ResponsesPassthroughDecision::PassError => {
+                return Some(Ok(http_utils::http_response(
+                    status,
+                    &content_type,
+                    &response_body,
+                )));
+            }
+        }
     }
 
     // Only validate on the first probe (unknown state).  Once confirmed,
@@ -632,7 +715,11 @@ async fn forward_openai_chat_request(
                 if is_terminal || first_error.is_none() {
                     first_error = Some((status, body));
                 }
-                if is_terminal {
+                // Skip the fast-bail at attempt 0: a 401/403 there often means
+                // "this host rejected the protocol's auth header shape" rather
+                // than "your key is bad" (e.g. cross-protocol gateways). Probe
+                // at least one fallback before believing the upstream.
+                if is_terminal && attempt > 0 {
                     // The path answered (with an error, but it answered) —
                     // pin it in memory so retry storms from codex/claude
                     // don't re-probe the wrong chat/completions paths every
@@ -982,6 +1069,65 @@ fn apply_selected_model(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn response_is_2xx_recognises_status_line() {
+        assert!(response_is_2xx("HTTP/1.1 200 OK\r\n\r\n{}"));
+        assert!(response_is_2xx("HTTP/1.1 204 No Content\r\n"));
+        assert!(!response_is_2xx("HTTP/1.1 502 Bad Gateway\r\n"));
+        assert!(!response_is_2xx("HTTP/1.1 429 Too Many Requests\r\n"));
+        assert!(!response_is_2xx("garbage"));
+    }
+
+    #[test]
+    fn classify_passthrough_error_latches_only_on_endpoint_missing_when_unknown() {
+        for status in [404, 405, 415, 501] {
+            assert_eq!(
+                classify_responses_passthrough_error(0, status),
+                ResponsesPassthroughDecision::LatchUnsupported,
+                "endpoint-missing status {status} should latch when state is unknown",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_passthrough_error_reprobes_on_transient_when_unknown() {
+        // Transient errors (rate-limit, 5xx, server timeout) on the first probe
+        // must NOT latch the key as unsupported. The next request should re-probe.
+        for status in [400, 401, 403, 408, 422, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                classify_responses_passthrough_error(0, status),
+                ResponsesPassthroughDecision::Reprobe,
+                "transient status {status} should re-probe when state is unknown",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_passthrough_error_passes_error_to_client_when_known_supported() {
+        // Once we've confirmed the upstream supports Responses API, any non-200
+        // is the upstream's real answer — surface it to the client unchanged.
+        for status in [400, 401, 403, 404, 422, 429, 500, 502, 503] {
+            assert_eq!(
+                classify_responses_passthrough_error(1, status),
+                ResponsesPassthroughDecision::PassError,
+                "status {status} should pass through when state is known-supported",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_passthrough_error_passes_error_when_known_unsupported() {
+        // State == 2 means we've already given up on /v1/responses for this key,
+        // so the chat-fallback path should be in use; this branch only fires
+        // when something weird sends us back through the passthrough function.
+        // Either way, treat as PassError (not Reprobe) so we don't accidentally
+        // re-enable.
+        assert_eq!(
+            classify_responses_passthrough_error(2, 500),
+            ResponsesPassthroughDecision::PassError,
+        );
+    }
 
     #[test]
     fn strip_anthropic_error_wrap_unwraps_minimax_500_body() {

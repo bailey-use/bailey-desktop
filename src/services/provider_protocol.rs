@@ -82,6 +82,21 @@ impl PathVariant {
         }
         default_path
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Stripped => "stripped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(Self::Default),
+            "stripped" => Some(Self::Stripped),
+            _ => None,
+        }
+    }
 }
 
 /// Pack `(protocol, path_variant)` into the byte stored in the active-route

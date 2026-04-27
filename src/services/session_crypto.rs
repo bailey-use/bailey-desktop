@@ -30,9 +30,9 @@ impl SecretKey {
     }
 }
 
-#[cfg(any(test, feature = "test-fast-crypto"))]
+#[cfg(any(test, feature = "__internal_test_fast_crypto"))]
 const ITERATIONS: u32 = 100;
-#[cfg(not(any(test, feature = "test-fast-crypto")))]
+#[cfg(not(any(test, feature = "__internal_test_fast_crypto")))]
 const ITERATIONS: u32 = 100_000;
 
 fn derive_key() -> SecretKey {

@@ -13,6 +13,9 @@ fn make_key(base_url: &str, key_secret: &str) -> ApiKey {
         codex_mode: None,
         opencode_mode: None,
         pi_mode: None,
+        claude_path_variant: None,
+        gemini_path_variant: None,
+        routing_schema_version: 0,
         key: Zeroizing::new(key_secret.to_string()),
         created_at: "2025-01-01T00:00:00Z".to_string(),
     }

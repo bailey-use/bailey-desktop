@@ -130,6 +130,12 @@ pub(crate) async fn prepare_runtime_env(
         write_pi_agent_dir(&mut env, Some(port)).await?;
     }
 
+    if tool == AIToolType::Pi && env.contains_key("AIVO_USE_PI_ROUTER") {
+        let (port, _active, _responses_api, _success) =
+            start_responses_to_chat_router(&env).await?;
+        write_pi_agent_dir(&mut env, Some(port)).await?;
+    }
+
     let pi_agent_dir = env.get("PI_CODING_AGENT_DIR").cloned();
 
     let codex_oauth_sync =
@@ -428,15 +434,10 @@ pub(crate) async fn persist_runtime_discoveries(
     session_store: &SessionStore,
     tool: AIToolType,
     key: &ApiKey,
-    key_override_used: bool,
     router_protocol: Option<Arc<AtomicU8>>,
     responses_api_support: Option<Arc<AtomicU8>>,
     request_succeeded: Option<Arc<AtomicBool>>,
 ) {
-    if key_override_used {
-        return;
-    }
-
     // Gate protocol/responses-api persistence on at least one successful
     // upstream response. Without this, a session that only saw failures (bad
     // API key, transient 5xx, rate limits) could silently rewrite the
@@ -1270,7 +1271,6 @@ mod tests {
             &store,
             AIToolType::Claude,
             &key,
-            false,
             Some(active),
             None,
             Some(succeeded),
@@ -1315,7 +1315,6 @@ mod tests {
             &store,
             AIToolType::Claude,
             &key,
-            false,
             Some(active),
             None,
             Some(succeeded),
@@ -1327,6 +1326,56 @@ mod tests {
             reloaded.claude_protocol,
             Some(ClaudeProviderProtocol::Openai),
             "claude_protocol must be rewritten to the learned protocol after a successful request"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_runtime_discoveries_writes_google_pin_for_google_host_key() {
+        // Mirrors the live user flow: claude key against
+        // generativelanguage.googleapis.com. resolve_claude_protocol pre-fills
+        // the in-memory key.claude_protocol with Anthropic (the cli-native bet);
+        // the router fallback then learns Google. Persistence must rewrite the
+        // claude_protocol pin to Google so the next launch skips the probe.
+        use crate::services::ai_launcher::AIToolType;
+        use crate::services::provider_protocol::ProviderProtocol;
+        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let key_id = store
+            .add_key_with_protocol(
+                "google",
+                "https://generativelanguage.googleapis.com",
+                None,
+                "ya29-test",
+            )
+            .await
+            .unwrap();
+        let mut key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        // resolve_claude_protocol fills this in-memory before launch.
+        key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
+
+        // Router observed Google success; pin advanced to Google.
+        let active = Arc::new(AtomicU8::new(ProviderProtocol::Google.to_u8()));
+        let succeeded = Arc::new(AtomicBool::new(true));
+
+        super::persist_runtime_discoveries(
+            &store,
+            AIToolType::Claude,
+            &key,
+            Some(active),
+            None,
+            Some(succeeded),
+        )
+        .await;
+
+        let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.claude_protocol,
+            Some(ClaudeProviderProtocol::Google),
+            "google host pin must persist to disk so the next launch skips the probe"
         );
     }
 

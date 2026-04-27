@@ -14,10 +14,8 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
-use crate::services::protocol_fallback::{AttemptRecord, log_exhausted_fallback};
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, fallback_protocols, is_protocol_mismatch,
-    is_terminal_upstream_error,
+    ProviderProtocol, fallback_protocols, is_protocol_mismatch, is_terminal_upstream_error,
 };
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_to_chat_router::{
@@ -602,7 +600,6 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         .collect();
 
     let mut first_error: Option<RouterResponse> = None;
-    let mut attempts: Vec<AttemptRecord> = Vec::new();
     for (attempt, protocol) in candidates.into_iter().enumerate() {
         let mut body_clone = body.clone();
         let response = match protocol {
@@ -625,20 +622,16 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         };
 
         if is_protocol_mismatch(status) {
-            let body_preview = match &response {
-                RouterResponse::Buffered { body, .. } => String::from_utf8_lossy(body).into_owned(),
-                RouterResponse::Streaming { .. } => String::new(),
-            };
-            attempts.push(AttemptRecord::new(
-                protocol,
-                PathVariant::Default,
-                status,
-                &body_preview,
-            ));
-            if first_error.is_none() {
+            let is_terminal = is_terminal_upstream_error(status);
+            if is_terminal || first_error.is_none() {
                 first_error = Some(response);
             }
-            if is_terminal_upstream_error(status) {
+            if is_terminal {
+                // Pin in-memory so concurrent/retry requests skip the
+                // wrong-path probes and hit this protocol directly.
+                state
+                    .active_protocol
+                    .store(protocol.to_u8(), Ordering::Relaxed);
                 break;
             }
             continue;
@@ -653,8 +646,6 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         }
         return Ok(response);
     }
-
-    log_exhausted_fallback("serve", &attempts);
 
     Ok(first_error.unwrap_or(RouterResponse::buffered(
         503,

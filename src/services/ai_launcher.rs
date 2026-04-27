@@ -382,7 +382,6 @@ impl AILauncher {
             &self.session_store,
             options.tool,
             &resolved.key,
-            options.key_override.is_some(),
             runtime.router_protocol,
             runtime.responses_api_support,
             runtime.request_succeeded,

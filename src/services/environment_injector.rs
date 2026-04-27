@@ -823,6 +823,31 @@ impl EnvironmentInjector {
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 AIVO_STARTER_REAL_URL.to_string(),
             );
+        } else if crate::services::http_debug::is_debug_active() {
+            // Under --debug, route pi through the local responses-to-chat
+            // bridge so outbound traffic is captured by the JSONL logger.
+            // Pi's native HTTP client doesn't go through aivo's `send_logged`
+            // instrumentation, so the direct path below records nothing.
+            let models_json = build_pi_models_json(
+                PLACEHOLDER_LOOPBACK_URL,
+                AIVO_STARTER_SENTINEL,
+                "openai-completions",
+                model,
+            );
+            env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
+            env.insert("AIVO_USE_PI_ROUTER".to_string(), "1".to_string());
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
+                key.key.to_string(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
+                key.base_url.clone(),
+            );
+            env.insert(
+                "AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL".to_string(),
+                profile.default_protocol.as_str().to_string(),
+            );
         } else {
             // Direct connection — pi talks to the upstream natively.
             // Map aivo's ProviderProtocol to pi's API type string.
@@ -951,8 +976,21 @@ mod tests {
         k
     }
 
+    /// All `use_direct_*` predicates consult `is_debug_active()`. The
+    /// debug-toggling tests serialize via `DEBUG_TEST_MUTEX`; tests that
+    /// assume the debug flag is off must take the same mutex (and explicitly
+    /// reset the flag) to avoid racing with parallel toggles.
+    fn debug_off_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+        guard
+    }
+
     #[test]
     fn use_direct_anthropic_false_for_generic_openai_host_with_anthropic_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.example.com/v1");
         key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
         assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
@@ -960,12 +998,14 @@ mod tests {
 
     #[test]
     fn use_direct_anthropic_true_for_anthropic_host_with_no_pin() {
+        let _guard = debug_off_guard();
         let key = test_api_key("https://api.anthropic.com");
         assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
     }
 
     #[test]
     fn use_direct_anthropic_true_for_anthropic_host_with_anthropic_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.anthropic.com");
         key.claude_protocol = Some(ClaudeProviderProtocol::Anthropic);
         assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
@@ -973,6 +1013,7 @@ mod tests {
 
     #[test]
     fn use_direct_anthropic_false_for_anthropic_host_with_openai_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.anthropic.com");
         key.claude_protocol = Some(ClaudeProviderProtocol::Openai);
         assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
@@ -980,6 +1021,7 @@ mod tests {
 
     #[test]
     fn use_google_native_false_for_generic_openai_host_with_google_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://api.example.com/v1");
         key.gemini_protocol = Some(GeminiProviderProtocol::Google);
         assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
@@ -987,12 +1029,14 @@ mod tests {
 
     #[test]
     fn use_google_native_true_for_google_host_with_no_pin() {
+        let _guard = debug_off_guard();
         let key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
         assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
     }
 
     #[test]
     fn use_google_native_true_for_google_host_with_google_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
         key.gemini_protocol = Some(GeminiProviderProtocol::Google);
         assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
@@ -1000,6 +1044,7 @@ mod tests {
 
     #[test]
     fn use_google_native_false_for_google_host_with_openai_pin() {
+        let _guard = debug_off_guard();
         let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
         key.gemini_protocol = Some(GeminiProviderProtocol::Openai);
         assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
@@ -2411,6 +2456,14 @@ mod tests {
 
     #[test]
     fn test_for_pi_google_preserves_v1beta_suffix() {
+        // for_pi now consults is_debug_active(); take the same mutex the
+        // debug-toggling tests use so a parallel toggle can't flip us into
+        // the routed branch.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
@@ -2428,6 +2481,11 @@ mod tests {
 
     #[test]
     fn test_for_pi_google_adds_v1beta_when_missing() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://generativelanguage.googleapis.com".to_string();
@@ -2445,6 +2503,11 @@ mod tests {
 
     #[test]
     fn test_for_pi_ollama_uses_direct_connection() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
         let injector = EnvironmentInjector::new();
         let key = ollama_key();
         let env = injector.for_pi(&key, Some("llama3.2"));
@@ -2461,6 +2524,56 @@ mod tests {
         assert_eq!(parsed["providers"]["aivo"]["api"], "openai-completions");
         assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
         assert!(!env.contains_key("AIVO_USE_PI_COPILOT_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_pi_routes_through_bridge_under_debug() {
+        // Without this routing, pi talks straight to upstream and the JSONL
+        // logger captures nothing — pi has no aivo `send_logged` instrumentation.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(true);
+
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        let env = injector.for_pi(&key, Some("MiniMax-M1"));
+
+        assert_eq!(env.get("AIVO_USE_PI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
+            Some(&"https://api.minimax.io/anthropic".to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"anthropic".to_string()),
+            "minimax /anthropic should map to anthropic upstream protocol"
+        );
+        // Pi's models.json points at the loopback placeholder; launch_runtime
+        // substitutes the real port after the router binds.
+        let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
+        assert!(models_json.contains(PLACEHOLDER_LOOPBACK_URL));
+        assert!(!env.contains_key("AIVO_SETUP_PI_AGENT_DIR"));
+
+        crate::services::http_debug::set_test_debug_active(false);
+    }
+
+    #[test]
+    fn test_for_pi_direct_when_debug_inactive() {
+        // With --debug off, behavior is unchanged: direct connection.
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.minimax.io/anthropic".to_string();
+        let env = injector.for_pi(&key, Some("MiniMax-M1"));
+
+        assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
+        assert!(!env.contains_key("AIVO_USE_PI_ROUTER"));
     }
 
     #[test]

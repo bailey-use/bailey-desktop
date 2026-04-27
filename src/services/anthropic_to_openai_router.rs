@@ -45,11 +45,10 @@ use crate::services::openai_models::{
     stringify_message_content as stringify_typed_message_content,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, AttemptRecord, classify_attempt, commit_protocol_switch,
-    log_exhausted_fallback, protocol_candidates,
+    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{
-    PathVariant, ProviderProtocol, is_endpoint_missing, is_protocol_mismatch,
+    PathVariant, ProviderProtocol, decode_route, is_endpoint_missing, is_protocol_mismatch,
     is_terminal_upstream_error,
 };
 
@@ -93,9 +92,18 @@ struct AnthropicToOpenAIRouterState {
 
 /// Learned state for the native Anthropic probe, cloned into each request
 /// handler so it can be mutated across concurrent requests.
+/// After this many consecutive non-terminal upstream errors from the native
+/// `/v1/messages` probe (e.g. repeated 400/422 shape rejections), give up and
+/// mark the probe Failed so subsequent requests skip the probe and go straight
+/// to the chat/completions fallback. Terminal errors (5xx/auth/rate-limit) are
+/// not counted — those are surfaced directly via `Terminal` and the user is
+/// expected to keep retrying the same path.
+const PROBE_UPSTREAM_ERROR_LIMIT: u8 = 3;
+
 #[derive(Clone)]
 struct ProbeState {
     anthropic_outcome: Arc<AtomicU8>,
+    consecutive_upstream_errors: Arc<AtomicU8>,
     /// Set to true when the provider rejects `anthropic-beta` headers (e.g. Bedrock, Vertex AI).
     /// Once learned, the header is stripped from all future requests.
     beta_header_rejected: Arc<AtomicBool>,
@@ -105,6 +113,7 @@ impl ProbeState {
     fn new() -> Self {
         Self {
             anthropic_outcome: Arc::new(AtomicU8::new(ProbeOutcome::Unlearned as u8)),
+            consecutive_upstream_errors: Arc::new(AtomicU8::new(0)),
             beta_header_rejected: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -116,6 +125,18 @@ impl ProbeState {
     fn set_outcome(&self, outcome: ProbeOutcome) {
         self.anthropic_outcome
             .store(outcome as u8, Ordering::Relaxed);
+    }
+
+    fn reset_upstream_error_streak(&self) {
+        self.consecutive_upstream_errors.store(0, Ordering::Relaxed);
+    }
+
+    /// Increment the streak and return true once it reaches the limit.
+    fn record_upstream_error(&self) -> bool {
+        let prev = self
+            .consecutive_upstream_errors
+            .fetch_add(1, Ordering::Relaxed);
+        prev + 1 >= PROBE_UPSTREAM_ERROR_LIMIT
     }
 }
 
@@ -166,10 +187,14 @@ enum RouterResponse {
 
 /// Outcome of a single native `/v1/messages` send attempt. Distinguishes
 /// "endpoint truly missing" (safe to flip the protocol pin to Openai) from
-/// "endpoint exists but errored" (auth/rate/5xx — don't poison the pin).
+/// "endpoint exists but errored" — and within errored, separates
+/// terminal/authoritative responses (5xx/401/403/429) from transient ones.
 enum SendNativeOutcome {
     Success(RouterResponse),
     EndpointMissing,
+    /// Path answered with an authoritative error (5xx/auth/rate-limit) that
+    /// chat/completions fallback can't fix; surface the response as-is.
+    Terminal(RouterResponse),
     UpstreamError,
 }
 
@@ -180,6 +205,7 @@ enum SendNativeOutcome {
 enum NativeAnthropicResult {
     Success(RouterResponse),
     EndpointMissing,
+    Terminal(RouterResponse),
     UpstreamError,
 }
 
@@ -394,7 +420,7 @@ async fn send_native_anthropic(
 
             let retry_status = retry_response.status().as_u16();
             if is_protocol_mismatch(retry_status) {
-                return Ok(classify_native_failure(retry_status));
+                return classify_native_failure(retry_status, retry_response).await;
             }
 
             let retry_ct = http_utils::response_content_type(&retry_response);
@@ -411,7 +437,7 @@ async fn send_native_anthropic(
     }
 
     if is_protocol_mismatch(status_code) {
-        return Ok(classify_native_failure(status_code));
+        return classify_native_failure(status_code, response).await;
     }
 
     let content_type = http_utils::response_content_type(&response);
@@ -423,12 +449,23 @@ async fn send_native_anthropic(
     }))
 }
 
-fn classify_native_failure(status: u16) -> SendNativeOutcome {
+async fn classify_native_failure(
+    status: u16,
+    response: reqwest::Response,
+) -> Result<SendNativeOutcome> {
     if is_endpoint_missing(status) {
-        SendNativeOutcome::EndpointMissing
-    } else {
-        SendNativeOutcome::UpstreamError
+        return Ok(SendNativeOutcome::EndpointMissing);
     }
+    if is_terminal_upstream_error(status) {
+        let content_type = http_utils::response_content_type(&response);
+        let body = response.bytes().await?;
+        return Ok(SendNativeOutcome::Terminal(RouterResponse::Buffered {
+            status,
+            content_type,
+            body: body.to_vec(),
+        }));
+    }
+    Ok(SendNativeOutcome::UpstreamError)
 }
 
 /// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
@@ -478,7 +515,13 @@ async fn try_native_anthropic(
         {
             SendNativeOutcome::Success(response) => {
                 probe.set_outcome(path.to_outcome());
+                probe.reset_upstream_error_streak();
                 return Ok(NativeAnthropicResult::Success(response));
+            }
+            SendNativeOutcome::Terminal(response) => {
+                // Path is real — keep probing on retries (don't bump the streak).
+                probe.reset_upstream_error_streak();
+                return Ok(NativeAnthropicResult::Terminal(response));
             }
             SendNativeOutcome::EndpointMissing => continue,
             SendNativeOutcome::UpstreamError => {
@@ -489,8 +532,12 @@ async fn try_native_anthropic(
     }
 
     if saw_upstream_error {
-        // Endpoint may exist but errored — leave probe state Unlearned so
-        // future requests can re-try without permanently disabling the probe.
+        // Endpoint may exist but produced a non-terminal error (400/422).
+        // After enough consecutive failures, mark Failed so the probe stops
+        // wasting time on subsequent requests.
+        if probe.record_upstream_error() {
+            probe.set_outcome(ProbeOutcome::Failed);
+        }
         Ok(NativeAnthropicResult::UpstreamError)
     } else {
         // Every candidate confirmed the path doesn't exist.
@@ -499,11 +546,16 @@ async fn try_native_anthropic(
     }
 }
 
-/// Gate the speculative native `/v1/messages` probe on the pin. Sniffing the
-/// model name would re-probe on every launch even after the pin learned the
-/// host speaks Openai.
-fn should_try_native_anthropic(target_protocol: ProviderProtocol) -> bool {
-    target_protocol == ProviderProtocol::Anthropic
+/// Skip the probe once the active pin has moved off Anthropic — re-probing
+/// would short-circuit to `EndpointMissing` and undo the learned pin.
+fn should_try_native_anthropic(
+    target_protocol: ProviderProtocol,
+    active_protocol: &AtomicU8,
+) -> bool {
+    if target_protocol != ProviderProtocol::Anthropic {
+        return false;
+    }
+    decode_route(active_protocol.load(Ordering::Relaxed)).0 == ProviderProtocol::Anthropic
 }
 
 /// Convert Anthropic /v1/messages request to OpenAI /v1/chat/completions
@@ -529,20 +581,27 @@ async fn handle_anthropic_to_upstream(
         .and_then(|m| m.as_str())
         .is_some_and(|m| m.to_ascii_lowercase().contains("claude"));
 
-    if should_try_native_anthropic(config.target_protocol) {
+    if should_try_native_anthropic(config.target_protocol, active_protocol) {
         match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
             NativeAnthropicResult::Success(response) => {
                 request_succeeded.store(true, Ordering::Relaxed);
                 return Ok(response);
             }
+            NativeAnthropicResult::Terminal(response) => {
+                return Ok(response);
+            }
             NativeAnthropicResult::EndpointMissing => {
-                // Endpoint truly missing — pre-pin Openai so a fallback success
-                // at attempt==0 (where `commit_protocol_switch` is a no-op)
-                // still gets persisted.
-                active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
+                // Pre-pin Openai so a fallback success at attempt==0 (where
+                // `commit_protocol_switch` is a no-op) still persists. Guard
+                // against clobbering a learned non-Anthropic pin.
+                if decode_route(active_protocol.load(Ordering::Relaxed)).0
+                    == ProviderProtocol::Anthropic
+                {
+                    active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
+                }
             }
             NativeAnthropicResult::UpstreamError => {
-                // Endpoint may exist; don't flip the pin on auth/rate/5xx.
+                // Endpoint may exist; don't flip the pin on transient errors.
             }
         }
     }
@@ -565,9 +624,15 @@ async fn handle_anthropic_to_upstream(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let candidates = protocol_candidates(active_protocol);
+    // Anthropic candidates would just hit /v1/chat/completions again (the
+    // catch-all `_` arm below), byte-identical to the corresponding Openai
+    // candidate — native Anthropic forwarding lives in `try_native_anthropic`,
+    // not in this loop. Drop them so we don't pay for duplicate requests.
+    let candidates: Vec<(ProviderProtocol, PathVariant)> = protocol_candidates(active_protocol)
+        .into_iter()
+        .filter(|(proto, _)| *proto != ProviderProtocol::Anthropic)
+        .collect();
     let mut first_error: Option<RouterResponse> = None;
-    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         let mut req_body = simplified.clone();
@@ -741,20 +806,26 @@ async fn handle_anthropic_to_upstream(
                 return Ok(r);
             }
             AttemptOutcome::Mismatch { status, body } => {
-                attempts.push(AttemptRecord::new(protocol, variant, status, &body));
-                first_error.get_or_insert(RouterResponse::Buffered {
-                    status,
-                    content_type: CONTENT_TYPE_JSON.to_string(),
-                    body: body.into_bytes(),
-                });
-                if is_terminal_upstream_error(status) {
+                let is_terminal = is_terminal_upstream_error(status);
+                // Terminal errors (5xx, auth, rate-limit) are more diagnostic
+                // than the leading 404 that fallback emits while probing wrong
+                // paths — overwrite so the user sees the real upstream failure.
+                if is_terminal || first_error.is_none() {
+                    first_error = Some(RouterResponse::Buffered {
+                        status,
+                        content_type: CONTENT_TYPE_JSON.to_string(),
+                        body: body.into_bytes(),
+                    });
+                }
+                if is_terminal {
+                    // Pin in-memory so retry storms hit this path directly
+                    // instead of re-probing the wrong chat/completions paths.
+                    commit_protocol_switch(active_protocol, protocol, variant, attempt);
                     break;
                 }
             }
         }
     }
-
-    log_exhausted_fallback("claude", &attempts);
 
     Ok(first_error.unwrap_or(RouterResponse::Buffered {
         status: 503,
@@ -1498,18 +1569,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_try_native_anthropic_when_target_is_anthropic() {
-        assert!(should_try_native_anthropic(ProviderProtocol::Anthropic));
+    fn should_try_native_anthropic_when_target_and_active_are_anthropic() {
+        let active = AtomicU8::new(ProviderProtocol::Anthropic.to_u8());
+        assert!(should_try_native_anthropic(
+            ProviderProtocol::Anthropic,
+            &active
+        ));
     }
 
     #[test]
-    fn should_skip_native_anthropic_when_pin_is_not_anthropic() {
-        for pin in [
+    fn should_skip_native_anthropic_when_target_is_not_anthropic() {
+        let active = AtomicU8::new(ProviderProtocol::Anthropic.to_u8());
+        for target in [
             ProviderProtocol::Openai,
             ProviderProtocol::ResponsesApi,
             ProviderProtocol::Google,
         ] {
-            assert!(!should_try_native_anthropic(pin), "pin={pin:?}");
+            assert!(
+                !should_try_native_anthropic(target, &active),
+                "target={target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_skip_native_anthropic_when_active_pin_moved_off_anthropic() {
+        // Regression: after a prior request learned that the host speaks
+        // (e.g.) Google, re-probing /v1/messages would short-circuit to
+        // EndpointMissing and the unconditional pre-pin used to reset the
+        // learned Google pin back to Openai.
+        for active_pin in [
+            ProviderProtocol::Openai,
+            ProviderProtocol::ResponsesApi,
+            ProviderProtocol::Google,
+        ] {
+            let active = AtomicU8::new(active_pin.to_u8());
+            assert!(
+                !should_try_native_anthropic(ProviderProtocol::Anthropic, &active),
+                "active_pin={active_pin:?}"
+            );
         }
     }
 
@@ -1586,6 +1684,27 @@ mod tests {
     fn probe_paths_returns_none_when_failed() {
         assert_eq!(probe_paths(ProbeOutcome::Failed, None), None);
         assert_eq!(probe_paths(ProbeOutcome::Failed, Some("/anthropic")), None);
+    }
+
+    #[test]
+    fn probe_state_counts_consecutive_upstream_errors() {
+        let probe = ProbeState::new();
+        assert!(!probe.record_upstream_error()); // 1
+        assert!(!probe.record_upstream_error()); // 2
+        // Third tick reaches the limit (PROBE_UPSTREAM_ERROR_LIMIT = 3).
+        assert!(probe.record_upstream_error());
+    }
+
+    #[test]
+    fn probe_state_resets_streak_on_success() {
+        let probe = ProbeState::new();
+        let _ = probe.record_upstream_error();
+        let _ = probe.record_upstream_error();
+        probe.reset_upstream_error_streak();
+        // Counter is back to 0; need three more errors to reach the limit.
+        assert!(!probe.record_upstream_error());
+        assert!(!probe.record_upstream_error());
+        assert!(probe.record_upstream_error());
     }
 
     #[test]

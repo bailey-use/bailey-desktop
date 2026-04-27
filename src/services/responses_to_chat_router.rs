@@ -31,8 +31,7 @@ use crate::services::openai_gemini_bridge::{
     openai_chat_model,
 };
 use crate::services::protocol_fallback::{
-    AttemptOutcome, AttemptRecord, classify_attempt, commit_protocol_switch,
-    log_exhausted_fallback, protocol_candidates,
+    AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, decode_route, is_protocol_mismatch, is_terminal_upstream_error,
@@ -597,9 +596,20 @@ async fn forward_openai_chat_request(
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
 ) -> Result<ForwardedChatResponse> {
-    let candidates = protocol_candidates(active_protocol);
+    // Openai and ResponsesApi both route through `forward_openai_protocol`,
+    // so one is a byte-identical duplicate of the other. Drop the non-active.
+    let active_proto = decode_route(active_protocol.load(Ordering::Relaxed)).0;
+    let candidates: Vec<(ProviderProtocol, PathVariant)> = protocol_candidates(active_protocol)
+        .into_iter()
+        .filter(|(proto, _)| {
+            !matches!(
+                (active_proto, *proto),
+                (ProviderProtocol::Openai, ProviderProtocol::ResponsesApi)
+                    | (ProviderProtocol::ResponsesApi, ProviderProtocol::Openai)
+            )
+        })
+        .collect();
     let mut first_error: Option<(u16, String)> = None;
-    let mut attempts: Vec<AttemptRecord> = Vec::new();
 
     for (attempt, (protocol, variant)) in candidates.into_iter().enumerate() {
         match forward_chat_for_protocol(
@@ -618,16 +628,22 @@ async fn forward_openai_chat_request(
                 return Ok(ForwardedChatResponse::Success(value));
             }
             AttemptOutcome::Mismatch { status, body } => {
-                attempts.push(AttemptRecord::new(protocol, variant, status, &body));
-                first_error.get_or_insert((status, body));
-                if is_terminal_upstream_error(status) {
+                let is_terminal = is_terminal_upstream_error(status);
+                if is_terminal || first_error.is_none() {
+                    first_error = Some((status, body));
+                }
+                if is_terminal {
+                    // The path answered (with an error, but it answered) —
+                    // pin it in memory so retry storms from codex/claude
+                    // don't re-probe the wrong chat/completions paths every
+                    // time. Don't flip request_succeeded: we still don't
+                    // want to *persist* the pin to disk based on a 5xx.
+                    commit_protocol_switch(active_protocol, protocol, variant, attempt);
                     break;
                 }
             }
         }
     }
-
-    log_exhausted_fallback("codex", &attempts);
 
     let (status, body) = first_error.unwrap_or_default();
     Ok(ForwardedChatResponse::HttpError { status, body })
@@ -791,18 +807,34 @@ async fn forward_anthropic_protocol(
 
     let status_code = response.status().as_u16();
     let response_text = response.text().await?;
-    let parsed = if status_code == 200 {
+    if status_code == 200 {
         let anthropic_response: Value = serde_json::from_str(&response_text)?;
-        Some(convert_anthropic_to_openai_chat_response(
+        let openai_response = convert_anthropic_to_openai_chat_response(
             &anthropic_response,
             body.get("model")
                 .and_then(|v| v.as_str())
                 .unwrap_or("gpt-4o"),
-        ))
-    } else {
-        None
+        );
+        return Ok(AttemptOutcome::Success(openai_response));
+    }
+    // Anthropic error bodies wrap the OpenAI-shape `{"error":{...}}` in an
+    // outer `{"type":"error", "error":{...}}` envelope. Codex/openai clients
+    // can't parse that and fall back to generic "high demand" messages —
+    // strip the wrap so the real upstream message reaches the user.
+    let normalized = strip_anthropic_error_wrap(&response_text);
+    Ok(classify_attempt::<Value>(status_code, normalized, None))
+}
+
+fn strip_anthropic_error_wrap(body: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
     };
-    Ok(classify_attempt(status_code, response_text, parsed))
+    if parsed.get("type").and_then(|v| v.as_str()) == Some("error")
+        && let Some(inner) = parsed.get("error")
+    {
+        return json!({ "error": inner }).to_string();
+    }
+    body.to_string()
 }
 
 async fn forward_google_protocol(
@@ -950,6 +982,34 @@ fn apply_selected_model(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn strip_anthropic_error_wrap_unwraps_minimax_500_body() {
+        // Real body observed from minimax /v1/messages on a plan/billing error.
+        let body = r#"{"type":"error","error":{"type":"api_error","message":"your current token plan not support model, MiniMax-M2.7 (2061)"},"request_id":"abc"}"#;
+        let stripped = strip_anthropic_error_wrap(body);
+        let parsed: Value = serde_json::from_str(&stripped).unwrap();
+        // Outer envelope is gone; codex-readable shape: { error: { type, message } }.
+        assert!(parsed.get("type").is_none());
+        assert_eq!(
+            parsed["error"]["message"],
+            "your current token plan not support model, MiniMax-M2.7 (2061)"
+        );
+        assert_eq!(parsed["error"]["type"], "api_error");
+    }
+
+    #[test]
+    fn strip_anthropic_error_wrap_passes_through_openai_shape() {
+        let body = r#"{"error":{"message":"bad key","type":"invalid_request"}}"#;
+        // No outer `"type":"error"` wrap → returned unchanged.
+        assert_eq!(strip_anthropic_error_wrap(body), body);
+    }
+
+    #[test]
+    fn strip_anthropic_error_wrap_passes_through_invalid_json() {
+        let body = "<html>504 Gateway Timeout</html>";
+        assert_eq!(strip_anthropic_error_wrap(body), body);
+    }
 
     // ── HTTP body extraction ────────────────────────────────────────────────────
 

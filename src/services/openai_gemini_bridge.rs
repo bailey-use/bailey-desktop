@@ -598,7 +598,7 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         .and_then(|u| u.get("promptTokenCount"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let completion_tokens = resp
+    let candidates_tokens = resp
         .get("usageMetadata")
         .and_then(|u| u.get("candidatesTokenCount"))
         .and_then(|v| v.as_u64())
@@ -615,6 +615,11 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         .get("usageMetadata")
         .and_then(|u| u.get("thoughtsTokenCount"))
         .and_then(|v| v.as_u64());
+    // OpenAI's contract: `completion_tokens` is the total output and
+    // already includes reasoning. Gemini reports candidates + thoughts
+    // separately, so fold them here — otherwise total_tokens
+    // undercounts by the thinking budget.
+    let completion_tokens = candidates_tokens + thoughts_tokens.unwrap_or(0);
 
     let mut usage = json!({
         "prompt_tokens": prompt_tokens,
@@ -2060,6 +2065,34 @@ mod tests {
             chat["usage"]["completion_tokens_details"]["reasoning_tokens"],
             42
         );
+        // Per OpenAI's reasoning-model contract, completion_tokens already
+        // includes reasoning_tokens. Gemini reports them separately, so the
+        // bridge must fold them in or total_tokens undercounts.
+        assert_eq!(chat["usage"]["prompt_tokens"], 10);
+        assert_eq!(chat["usage"]["completion_tokens"], 5 + 42);
+        assert_eq!(chat["usage"]["total_tokens"], 10 + 5 + 42);
+    }
+
+    #[test]
+    fn gemini_no_thoughts_keeps_completion_tokens_unchanged() {
+        // Regression guard: when thoughtsTokenCount is absent (non-thinking
+        // models, or thinking disabled), completion_tokens must equal
+        // candidatesTokenCount and there must be no reasoning_tokens block.
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [{"text": "hi"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "candidatesTokenCount": 3
+            }
+        });
+        let chat = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-flash");
+        assert_eq!(chat["usage"]["prompt_tokens"], 7);
+        assert_eq!(chat["usage"]["completion_tokens"], 3);
+        assert_eq!(chat["usage"]["total_tokens"], 10);
+        assert!(chat["usage"].get("completion_tokens_details").is_none());
     }
 
     #[test]

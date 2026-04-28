@@ -18,7 +18,6 @@ use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::nickname_registry;
 use crate::services::project_id::Thread;
-use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::share_config::{ShareCleanup, maybe_enable_share};
 use crate::services::system_env;
@@ -355,7 +354,7 @@ impl RunCommand {
             }
         };
 
-        claude_overrides.max_context = resolve_max_context(key_override.as_ref(), max_context);
+        claude_overrides.max_context = resolve_max_context(resolved_model.as_deref(), max_context);
 
         let launch_model = resolve_model_placeholder(resolved_model);
 
@@ -785,13 +784,13 @@ fn inject_codex(rendered: &RenderedContext, mut args: Vec<String>) -> Vec<String
     }
 }
 
-/// The starter endpoint already supports 1M context; default the flag so the
-/// status bar reflects it without the user having to remember `--max-context`.
-fn resolve_max_context(key: Option<&ApiKey>, explicit: Option<String>) -> Option<String> {
-    explicit.or_else(|| {
-        key.is_some_and(|k| is_aivo_starter_base(&k.base_url))
-            .then(|| "1m".to_string())
-    })
+/// The `aivo/starter` model already supports 1M context; default the flag so
+/// the status bar reflects it without the user having to remember
+/// `--max-context`. Matches on the resolved model name — the starter key's
+/// gateway also serves other models that don't have a 1M window.
+fn resolve_max_context(model: Option<&str>, explicit: Option<String>) -> Option<String> {
+    explicit
+        .or_else(|| (model == Some(crate::constants::AIVO_STARTER_MODEL)).then(|| "1m".to_string()))
 }
 
 #[cfg(test)]
@@ -882,51 +881,32 @@ mod tests {
         }
     }
 
-    fn make_key(base_url: &str) -> ApiKey {
-        ApiKey::new_with_protocol(
-            "id".into(),
-            "name".into(),
-            base_url.into(),
-            None,
-            "secret".into(),
-        )
-    }
-
     #[test]
-    fn resolve_max_context_defaults_to_1m_for_starter() {
-        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
+    fn resolve_max_context_defaults_to_1m_for_starter_model() {
         assert_eq!(
-            resolve_max_context(Some(&key), None),
+            resolve_max_context(Some(crate::constants::AIVO_STARTER_MODEL), None),
             Some("1m".to_string())
         );
     }
 
     #[test]
-    fn resolve_max_context_defaults_to_1m_for_starter_real_url() {
-        let key = make_key(crate::constants::AIVO_STARTER_REAL_URL);
+    fn resolve_max_context_user_override_wins_for_starter_model() {
         assert_eq!(
-            resolve_max_context(Some(&key), None),
-            Some("1m".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_max_context_user_override_wins_for_starter() {
-        let key = make_key(crate::constants::AIVO_STARTER_SENTINEL);
-        assert_eq!(
-            resolve_max_context(Some(&key), Some("2m".to_string())),
+            resolve_max_context(
+                Some(crate::constants::AIVO_STARTER_MODEL),
+                Some("2m".to_string())
+            ),
             Some("2m".to_string())
         );
     }
 
     #[test]
-    fn resolve_max_context_no_default_for_non_starter_key() {
-        let key = make_key("https://api.anthropic.com");
-        assert_eq!(resolve_max_context(Some(&key), None), None);
+    fn resolve_max_context_no_default_for_non_starter_model() {
+        assert_eq!(resolve_max_context(Some("claude-sonnet-4-5"), None), None);
     }
 
     #[test]
-    fn resolve_max_context_no_default_when_key_missing() {
+    fn resolve_max_context_no_default_when_model_missing() {
         assert_eq!(resolve_max_context(None, None), None);
     }
 }

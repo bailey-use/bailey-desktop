@@ -16,7 +16,7 @@ mod style;
 mod tui;
 mod version;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, ModelsSubcommand};
 use commands::{
     AliasCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand, KeysCommand, LogsCommand,
     McpServeCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, StartCommand,
@@ -110,9 +110,11 @@ async fn main() {
                 ImageCommand::print_help();
                 ImageCommand::print_active_selection(&session_store).await;
             }
-            Commands::Models(_) => ModelsCommand::print_help(),
+            Commands::Models(models_args) => match &models_args.subcommand {
+                Some(ModelsSubcommand::Alias(_)) => AliasCommand::print_help(),
+                None => ModelsCommand::print_help(),
+            },
             Commands::Serve(_) => ServeCommand::print_help(),
-            Commands::Alias(_) => AliasCommand::print_help(),
             Commands::Info(_) => InfoCommand::print_help(),
             Commands::Logs(_) => LogsCommand::print_help(),
             Commands::Stats(_) => StatsCommand::print_help(),
@@ -156,11 +158,6 @@ async fn main() {
 
     // Route to command handler
     let exit_code = match command {
-        Commands::Alias(alias_args) => {
-            let command = AliasCommand::new(session_store);
-            command.execute(alias_args).await
-        }
-
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
@@ -447,24 +444,29 @@ async fn main() {
         }
 
         Commands::Models(models_args) => {
-            let key_override = key_or_exit(
-                resolve_key_override(
-                    &session_store,
-                    models_args.key.as_deref(),
-                    KeyLookupMode::RequireActiveOrPrompt,
-                    KeyCompatContext::None,
-                )
-                .await,
-            );
-            let command = ModelsCommand::new(session_store, models_cache);
-            command
-                .execute(
-                    key_override,
-                    models_args.refresh,
-                    models_args.search,
-                    models_args.json,
-                )
-                .await
+            if let Some(ModelsSubcommand::Alias(alias_args)) = models_args.subcommand {
+                let command = AliasCommand::new(session_store);
+                command.execute(alias_args).await
+            } else {
+                let key_override = key_or_exit(
+                    resolve_key_override(
+                        &session_store,
+                        models_args.key.as_deref(),
+                        KeyLookupMode::RequireActiveOrPrompt,
+                        KeyCompatContext::None,
+                    )
+                    .await,
+                );
+                let command = ModelsCommand::new(session_store, models_cache);
+                command
+                    .execute(
+                        key_override,
+                        models_args.refresh,
+                        models_args.search,
+                        models_args.json,
+                    )
+                    .await
+            }
         }
 
         Commands::Serve(serve_args) => {
@@ -583,6 +585,16 @@ fn rewrite_cli_args(raw_args: Vec<String>) -> Vec<String> {
         return rewritten;
     }
 
+    if raw_args[1] == "alias" {
+        let mut rewritten = vec![
+            raw_args[0].clone(),
+            "models".to_string(),
+            "alias".to_string(),
+        ];
+        rewritten.extend_from_slice(&raw_args[2..]);
+        return rewritten;
+    }
+
     if raw_args[1] == "-x" || raw_args[1] == "--execute" {
         let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
@@ -614,7 +626,6 @@ fn print_help() {
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("keys", "Manage API keys (use, rm, add, cat, edit)");
     print_cmd("models", "List available models from the active provider");
-    print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("info", "Show system info, keys, tools, and directory state");
     print_cmd("logs", "Show recent local logs from chat, run, and serve");
     print_cmd("stats", "Show usage statistics");
@@ -631,6 +642,7 @@ fn print_help() {
     };
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
+    print_shortcut("alias", "models alias");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
     print_shortcut("claude/codex/gemini/opencode/pi", " run <tool>");
     println!();

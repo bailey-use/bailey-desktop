@@ -32,15 +32,24 @@ impl AliasCommand {
     }
 
     async fn execute_internal(&self, args: AliasArgs) -> Result<ExitCode> {
-        // `aivo alias rm <name>`
-        if args.rm {
+        // `rm <name>` keyword form (matches what the help advertises) and
+        // `--rm <name>` flag form. The keyword form only triggers when the
+        // first positional is *exactly* "rm"; `rm=model` still creates an
+        // alias literally named `rm`.
+        let rm_keyword = args.assignment.as_deref() == Some("rm");
+        if args.rm || rm_keyword {
             if args.json {
                 anyhow::bail!("--json only applies to listing aliases");
             }
-            return self.remove_alias(&args).await;
+            let name = if rm_keyword {
+                args.value.as_deref()
+            } else {
+                args.assignment.as_deref()
+            };
+            return self.remove_alias(name).await;
         }
 
-        // `aivo alias name=model` or `aivo alias name model`
+        // `aivo models alias name=model` or `aivo models alias name model`
         if let Some(ref assignment) = args.assignment {
             if args.json {
                 anyhow::bail!("--json only applies to listing aliases");
@@ -48,7 +57,7 @@ impl AliasCommand {
             return self.set_alias(assignment, args.value.as_deref()).await;
         }
 
-        // `aivo alias` — list all
+        // `aivo models alias` — list all
         self.list_aliases(args.json).await
     }
 
@@ -71,7 +80,7 @@ impl AliasCommand {
             println!();
             println!(
                 "{}",
-                style::dim("Create one with: aivo alias fast=claude-haiku-4-5")
+                style::dim("Create one with: aivo models alias fast=claude-haiku-4-5")
             );
             return Ok(ExitCode::Success);
         }
@@ -99,7 +108,7 @@ impl AliasCommand {
             (assignment.to_string(), val.to_string())
         } else {
             eprintln!(
-                "{} Expected format: aivo alias name=model",
+                "{} Expected format: aivo models alias name=model",
                 style::red("Error:")
             );
             return Ok(ExitCode::UserError);
@@ -156,11 +165,14 @@ impl AliasCommand {
         Ok(ExitCode::Success)
     }
 
-    async fn remove_alias(&self, args: &AliasArgs) -> Result<ExitCode> {
-        let name = match &args.assignment {
-            Some(n) => n.as_str(),
+    async fn remove_alias(&self, name: Option<&str>) -> Result<ExitCode> {
+        let name = match name {
+            Some(n) => n,
             None => {
-                eprintln!("{} Expected: aivo alias rm <name>", style::red("Error:"));
+                eprintln!(
+                    "{} Expected: aivo models alias rm <name>",
+                    style::red("Error:")
+                );
                 return Ok(ExitCode::UserError);
             }
         };
@@ -183,7 +195,7 @@ impl AliasCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo alias [name=model]", style::bold("Usage:"));
+        println!("{} aivo models alias [name=model]", style::bold("Usage:"));
         println!();
         println!("{}", style::dim("Create, list, or remove model aliases."));
         println!();
@@ -211,11 +223,17 @@ impl AliasCommand {
         print_opt("--json", "Output alias list as JSON (listing only)");
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo alias fast=claude-haiku-4-5"));
-        println!("  {}", style::dim("aivo alias best claude-sonnet-4-6"));
-        println!("  {}", style::dim("aivo alias rm fast"));
-        println!("  {}", style::dim("aivo alias"));
-        println!("  {}", style::dim("aivo alias --json"));
+        println!(
+            "  {}",
+            style::dim("aivo models alias fast=claude-haiku-4-5")
+        );
+        println!(
+            "  {}",
+            style::dim("aivo models alias best claude-sonnet-4-6")
+        );
+        println!("  {}", style::dim("aivo models alias rm fast"));
+        println!("  {}", style::dim("aivo models alias"));
+        println!("  {}", style::dim("aivo models alias --json"));
     }
 }
 

@@ -386,7 +386,7 @@ impl ModelsCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo models", style::bold("Usage:"));
+        println!("{} aivo models [subcommand]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -398,6 +398,16 @@ impl ModelsCommand {
                 "Calls /v1/models (OpenAI/Anthropic-compatible), /v1beta/models (Google), or /ai/models/search (Cloudflare)."
             )
         );
+        println!();
+        println!("{}", style::bold("Subcommands:"));
+        let print_sub = |name: &str, desc: &str| {
+            println!(
+                "  {}{}",
+                style::cyan(format!("{:<14}", name)),
+                style::dim(desc)
+            );
+        };
+        print_sub("alias", "Create, list, or remove model aliases");
         println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
@@ -421,6 +431,10 @@ impl ModelsCommand {
         println!("  {}", style::dim("aivo models --key openrouter"));
         println!("  {}", style::dim("aivo models --refresh"));
         println!("  {}", style::dim("aivo models --json | jq '.models[].id'"));
+        println!(
+            "  {}",
+            style::dim("aivo models alias fast=claude-haiku-4-5")
+        );
     }
 }
 

@@ -78,10 +78,10 @@ aivo claude --model llama3.2
 | [run](#run) | Launch an AI tool (claude, codex, gemini, opencode, pi) |
 | [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
 | [models](#models) | List available models from the active provider |
+| [models alias](#models-alias) | Create short names for models |
 | [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
 | [image](#image) | Generate images from a text prompt |
 | [serve](#serve) | Local OpenAI-compatible API server |
-| [alias](#alias) | Create short names for models |
 | [info](#info) | Show system info, keys, tools, and directory state |
 | [logs](#logs) | Query local SQLite logs for chat, run, and serve |
 | [stats](#stats) | Show usage statistics |
@@ -517,19 +517,19 @@ aivo serve --auth-token                  # auto-generated token
 aivo serve --auth-token my-secret        # specific token
 ```
 
-## alias
+## models alias
 
 Create short names for models. Aliases work anywhere a model name is accepted.
 
 ```bash
-aivo alias                               # list all aliases
+aivo models alias                        # list all aliases
 ```
 
 #### Create an alias
 
 ```bash
-aivo alias fast=claude-haiku-4-5
-aivo alias best claude-sonnet-4-6        # alternative syntax
+aivo models alias fast=claude-haiku-4-5
+aivo models alias best claude-sonnet-4-6 # alternative syntax
 ```
 
 Then use it in place of the full model name:
@@ -542,7 +542,7 @@ aivo chat -m best
 #### Remove an alias
 
 ```bash
-aivo alias rm fast
+aivo models alias rm fast
 ```
 
 #### `--json`
@@ -550,7 +550,7 @@ aivo alias rm fast
 Output the alias list as JSON:
 
 ```bash
-aivo alias --json
+aivo models alias --json
 ```
 
 ## info

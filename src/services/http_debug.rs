@@ -245,7 +245,9 @@ pub fn default_log_path() -> PathBuf {
     let home = crate::services::system_env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let pid = std::process::id();
-    home.join(".config/aivo/logs")
+    home.join(".config")
+        .join("aivo")
+        .join("logs")
         .join(format!("debug-{now}-{pid}.jsonl"))
 }
 
@@ -767,10 +769,18 @@ mod tests {
     #[test]
     fn default_log_path_has_expected_shape() {
         let p = default_log_path();
-        let s = p.to_string_lossy();
-        assert!(s.contains("/.config/aivo/logs/"), "unexpected path: {s}");
-        assert!(s.contains("debug-"), "missing prefix: {s}");
-        assert!(s.ends_with(".jsonl"), "wrong extension: {s}");
+        // `Path::ends_with` compares whole path components, so it tolerates
+        // platform-native separators on Windows (`\`) and Unix (`/`).
+        let parent = p.parent().expect("log path must have a parent");
+        assert!(
+            parent.ends_with(std::path::Path::new(".config/aivo/logs")),
+            "unexpected parent: {}",
+            parent.display()
+        );
+        let name = p.file_name().expect("log path must have a file name");
+        let name = name.to_string_lossy();
+        assert!(name.starts_with("debug-"), "missing prefix: {name}");
+        assert!(name.ends_with(".jsonl"), "wrong extension: {name}");
     }
 
     #[test]

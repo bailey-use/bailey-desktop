@@ -326,6 +326,7 @@ async fn handle_api_request(
                 client,
                 active_protocol,
                 request_succeeded,
+                learned_requires_reasoning,
                 socket,
             )
             .await
@@ -514,9 +515,14 @@ async fn handle_responses_api_via_chat(
         .to_string();
 
     // Create a config copy with the model pinned to avoid protocol-based transformation
-    // before we know which protocol the fallback loop will select.
+    // before we know which protocol the fallback loop will select. Flip on the
+    // learned strict-mode quirk here so requests after a successful in-cascade
+    // recovery skip the wasted first attempt — without this, every request in
+    // the same launch pays one 400 + retry round-trip until process exit.
     let mut chat_config = (**config).clone();
     chat_config.actual_model = Some(original_model.clone());
+    chat_config.requires_reasoning_content =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let chat_body = convert_responses_to_chat_request(body, &chat_config);
     let chat_response = match forward_openai_chat_request(
         &chat_body,
@@ -549,10 +555,14 @@ async fn handle_responses_api_via_chat(
 // =============================================================================
 
 /// Applies shared request transforms (tool filtering, token caps, model selection).
+/// `requires_reasoning_content` is passed in (rather than read from `config`) so
+/// callers can OR in the runtime-learned flag — letting requests after a
+/// successful in-cascade recovery skip the wasted first attempt.
 fn prepare_chat_completions_body(
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     protocol: ProviderProtocol,
+    requires_reasoning_content: bool,
 ) -> Value {
     let mut body = body.clone();
     filter_tools(&mut body);
@@ -561,7 +571,7 @@ fn prepare_chat_completions_body(
         config.max_tokens_cap,
         &["max_tokens", "max_output_tokens"],
     );
-    if config.requires_reasoning_content {
+    if requires_reasoning_content {
         ensure_assistant_reasoning_content_in_chat_request(&mut body);
     }
     apply_selected_model(&mut body, config, protocol);
@@ -576,6 +586,7 @@ async fn stream_chat_completions(
     client: &reqwest::Client,
     active_protocol: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
 ) -> Result<()> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
@@ -584,7 +595,9 @@ async fn stream_chat_completions(
         anyhow::bail!("streaming passthrough only for OpenAI protocol");
     }
 
-    let body = prepare_chat_completions_body(body, config, protocol);
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
+    let body = prepare_chat_completions_body(body, config, protocol, effective_requires_reasoning);
 
     let target_url = build_target_url(
         &config.target_base_url,
@@ -639,10 +652,13 @@ async fn handle_chat_completions_with_filter(
     saw_authoritative_response: &Arc<AtomicBool>,
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<String> {
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let body = prepare_chat_completions_body(
         body,
         config,
         ProviderProtocol::from_u8(active_protocol.load(Ordering::Relaxed)),
+        effective_requires_reasoning,
     );
     let requested_stream = body
         .get("stream")
@@ -739,6 +755,11 @@ async fn forward_openai_chat_request(
     let mut body_for_attempts = body.clone();
     let mut retried_with_strict = false;
     let mut idx = 0;
+    // Snapshot once so the retry decision matches what's actually on the wire:
+    // when learned was already true at the start of this request, the body is
+    // already strict and a retry would be a wasted round-trip.
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
 
     while idx < candidates.len() {
         let (protocol, variant) = candidates[idx];
@@ -777,7 +798,7 @@ async fn forward_openai_chat_request(
                     saw_authoritative_response.store(true, Ordering::Relaxed);
                     if classification.quirk_hint == Some("requires_reasoning_content") {
                         learned_requires_reasoning.store(true, Ordering::Relaxed);
-                        if !retried_with_strict && !config.requires_reasoning_content {
+                        if !retried_with_strict && !effective_requires_reasoning {
                             retried_with_strict = true;
                             body_for_attempts = body.clone();
                             ensure_assistant_reasoning_content_in_chat_request(
@@ -1254,9 +1275,49 @@ mod tests {
             "messages": [{"role": "assistant", "content": "OK, continuing."}]
         });
 
-        let prepared = prepare_chat_completions_body(&body, &config, ProviderProtocol::Openai);
+        let prepared =
+            prepare_chat_completions_body(&body, &config, ProviderProtocol::Openai, true);
         let messages = prepared["messages"].as_array().unwrap();
         assert_eq!(messages[0]["reasoning_content"], "OK, continuing.");
+    }
+
+    #[test]
+    fn prepare_chat_completions_body_obeys_bool_param_not_config_field() {
+        // The bool param is what callers OR with the runtime-learned flag — if
+        // we still read `config.requires_reasoning_content` here, every request
+        // in the same launch would pay one wasted 400 + retry round-trip until
+        // process exit, and only the persisted-to-keystore quirk would help on
+        // the *next* launch.
+        let config = ResponsesToChatRouterConfig {
+            target_base_url: "https://api.example.com".to_string(),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false, // config says no
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+        };
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "assistant", "content": "OK, continuing."}]
+        });
+
+        // Caller passes `true` (e.g. learned arc said so) — body must be strict.
+        let prepared =
+            prepare_chat_completions_body(&body, &config, ProviderProtocol::Openai, true);
+        let messages = prepared["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["reasoning_content"], "OK, continuing.");
+
+        // Caller passes `false` — body must NOT carry reasoning_content even
+        // if some future config field is added that we'd otherwise read.
+        let prepared =
+            prepare_chat_completions_body(&body, &config, ProviderProtocol::Openai, false);
+        let messages = prepared["messages"].as_array().unwrap();
+        assert!(messages[0].get("reasoning_content").is_none());
     }
 
     // ── HTTP body extraction ────────────────────────────────────────────────────

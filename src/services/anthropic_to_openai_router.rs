@@ -688,9 +688,15 @@ async fn handle_anthropic_to_upstream(
         }
     }
 
+    // OR in the runtime-learned flag so requests after a successful in-cascade
+    // recovery skip the wasted first attempt: without this, every request in
+    // the same launch pays one 400 + retry round-trip until the process exits
+    // and `persist_runtime_discoveries` writes the quirk back to the key.
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let mut simplified = build_simplified_openai_body(
         &body,
-        config.requires_reasoning_content,
+        effective_requires_reasoning,
         model_is_claude,
         config.strip_cache_control,
         config.max_tokens_cap,
@@ -934,7 +940,7 @@ async fn handle_anthropic_to_upstream(
                         // without it, rebuild `simplified` with strict mode
                         // and retry the same (protocol, variant) so the
                         // *current* request succeeds without a relaunch.
-                        if !retried_with_strict && !config.requires_reasoning_content {
+                        if !retried_with_strict && !effective_requires_reasoning {
                             retried_with_strict = true;
                             if let Ok(strict) = build_simplified_openai_body(
                                 &body,

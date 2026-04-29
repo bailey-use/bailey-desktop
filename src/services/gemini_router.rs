@@ -148,10 +148,14 @@ async fn handle_request(
             let model = config.forced_model.clone().unwrap_or(extracted_model);
             let body: Value = serde_json::from_str(http_utils::extract_request_body(request)?)?;
             let tool_schemas = extract_tool_schemas(&body);
+            // OR in the runtime-learned flag so requests after a successful
+            // in-cascade recovery skip the wasted first attempt.
+            let effective_requires_reasoning = config.requires_reasoning_content
+                || learned_requires_reasoning.load(Ordering::Relaxed);
             let openai_req = convert_gemini_to_openai(
                 &body,
                 &model,
-                config.requires_reasoning_content,
+                effective_requires_reasoning,
                 config.max_tokens_cap,
             );
             // openai_req already has the model from the Gemini request body — don't pre-select here;
@@ -221,6 +225,12 @@ async fn forward_to_provider(
     let mut first_error: Option<(u16, String)> = None;
     let original_openai_req = openai_req;
     let mut body_for_attempts = original_openai_req.clone();
+    // Snapshot once at the top: the caller in `handle_request` already used the
+    // same OR'd value when building `original_openai_req`, so this matches the
+    // strictness that's actually on the wire and prevents a wasted retry when
+    // the upstream rejects an already-strict body.
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let mut retried_with_strict = false;
     let mut idx = 0;
 
@@ -404,7 +414,7 @@ async fn forward_to_provider(
                     saw_authoritative_response.store(true, Ordering::Relaxed);
                     if classification.quirk_hint == Some("requires_reasoning_content") {
                         learned_requires_reasoning.store(true, Ordering::Relaxed);
-                        if !retried_with_strict && !config.requires_reasoning_content {
+                        if !retried_with_strict && !effective_requires_reasoning {
                             retried_with_strict = true;
                             body_for_attempts = original_openai_req.clone();
                             ensure_assistant_reasoning_content_in_chat_request(

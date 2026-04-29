@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.19.6
+
+### Fixes
+
+- Fix handling `reasoning_content` in deepseek learn the config
+- Reorder `--help` command listing (keys, models, chat, serve, image, stats)
+
+
 ## v0.19.5
 
 ### Improvements

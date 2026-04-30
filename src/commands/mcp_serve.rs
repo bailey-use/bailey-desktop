@@ -378,7 +378,27 @@ async fn handle_get_session(
             .ok_or_else(|| {
                 format!("No active tool found with nickname '{nick}'. Is it still running?")
             })?;
-        (entry.cli.clone(), None, Vec::new(), Some(entry.started_at))
+
+        // Resolve every active nickname to a distinct session via the same
+        // greedy walk `list_sessions` uses, then pin this lookup to *that*
+        // session id. Without this, two same-CLI peers (e.g. two claude
+        // windows) collapse onto whichever JSONL has the freshest mtime —
+        // usually the caller's own session — because the only filter is
+        // `updated_at >= peer.started_at`, which the caller trivially
+        // satisfies.
+        let registry_entries = nickname_registry::list_active(root).await;
+        let nickname_by_session_id =
+            resolve_nickname_session_ids(project_root, &registry_entries).await;
+        let pinned_session_id = nickname_by_session_id
+            .into_iter()
+            .find_map(|(sid, n)| (n == nick).then_some(sid));
+        let Some(sid) = pinned_session_id else {
+            return Err(format!(
+                "No {} session found for nickname '{nick}' in this project. The tool may not have written any turns yet.",
+                entry.cli
+            ));
+        };
+        (entry.cli.clone(), Some(sid), Vec::new(), None)
     } else {
         let cli = args.get("cli").and_then(|v| v.as_str()).ok_or_else(|| {
             "Missing required argument: provide either 'nickname' or 'cli'".to_string()

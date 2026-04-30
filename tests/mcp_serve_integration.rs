@@ -696,6 +696,109 @@ fn nickname_based_peer_lookup() {
     let _ = child.kill();
 }
 
+/// Same-CLI peers via `--as` must each resolve to their own session, even
+/// when the *other* peer's JSONL is fresher by mtime. Reproduces the bug
+/// where `get_session(nickname=peer)` would short-circuit to the newest
+/// claude file (the caller's) regardless of which nickname was asked for,
+/// because resolution only checked `updated_at >= peer.started_at`.
+#[test]
+fn nickname_get_session_distinguishes_same_cli_peers_by_started_at() {
+    let exe = aivo_exe();
+    if !exe.exists() {
+        eprintln!("skipping: aivo binary not found at {}", exe.display());
+        return;
+    }
+
+    let home_dir = tempfile::TempDir::new().unwrap();
+    let home = home_dir.path();
+    let project_dir = tempfile::TempDir::new().unwrap();
+    let project_root = std::fs::canonicalize(project_dir.path()).unwrap();
+    let cwd_str = project_root.to_string_lossy().to_string();
+    let pid = std::process::id();
+
+    let peer_user_ts = ts_minutes_ago(40);
+    let peer_assistant_ts = ts_minutes_ago(39);
+    let caller_user_ts = ts_minutes_ago(10);
+    let caller_assistant_ts = ts_minutes_ago(9);
+    let peer_started_at = ts_minutes_ago(41);
+    let caller_started_at = ts_minutes_ago(11);
+
+    // Peer session first → older mtime.
+    seed_claude(
+        home,
+        &cwd_str,
+        "sid-peer-BBBB",
+        &[
+            format!(
+                r#"{{"type":"user","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"{peer_user_ts}","message":{{"content":"Peer is refactoring the parser cleanup module."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-peer-BBBB","isSidechain":false,"timestamp":"{peer_assistant_ts}","message":{{"content":[{{"type":"text","text":"Refactored the parser function signatures for clarity."}}]}}}}"#
+            ),
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Caller session second → newer mtime; without the fix this is what
+    // `get_session(nickname=peer)` currently returns.
+    seed_claude(
+        home,
+        &cwd_str,
+        "sid-caller-AAAA",
+        &[
+            format!(
+                r#"{{"type":"user","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"{caller_user_ts}","message":{{"content":"Caller is asking the peer about parser status."}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"sid-caller-AAAA","isSidechain":false,"timestamp":"{caller_assistant_ts}","message":{{"content":[{{"type":"text","text":"Reaching out to the peer claude window now."}}]}}}}"#
+            ),
+        ],
+    );
+
+    write_registry_entry(home, &cwd_str, "peer", "claude", pid, &peer_started_at);
+    write_registry_entry(home, &cwd_str, "caller", "claude", pid, &caller_started_at);
+
+    let (mut child, mut send, mut recv) = spawn_server(home, &project_root);
+
+    send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
+    let _ = recv().expect("initialize");
+
+    // Asking for the *peer* must return the peer's transcript, not the
+    // caller's newer one.
+    send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_session","arguments":{"nickname":"peer"}}}"#,
+    );
+    let resp = recv().expect("get_session nickname=peer");
+    assert!(
+        resp["result"]["isError"].is_null() || resp["result"]["isError"] == false,
+        "get_session(peer) should not error: {resp:?}"
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        parsed["session_id"], "sid-peer-BBBB",
+        "nickname='peer' must resolve to peer's session, not caller's newer mtime session"
+    );
+    let turns_str = parsed["turns"].to_string();
+    assert!(
+        turns_str.contains("parser"),
+        "peer transcript should contain peer's content (parser), got: {turns_str}"
+    );
+
+    // Symmetric check: caller resolves to its own session.
+    send(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_session","arguments":{"nickname":"caller"}}}"#,
+    );
+    let resp = recv().expect("get_session nickname=caller");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        parsed["session_id"], "sid-caller-AAAA",
+        "nickname='caller' must resolve to caller's own session"
+    );
+
+    let _ = child.kill();
+}
+
 /// Quieten `unused` lint on the helper when it's not wired into a particular test.
 #[allow(dead_code)]
 fn _compile_check(_: &Path) {

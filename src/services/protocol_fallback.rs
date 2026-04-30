@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::provider_protocol::{
-    PathVariant, ProviderProtocol, decode_route, encode_route, fallback_path_variants,
-    fallback_protocols,
+    AttemptClassification, PathVariant, ProviderProtocol, decode_route, encode_route,
+    fallback_path_variants, fallback_protocols,
 };
 
 /// Outcome of a single protocol attempt in the fallback loop.
@@ -91,6 +91,43 @@ pub fn record_request_outcome(
     } else {
         false
     }
+}
+
+/// Decide whether a fallback cascade should stop after a single mismatch
+/// instead of continuing to the next `(protocol, path_variant)` candidate.
+///
+/// Centralises three break conditions so every router applies them
+/// identically:
+///
+/// 1. **Semantic rejection** — a 4xx with a structured LLM-API error
+///    envelope (`error.type` / `error.code` / `error.status`). The upstream
+///    parsed our request and answered authoritatively; another candidate
+///    cannot do better.
+/// 2. **Terminal error past attempt 0** — auth/rate-limit/5xx from a
+///    fallback candidate. Attempt 0 is exempted because a 401 there can
+///    also mean "this host doesn't recognize my auth-header shape" (e.g.
+///    DeepSeek seeing Google's `x-goog-api-key`); we probe one fallback
+///    before bailing on that family of errors.
+/// 3. **Any error on a proven route's attempt 0** — once the active route
+///    has answered authoritatively at least once (`route_proven`), attempt
+///    0 is the *proven* path, not a guess. Errors here are the request's
+///    fault, not the route's; fanning out across 4 unrelated protocol
+///    shapes just amplifies the same upstream failure into N gateway hits.
+pub fn should_bail_on_mismatch(
+    attempt: usize,
+    classification: &AttemptClassification,
+    route_proven: bool,
+) -> bool {
+    if classification.is_semantic_rejection {
+        return true;
+    }
+    if classification.is_terminal && attempt > 0 {
+        return true;
+    }
+    if attempt == 0 && route_proven {
+        return true;
+    }
+    false
 }
 
 /// Classify an HTTP response into an attempt outcome.
@@ -289,6 +326,67 @@ mod tests {
         );
         // Counter zeroed so the next failure starts a fresh streak.
         assert_eq!(failures.load(Ordering::Relaxed), 0);
+    }
+
+    fn cls(is_terminal: bool, is_semantic_rejection: bool) -> AttemptClassification {
+        AttemptClassification {
+            is_terminal,
+            is_semantic_rejection,
+            quirk_hint: None,
+        }
+    }
+
+    #[test]
+    fn bail_on_semantic_rejection_at_any_attempt() {
+        let c = cls(false, true);
+        for attempt in [0usize, 1, 5] {
+            for proven in [false, true] {
+                assert!(
+                    should_bail_on_mismatch(attempt, &c, proven),
+                    "expected bail for attempt={attempt}, proven={proven}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bail_on_terminal_only_after_attempt_zero() {
+        let c = cls(true, false);
+        // Attempt 0: a 401/403/429/5xx could still be the upstream rejecting
+        // our auth-header *shape* (e.g. DeepSeek seeing `x-goog-api-key`).
+        // Probe one fallback before bailing.
+        assert!(!should_bail_on_mismatch(0, &c, false));
+        assert!(should_bail_on_mismatch(1, &c, false));
+        assert!(should_bail_on_mismatch(2, &c, false));
+    }
+
+    #[test]
+    fn bail_on_attempt_zero_when_route_is_proven() {
+        // Pin-trust: once the active route has answered authoritatively at
+        // least once (2xx or semantic rejection), attempt 0 is the proven
+        // path, not a guess. An error here is the request's fault — surface
+        // it instead of fanning out across 4 unrelated protocol shapes.
+        let c = cls(false, false);
+        assert!(should_bail_on_mismatch(0, &c, true));
+    }
+
+    #[test]
+    fn no_bail_on_attempt_zero_when_route_is_unproven() {
+        // The "first request after launch" scenario: route is just a guess.
+        // A masked gateway error like {"error":"Upstream request failed"}
+        // (status 400) is neither terminal nor a semantic rejection, so
+        // the cascade legitimately probes the next candidate.
+        let c = cls(false, false);
+        assert!(!should_bail_on_mismatch(0, &c, false));
+    }
+
+    #[test]
+    fn no_bail_on_unproven_attempt_one_with_unstructured_error() {
+        // Even past attempt 0, an unstructured error on an unproven route
+        // shouldn't bail — we still haven't seen *any* candidate respond
+        // authoritatively, so the cascade keeps walking.
+        let c = cls(false, false);
+        assert!(!should_bail_on_mismatch(1, &c, false));
     }
 
     #[test]

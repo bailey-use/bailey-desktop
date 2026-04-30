@@ -23,6 +23,7 @@ use crate::services::openai_gemini_bridge::{
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
+    should_bail_on_mismatch,
 };
 use crate::services::provider_protocol::{ProviderProtocol, classify_failed_attempt};
 
@@ -440,6 +441,18 @@ async fn forward_to_provider(
                     // Pin in-memory: the path answered authoritatively, so
                     // retry storms hit it directly instead of re-probing.
                     commit_protocol_switch(active_protocol, protocol, variant, attempt);
+                    break;
+                }
+                // Pin-trust: once the active route has ever answered
+                // authoritatively, an attempt-0 mismatch is the upstream's
+                // real answer — not a wrong-protocol guess. Surface it
+                // rather than fan out across 4 unrelated protocol shapes
+                // and pay 4 wasted gateway hits per failure.
+                if should_bail_on_mismatch(
+                    attempt,
+                    &classification,
+                    saw_authoritative_response.load(Ordering::Relaxed),
+                ) {
                     break;
                 }
             }

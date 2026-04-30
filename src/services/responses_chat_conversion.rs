@@ -157,13 +157,33 @@ pub fn convert_responses_to_chat_request(
                         .get("arguments")
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    let mut msg = json!({
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}]
-                    });
-                    attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
-                    messages.push(msg);
+                    let tool_call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
+                    // Coalesce parallel calls: when the previous item was also a
+                    // function_call, append to that assistant message's
+                    // tool_calls array instead of starting a new one. Chat
+                    // Completions requires every assistant tool_calls message to
+                    // be immediately followed by tool messages — splitting
+                    // parallel calls across two assistant messages produces
+                    // "insufficient tool messages following tool_calls message"
+                    // from strict OpenAI validators.
+                    if let Some(last) = messages.last_mut()
+                        && last.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                        && last.get("content").is_some_and(|c| c.is_null())
+                        && let Some(arr) = last.get_mut("tool_calls").and_then(|v| v.as_array_mut())
+                    {
+                        arr.push(tool_call);
+                        if last.get("reasoning_content").is_none() {
+                            attach_reasoning_content(last, item, config.requires_reasoning_content);
+                        }
+                    } else {
+                        let mut msg = json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [tool_call]
+                        });
+                        attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
+                        messages.push(msg);
+                    }
                 }
                 Some("function_call_output") => {
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -1108,6 +1128,59 @@ mod tests {
         assert_eq!(msgs[2]["role"], "tool");
         assert_eq!(msgs[2]["tool_call_id"], "call_abc");
         assert_eq!(msgs[2]["content"], "file1.txt\nfile2.txt");
+    }
+
+    #[test]
+    fn test_convert_request_parallel_function_calls_coalesce_into_one_assistant_message() {
+        // Codex emits parallel tool calls back as multiple consecutive
+        // `function_call` items followed by their `function_call_output`s.
+        // Chat Completions requires a single assistant message carrying all
+        // parallel tool_calls, immediately followed by one tool message per
+        // tool_call_id — otherwise OpenAI strict validators reject with
+        // "An assistant message with 'tool_calls' must be followed by tool
+        // messages responding to each 'tool_call_id'."
+        let body = json!({
+            "model": "gpt-4",
+            "input": [
+                {"type": "message", "role": "user", "content": "do two things"},
+                {"type": "function_call", "call_id": "call_a", "name": "shell", "arguments": "{\"cmd\":\"ls\"}"},
+                {"type": "function_call", "call_id": "call_b", "name": "shell", "arguments": "{\"cmd\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call_a", "output": "files"},
+                {"type": "function_call_output", "call_id": "call_b", "output": "/tmp"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(
+            &body,
+            &ResponsesToChatRouterConfig {
+                target_base_url: "https://example.com/v1".to_string(),
+                api_key: String::new(),
+                target_protocol: ProviderProtocol::Openai,
+                target_path_variant: None,
+                copilot_token_manager: None,
+                model_prefix: None,
+                requires_reasoning_content: false,
+                actual_model: None,
+                max_tokens_cap: None,
+                responses_api_supported: None,
+                is_starter: false,
+            },
+        );
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "user + 1 assistant + 2 tool messages");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[1]["role"], "assistant");
+        let tool_calls = msgs[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "parallel calls share one assistant msg"
+        );
+        assert_eq!(tool_calls[0]["id"], "call_a");
+        assert_eq!(tool_calls[1]["id"], "call_b");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_a");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_b");
     }
 
     #[test]

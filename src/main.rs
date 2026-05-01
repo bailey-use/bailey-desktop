@@ -389,22 +389,47 @@ async fn main() {
                     .ok()
                     .flatten()
                     .filter(|sel| key_override.as_ref().is_some_and(|k| k.id == sel.key_id));
+                // First-run-only fallback: when the user has just installed
+                // aivo and hasn't added any of their own keys yet (only the
+                // auto-created `aivo-starter` key exists, and it's active),
+                // skip the model picker and use the seeded chat model
+                // (`aivo/starter` from `ensure_starter_key`). Once the user
+                // adds another key, the fallback no longer applies and the
+                // picker resumes its normal behavior.
+                let persisted_model_for_key = match last_sel_for_key
+                    .as_ref()
+                    .and_then(|sel| sel.model.clone())
+                {
+                    Some(m) => Some(m),
+                    None => {
+                        if let Some(k) = key_override.as_ref()
+                            && crate::services::provider_profile::is_aivo_starter_base(&k.base_url)
+                            && session_store
+                                .get_keys()
+                                .await
+                                .map(|keys| keys.len() == 1)
+                                .unwrap_or(false)
+                        {
+                            session_store.get_chat_model(&k.id).await.ok().flatten()
+                        } else {
+                            None
+                        }
+                    }
+                };
                 let model = if model.is_some() {
                     model
                 } else if dry_run {
-                    // --dry-run never opens a picker. Reuse last selection for
+                    // --dry-run never opens a picker. Reuse persisted model for
                     // this key if any; otherwise let the tool's default surface
                     // in the dry-run output.
-                    last_sel_for_key.and_then(|sel| sel.model)
+                    persisted_model_for_key
                 } else if key_explicit {
                     // -k used without -m → force model picker
                     Some(String::new())
                 } else {
                     // Same key as last time → reuse saved model (could be
                     // __default__); otherwise empty string triggers the picker.
-                    last_sel_for_key
-                        .and_then(|sel| sel.model)
-                        .or(Some(String::new()))
+                    persisted_model_for_key.or(Some(String::new()))
                 };
 
                 let env = if !env_strings.is_empty() {

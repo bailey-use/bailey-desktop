@@ -238,9 +238,15 @@ impl AILauncher {
         let cwd = crate::services::system_env::current_dir_string();
         let log_args = runtime_args.args.clone();
 
-        // Check if the tool binary is available on PATH before attempting to spawn
+        // Check if the tool binary is available on PATH before attempting to spawn.
+        // When found, pin `tool_config.command` to the full resolved path so the
+        // spawn step picks up the correct extension on Windows — CreateProcessW
+        // does not honor PATHEXT for non-.exe files, so a bare `claude` would
+        // fail to spawn even when `claude.cmd` is on PATH.
         let path_dirs = collect_path_dirs();
-        if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
+        if let Some(found) = find_in_dirs(&resolved.tool_config.command, &path_dirs) {
+            resolved.tool_config.command = found.to_string_lossy().into_owned();
+        } else {
             let tool = options.tool;
 
             let not_installed = || -> Result<()> {
@@ -329,21 +335,29 @@ impl AILauncher {
                 Some(fresh) => collect_path_dirs_from(Some(fresh)),
                 None => collect_path_dirs(),
             };
-            if find_in_dirs(&resolved.tool_config.command, &path_dirs).is_none() {
-                // PATH still doesn't see the binary (e.g. the installer wrote
-                // to `~/.local/bin` and added an `export PATH=...` line to a
-                // shell profile that this non-login shell hasn't sourced).
-                // Try the installer's well-known drop locations and, if found,
-                // exec the binary by absolute path so the launch can proceed.
-                let fallback_dirs = tool.well_known_install_dirs();
-                if let Some(found) = find_in_dirs(&resolved.tool_config.command, &fallback_dirs) {
+            // Resolve the binary to a full path with extension. Required on
+            // Windows so .cmd/.bat npm shims can be spawned via CreateProcessW.
+            let resolved_path =
+                find_in_dirs(&resolved.tool_config.command, &path_dirs).or_else(|| {
+                    // PATH still doesn't see the binary (e.g. the installer
+                    // wrote to `~/.local/bin` and added an `export PATH=...`
+                    // line to a shell profile that this non-login shell hasn't
+                    // sourced). Try the installer's well-known drop locations.
+                    find_in_dirs(
+                        &resolved.tool_config.command,
+                        &tool.well_known_install_dirs(),
+                    )
+                });
+            match resolved_path {
+                Some(found) => {
                     eprintln!(
                         "  {} Found at {}",
                         crate::style::arrow_symbol(),
                         crate::style::dim(found.display().to_string())
                     );
                     resolved.tool_config.command = found.to_string_lossy().into_owned();
-                } else {
+                }
+                None => {
                     eprintln!(
                         "  {} '{}' was installed but not found on PATH. You may need to restart your shell.",
                         crate::style::yellow("!"),

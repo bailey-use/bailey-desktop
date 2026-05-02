@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.19.15
+
+### Features
+
+- New media-generation subcommands `aivo video`, `aivo audio`, and `aivo speak` join the existing `aivo image`, sharing a `services::media_io` module for output path parsing, overwrite policy, atomic writes, and error extraction. Hidden from `--help` for now while the surface stabilizes.
+
+### Internal
+
+- CI: scope concurrency cancellation to `ci.yml` and run the test workflow on `main` pushes / PRs so the matrix validates before tagging.
+
+
 ## v0.19.14
 
 ### Fixes

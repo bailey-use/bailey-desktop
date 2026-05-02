@@ -1,0 +1,11 @@
+# Statically link the MSVC C runtime for Windows targets so the released
+# binaries don't depend on VCRUNTIME140.dll being installed on the user's
+# machine. On Windows ARM64 in particular, vcruntime140.dll is not part of
+# the base OS and ships only with the Visual C++ Redistributable — without
+# this flag, `aivo.exe` silently fails to load with STATUS_DLL_NOT_FOUND
+# (0xC0000135) on a fresh ARM64 install.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

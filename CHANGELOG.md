@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.10
+
+### Fixes
+
+- Chat TUI / `keys add` secret prompt: filter Windows key Release events so typed characters aren't doubled — crossterm emits both Press and Release on Windows for every keystroke; we now only process Press
+
+
 ## v0.19.9
 
 ### Fixes

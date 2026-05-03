@@ -660,33 +660,15 @@ pub(crate) async fn process_pi_sessions(pi_agent_dir: Option<&str>) {
     let real_sessions = crate::services::system_env::home_dir()
         .map(|h| h.join(".pi").join("agent").join("sessions"));
 
-    let mut dirs = vec![temp_sessions.clone()];
-    while let Some(dir) = dirs.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
+    let Some(real_sessions) = real_sessions else {
+        return;
+    };
 
-            if let Some(ref real) = real_sessions
-                && let Ok(rel) = path.strip_prefix(&temp_sessions)
-            {
-                let dest = real.join(rel);
-                if let Some(parent) = dest.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                let _ = tokio::fs::copy(&path, &dest).await;
-            }
-        }
+    if pi_sessions_share_storage(&temp_sessions, &real_sessions).await {
+        return;
     }
+
+    copy_pi_session_jsonl_tree(&temp_sessions, &real_sessions).await;
 }
 
 pub(crate) async fn cleanup_runtime_artifacts(
@@ -736,6 +718,9 @@ async fn write_pi_agent_dir(env: &mut HashMap<String, String>, port: Option<u16>
     if let Some(home) = crate::services::system_env::home_dir() {
         let real_bin = home.join(".pi").join("agent").join("bin");
         populate_pi_bin_dir(&real_bin, &dir.join("bin")).await;
+        seed_pi_sessions(Some(home.join(".pi").join("agent").join("sessions")), &dir).await;
+    } else {
+        seed_pi_sessions(None, &dir).await;
     }
 
     env.insert(
@@ -789,6 +774,88 @@ async fn populate_pi_bin_dir(real_bin: &std::path::Path, dest_bin: &std::path::P
 
 #[cfg(not(any(unix, windows)))]
 async fn populate_pi_bin_dir(_real_bin: &std::path::Path, _dest_bin: &std::path::Path) {}
+
+async fn seed_pi_sessions(
+    real_sessions: Option<std::path::PathBuf>,
+    temp_agent_dir: &std::path::Path,
+) {
+    let temp_sessions = temp_agent_dir.join("sessions");
+
+    let Some(real_sessions) = real_sessions else {
+        let _ = tokio::fs::create_dir_all(&temp_sessions).await;
+        return;
+    };
+
+    if tokio::fs::create_dir_all(&real_sessions).await.is_err() {
+        let _ = tokio::fs::create_dir_all(&temp_sessions).await;
+        return;
+    }
+
+    if link_pi_sessions_dir(&real_sessions, &temp_sessions).await {
+        return;
+    }
+
+    copy_pi_session_jsonl_tree(&real_sessions, &temp_sessions).await;
+}
+
+#[cfg(unix)]
+async fn link_pi_sessions_dir(
+    real_sessions: &std::path::Path,
+    temp_sessions: &std::path::Path,
+) -> bool {
+    tokio::fs::symlink(real_sessions, temp_sessions)
+        .await
+        .is_ok()
+}
+
+#[cfg(not(unix))]
+async fn link_pi_sessions_dir(
+    _real_sessions: &std::path::Path,
+    _temp_sessions: &std::path::Path,
+) -> bool {
+    false
+}
+
+async fn pi_sessions_share_storage(
+    temp_sessions: &std::path::Path,
+    real_sessions: &std::path::Path,
+) -> bool {
+    let (Ok(temp), Ok(real)) = (
+        tokio::fs::canonicalize(temp_sessions).await,
+        tokio::fs::canonicalize(real_sessions).await,
+    ) else {
+        return false;
+    };
+    temp == real
+}
+
+async fn copy_pi_session_jsonl_tree(src_root: &std::path::Path, dst_root: &std::path::Path) {
+    let mut dirs = vec![src_root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(src_root) else {
+                continue;
+            };
+            let dest = dst_root.join(rel);
+            if let Some(parent) = dest.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::copy(&path, &dest).await;
+        }
+    }
+}
 
 fn set_local_base_url(env: &mut HashMap<String, String>, key: &str, port: u16) {
     env.insert(key.to_string(), format!("http://127.0.0.1:{port}"));
@@ -1985,5 +2052,55 @@ mod tests {
 
         let reloaded = store.get_key_by_id(&key_id).await.unwrap().unwrap();
         assert_eq!(reloaded.claude_path_variant, None);
+    }
+
+    #[tokio::test]
+    async fn copy_pi_session_jsonl_tree_preserves_nested_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        let nested = src.join("--Users-alice-project-work-aivo--");
+        tokio::fs::create_dir_all(&nested).await.unwrap();
+        tokio::fs::write(nested.join("old.jsonl"), "{\"type\":\"session\"}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(nested.join("ignore.txt"), "nope")
+            .await
+            .unwrap();
+
+        super::copy_pi_session_jsonl_tree(&src, &dst).await;
+
+        let copied =
+            tokio::fs::read_to_string(dst.join("--Users-alice-project-work-aivo--/old.jsonl"))
+                .await
+                .unwrap();
+        assert_eq!(copied, "{\"type\":\"session\"}\n");
+        assert!(
+            !dst.join("--Users-alice-project-work-aivo--/ignore.txt")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_pi_sessions_exposes_prior_history_to_temp_agent_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let real_sessions = temp.path().join("real-sessions");
+        let project_dir = real_sessions.join("--Users-alice-project-work-aivo--");
+        tokio::fs::create_dir_all(&project_dir).await.unwrap();
+        tokio::fs::write(project_dir.join("prior.jsonl"), "{\"type\":\"session\"}\n")
+            .await
+            .unwrap();
+
+        let temp_agent = temp.path().join("temp-agent");
+        tokio::fs::create_dir_all(&temp_agent).await.unwrap();
+
+        super::seed_pi_sessions(Some(real_sessions), &temp_agent).await;
+
+        let visible = tokio::fs::read_to_string(
+            temp_agent.join("sessions/--Users-alice-project-work-aivo--/prior.jsonl"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(visible, "{\"type\":\"session\"}\n");
     }
 }

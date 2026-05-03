@@ -267,8 +267,18 @@ impl StatsCommand {
         let has_global = global
             .as_ref()
             .is_some_and(|gs| gs.total_tokens() > 0 || gs.sessions > 0);
+        // aivo-proxy aggregates lack per-event timestamps, so they can't be
+        // filtered to the requested window. Treat them as unavailable when
+        // --since is set; otherwise a 1m filter could fall through to the
+        // unfiltered lifetime totals and report more activity than a 10m one.
+        let aivo_available = cutoff.is_none() && aivo.launches > 0;
+        let omitted_sources: &[&str] = if cutoff.is_some() && aivo.launches > 0 {
+            &["aivo-proxy"]
+        } else {
+            &[]
+        };
 
-        if !has_global && aivo.launches == 0 {
+        if !has_global && !aivo_available {
             if args.json {
                 return print_json(&empty_tool_view_json(&tool));
             }
@@ -279,6 +289,7 @@ impl StatsCommand {
                     global_stats::tool_display_name(&tool)
                 ))
             );
+            render_since_footer(args.since.as_deref(), omitted_sources);
             return ExitCode::Success;
         }
 
@@ -322,7 +333,7 @@ impl StatsCommand {
                 None
             };
             (view, top)
-        } else {
+        } else if aivo_available {
             let view = ToolView {
                 source: StatsSource::Aivo,
                 count: aivo.launches,
@@ -331,6 +342,19 @@ impl StatsCommand {
                 cache_read: aivo.cache_read,
                 cache_write: aivo.cache_write,
                 models: aivo.models,
+            };
+            (view, None)
+        } else {
+            // --since is set and global has no matching files. Render an empty
+            // window-scoped view rather than falling back to lifetime totals.
+            let view = ToolView {
+                source: StatsSource::Global,
+                count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read: 0,
+                cache_write: 0,
+                models: HashMap::new(),
             };
             (view, None)
         };
@@ -344,7 +368,7 @@ impl StatsCommand {
                 top_sessions.as_deref(),
                 args,
                 window,
-                &[],
+                omitted_sources,
             ));
         }
 
@@ -352,7 +376,7 @@ impl StatsCommand {
         if let Some(sessions) = top_sessions {
             render_top_sessions(&sessions, fmt);
         }
-        render_since_footer(args.since.as_deref(), &[]);
+        render_since_footer(args.since.as_deref(), omitted_sources);
 
         ExitCode::Success
     }

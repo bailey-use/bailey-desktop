@@ -4,6 +4,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -226,6 +227,43 @@ impl LogStore {
         })
         .await
         .context("Failed to join log reference lookup task")?
+    }
+
+    /// Counts `tool_launch` events (phase = `started`) since `cutoff`,
+    /// grouped by model. Surfaces models the user actually launched in the
+    /// window even when no upstream usage was recorded — the table-of-truth
+    /// for "what did I run", independent of provider-side `usage` fields.
+    /// `tool_filter` scopes to a single tool (e.g. `claude`) when set.
+    pub async fn aggregate_run_models_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        tool_filter: Option<&str>,
+    ) -> Result<HashMap<String, u64>> {
+        let path = self.path.clone();
+        let cutoff_str = cutoff.to_rfc3339();
+        let tool_filter = tool_filter.map(|t| t.to_string());
+        tokio::task::spawn_blocking(move || {
+            if !path.exists() {
+                return Ok(HashMap::new());
+            }
+            let direct = open_read_connection(&path).and_then(|conn| {
+                aggregate_run_models_with_connection(&conn, &cutoff_str, tool_filter.as_deref())
+            });
+            match direct {
+                Ok(map) => Ok(map),
+                Err(direct_err) => with_snapshot_connection(&path, |conn| {
+                    aggregate_run_models_with_connection(conn, &cutoff_str, tool_filter.as_deref())
+                })
+                .with_context(|| {
+                    format!(
+                        "Failed to aggregate run models from {:?}: {direct_err:#}",
+                        path
+                    )
+                }),
+            }
+        })
+        .await
+        .context("Failed to join run-model aggregation task")?
     }
 
     pub async fn status(&self) -> Result<LogStatus> {
@@ -595,6 +633,39 @@ fn get_by_reference_with_connection(
     }
 }
 
+fn aggregate_run_models_with_connection(
+    conn: &Connection,
+    cutoff: &str,
+    tool_filter: Option<&str>,
+) -> Result<HashMap<String, u64>> {
+    let mut sql = String::from(
+        "select model, count(*) from events \
+         where kind = 'tool_launch' and phase = 'started' \
+         and ts_utc >= ? and model is not null and trim(model) != ''",
+    );
+    let mut params: Vec<SqlValue> = vec![SqlValue::Text(cutoff.to_string())];
+    if let Some(t) = tool_filter {
+        sql.push_str(" and tool = ?");
+        params.push(SqlValue::Text(t.to_string()));
+    }
+    sql.push_str(" group by model");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare run-model aggregation query")?;
+    let rows = stmt
+        .query_map(params_from_iter(params), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+        })
+        .context("Failed to execute run-model aggregation query")?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (model, count) = row.context("Failed to read run-model aggregation row")?;
+        out.insert(model, count);
+    }
+    Ok(out)
+}
+
 fn status_with_connection(conn: &Connection, path: &Path) -> Result<LogStatus> {
     let total_entries: u64 = conn
         .query_row("select count(*) from events", [], |row| row.get(0))
@@ -858,5 +929,128 @@ mod tests {
             .unwrap();
         assert_eq!(entry.id, finished_id);
         assert_eq!(entry.phase.as_deref(), Some("finished"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_run_models_since_groups_started_launches() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        // Two `started` launches for grok-4.3 under claude — should count 2.
+        for _ in 0..2 {
+            store
+                .append(LogEvent {
+                    source: "run".to_string(),
+                    kind: "tool_launch".to_string(),
+                    phase: Some("started".to_string()),
+                    tool: Some("claude".to_string()),
+                    model: Some("grok-4.3".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        // A `finished` row for the same model — must NOT be double-counted.
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                phase: Some("finished".to_string()),
+                tool: Some("claude".to_string()),
+                model: Some("grok-4.3".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A `started` launch under codex for a different model.
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                phase: Some("started".to_string()),
+                tool: Some("codex".to_string()),
+                model: Some("kimi-k2.6".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A chat_turn (kind != tool_launch) — must be ignored.
+        store
+            .append(LogEvent {
+                source: "chat".to_string(),
+                kind: "chat_turn".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A row with empty model — must be skipped.
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                phase: Some("started".to_string()),
+                tool: Some("claude".to_string()),
+                model: Some("".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let all = store
+            .aggregate_run_models_since(cutoff, None)
+            .await
+            .unwrap();
+        assert_eq!(all.get("grok-4.3").copied(), Some(2));
+        assert_eq!(all.get("kimi-k2.6").copied(), Some(1));
+        assert!(!all.contains_key("deepseek-v4-flash"));
+        assert!(!all.contains_key(""));
+
+        let only_claude = store
+            .aggregate_run_models_since(cutoff, Some("claude"))
+            .await
+            .unwrap();
+        assert_eq!(only_claude.get("grok-4.3").copied(), Some(2));
+        assert!(!only_claude.contains_key("kimi-k2.6"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_run_models_since_respects_cutoff() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        store
+            .append(LogEvent {
+                source: "run".to_string(),
+                kind: "tool_launch".to_string(),
+                phase: Some("started".to_string()),
+                tool: Some("claude".to_string()),
+                model: Some("grok-4.3".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Cutoff one hour in the future — the just-appended row is older than
+        // the cutoff and must be excluded.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let map = store
+            .aggregate_run_models_since(future, None)
+            .await
+            .unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_run_models_since_returns_empty_when_db_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let map = store
+            .aggregate_run_models_since(cutoff, None)
+            .await
+            .unwrap();
+        assert!(map.is_empty());
     }
 }

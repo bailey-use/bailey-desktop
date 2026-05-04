@@ -165,11 +165,35 @@ impl StatsCommand {
             entry.cache_read = entry.cache_read.saturating_add(tokens.cache_read_tokens);
             entry.cache_write = entry.cache_write.saturating_add(tokens.cache_write_tokens);
         }
-        let model_tokens = combine_model_tokens(&global, &aivo_model_usage);
-        let total_models = model_tokens
-            .values()
-            .filter(|m| m.tokens() > 0 || m.cached() > 0)
-            .count() as u64;
+        let mut model_tokens = combine_model_tokens(&global, &aivo_model_usage);
+        // Under --since, surface models that were launched in the window even
+        // if no upstream usage was recorded — `logs.db` is the table-of-truth
+        // for "what did I run", independent of provider-side `usage` fields.
+        if let Some(c) = cutoff {
+            let run_models = self
+                .store
+                .logs()
+                .aggregate_run_models_since(c, None)
+                .await
+                .unwrap_or_default();
+            for model in run_models.keys() {
+                let key = global_stats::normalize_model_for_display(model);
+                model_tokens.entry(key).or_default();
+            }
+        }
+        // Under --since, every entry in `model_tokens` represents real activity
+        // (either real tokens, or a `tool_launch` row); count them all so the
+        // header tally matches the rendered table. Without --since, keep the
+        // legacy filter so stale zero-token rows from older parsers don't
+        // inflate the count.
+        let total_models = if cutoff.is_some() {
+            model_tokens.len() as u64
+        } else {
+            model_tokens
+                .values()
+                .filter(|m| m.tokens() > 0 || m.cached() > 0)
+                .count() as u64
+        };
 
         let omitted_sources: &[&str] = if cutoff.is_some() {
             &["aivo-proxy"]
@@ -336,7 +360,7 @@ impl StatsCommand {
             return ExitCode::Success;
         }
 
-        let (view, top_sessions) = if let Some(gs) = global
+        let (mut view, top_sessions) = if let Some(gs) = global
             .as_ref()
             .filter(|gs| gs.total_tokens() > 0 || gs.sessions > 0)
         {
@@ -411,6 +435,21 @@ impl StatsCommand {
             };
             (view, None)
         };
+
+        // Same logs.db augmentation as the overview: scoped to this tool so a
+        // run with all-zero recorded usage still surfaces under --since.
+        if let Some(c) = cutoff {
+            let run_models = self
+                .store
+                .logs()
+                .aggregate_run_models_since(c, Some(&tool))
+                .await
+                .unwrap_or_default();
+            for model in run_models.keys() {
+                let key = global_stats::normalize_model_for_display(model);
+                view.models.entry(key).or_default();
+            }
+        }
 
         let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
 
@@ -531,11 +570,12 @@ impl StatsCommand {
 fn filter_models<'a>(
     models: impl IntoIterator<Item = (&'a String, &'a ModelTotals)>,
     search: Option<&str>,
+    keep_zero_rows: bool,
 ) -> Vec<(String, ModelTotals)> {
     let needle = search.map(|s| s.to_lowercase());
     let mut rows: Vec<(String, ModelTotals)> = models
         .into_iter()
-        .filter(|(_, m)| m.tokens() > 0 || m.cached() > 0)
+        .filter(|(_, m)| keep_zero_rows || m.tokens() > 0 || m.cached() > 0)
         .filter(|(name, _)| {
             needle
                 .as_ref()
@@ -594,7 +634,7 @@ fn build_overview_json(
         })
         .collect();
 
-    let by_model: Vec<Value> = filter_models(model_tokens, search)
+    let by_model: Vec<Value> = filter_models(model_tokens, search, window.is_some())
         .into_iter()
         .map(|(name, m)| {
             json!({
@@ -646,27 +686,33 @@ fn build_tool_view_json(
         StatsSource::Global => "global",
         StatsSource::Aivo => "aivo",
     };
-    let by_model: Vec<Value> = filter_models(&view.models, args.search.as_deref())
-        .into_iter()
-        .map(|(name, m)| {
-            json!({
-                "name": name,
-                "tokens": m.tokens(),
-                "input_tokens": m.input,
-                "output_tokens": m.output,
-                "cached_tokens": m.cached(),
-                "cache_read_tokens": m.cache_read,
-                "cache_write_tokens": m.cache_write,
-                "total_tokens": m.total(),
+    let by_model: Vec<Value> =
+        filter_models(&view.models, args.search.as_deref(), window.is_some())
+            .into_iter()
+            .map(|(name, m)| {
+                json!({
+                    "name": name,
+                    "tokens": m.tokens(),
+                    "input_tokens": m.input,
+                    "output_tokens": m.output,
+                    "cached_tokens": m.cached(),
+                    "cache_read_tokens": m.cache_read,
+                    "cache_write_tokens": m.cache_write,
+                    "total_tokens": m.total(),
+                })
             })
-        })
-        .collect();
-    // Match the human view's count: total models with any tokens, ignoring search filter.
-    let total_models = view
-        .models
-        .values()
-        .filter(|m| m.tokens() > 0 || m.cached() > 0)
-        .count() as u64;
+            .collect();
+    // Match the human view's count: under --since, every entry in
+    // `view.models` represents real activity (real tokens or a logged
+    // launch), so count them all. Without a window keep the legacy filter.
+    let total_models = if window.is_some() {
+        view.models.len() as u64
+    } else {
+        view.models
+            .values()
+            .filter(|m| m.tokens() > 0 || m.cached() > 0)
+            .count() as u64
+    };
     let mut payload = json!({
         "tool": tool,
         "source": source,
@@ -857,11 +903,14 @@ struct AivoToolStats {
 fn print_tool_view(view: &ToolView, fmt: fn(u64) -> String, args: &StatsArgs) {
     let total_tokens = view.input_tokens.saturating_add(view.output_tokens);
     let total_cache = view.cache_read.saturating_add(view.cache_write);
-    let model_count = view
-        .models
-        .values()
-        .filter(|m| m.tokens() > 0 || m.cached() > 0)
-        .count() as u64;
+    let model_count = if args.since.is_some() {
+        view.models.len() as u64
+    } else {
+        view.models
+            .values()
+            .filter(|m| m.tokens() > 0 || m.cached() > 0)
+            .count() as u64
+    };
 
     let count_label = match view.source {
         StatsSource::Global => "sessions",
@@ -898,7 +947,7 @@ fn render_model_table(
     args: &StatsArgs,
 ) {
     let searching = args.search.is_some();
-    let mut model_rows = filter_models(models, args.search.as_deref());
+    let mut model_rows = filter_models(models, args.search.as_deref(), args.since.is_some());
 
     if model_rows.is_empty() {
         return;
@@ -1943,6 +1992,92 @@ mod tests {
         assert!(
             result.is_empty(),
             "lifetime models must not leak under cutoff"
+        );
+    }
+
+    #[test]
+    fn filter_models_keeps_zero_rows_under_window() {
+        // Models with zero tokens represent runs we know happened (logged in
+        // logs.db) but for which no upstream usage was recorded. Under
+        // --since the user explicitly asked "what did I do in this window";
+        // dropping these would silently hide the answer.
+        let mut models = HashMap::new();
+        models.insert("grok-4.3".to_string(), ModelTotals::default());
+        models.insert(
+            "claude-opus-4-7".to_string(),
+            ModelTotals {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+            },
+        );
+
+        let windowed = filter_models(&models, None, true);
+        let names: Vec<&str> = windowed.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"grok-4.3"));
+        assert!(names.contains(&"claude-opus-4-7"));
+
+        let lifetime = filter_models(&models, None, false);
+        let names: Vec<&str> = lifetime.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"grok-4.3"));
+        assert!(names.contains(&"claude-opus-4-7"));
+    }
+
+    #[test]
+    fn overview_json_includes_zero_token_model_under_window() {
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+        let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
+        let mut model_tokens: HashMap<String, ModelTotals> = HashMap::new();
+        model_tokens.insert("grok-4.3".to_string(), ModelTotals::default());
+        let payload = build_overview_json(
+            &tool_tokens,
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            1, // total_models pre-computed by show()
+            None,
+            Some(("1h", cutoff)),
+            &[],
+        );
+        let by_model = payload
+            .get("by_model")
+            .and_then(|v| v.as_array())
+            .expect("by_model array");
+        let names: Vec<&str> = by_model
+            .iter()
+            .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"grok-4.3"),
+            "zero-token model must surface under --since, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn overview_json_omits_zero_token_model_without_window() {
+        let tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
+        let mut model_tokens: HashMap<String, ModelTotals> = HashMap::new();
+        model_tokens.insert("grok-4.3".to_string(), ModelTotals::default());
+        let payload = build_overview_json(
+            &tool_tokens,
+            &model_tokens,
+            (0, 0),
+            (0, 0),
+            0,
+            0,
+            None,
+            None,
+            &[],
+        );
+        let by_model = payload
+            .get("by_model")
+            .and_then(|v| v.as_array())
+            .expect("by_model array");
+        assert!(
+            by_model.is_empty(),
+            "lifetime view must keep its zero-row filter"
         );
     }
 

@@ -147,15 +147,24 @@ pub fn convert_anthropic_to_openai_request(
         .map(|transform| transform(raw_model))
         .unwrap_or_else(|| raw_model.to_string());
 
+    let stream = if config.preserve_stream {
+        body.get("stream").cloned().unwrap_or(json!(false))
+    } else {
+        json!(false)
+    };
     let mut req = json!({
         "model": model,
         "messages": messages,
-        "stream": if config.preserve_stream {
-            body.get("stream").cloned().unwrap_or(json!(false))
-        } else {
-            json!(false)
-        },
+        "stream": stream,
     });
+    // OpenAI-compatible providers only emit `usage` in stream chunks when
+    // `stream_options.include_usage` is set. Without it, xAI/DeepSeek/etc.
+    // close the stream with no usage event, the bridge writes `message_delta`
+    // with zero tokens, and Claude Code logs all-zero usage — making the
+    // model invisible to `aivo stats` (which filters zero-token rows).
+    if stream == json!(true) {
+        req["stream_options"] = json!({"include_usage": true});
+    }
 
     if let Some(mt) = body.get("max_tokens") {
         req["max_tokens"] = mt.clone();
@@ -565,6 +574,52 @@ mod tests {
             tool_result_supports_multimodal: true,
             fallback_tool_arguments_json: "{}",
         }
+    }
+
+    fn streaming_config() -> AnthropicToOpenAIConfig {
+        AnthropicToOpenAIConfig {
+            preserve_stream: true,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn streaming_request_sets_include_usage() {
+        // Without stream_options.include_usage, xAI / DeepSeek / OpenRouter
+        // never emit a usage event in the SSE stream, so `aivo run claude`
+        // backed by an OpenAI-shape upstream logs zero-token assistant turns.
+        let body = json!({
+            "model": "grok-4.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let req = convert_anthropic_to_openai_request(&body, &streaming_config());
+        assert_eq!(req["stream"], json!(true));
+        assert_eq!(req["stream_options"], json!({"include_usage": true}));
+    }
+
+    #[test]
+    fn non_streaming_request_omits_stream_options() {
+        let body = json!({
+            "model": "grok-4.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+        });
+        let req = convert_anthropic_to_openai_request(&body, &streaming_config());
+        assert_eq!(req["stream"], json!(false));
+        assert!(req.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn forced_non_streaming_omits_stream_options_even_if_client_streams() {
+        let body = json!({
+            "model": "grok-4.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["stream"], json!(false));
+        assert!(req.get("stream_options").is_none());
     }
 
     #[test]

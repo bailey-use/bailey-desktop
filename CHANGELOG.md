@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.19.16
+
+### Features
+
+- `aivo run`: auto-detect 1m / 2m context windows so users don't have to pass the flag.
+- Claude gateway: `/v1/models` endpoint backs the model picker and accepts `x-api-key` auth alongside bearer tokens.
+- Stats: per-model cache breakdown with a new `-d` / `--detailed` view (input / output / cached / total), and `--since` now counts one-shot `aivo -x` chat turns with per-session token totals.
+
+### Fixes
+
+- Stats `--since`: window is now actually windowed. Suppresses lifetime aivo-proxy and per-key counters from leaking into the cutoff, applies the cutoff to event timestamps, surfaces every model the user launched in-window (even when the upstream withheld usage), and records chat tokens under the upstream model name to match `claude-code`.
+- Pi: reuse session history when relaunching under `aivo pi`.
+
+
 ## v0.19.15
 
 ### Features

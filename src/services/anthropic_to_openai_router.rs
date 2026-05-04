@@ -2304,6 +2304,28 @@ data: [DONE]\n";
         assert_eq!(payload["usage"]["output_tokens"], 86);
     }
 
+    /// xAI/Grok and other OpenAI-compatible providers may emit usage with
+    /// `input_tokens`/`output_tokens` instead of `prompt_tokens`/`completion_tokens`.
+    /// The alias mapping ensures these are captured and forwarded to Claude Code.
+    #[test]
+    fn openai_sse_to_anthropic_accepts_input_output_token_names() {
+        let sse = "data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+	data: {\"id\":\"chatcmpl_xai\",\"model\":\"grok-4.3\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"input_tokens\":15000,\"output_tokens\":42}}\n\
+	data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        assert_eq!(payload["usage"]["input_tokens"], 15000);
+        assert_eq!(payload["usage"]["output_tokens"], 42);
+    }
+
     /// Regression: OpenAI-compatible upstreams (zai, DeepSeek, gemma —
     /// everything `aivo/starter` routes to) emit cached input tokens at
     /// `usage.prompt_tokens_details.cached_tokens`, not at

@@ -355,9 +355,9 @@ pub(crate) struct OpenAIChatChunk {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct OpenAIChatChunkUsage {
-    #[serde(default)]
+    #[serde(default, alias = "input_tokens")]
     pub prompt_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, alias = "output_tokens")]
     pub completion_tokens: Option<u64>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u64>,

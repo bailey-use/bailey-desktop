@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.19.17
+
+### Fixes
+
+- xAI / OpenAI-compatible providers: usage stats now flow through correctly. Some providers (xAI/Grok especially) emit `input_tokens` / `output_tokens` instead of `prompt_tokens` / `completion_tokens`; the router and bridges now accept both aliases and preserve them end-to-end through the Anthropic bridge so Claude Code sees real token counts instead of zeros.
+
+### Internal
+
+- Tests: `claude` setup-token spawn retries on transient `Other` errors to de-flake CI.
+
+
 ## v0.19.16
 
 ### Features

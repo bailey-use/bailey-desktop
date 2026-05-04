@@ -31,14 +31,25 @@ static KNOWN_PROVIDERS: LazyLock<Vec<KnownProvider>> = LazyLock::new(|| {
 /// contain descriptive words like "China" or "Gateway" that also produce
 /// false positives on short inputs.
 pub fn find_by_name_substring(input: &str) -> Option<&KnownProvider> {
+    matching_providers(input).next()
+}
+
+/// Like `find_by_name_substring` but yields every match in declaration order.
+/// Used by the interactive picker to hoist *all* matching providers (e.g. an
+/// input of "bedrock" matches both `bedrock-mantle` and `bedrock-runtime`).
+pub fn find_all_by_name_substring(input: &str) -> Vec<&KnownProvider> {
+    matching_providers(input).collect()
+}
+
+fn matching_providers(input: &str) -> impl Iterator<Item = &'static KnownProvider> {
     const MIN_LEN: usize = 3;
-    if input.len() < MIN_LEN {
-        return None;
-    }
-    let input_lower = input.to_ascii_lowercase();
-    KNOWN_PROVIDERS.iter().find(|p| {
-        let id_lower = p.id.to_ascii_lowercase();
-        id_lower.contains(&input_lower) || input_lower.contains(&id_lower)
+    let input_lower = (input.len() >= MIN_LEN).then(|| input.to_ascii_lowercase());
+    KNOWN_PROVIDERS.iter().filter(move |p| match &input_lower {
+        Some(s) => {
+            let id_lower = p.id.to_ascii_lowercase();
+            id_lower.contains(s) || s.contains(&id_lower)
+        }
+        None => false,
     })
 }
 

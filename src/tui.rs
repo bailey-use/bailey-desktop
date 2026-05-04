@@ -1,5 +1,18 @@
 use console::{Key, Term};
 
+/// Outcome returned by `FuzzySelect::interact_outcome`. Most callers want
+/// `interact_opt` instead, which collapses `Query` and `Cancelled` to `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuzzyOutcome {
+    /// User pressed Enter while a list item was highlighted.
+    Selected(usize),
+    /// User pressed Enter while the filtered list was empty. Carries the typed
+    /// query so the caller can treat it as a custom literal.
+    Query(String),
+    /// User pressed Esc / Ctrl-C.
+    Cancelled,
+}
+
 impl Default for FuzzySelect {
     fn default() -> Self {
         Self::new()
@@ -62,6 +75,17 @@ impl FuzzySelect {
     }
 
     pub fn interact_opt(self) -> std::io::Result<Option<usize>> {
+        match self.interact_outcome()? {
+            FuzzyOutcome::Selected(i) => Ok(Some(i)),
+            FuzzyOutcome::Query(_) | FuzzyOutcome::Cancelled => Ok(None),
+        }
+    }
+
+    /// Like `interact_opt`, but distinguishes "user pressed Enter on an empty
+    /// filter" from "user cancelled." Useful for pickers that accept the typed
+    /// query as a custom value when no list entry matches (e.g. an AWS region
+    /// not in the curated autocomplete list).
+    pub fn interact_outcome(self) -> std::io::Result<FuzzyOutcome> {
         let term = Term::stderr();
         term.hide_cursor()?;
 
@@ -217,14 +241,14 @@ impl FuzzySelect {
                             continue;
                         }
                         term.show_cursor()?;
-                        return Ok(Some(orig_idx));
+                        return Ok(FuzzyOutcome::Selected(orig_idx));
                     }
                     term.show_cursor()?;
-                    return Ok(None);
+                    return Ok(FuzzyOutcome::Query(query));
                 }
                 Key::Escape | Key::CtrlC => {
                     term.show_cursor()?;
-                    return Ok(None);
+                    return Ok(FuzzyOutcome::Cancelled);
                 }
                 Key::Backspace if !query.is_empty() => {
                     query.pop();

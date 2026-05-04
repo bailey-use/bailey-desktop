@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::cli::KeysArgs;
 use crate::commands::keys_ui;
 use crate::commands::truncate_url_for_display;
-use crate::tui::FuzzySelect;
+use crate::tui::{FuzzyOutcome, FuzzySelect};
 
 use crate::errors::ExitCode;
 use crate::services::provider_profile::is_aivo_starter_base;
@@ -184,6 +184,9 @@ fn detect_base_url(name: &str) -> Option<&str> {
 /// Placeholder used in `providers.json` for Cloudflare Workers AI account ID.
 const CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER: &str = "${CLOUDFLARE_ACCOUNT_ID}";
 
+/// Placeholder used in `providers.json` for the Amazon Bedrock region.
+const AWS_REGION_PLACEHOLDER: &str = "${AWS_REGION}";
+
 /// Validates a user-supplied base URL. Returns `Err` with a user-facing message
 /// if the URL is malformed. Accepts `http(s)://host[/path]` with no whitespace.
 fn validate_base_url(url: &str) -> Result<(), &'static str> {
@@ -232,6 +235,110 @@ fn format_picker_choice(label: &str, hint: &str) -> String {
         style::dim(hint),
         width = PICKER_LABEL_WIDTH
     )
+}
+
+/// AWS regions where Amazon Bedrock is available. Pairs are (region, city) so
+/// the fuzzy filter can match either form.
+const BEDROCK_REGIONS: &[(&str, &str)] = &[
+    ("us-east-1", "N. Virginia"),
+    ("us-east-2", "Ohio"),
+    ("us-west-1", "N. California"),
+    ("us-west-2", "Oregon"),
+    ("af-south-1", "Cape Town"),
+    ("ap-east-1", "Hong Kong"),
+    ("ap-east-2", "Taipei"),
+    ("ap-northeast-1", "Tokyo"),
+    ("ap-northeast-2", "Seoul"),
+    ("ap-northeast-3", "Osaka"),
+    ("ap-south-1", "Mumbai"),
+    ("ap-south-2", "Hyderabad"),
+    ("ap-southeast-1", "Singapore"),
+    ("ap-southeast-2", "Sydney"),
+    ("ap-southeast-3", "Jakarta"),
+    ("ap-southeast-4", "Melbourne"),
+    ("ap-southeast-5", "Malaysia"),
+    ("ap-southeast-7", "Thailand"),
+    ("ca-central-1", "Canada Central"),
+    ("ca-west-1", "Calgary"),
+    ("eu-central-1", "Frankfurt"),
+    ("eu-central-2", "Zurich"),
+    ("eu-west-1", "Ireland"),
+    ("eu-west-2", "London"),
+    ("eu-west-3", "Paris"),
+    ("eu-north-1", "Stockholm"),
+    ("eu-south-1", "Milan"),
+    ("eu-south-2", "Spain"),
+    ("il-central-1", "Tel Aviv"),
+    ("me-central-1", "UAE"),
+    ("me-south-1", "Bahrain"),
+    ("mx-central-1", "Mexico Central"),
+    ("sa-east-1", "São Paulo"),
+    ("us-gov-east-1", "GovCloud East"),
+    ("us-gov-west-1", "GovCloud West"),
+];
+
+/// Picks an AWS region for the Bedrock provider. Returns `Ok(None)` if the
+/// user cancels the picker (Esc / Ctrl-C). If the user types a query that
+/// matches no list entry and presses Enter, the typed query is accepted as a
+/// custom literal — `parse_aws_region` normalizes recognized inputs (bare
+/// regions or Bedrock URLs); URL-shaped strings that don't match a known
+/// Bedrock host are refused so they can't corrupt the URL template.
+///
+/// Prints a `Region: <id>  <city>` confirmation line after a successful pick
+/// so the chosen region stays visible once the picker UI clears.
+fn pick_bedrock_region() -> Result<Option<String>> {
+    let labels: Vec<String> = BEDROCK_REGIONS
+        .iter()
+        .map(|(region, city)| format_picker_choice(region, city))
+        .collect();
+
+    let outcome = FuzzySelect::new()
+        .with_prompt("AWS Region")
+        .items(&labels)
+        .default(0)
+        .interact_outcome()?;
+    restore_cooked_mode();
+
+    let (region, hint) = match outcome {
+        FuzzyOutcome::Selected(idx) => {
+            let (r, city) = BEDROCK_REGIONS[idx];
+            (r.to_string(), Some(city.to_string()))
+        }
+        FuzzyOutcome::Cancelled => return Ok(None),
+        FuzzyOutcome::Query(q) => {
+            // `Query` is only emitted when the filter has zero matches, which
+            // requires a non-empty query (an empty query matches every item),
+            // so `trimmed` here is guaranteed non-empty.
+            let trimmed = q.trim();
+            if let Some(r) = crate::services::provider_profile::parse_aws_region(trimmed) {
+                let city = BEDROCK_REGIONS
+                    .iter()
+                    .find(|(reg, _)| *reg == r)
+                    .map(|(_, c)| (*c).to_string());
+                (r, city)
+            } else if trimmed.contains('/') || trimmed.contains(':') || trimmed.contains('.') {
+                eprintln!(
+                    "{} '{}' isn't a recognized AWS region or Bedrock URL",
+                    style::red("Error:"),
+                    trimmed
+                );
+                return Ok(None);
+            } else {
+                (trimmed.to_string(), Some("custom".to_string()))
+            }
+        }
+    };
+
+    match &hint {
+        Some(h) => println!(
+            "{} {}  {}",
+            style::dim("Region:"),
+            style::cyan(&region),
+            style::dim(format!("({h})")),
+        ),
+        None => println!("{} {}", style::dim("Region:"), style::cyan(&region)),
+    }
+    Ok(Some(region))
 }
 
 /// Prompts for a secret. If the user enters nothing, asks whether to save
@@ -1231,36 +1338,44 @@ impl KeysCommand {
 
         push(&mut choices, &mut labels, ProviderChoice::Custom);
 
-        let detected_url = (!name.is_empty()).then(|| detect_base_url(name)).flatten();
-        let detected_idx =
-            detected_url.and_then(|url| providers.iter().position(|p| p.base_url == url));
-
-        let hoisted_special: Option<ProviderChoice> = if detected_idx.is_none() && !name.is_empty()
-        {
-            match name.trim().to_ascii_lowercase().as_str() {
-                "ollama" => Some(ProviderChoice::Ollama),
-                "copilot" => Some(ProviderChoice::Copilot),
-                "codex" => Some(ProviderChoice::CodexOAuth),
-                "claude" => Some(ProviderChoice::ClaudeOAuth),
-                "gemini" => Some(ProviderChoice::GeminiOAuth),
-                _ => None,
-            }
+        let detected_indices: Vec<usize> = if name.is_empty() {
+            Vec::new()
         } else {
-            None
+            crate::services::known_providers::find_all_by_name_substring(name)
+                .into_iter()
+                .filter_map(|m| providers.iter().position(|p| p.base_url == m.base_url))
+                .collect()
         };
 
-        // Hoist the matched entry right after Custom URL so it's visible
-        // without scrolling.
-        if let Some(di) = detected_idx {
-            push(&mut choices, &mut labels, ProviderChoice::Known(di));
-            preselected = Some(labels.len() - 1);
+        let hoisted_special: Option<ProviderChoice> =
+            if detected_indices.is_empty() && !name.is_empty() {
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "ollama" => Some(ProviderChoice::Ollama),
+                    "copilot" => Some(ProviderChoice::Copilot),
+                    "codex" => Some(ProviderChoice::CodexOAuth),
+                    "claude" => Some(ProviderChoice::ClaudeOAuth),
+                    "gemini" => Some(ProviderChoice::GeminiOAuth),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+        // Hoist every matched entry right after Custom URL so users can pick
+        // among ambiguous matches (e.g. "bedrock" → Mantle + Runtime) without
+        // scrolling. The first match becomes the picker default.
+        if !detected_indices.is_empty() {
+            for &di in &detected_indices {
+                push(&mut choices, &mut labels, ProviderChoice::Known(di));
+            }
+            preselected = Some(labels.len() - detected_indices.len());
         } else if let Some(special) = hoisted_special {
             push(&mut choices, &mut labels, special);
             preselected = Some(labels.len() - 1);
         }
 
         for (i, _) in providers.iter().enumerate() {
-            if Some(i) == detected_idx {
+            if detected_indices.contains(&i) {
                 continue;
             }
             push(&mut choices, &mut labels, ProviderChoice::Known(i));
@@ -1360,6 +1475,12 @@ impl KeysCommand {
             provider
                 .base_url
                 .replace(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER, &account_id)
+        } else if provider.base_url.contains(AWS_REGION_PLACEHOLDER) {
+            keys_ui::step_header(3, 3, "Credentials", "AWS region, then Bedrock API key");
+            let Some(region) = pick_bedrock_region()? else {
+                return Ok(ExitCode::Success);
+            };
+            provider.base_url.replace(AWS_REGION_PLACEHOLDER, &region)
         } else {
             keys_ui::step_header(3, 3, "API Key", "input is hidden");
             provider.base_url.clone()

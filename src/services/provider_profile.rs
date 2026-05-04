@@ -185,6 +185,56 @@ pub fn is_direct_openai_base(base_url: &str) -> bool {
         .contains("api.openai.com")
 }
 
+/// Normalize a user-supplied AWS region input from the `keys add` Bedrock prompt.
+///
+/// Accepts any of:
+///   - a bare region: `us-east-1`, `eu-central-1`, `us-gov-east-1`
+///   - a Bedrock Mantle URL: `https://bedrock-mantle.us-east-1.api.aws/v1`
+///   - a Bedrock Invoke URL: `https://bedrock-runtime.us-east-1.amazonaws.com`
+///   - any of the above with or without scheme, trailing slash, or path
+///
+/// Returns the canonical region (e.g. `us-east-1`) or `None` if the input is
+/// neither a plausible bare region nor a recognizable Bedrock URL.
+pub fn parse_aws_region(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains('.') && !trimmed.contains('/') {
+        return is_plausible_region(trimmed).then(|| trimmed.to_string());
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed = reqwest::Url::parse(&with_scheme).ok()?;
+    let host = parsed.host_str()?;
+    let region = if let Some(rest) = host.strip_prefix("bedrock-mantle.") {
+        rest.strip_suffix(".api.aws")?
+    } else if let Some(rest) = host.strip_prefix("bedrock-runtime.") {
+        rest.strip_suffix(".amazonaws.com")?
+    } else {
+        return None;
+    };
+    is_plausible_region(region).then(|| region.to_string())
+}
+
+fn is_plausible_region(s: &str) -> bool {
+    if !s.contains('-') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if !bytes.first().is_some_and(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    if !bytes.last().is_some_and(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    s.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 pub fn cloudflare_ai_base(base_url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(base_url).ok()?;
     let host = parsed.host_str()?;
@@ -611,5 +661,95 @@ mod tests {
 
         let other = ProviderQuirks::for_base_url("https://api.example.com/v1");
         assert_eq!(other.anthropic_path_prefix, None);
+    }
+
+    #[test]
+    fn parse_aws_region_accepts_bare_region() {
+        use super::parse_aws_region;
+        assert_eq!(parse_aws_region("us-east-1"), Some("us-east-1".into()));
+        assert_eq!(
+            parse_aws_region("eu-central-1"),
+            Some("eu-central-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("ap-northeast-1"),
+            Some("ap-northeast-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("us-gov-east-1"),
+            Some("us-gov-east-1".into())
+        );
+        assert_eq!(parse_aws_region("  us-west-2  "), Some("us-west-2".into()));
+    }
+
+    #[test]
+    fn parse_aws_region_accepts_mantle_url() {
+        use super::parse_aws_region;
+        assert_eq!(
+            parse_aws_region("https://bedrock-mantle.us-east-1.api.aws/v1"),
+            Some("us-east-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("https://bedrock-mantle.ap-northeast-1.api.aws/v1"),
+            Some("ap-northeast-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("bedrock-mantle.eu-central-1.api.aws/v1"),
+            Some("eu-central-1".into())
+        );
+    }
+
+    #[test]
+    fn parse_aws_region_accepts_invoke_url() {
+        use super::parse_aws_region;
+        assert_eq!(
+            parse_aws_region("https://bedrock-runtime.us-east-1.amazonaws.com"),
+            Some("us-east-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("http://bedrock-runtime.eu-central-1.amazonaws.com"),
+            Some("eu-central-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("bedrock-runtime.ap-northeast-1.amazonaws.com"),
+            Some("ap-northeast-1".into())
+        );
+    }
+
+    #[test]
+    fn parse_aws_region_tolerates_trailing_slash_and_path() {
+        use super::parse_aws_region;
+        assert_eq!(
+            parse_aws_region("https://bedrock-mantle.us-east-1.api.aws/v1/"),
+            Some("us-east-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("https://bedrock-runtime.us-east-1.amazonaws.com/"),
+            Some("us-east-1".into())
+        );
+        assert_eq!(
+            parse_aws_region("bedrock-runtime.us-west-2.amazonaws.com/model/foo/invoke"),
+            Some("us-west-2".into())
+        );
+    }
+
+    #[test]
+    fn parse_aws_region_rejects_garbage() {
+        use super::parse_aws_region;
+        assert_eq!(parse_aws_region(""), None);
+        assert_eq!(parse_aws_region("   "), None);
+        assert_eq!(parse_aws_region("us east 1"), None);
+        assert_eq!(parse_aws_region("US-EAST-1"), None);
+        assert_eq!(parse_aws_region("garbage"), None);
+        assert_eq!(parse_aws_region("https://api.openai.com/v1"), None);
+        assert_eq!(
+            parse_aws_region("https://bedrock-runtime.us-east-1.example.com"),
+            None
+        );
+        assert_eq!(
+            parse_aws_region("https://bedrock-mantle.us-east-1.example.com"),
+            None
+        );
+        assert_eq!(parse_aws_region("us-east-1.amazonaws.com"), None);
     }
 }

@@ -35,5 +35,6 @@
   {"id":"together-ai","name": "Together.ai", "base_url": "https://api.together.xyz/v1"},
   {"id":"inception","name":"Inception","base_url":"https://api.inceptionlabs.ai/v1/"},
   {"id":"poolside","name":"Poolside","base_url":"https://inference.poolside.ai/v1"},
-  {"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI","base_url":"https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"}
+  {"id":"cloudflare-workers-ai","name":"Cloudflare Workers AI","base_url":"https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1"},
+  {"id":"bedrock","name":"Amazon Bedrock","base_url":"https://bedrock-mantle.${AWS_REGION}.api.aws/v1"}
 ]

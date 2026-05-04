@@ -160,7 +160,7 @@ impl VideoCommand {
             }
         };
         let policy = OverwritePolicy::from_flags(args.force, args.json);
-        let final_path = match crate::commands::resolve_final_path(&initial_path, policy) {
+        let final_path = match crate::commands::resolve_final_path(&initial_path, policy, "-f") {
             Some(p) => p,
             None => return ExitCode::UserError,
         };

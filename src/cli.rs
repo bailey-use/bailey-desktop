@@ -72,11 +72,8 @@ pub enum Commands {
     #[command(hide = true)]
     Video(VideoArgs),
 
-    /// Generate speech audio (TTS) from a text prompt (OpenAI-compatible providers)
-    #[command(hide = true)]
-    Audio(AudioArgs),
-
-    /// Speak a text prompt aloud — `aivo audio` with `--play` defaulted on
+    /// Speak a text prompt aloud (TTS). Saves to `~/.config/aivo/audio/`
+    /// by default and reuses the cached file on repeat calls.
     #[command(hide = true)]
     Speak(AudioArgs),
 
@@ -638,10 +635,17 @@ pub struct VideoArgs {
 /// `PartialEq` is sufficient for clap and tests.
 #[derive(Args, Debug, Clone, Default, PartialEq)]
 pub struct AudioArgs {
-    /// Text prompt to read aloud. When omitted, `aivo audio` prints help
-    /// and the active key/model instead of generating anything.
+    /// Text prompt to read aloud. When omitted, falls back to `--file` or
+    /// piped stdin; with none of those, prints help and the active
+    /// key/model instead of generating anything.
     #[arg(value_name = "PROMPT", value_parser = non_empty())]
     pub prompt: Option<String>,
+
+    /// Read the prompt text from a file (UTF-8). Mutually exclusive with
+    /// the positional `<PROMPT>`.
+    #[arg(short = 'f', long = "file", value_name = "PATH",
+          value_parser = non_empty(), conflicts_with = "prompt")]
+    pub file: Option<String>,
 
     /// Audio model (e.g. tts-1, tts-1-hd, gpt-4o-mini-tts)
     #[arg(short, long, value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
@@ -658,13 +662,15 @@ pub struct AudioArgs {
     pub key: Option<String>,
 
     /// Output path: file (`hello.mp3`), directory (`out/`), or template
-    /// with `{ts}`/`{model}` tokens. Default: `./aivo-<timestamp>.mp3`.
+    /// with `{ts}`/`{model}` tokens. When omitted, the audio is saved
+    /// (and cached) under `~/.config/aivo/audio/`.
     #[arg(short = 'o', long, value_name = "PATH", value_parser = non_empty())]
     pub output: Option<String>,
 
-    /// Overwrite existing files without prompting
-    #[arg(short = 'f', long)]
-    pub force: bool,
+    /// Overwrite any existing artifact: bypass the cache (regenerate)
+    /// and overwrite a colliding -o path without prompting.
+    #[arg(long)]
+    pub overwrite: bool,
 
     /// Voice (provider-specific: alloy/echo/fable/onyx/nova/shimmer for
     /// OpenAI; Aoede/Charon/Kore/etc. for Gemini TTS)
@@ -683,14 +689,8 @@ pub struct AudioArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Play the audio through speakers after generation. With no `-o`, plays
-    /// from a temp file and discards. With `-o`, saves the file *and* plays.
-    /// Defaults on for `aivo speak`, off for `aivo audio`.
-    #[arg(long, conflicts_with = "no_play")]
-    pub play: bool,
-
-    /// Suppress playback even when invoked as `aivo speak`. Useful for
-    /// scripting where a `speak` invocation should just save a file.
+    /// Suppress playback. Useful for scripting where `speak` should just
+    /// save a file.
     #[arg(long)]
     pub no_play: bool,
 

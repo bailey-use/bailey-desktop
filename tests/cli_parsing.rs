@@ -284,3 +284,98 @@ fn non_alias_not_rewritten() {
     let cli = Cli::try_parse_from(&args).unwrap();
     assert!(matches!(cli.command, Some(Commands::Keys(_))));
 }
+
+#[test]
+fn speak_with_prompt() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "hello world"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.prompt.as_deref(), Some("hello world"));
+        assert!(args.file.is_none());
+        assert!(!args.overwrite);
+        assert!(!args.no_play);
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn speak_with_file_short_flag() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "-f", "script.txt"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.file.as_deref(), Some("script.txt"));
+        assert!(args.prompt.is_none());
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn speak_with_file_long_flag() {
+    let cli = Cli::try_parse_from(["aivo", "speak", "--file", "lines.md"]).unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.file.as_deref(), Some("lines.md"));
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn speak_prompt_and_file_are_mutually_exclusive() {
+    let err = Cli::try_parse_from(["aivo", "speak", "hello", "-f", "script.txt"]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be used") || msg.contains("conflict"),
+        "expected conflict error, got: {msg}"
+    );
+}
+
+#[test]
+fn speak_full_flag_set() {
+    let cli = Cli::try_parse_from([
+        "aivo",
+        "speak",
+        "narration",
+        "-m",
+        "tts-1-hd",
+        "-k",
+        "openai",
+        "-o",
+        "/tmp/out.mp3",
+        "--voice",
+        "nova",
+        "--format",
+        "wav",
+        "--speed",
+        "1.25",
+        "--no-play",
+        "--overwrite",
+        "--json",
+    ])
+    .unwrap();
+    if let Some(Commands::Speak(args)) = cli.command {
+        assert_eq!(args.prompt.as_deref(), Some("narration"));
+        assert_eq!(args.model.as_deref(), Some("tts-1-hd"));
+        assert_eq!(args.key.as_deref(), Some("openai"));
+        assert_eq!(args.output.as_deref(), Some("/tmp/out.mp3"));
+        assert_eq!(args.voice.as_deref(), Some("nova"));
+        assert_eq!(args.format.as_deref(), Some("wav"));
+        assert_eq!(args.speed, Some(1.25));
+        assert!(args.no_play);
+        assert!(args.overwrite);
+        assert!(args.json);
+    } else {
+        panic!("Expected Speak command");
+    }
+}
+
+#[test]
+fn audio_command_is_unrecognized() {
+    let err = Cli::try_parse_from(["aivo", "audio", "hello"]).unwrap_err();
+    let msg = err.to_string();
+    // clap reports "unrecognized subcommand" or similar — the specific
+    // wording depends on the version; just ensure parsing fails.
+    assert!(
+        msg.contains("audio") || msg.contains("unrecognized") || msg.contains("subcommand"),
+        "expected unrecognized-subcommand error, got: {msg}"
+    );
+}

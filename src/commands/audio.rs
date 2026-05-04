@@ -1,14 +1,14 @@
-//! `aivo audio` — generate speech (TTS) from a text prompt.
+//! `aivo speak` — generate speech (TTS) from a text prompt and play it.
 //!
-//! Resolves a key, takes the prompt from the positional arg, calls the
-//! provider, saves the result. Mirrors `aivo image`'s flow exactly: the
-//! shared `services::audio_gen` module handles HTTP + bytes; this module
-//! owns the CLI ergonomics (help text, model picker, overwrite policy,
-//! human / JSON output). When no prompt is provided we print the command
-//! help and the audio-scope active key/model.
+//! Resolves a key, takes the prompt from a positional arg / `--file` /
+//! piped stdin, calls the provider, saves the result, and plays it. Every
+//! invocation lands in the on-disk cache at `~/.config/aivo/audio/`,
+//! keyed by `(prompt, voice, model, format, speed)`. Repeat calls with
+//! identical inputs hit the cache and skip the provider entirely.
 
 use std::fs;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::cli::AudioArgs;
 use crate::errors::ExitCode;
+use crate::services::audio_cache::{self, CacheKey};
 use crate::services::audio_gen::{self, AudioArtifact, AudioRequest};
 use crate::services::http_utils::router_http_client;
 use crate::services::media_io::{self, OutputTarget, OverwritePolicy, human_bytes};
@@ -39,80 +40,55 @@ impl AudioCommand {
     }
 
     pub fn print_help() {
-        Self::print_help_for("aivo audio", "— generate speech (TTS) from a prompt", false);
-    }
-
-    /// Same help structure as `aivo audio`, but tweaks the description and
-    /// examples to highlight the play-by-default behavior.
-    pub fn print_speak_help() {
-        Self::print_help_for("aivo speak", "— speak a prompt aloud (TTS + play)", true);
-    }
-
-    fn print_help_for(name: &str, blurb: &str, default_play: bool) {
-        println!("{} {}", style::cyan(name), style::dim(blurb));
+        let name = "aivo speak";
+        println!(
+            "{} {}",
+            style::cyan(name),
+            style::dim("— speak a prompt aloud (TTS, cached, plays by default)")
+        );
         println!();
-        println!("{} {} [OPTIONS] <PROMPT>", style::bold("Usage:"), name);
+        println!("{} {} [OPTIONS] [<PROMPT>]", style::bold("Usage:"), name);
         println!();
         println!("{}", style::bold("Arguments:"));
         println!(
             "  {}{}",
             style::cyan(format!("{:<24}", "PROMPT")),
-            style::dim("Text to read aloud")
+            style::dim("Text to read aloud (or use -f / pipe stdin)")
         );
         println!();
         println!("{}", style::bold("Options:"));
         let opt = |f: &str, d: &str| {
             println!("  {}{}", style::cyan(format!("{:<24}", f)), style::dim(d));
         };
+        opt("-f, --file <PATH>", "Read prompt text from a file (UTF-8)");
         opt("-m, --model <MODEL>", "TTS model (e.g. tts-1, tts-1-hd)");
         opt("-k, --key <ID|NAME>", "API key to use");
         opt(
             "-o, --output <PATH>",
-            "File, directory, or template ({ts}/{model})",
+            "File, directory, or template ({ts}/{model}); default: cache dir",
         );
-        opt("-f, --force", "Overwrite existing files without prompting");
+        opt(
+            "    --overwrite",
+            "Bypass cache and overwrite -o without prompting",
+        );
         opt("    --voice <VOICE>", "alloy | nova | onyx | echo | …");
         opt(
             "    --format <FORMAT>",
             "mp3 (default) | wav | opus | aac | flac",
         );
         opt("    --speed <SPEED>", "Playback speed, typically 0.25–4.0");
-        if default_play {
-            opt(
-                "    --no-play",
-                "Save without playing (default for `aivo audio`)",
-            );
-        } else {
-            opt(
-                "    --play",
-                "Play through speakers after generation (or use `aivo speak`)",
-            );
-        }
+        opt("    --no-play", "Save without playing");
         opt("-r, --refresh", "Bypass model-list cache");
         opt("    --json", "Emit JSON result (for scripting)");
         println!();
         println!("{}", style::bold("Examples:"));
-        if default_play {
-            println!("  {}", style::dim("aivo speak \"hello world\""));
-            println!(
-                "  {}",
-                style::dim("aivo speak \"narration line\" -m tts-1-hd --voice nova")
-            );
-            println!(
-                "  {}",
-                style::dim("aivo speak \"...\" --no-play -o out.mp3   # save only")
-            );
-        } else {
-            println!("  {}", style::dim("aivo audio \"hello world\""));
-            println!(
-                "  {}",
-                style::dim("aivo audio \"narration line\" -m tts-1-hd --voice nova -o out.mp3")
-            );
-            println!(
-                "  {}",
-                style::dim("aivo audio \"...\" --play   # save mp3 and play it")
-            );
-        }
+        let ex = |s: &str| println!("  {}", style::dim(s));
+        ex("aivo speak \"hello world\"");
+        ex("aivo speak \"narration line\" -m tts-1-hd --voice nova");
+        ex("aivo speak -f script.txt");
+        ex("echo \"hi from pipe\" | aivo speak");
+        ex("aivo speak \"...\" --no-play -o out.mp3   # save only");
+        ex("aivo speak \"...\" --overwrite           # force regenerate");
     }
 
     /// Prints the audio-scope active key and model under the help output.
@@ -127,31 +103,7 @@ impl AudioCommand {
         crate::commands::print_active_selection_for(session_store, sel).await;
     }
 
-    /// `default_play` flips the play-vs-save default. `aivo audio` passes
-    /// `false` (save unless `--play`); `aivo speak` passes `true` (play
-    /// unless `--no-play`).
-    pub async fn execute(self, args: AudioArgs, key: ApiKey, default_play: bool) -> ExitCode {
-        // No prompt → print help + audio-scope active selection. Don't fall
-        // back to stdin: a misfired empty stdin shouldn't fire a model picker
-        // and burn an API call.
-        let prompt = match args
-            .prompt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(p) => p.to_string(),
-            None => {
-                if default_play {
-                    Self::print_speak_help();
-                } else {
-                    Self::print_help();
-                }
-                Self::print_active_selection(&self.session_store).await;
-                return ExitCode::Success;
-            }
-        };
-
+    pub async fn execute(self, args: AudioArgs, key: ApiKey, prompt: String) -> ExitCode {
         let model = match resolve_audio_model(&self.session_store, &self.cache, &args, &key).await {
             Ok(Some(m)) => m,
             Ok(None) => return ExitCode::Success, // picker cancelled
@@ -161,119 +113,156 @@ impl AudioCommand {
             }
         };
 
-        let play_requested = args.play || (default_play && !args.no_play);
-        let wants_save = args.output.is_some();
-        // Pure-play mode: ask for raw PCM. It's the only format every
-        // OpenAI TTS model accepts (gpt-4o-mini-tts rejects "wav" as
-        // `Invalid option: expected one of "mp3"|"pcm"`), and Gemini
-        // returns L16 PCM regardless of what we ask for. `audio_gen`
-        // wraps the raw bytes in a WAV header before we save them, so
-        // afplay/aplay/SoundPlayer get a playable file on every platform.
-        // When -o is set we honor the user's --format and let playback
-        // be best-effort against the saved file.
-        let request_format = if play_requested && !wants_save {
-            Some("pcm".to_string())
-        } else {
-            args.format.clone()
+        let cache_key = CacheKey::from_inputs(
+            &prompt,
+            args.voice.as_deref(),
+            &model,
+            args.format.as_deref(),
+            args.speed,
+        );
+        let ext = default_extension(args.format.as_deref());
+        let cache_dir = audio_cache::audio_cache_dir(self.session_store.config_dir());
+        let cache_file = audio_cache::cache_path(&cache_dir, &cache_key, &ext);
+
+        // Resolve the user-visible save path. None → save *is* the cache file.
+        // Some(path) → save into the user's chosen path; the cache file is
+        // still populated for future hits.
+        let user_output_path: Option<PathBuf> = match args.output.as_deref() {
+            None => None,
+            Some(_) => {
+                let target = OutputTarget::parse(args.output.as_deref());
+                let initial = match media_io::resolve_output_path(&target, &model, &ext) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{} {}", style::red("Error:"), e);
+                        return ExitCode::UserError;
+                    }
+                };
+                let policy = OverwritePolicy::from_flags(args.overwrite, args.json);
+                match crate::commands::resolve_final_path(&initial, policy, "--overwrite") {
+                    Some(p) => Some(p),
+                    None => return ExitCode::UserError,
+                }
+            }
         };
 
-        let (initial_path, is_temp) = if play_requested && !wants_save {
-            let suffix: u32 = rand::random();
-            let path = std::env::temp_dir().join(format!("aivo-tts-{suffix:x}.wav"));
-            (path, true)
+        // Try the cache first. ENOENT == cache miss; any other error is
+        // surfaced (corrupt permissions, etc.). `--overwrite` skips the
+        // lookup so the next branch always regenerates.
+        let cache_metadata = if args.overwrite {
+            None
         } else {
-            let target = OutputTarget::parse(args.output.as_deref());
-            let ext = default_extension(request_format.as_deref());
-            let initial = match media_io::resolve_output_path(&target, &model, &ext) {
-                Ok(p) => p,
+            match fs::metadata(&cache_file) {
+                Ok(m) => Some(m),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => {
-                    eprintln!("{} {}", style::red("Error:"), e);
+                    eprintln!(
+                        "{} cached file unreadable ({}): {}",
+                        style::red("Error:"),
+                        cache_file.display(),
+                        e
+                    );
                     return ExitCode::UserError;
                 }
-            };
-            let policy = OverwritePolicy::from_flags(args.force, args.json);
-            let resolved = match crate::commands::resolve_final_path(&initial, policy) {
-                Some(p) => p,
-                None => return ExitCode::UserError,
-            };
-            (resolved, false)
-        };
-
-        // For temp files we picked the `.wav` extension ourselves and the
-        // caller will play whatever the provider returns; treat as pinned so
-        // the server can't silently rename the temp path.
-        let pinned = if is_temp {
-            true
-        } else {
-            OutputTarget::parse(args.output.as_deref()).pins_extension()
-        };
-
-        let request = AudioRequest {
-            prompt,
-            model: model.clone(),
-            voice: args.voice.clone(),
-            format: request_format.clone(),
-            speed: args.speed,
-        };
-
-        let spinner = start_spinner_if_tty(&model, play_requested && !wants_save);
-        let start = std::time::Instant::now();
-        let result = audio_gen::generate(&key, &request, Some(&initial_path), pinned).await;
-        let elapsed = start.elapsed();
-        stop_spinner(spinner);
-
-        let artifact = match result {
-            Ok(a) => a,
-            Err(e) => {
-                if is_temp {
-                    let _ = fs::remove_file(&initial_path);
-                }
-                eprintln!("{} {}", style::red("Error:"), e);
-                return ExitCode::NetworkError;
             }
+        };
+        let cache_hit = cache_metadata.is_some();
+
+        let mut elapsed = std::time::Duration::ZERO;
+        let bytes = if let Some(meta) = cache_metadata {
+            meta.len()
+        } else {
+            if let Some(parent) = cache_file.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                eprintln!(
+                    "{} cannot create cache dir '{}': {}",
+                    style::red("Error:"),
+                    parent.display(),
+                    e
+                );
+                return ExitCode::UserError;
+            }
+            // Pin the extension on the cache path: the cache filename's
+            // extension is derived from `args.format`, and we want the same
+            // bytes mapped to the same path on every run regardless of the
+            // server's content-type header.
+            let request = AudioRequest {
+                prompt: prompt.clone(),
+                model: model.clone(),
+                voice: args.voice.clone(),
+                format: args.format.clone(),
+                speed: args.speed,
+            };
+            let spinner = start_spinner_if_tty(&model);
+            let start = std::time::Instant::now();
+            let result = audio_gen::generate(&key, &request, Some(&cache_file), true).await;
+            elapsed = start.elapsed();
+            stop_spinner(spinner);
+            match result {
+                Ok(a) => a.bytes,
+                Err(e) => {
+                    eprintln!("{} {}", style::red("Error:"), e);
+                    return ExitCode::NetworkError;
+                }
+            }
+        };
+
+        let final_path = match user_output_path {
+            Some(dest) if dest != cache_file => {
+                if let Err(e) = fs::copy(&cache_file, &dest) {
+                    eprintln!(
+                        "{} cannot write '{}': {}",
+                        style::red("Error:"),
+                        dest.display(),
+                        e
+                    );
+                    return ExitCode::UserError;
+                }
+                dest
+            }
+            Some(dest) => dest,
+            None => cache_file.clone(),
+        };
+        let artifact = AudioArtifact {
+            path: Some(final_path.clone()),
+            bytes,
         };
 
         let mut played = false;
         let mut playback_error: Option<String> = None;
-        if play_requested {
-            let target_for_play = artifact
-                .path
-                .clone()
-                .unwrap_or_else(|| initial_path.clone());
-            match playback::play_audio_blocking(&target_for_play) {
+        if !args.no_play {
+            match playback::play_audio_blocking(&final_path) {
                 Ok(()) => played = true,
                 Err(e) => playback_error = Some(e.to_string()),
             }
         }
 
-        // Cleanup the temp file *after* playback. Always — even when
-        // playback failed — so we don't leave junk in /tmp.
-        if is_temp {
-            if let Some(p) = artifact.path.as_ref() {
-                let _ = fs::remove_file(p);
-            } else {
-                let _ = fs::remove_file(&initial_path);
-            }
-        }
-
-        // Persist (key, model) into the audio-only slot so the next audio
-        // session defaults to it. Stored separately from `last_selection`
-        // and `last_image_selection`.
         let _ = self
             .session_store
             .set_last_audio_selection(&key, Some(&model))
             .await;
 
         if args.json {
-            print_json(&artifact, &key, &model, &request, elapsed, played, is_temp);
+            print_json(
+                &artifact,
+                &key,
+                &model,
+                args.voice.as_deref(),
+                args.format.as_deref(),
+                args.speed,
+                elapsed,
+                played,
+                cache_hit,
+            );
         } else {
             print_human(
                 &artifact,
                 &key,
                 &model,
-                request.voice.as_deref(),
+                args.voice.as_deref(),
                 played,
-                is_temp,
+                cache_hit,
                 playback_error.as_deref(),
             );
         }
@@ -353,13 +342,9 @@ fn default_extension(format: Option<&str>) -> String {
     }
 }
 
-fn start_spinner_if_tty(model: &str, play_only: bool) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
+fn start_spinner_if_tty(model: &str) -> Option<(Arc<AtomicBool>, JoinHandle<()>)> {
     if std::io::stderr().is_terminal() {
-        let label = if play_only {
-            format!(" Speaking with {}…", model)
-        } else {
-            format!(" Generating audio with {}…", model)
-        };
+        let label = format!(" Speaking with {}…", model);
         Some(style::start_spinner(Some(&label)))
     } else {
         None
@@ -378,67 +363,77 @@ fn print_human(
     model: &str,
     voice: Option<&str>,
     played: bool,
-    is_temp: bool,
+    cached: bool,
     playback_error: Option<&str>,
 ) {
-    // Three end-states: played-only (temp), saved-only, saved-and-played.
-    if is_temp {
-        // Temp file is gone by now; just confirm we spoke.
-        println!(
-            "{} spoken ({}) via {}/{}",
-            style::success_symbol(),
-            voice.unwrap_or("default voice"),
-            style::dim(key.display_name()),
-            style::dim(model),
-        );
-    } else if let Some(path) = &artifact.path {
-        let suffix = if played {
-            format!(" ({})", style::dim("played"))
-        } else if let Some(err) = playback_error {
-            format!(" ({}: {})", style::yellow("playback skipped"), err)
-        } else {
-            String::new()
-        };
-        println!(
-            "{} saved {} ({}, {}) via {}/{}{}",
-            style::success_symbol(),
-            style::cyan(path.display().to_string()),
-            voice.unwrap_or("default voice"),
-            human_bytes(artifact.bytes),
-            style::dim(key.display_name()),
-            style::dim(model),
-            suffix,
-        );
+    let Some(path) = &artifact.path else {
+        return;
+    };
+    let mut tags: Vec<String> = Vec::new();
+    if cached {
+        tags.push(style::dim("cached").to_string());
     }
+    if played {
+        tags.push(style::dim("played").to_string());
+    } else if let Some(err) = playback_error {
+        tags.push(format!("{}: {}", style::yellow("playback skipped"), err));
+    }
+    let suffix = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", tags.join(", "))
+    };
+    println!(
+        "{} saved {} ({}, {}) via {}/{}{}",
+        style::success_symbol(),
+        style::cyan(path.display().to_string()),
+        voice.unwrap_or("default voice"),
+        human_bytes(artifact.bytes),
+        style::dim(key.display_name()),
+        style::dim(model),
+        suffix,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_json(
     artifact: &AudioArtifact,
     key: &ApiKey,
     model: &str,
-    request: &AudioRequest,
+    voice: Option<&str>,
+    format: Option<&str>,
+    speed: Option<f32>,
     elapsed: std::time::Duration,
     played: bool,
-    is_temp: bool,
+    cached: bool,
 ) {
+    let path = artifact.path.as_ref().map(|p| p.display().to_string());
     let out = json!({
         "model": model,
         "key": key.display_name(),
-        "voice": request.voice,
-        "format": request.format,
-        "speed": request.speed,
+        "voice": voice,
+        "format": format,
+        "speed": speed,
         "duration_ms": elapsed.as_millis() as u64,
-        // is_temp means we discarded the file after playback; surface null
-        // rather than a stale temp path that no longer exists.
-        "path": if is_temp {
-            None
-        } else {
-            artifact.path.as_ref().map(|p| p.display().to_string())
-        },
+        "path": path,
         "bytes": artifact.bytes,
         "played": played,
+        "cached": cached,
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+}
+
+/// Reads prompt text from a file path. Trims trailing whitespace; rejects
+/// empty/whitespace-only files. Errors include the path for triage.
+#[allow(dead_code)] // used by the binary's main.rs; lib build doesn't see it
+pub fn read_prompt_file(path: &Path) -> anyhow::Result<String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read --file '{}': {}", path.display(), e))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--file '{}' is empty", path.display());
+    }
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -460,5 +455,28 @@ mod tests {
         assert_eq!(default_extension(Some("aac")), "aac");
         assert_eq!(default_extension(Some("flac")), "flac");
         assert_eq!(default_extension(Some("pcm")), "pcm");
+    }
+
+    #[test]
+    fn read_prompt_file_returns_trimmed_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.txt");
+        fs::write(&path, "  hello world  \n").unwrap();
+        let out = read_prompt_file(&path).unwrap();
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn read_prompt_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        fs::write(&path, "   \n\t\n").unwrap();
+        assert!(read_prompt_file(&path).is_err());
+    }
+
+    #[test]
+    fn read_prompt_file_reports_missing_path() {
+        let err = read_prompt_file(Path::new("/nonexistent/aivo-test.txt")).unwrap_err();
+        assert!(err.to_string().contains("--file"));
     }
 }

@@ -40,12 +40,18 @@ pub(crate) fn trim_to_one_line(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Decides the final write path for media commands (`image`/`audio`/
+/// Decides the final write path for media commands (`image`/`speak`/
 /// `video`). Reads the `force`/`json`-derived `policy`, prompts on
 /// existing files when interactive, and prints the standard
-/// "exists, pass -f to overwrite" error in non-interactive mode.
+/// "exists, pass <flag> to overwrite" error in non-interactive mode.
+/// `force_flag_hint` is the flag the caller advertises for non-interactive
+/// overwrite (e.g. `"-f"` for image/video, `"--overwrite"` for speak).
 /// Returns `None` when the user (or non-TTY) aborts.
-pub(crate) fn resolve_final_path(initial: &Path, policy: OverwritePolicy) -> Option<PathBuf> {
+pub(crate) fn resolve_final_path(
+    initial: &Path,
+    policy: OverwritePolicy,
+    force_flag_hint: &str,
+) -> Option<PathBuf> {
     let answer = if !policy.force && policy.interactive && initial.exists() {
         Some(prompt_overwrite(initial))
     } else {
@@ -56,9 +62,10 @@ pub(crate) fn resolve_final_path(initial: &Path, policy: OverwritePolicy) -> Opt
         OverwriteDecision::Abort => {
             if !policy.interactive {
                 eprintln!(
-                    "{} '{}' already exists (pass -f to overwrite).",
+                    "{} '{}' already exists (pass {} to overwrite).",
                     style::red("Error:"),
-                    initial.display()
+                    initial.display(),
+                    force_flag_hint,
                 );
             }
             None

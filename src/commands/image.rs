@@ -146,7 +146,7 @@ impl ImageCommand {
             // --url means no download, so no path to resolve against disk.
             None
         } else {
-            match crate::commands::resolve_final_path(&initial_path, policy) {
+            match crate::commands::resolve_final_path(&initial_path, policy, "-f") {
                 Some(p) => Some(p),
                 None => return ExitCode::UserError,
             }

@@ -31,6 +31,7 @@ use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{
     ApiKey, AttachmentStorage, MessageAttachment, SessionStore, SessionTokens, StoredChatMessage,
 };
+use crate::services::stdin_io::read_stdin_if_piped;
 use crate::style;
 
 use super::chat_request_builder::{
@@ -762,20 +763,6 @@ where
                 Err(e) => Err(e),
             }
         }
-    }
-}
-
-fn read_stdin_if_piped() -> Result<Option<String>> {
-    if io::stdin().is_terminal() {
-        return Ok(None);
-    }
-
-    let mut buf = String::new();
-    io::stdin().read_to_string(&mut buf)?;
-    if buf.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(buf))
     }
 }
 

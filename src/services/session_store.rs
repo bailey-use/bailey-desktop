@@ -1266,6 +1266,12 @@ impl SessionStore {
         &self.ctx.config_path
     }
 
+    /// Returns the directory holding `config.json` and other aivo state
+    /// (`logs/`, `sessions/`, the audio cache, etc.).
+    pub fn config_dir(&self) -> &std::path::Path {
+        &self.ctx.config_dir
+    }
+
     pub fn logs(&self) -> LogStore {
         self.logs.clone()
     }

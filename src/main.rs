@@ -119,12 +119,8 @@ async fn main() {
                 ImageCommand::print_help();
                 ImageCommand::print_active_selection(&session_store).await;
             }
-            Commands::Audio(_) => {
-                AudioCommand::print_help();
-                AudioCommand::print_active_selection(&session_store).await;
-            }
             Commands::Speak(_) => {
-                AudioCommand::print_speak_help();
+                AudioCommand::print_help();
                 AudioCommand::print_active_selection(&session_store).await;
             }
             Commands::Video(_) => {
@@ -266,24 +262,8 @@ async fn main() {
             command.execute(image_args, key).await
         }
 
-        Commands::Audio(audio_args) => {
-            audio_dispatch(
-                &session_store,
-                &models_cache,
-                audio_args,
-                /* default_play = */ false,
-            )
-            .await
-        }
-
         Commands::Speak(audio_args) => {
-            audio_dispatch(
-                &session_store,
-                &models_cache,
-                audio_args,
-                /* default_play = */ true,
-            )
-            .await
+            audio_dispatch(&session_store, &models_cache, audio_args).await
         }
 
         Commands::Video(video_args) => {
@@ -958,32 +938,27 @@ async fn ensure_compatible_key(
     }
 }
 
-/// Shared dispatch for `Commands::Audio` (`default_play = false`) and
-/// `Commands::Speak` (`default_play = true`). Both arms differ only in
-/// the play-by-default decision and which help screen they print on the
-/// no-prompt path; everything else (key resolution, compat re-check,
-/// command instantiation) is identical.
+/// Dispatch for `Commands::Speak`. Resolves the prompt from positional
+/// arg / `--file` / piped stdin (in that precedence) before any key or
+/// model work — so a no-prompt invocation in an interactive shell prints
+/// help instead of triggering a picker.
 async fn audio_dispatch(
     session_store: &SessionStore,
     models_cache: &services::ModelsCache,
     audio_args: cli::AudioArgs,
-    default_play: bool,
 ) -> ExitCode {
-    if audio_args
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        if default_play {
-            AudioCommand::print_speak_help();
-        } else {
+    let prompt = match resolve_speak_prompt(&audio_args) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
             AudioCommand::print_help();
+            AudioCommand::print_active_selection(session_store).await;
+            process::exit(ExitCode::Success.code());
         }
-        AudioCommand::print_active_selection(session_store).await;
-        process::exit(ExitCode::Success.code());
-    }
+        Err(e) => {
+            eprintln!("{} {}", style::red("Error:"), e);
+            process::exit(ExitCode::UserError.code());
+        }
+    };
 
     let key_override = key_or_exit(
         resolve_audio_key_override(
@@ -1016,7 +991,35 @@ async fn audio_dispatch(
         None => process::exit(ExitCode::UserError.code()),
     };
     let command = AudioCommand::new(session_store.clone(), models_cache.clone());
-    command.execute(audio_args, key, default_play).await
+    command.execute(audio_args, key, prompt).await
+}
+
+/// Resolves the speak prompt from (positional, `--file`, piped stdin) in
+/// that precedence. Returns `Ok(None)` to mean "show help" — i.e. the
+/// caller had no positional, no `--file`, and stdin was a TTY or empty.
+fn resolve_speak_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>> {
+    if let Some(p) = args
+        .prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(Some(p.to_string()));
+    }
+    if let Some(path) = args.file.as_deref() {
+        return commands::audio::read_prompt_file(std::path::Path::new(path)).map(Some);
+    }
+    match services::stdin_io::read_stdin_if_piped()? {
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 /// Dispatch for `Commands::Video`. Mirrors `audio_dispatch` but does *not*

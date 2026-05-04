@@ -47,6 +47,11 @@ unicode-width = "0.2"
 tempfile = "3.0"
 url = "2"
 
+# Audio playback (in-process; pause/seek/position).
+# Default features pull Symphonia, which decodes WAV / MP3 / FLAC / Vorbis.
+# AAC / Opus / PCM fall through to the system-player path in playback.rs.
+rodio = "0.20"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

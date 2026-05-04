@@ -677,8 +677,16 @@ pub struct AudioArgs {
     #[arg(long, value_name = "VOICE", value_parser = non_empty())]
     pub voice: Option<String>,
 
-    /// Audio format: mp3 (default) | wav | opus | aac | flac
-    #[arg(long, value_name = "FORMAT", value_parser = non_empty())]
+    /// Audio format. When unset, the interactive default is `wav` (so we
+    /// can stream PCM and start playback before generation finishes); for
+    /// `--no-play` or `-o` the buffered fallback defaults to `mp3`.
+    /// Provider support varies — OpenAI accepts mp3/wav/opus/aac/flac/pcm;
+    /// Gemini's TTS surface is fixed-format and ignores this flag.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        value_parser = ["mp3", "wav", "opus", "aac", "flac", "pcm"],
+    )]
     pub format: Option<String>,
 
     /// Playback speed, typically 0.25–4.0 (provider-dependent)
@@ -693,6 +701,17 @@ pub struct AudioArgs {
     /// save a file.
     #[arg(long)]
     pub no_play: bool,
+
+    /// Ignore any saved playback position and play from the beginning.
+    /// Without this, `speak` resumes where it left off after a previous
+    /// Ctrl-C / quit on the same cached entry.
+    #[arg(long)]
+    pub restart: bool,
+
+    /// Browse cached TTS history with a fuzzy picker. Each entry can be
+    /// replayed or deleted. Mutually exclusive with a prompt or `--file`.
+    #[arg(long, conflicts_with_all = ["prompt", "file"])]
+    pub history: bool,
 
     /// Emit a JSON object with the result (path, bytes, model, voice)
     #[arg(long)]

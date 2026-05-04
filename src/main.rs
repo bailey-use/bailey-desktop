@@ -947,6 +947,13 @@ async fn audio_dispatch(
     models_cache: &services::ModelsCache,
     audio_args: cli::AudioArgs,
 ) -> ExitCode {
+    // History mode is purely local: no provider call, no key resolution.
+    // Route it before we try to resolve a prompt or a key.
+    if audio_args.history {
+        let command = AudioCommand::new(session_store.clone(), models_cache.clone());
+        return command.run_history(audio_args).await;
+    }
+
     let prompt = match resolve_speak_prompt(&audio_args) {
         Ok(Some(p)) => p,
         Ok(None) => {

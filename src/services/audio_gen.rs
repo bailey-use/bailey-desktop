@@ -9,12 +9,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
+use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::services::http_utils::router_http_client;
 use crate::services::media_io::{align_extension, atomic_write, extract_error_message};
 use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
 use crate::services::session_store::ApiKey;
+
+/// Sample rate of OpenAI's `response_format: "pcm"` output. Documented as
+/// 24 kHz, 16-bit signed little-endian, mono — matches what `gpt-4o-mini-tts`
+/// and `tts-1*` emit. Gemini's L16 audio uses the same shape after we strip
+/// its `audio/L16; rate=24000` envelope.
+pub const PCM_STREAM_RATE_HZ: u32 = 24_000;
+pub const PCM_STREAM_CHANNELS: u16 = 1;
+pub const PCM_STREAM_BITS: u16 = 16;
 
 /// One TTS request.
 #[derive(Debug, Clone)]
@@ -80,6 +89,87 @@ pub async fn generate(
         ProviderProtocol::Google => generate_google(key, request, path, pinned_extension).await,
         ProviderProtocol::Anthropic => bail!("Anthropic does not support text-to-speech"),
     }
+}
+
+/// Streams OpenAI's `/v1/audio/speech` as raw PCM, calling `on_chunk` for
+/// each network chunk so the caller can begin playback before the full
+/// response arrives. Returns the accumulated PCM bytes (no WAV header).
+///
+/// The provider request always uses `response_format: "pcm"` — that's
+/// what makes streaming worthwhile, since PCM has no decoder framing and
+/// any chunk boundary is a safe playback boundary. Callers wrap the
+/// returned bytes with `wrap_pcm_as_wav` before persisting to disk.
+///
+/// `on_chunk` returns `false` to signal the caller no longer wants more
+/// audio (e.g. the user quit playback). On false, the function returns
+/// early with whatever PCM has accumulated so far — partial bytes the
+/// caller should *not* persist.
+pub async fn stream_openai_pcm<F>(
+    key: &ApiKey,
+    request: &AudioRequest,
+    mut on_chunk: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    let base = key.base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}/audio/speech")
+    } else {
+        format!("{base}/v1/audio/speech")
+    };
+
+    let mut body = json!({
+        "model": request.model,
+        "input": request.prompt,
+        "voice": request
+            .voice
+            .clone()
+            .unwrap_or_else(|| "alloy".to_string()),
+        "response_format": "pcm",
+        // `stream: true` is a no-op on legacy `tts-1` (server still buffers
+        // before sending) but enables true server-side streaming on the
+        // newer `gpt-4o*-tts` family. Sending it always is harmless.
+        "stream": true,
+    });
+    if let Some(speed) = request.speed {
+        body["speed"] = json!(speed);
+    }
+
+    let client = router_http_client();
+    let response = client
+        .post(&url)
+        .bearer_auth(key.key.as_str())
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("audio request to {url} failed"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        let detail = extract_error_message(&text).unwrap_or_else(|| text.clone());
+        bail!("audio generation failed ({}): {}", status.as_u16(), detail);
+    }
+
+    // Pre-size for ~10 seconds of mono 16-bit / 24 kHz so a typical short
+    // clip never reallocates. Long prompts will grow naturally.
+    let mut accumulated = Vec::with_capacity(48_000 * 10);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading audio chunk failed")?;
+        if chunk.is_empty() {
+            continue;
+        }
+        let keep_going = on_chunk(&chunk);
+        accumulated.extend_from_slice(&chunk);
+        if !keep_going {
+            // Caller no longer wants audio (e.g. user quit). Drop the
+            // remaining stream — reqwest closes the connection on drop.
+            break;
+        }
+    }
+    Ok(accumulated)
 }
 
 async fn generate_openai(
@@ -262,7 +352,12 @@ fn parse_pcm_params(mime: Option<&str>) -> Option<(u32, u16)> {
 /// PCM samples. Output is `pcm.len() + 44` bytes. Channels is the actual
 /// channel count (1 = mono, 2 = stereo); Gemini's TTS output is always
 /// mono so callers pass `1`.
-fn wrap_pcm_as_wav(pcm: &[u8], sample_rate: u32, channels: u16, bits_per_sample: u16) -> Vec<u8> {
+pub(crate) fn wrap_pcm_as_wav(
+    pcm: &[u8],
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+) -> Vec<u8> {
     let bytes_per_sample = bits_per_sample / 8;
     let byte_rate = sample_rate * u32::from(channels) * u32::from(bytes_per_sample);
     let block_align = channels * bytes_per_sample;

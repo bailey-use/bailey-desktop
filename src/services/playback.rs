@@ -1,27 +1,48 @@
-//! Cross-platform audio playback for `aivo speak` / `aivo audio --play`.
+//! Cross-platform audio playback for `aivo speak`.
 //!
-//! We hand an audio file to the OS audio stack via a per-platform CLI:
+//! Two paths:
 //!
-//! - macOS: `afplay` (built-in; handles MP3, WAV, AAC, M4A, …)
-//! - Linux: try `paplay` / `pw-play` / `aplay` / `ffplay` / `mpv` / `mpg123`
-//!   in order, falling through only when a binary isn't installed
-//! - Windows: PowerShell `System.Media.SoundPlayer.PlaySync()` (built-in;
-//!   WAV only)
+//! 1. `play_interactive` — primary. Decodes the file in-process with
+//!    [`rodio`], opens a sink on the system default output device, and on a
+//!    TTY drives a small key loop (SPACE pause / ←→ seek / q quit) while
+//!    streaming a status line. Returns the position at exit so callers can
+//!    persist a resume point.
+//! 2. `play_external` — fallback. Hands the file to a per-OS CLI player
+//!    (`afplay` / `paplay` / PowerShell `SoundPlayer`). Used when rodio
+//!    can't decode the format (AAC, Opus on some builds) or no audio device
+//!    is available. No pause / seek / position tracking — the function
+//!    simply blocks until the child exits.
 //!
-//! For "play-only, no save" mode (no `-o`) the audio command requests WAV
-//! from the provider so the path works on every platform. With `-o` set the
-//! caller's chosen format is honored and playback becomes best-effort —
-//! Windows can fail on MP3, and Linux falls through `paplay`/`aplay` (which
-//! reject MP3) to one of the codec-aware players if installed.
-
+use std::fs::File;
+use std::io::{BufReader, IsTerminal, Write};
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use rodio::buffer::SamplesBuffer;
+use rodio::{Decoder, OutputStream, Sink, Source};
+
+use crate::services::audio_gen::{PCM_STREAM_CHANNELS, PCM_STREAM_RATE_HZ};
+
+/// What happened during interactive playback. Callers use this to decide
+/// whether to clear or persist the resume position.
+#[derive(Debug, Clone)]
+pub struct PlaybackOutcome {
+    /// True if the audio reached its natural end (sink emptied). False if
+    /// the user quit or playback was interrupted.
+    pub completed: bool,
+    /// Last known playback position. Zero on natural completion (so the
+    /// next run starts from the beginning).
+    pub last_pos: Duration,
+}
 
 /// Linux CLI players in priority order. Each entry is
-/// `(binary, args_before_path)`.
+/// `(binary, args_before_path)`. Used by the external fallback path.
 #[cfg(target_os = "linux")]
 const LINUX_PLAYERS: &[(&str, &[&str])] = &[
     ("paplay", &[]),
@@ -32,19 +53,425 @@ const LINUX_PLAYERS: &[(&str, &[&str])] = &[
     ("mpg123", &["-q"]),
 ];
 
-/// Plays an audio file synchronously, returning when playback finishes (or
-/// the player exits with a non-success status). The path must already exist.
-/// On Linux/Windows the file should be WAV for guaranteed playback; on macOS
-/// `afplay` handles most common formats.
-pub fn play_audio_blocking(path: &Path) -> Result<()> {
+/// Best-effort total-duration probe. Opens `path` with rodio's decoder
+/// (no audio device touched) and reads `Source::total_duration`. Returns
+/// `None` for formats whose decoder can't report a length (some MP3s
+/// without Xing/VBRI headers, or formats rodio can't decode at all).
+pub fn probe_duration(path: &Path) -> Option<Duration> {
+    let file = File::open(path).ok()?;
+    let decoder = Decoder::new(BufReader::new(file)).ok()?;
+    decoder.total_duration()
+}
+
+/// Plays `path` with controllable in-process playback. Falls through to the
+/// external player when rodio can't decode the file. `start_at` is the
+/// initial seek offset (0 = beginning).
+pub fn play_interactive(path: &Path, start_at: Duration) -> Result<PlaybackOutcome> {
     if !path.exists() {
         bail!("audio file '{}' does not exist", path.display());
     }
-    play_impl(path)
+    match play_with_rodio(path, start_at) {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            eprintln!(
+                "{} interactive playback unavailable ({e}); falling back to system player",
+                crate::style::dim("note:")
+            );
+            play_external(path)?;
+            Ok(PlaybackOutcome {
+                completed: true,
+                last_pos: Duration::ZERO,
+            })
+        }
+    }
+}
+
+fn play_with_rodio(path: &Path, start_at: Duration) -> Result<PlaybackOutcome> {
+    let file = File::open(path)
+        .map_err(|e| anyhow::anyhow!("opening '{}' for playback: {e}", path.display()))?;
+    let decoder = Decoder::new(BufReader::new(file))
+        .map_err(|e| anyhow::anyhow!("rodio cannot decode '{}': {e}", path.display()))?;
+    // Total duration is best-effort: many MP3s report None. We only use it
+    // for the status line and seek clamping.
+    let total = decoder.total_duration();
+
+    let (_stream, handle) = OutputStream::try_default()
+        .map_err(|e| anyhow::anyhow!("opening default audio output device: {e}"))?;
+    let sink = Sink::try_new(&handle).map_err(|e| anyhow::anyhow!("creating audio sink: {e}"))?;
+    sink.append(decoder);
+
+    if !start_at.is_zero()
+        && let Err(e) = sink.try_seek(start_at)
+    {
+        eprintln!(
+            "{} seek to {:?} failed ({e}); starting from the beginning",
+            crate::style::dim("note:"),
+            start_at
+        );
+    }
+    sink.play();
+
+    if std::io::stderr().is_terminal() {
+        run_interactive_loop(&sink, total, start_at)
+    } else {
+        sink.sleep_until_end();
+        Ok(PlaybackOutcome {
+            completed: true,
+            last_pos: Duration::ZERO,
+        })
+    }
+}
+
+/// Drives the keyboard / status-line loop until the sink finishes or the
+/// user quits. Owns the raw-mode lifecycle through `RawModeGuard`.
+fn run_interactive_loop(
+    sink: &Sink,
+    total: Option<Duration>,
+    start_at: Duration,
+) -> Result<PlaybackOutcome> {
+    let _raw = RawModeGuard::enter()?;
+    print_help_line();
+
+    let started = Instant::now();
+    let mut last_render = Instant::now() - Duration::from_millis(500);
+    let mut user_quit = false;
+
+    loop {
+        if sink.empty() {
+            break;
+        }
+        // Poll with a short timeout so we re-render at ~4 Hz even when the
+        // user isn't typing.
+        if event::poll(Duration::from_millis(150))? {
+            match event::read()? {
+                Event::Key(KeyEvent {
+                    code, modifiers, ..
+                }) => match code {
+                    KeyCode::Char(' ') => {
+                        if sink.is_paused() {
+                            sink.play();
+                        } else {
+                            sink.pause();
+                        }
+                    }
+                    KeyCode::Left => {
+                        let cur = current_pos(sink, started, start_at);
+                        let target = cur.saturating_sub(Duration::from_secs(5));
+                        let _ = sink.try_seek(target);
+                    }
+                    KeyCode::Right => {
+                        let cur = current_pos(sink, started, start_at);
+                        let target = cur + Duration::from_secs(5);
+                        let target = match total {
+                            Some(t) if target >= t => t.saturating_sub(Duration::from_millis(100)),
+                            _ => target,
+                        };
+                        let _ = sink.try_seek(target);
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        user_quit = true;
+                        break;
+                    }
+                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        user_quit = true;
+                        break;
+                    }
+                    _ => {}
+                },
+                Event::Resize(_, _) => {
+                    last_render = Instant::now() - Duration::from_secs(1);
+                }
+                _ => {}
+            }
+        }
+        if last_render.elapsed() >= Duration::from_millis(250) {
+            render_status(sink, total);
+            last_render = Instant::now();
+        }
+    }
+
+    let last_pos = current_pos(sink, started, start_at);
+    sink.stop();
+    clear_status_line();
+
+    Ok(PlaybackOutcome {
+        completed: !user_quit,
+        last_pos: if user_quit { last_pos } else { Duration::ZERO },
+    })
+}
+
+/// Best-available current position. `Sink::get_pos` is accurate after seek;
+/// `started + start_at` is the wall-clock fallback for the very first frame
+/// before rodio publishes a position.
+fn current_pos(sink: &Sink, started: Instant, start_at: Duration) -> Duration {
+    let from_sink = sink.get_pos();
+    if from_sink.is_zero() {
+        start_at + started.elapsed()
+    } else {
+        from_sink
+    }
+}
+
+fn print_help_line() {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "{}",
+        crate::style::dim("controls: SPACE pause · ←/→ seek 5s · q quit (saves position)")
+    );
+}
+
+fn render_status(sink: &Sink, total: Option<Duration>) {
+    let pos = sink.get_pos();
+    let state = if sink.is_paused() { "❙❙" } else { "▶" };
+    let line = match total {
+        Some(t) => format!(
+            "  {state} {} / {}            ",
+            fmt_clock(pos),
+            fmt_clock(t),
+        ),
+        None => format!("  {state} {}            ", fmt_clock(pos)),
+    };
+    let mut err = std::io::stderr().lock();
+    // \r returns to column 0; trailing spaces clear stale chars when the
+    // line shrinks (e.g. paused → playing label change).
+    let _ = write!(err, "\r{line}");
+    let _ = err.flush();
+}
+
+fn clear_status_line() {
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "\r{}\r", " ".repeat(60));
+    let _ = err.flush();
+}
+
+fn fmt_clock(d: Duration) -> String {
+    let total = d.as_secs();
+    let m = total / 60;
+    let s = total % 60;
+    format!("{m:02}:{s:02}")
+}
+
+/// RAII guard that enables crossterm raw mode on entry and disables it on
+/// drop. We *must* restore cooked mode on every exit path or the user's
+/// terminal stays mute.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().map_err(|e| anyhow::anyhow!("entering raw terminal mode: {e}"))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+// ── Streaming playback (push raw PCM chunks as they arrive) ──────────────
+
+/// Runs streaming playback on the current thread until the producer
+/// drops `chunk_tx` (signalling end-of-stream) and the queue has played
+/// out, or the user quits. Reads raw little-endian 16-bit PCM (mono,
+/// 24 kHz) byte chunks from `chunk_rx`.
+///
+/// This entry point is called from a dedicated `std::thread` because
+/// rodio's `OutputStream` is `!Send` on macOS — the audio device handle,
+/// sink, and queue all stay on this thread for their entire lifetime.
+///
+/// On TTY: SPACE pauses, q/Esc/Ctrl-C saves position and quits, ←/→ are
+/// no-ops with a one-line hint. On non-TTY: silent drain to completion.
+pub fn run_streaming_playback(
+    chunk_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<PlaybackOutcome> {
+    let (_stream, handle) = OutputStream::try_default()
+        .map_err(|e| anyhow::anyhow!("opening default audio output device: {e}"))?;
+    let sink = Sink::try_new(&handle).map_err(|e| anyhow::anyhow!("creating audio sink: {e}"))?;
+    // `keep_alive_if_empty = true` so a brief network under-run between
+    // chunks doesn't end the sink — the queue plays silence instead.
+    let (queue, queue_out) = rodio::queue::queue::<i16>(true);
+    sink.append(queue_out);
+    sink.play();
+
+    let samples_pushed: u64 = 0;
+    let samples_pushed = std::cell::Cell::new(samples_pushed);
+
+    // Drain everything pending in chunk_rx and push to the queue. Returns
+    // true if the channel disconnected (sender dropped → no more chunks).
+    let drain_pending = || -> bool {
+        loop {
+            match chunk_rx.try_recv() {
+                Ok(chunk) => {
+                    let pushed = push_pcm_into_queue(&queue, &chunk);
+                    samples_pushed.set(samples_pushed.get() + pushed);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+            }
+        }
+    };
+
+    let on_tty = std::io::stderr().is_terminal();
+    if !on_tty {
+        // Silent drain: pull chunks, wait for sender disconnect + caught up.
+        let mut channel_disconnected = false;
+        loop {
+            if !channel_disconnected {
+                channel_disconnected = drain_pending();
+            }
+            if channel_disconnected {
+                let pushed_secs = samples_to_seconds(samples_pushed.get());
+                if sink.get_pos().as_secs_f32() >= pushed_secs - 0.05 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        sink.stop();
+        return Ok(PlaybackOutcome {
+            completed: true,
+            last_pos: Duration::ZERO,
+        });
+    }
+
+    let _raw = RawModeGuard::enter()?;
+    print_streaming_help_line();
+
+    let mut last_render = Instant::now() - Duration::from_millis(500);
+    let mut user_quit = false;
+    let mut channel_disconnected = false;
+
+    loop {
+        if !channel_disconnected {
+            channel_disconnected = drain_pending();
+        }
+        if channel_disconnected {
+            let pushed_secs = samples_to_seconds(samples_pushed.get());
+            if sink.get_pos().as_secs_f32() >= pushed_secs - 0.05 {
+                break;
+            }
+        }
+
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(KeyEvent {
+                code, modifiers, ..
+            }) = event::read()?
+        {
+            match code {
+                KeyCode::Char(' ') => {
+                    if sink.is_paused() {
+                        sink.play();
+                    } else {
+                        sink.pause();
+                    }
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    // Queue has discarded played samples; seek can't go
+                    // backward and forward-seek would just skip silence.
+                    print_streaming_seek_unavailable();
+                    last_render = Instant::now() - Duration::from_secs(1);
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    user_quit = true;
+                    break;
+                }
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    user_quit = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if last_render.elapsed() >= Duration::from_millis(250) {
+            render_streaming_status(&sink, samples_pushed.get(), channel_disconnected);
+            last_render = Instant::now();
+        }
+    }
+
+    let last_pos = sink.get_pos();
+    sink.stop();
+    clear_status_line();
+
+    Ok(PlaybackOutcome {
+        completed: !user_quit,
+        last_pos: if user_quit { last_pos } else { Duration::ZERO },
+    })
+}
+
+/// Returns the number of i16 samples pushed.
+fn push_pcm_into_queue(queue: &Arc<rodio::queue::SourcesQueueInput<i16>>, chunk: &[u8]) -> u64 {
+    let pair_count = chunk.len() / 2;
+    if pair_count == 0 {
+        return 0;
+    }
+    let mut samples = Vec::with_capacity(pair_count);
+    for i in 0..pair_count {
+        samples.push(i16::from_le_bytes([chunk[i * 2], chunk[i * 2 + 1]]));
+    }
+    let n = samples.len() as u64;
+    queue.append(SamplesBuffer::new(
+        PCM_STREAM_CHANNELS,
+        PCM_STREAM_RATE_HZ,
+        samples,
+    ));
+    n
+}
+
+fn samples_to_seconds(samples: u64) -> f32 {
+    let per_sec = u64::from(PCM_STREAM_RATE_HZ) * u64::from(PCM_STREAM_CHANNELS);
+    if per_sec == 0 {
+        0.0
+    } else {
+        samples as f32 / per_sec as f32
+    }
+}
+
+fn print_streaming_help_line() {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "{}",
+        crate::style::dim("controls: SPACE pause · q quit (seek disabled while streaming)")
+    );
+}
+
+fn print_streaming_seek_unavailable() {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "\r{}",
+        crate::style::dim("seek unavailable while streaming — wait for cache then seek on replay")
+    );
+}
+
+fn render_streaming_status(sink: &Sink, samples_pushed: u64, producer_done: bool) {
+    let pos = sink.get_pos();
+    let pushed_secs = samples_to_seconds(samples_pushed);
+    let state = if sink.is_paused() { "❙❙" } else { "▶" };
+    // Suffix shows whether the streamer is still feeding chunks. While
+    // downloading the duration column ticks up; once done it's fixed.
+    let stream_marker = if producer_done { "" } else { " · streaming" };
+    let line = format!(
+        "  {state} {} / {}{}            ",
+        fmt_clock(pos),
+        fmt_clock(Duration::from_secs_f32(pushed_secs)),
+        stream_marker,
+    );
+    let mut err = std::io::stderr().lock();
+    let _ = write!(err, "\r{line}");
+    let _ = err.flush();
+}
+
+// ── External fallback path (per-OS CLI player) ────────────────────────────
+
+fn play_external(path: &Path) -> Result<()> {
+    play_external_impl(path)
 }
 
 #[cfg(target_os = "macos")]
-fn play_impl(path: &Path) -> Result<()> {
+fn play_external_impl(path: &Path) -> Result<()> {
     let status = Command::new("afplay").arg(path).status().map_err(|e| {
         anyhow::anyhow!(
             "failed to invoke `afplay`: {e} \
@@ -58,7 +485,7 @@ fn play_impl(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn play_impl(path: &Path) -> Result<()> {
+fn play_external_impl(path: &Path) -> Result<()> {
     // PowerShell single-quoted strings need internal `'` doubled.
     let path_str = path.to_string_lossy().replace('\'', "''");
     let script = format!("(New-Object System.Media.SoundPlayer '{path_str}').PlaySync()");
@@ -76,7 +503,7 @@ fn play_impl(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn play_impl(path: &Path) -> Result<()> {
+fn play_external_impl(path: &Path) -> Result<()> {
     let mut not_found = Vec::new();
     for (binary, args) in LINUX_PLAYERS {
         let mut cmd = Command::new(binary);
@@ -100,7 +527,7 @@ fn play_impl(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn play_impl(_path: &Path) -> Result<()> {
+fn play_external_impl(_path: &Path) -> Result<()> {
     bail!(
         "audio playback isn't supported on this platform; use `-o <path>` to save to a file instead"
     )
@@ -112,9 +539,20 @@ mod tests {
 
     #[test]
     fn rejects_missing_file() {
-        let err =
-            play_audio_blocking(Path::new("/definitely/does/not/exist/aivo-test.wav")).unwrap_err();
+        let err = play_interactive(
+            Path::new("/definitely/does/not/exist/aivo-test.wav"),
+            Duration::ZERO,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn fmt_clock_renders_mm_ss() {
+        assert_eq!(fmt_clock(Duration::from_secs(0)), "00:00");
+        assert_eq!(fmt_clock(Duration::from_secs(5)), "00:05");
+        assert_eq!(fmt_clock(Duration::from_secs(75)), "01:15");
+        assert_eq!(fmt_clock(Duration::from_secs(3600)), "60:00");
     }
 
     #[cfg(target_os = "linux")]
@@ -135,8 +573,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_player_list_prefers_pulse_over_alsa() {
-        // PulseAudio handles long-running streams more gracefully than raw
-        // ALSA on most desktop distros; bias the probe toward it.
         let pulse_idx = LINUX_PLAYERS
             .iter()
             .position(|(n, _)| *n == "paplay")
@@ -151,8 +587,6 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_path_with_apostrophe_is_doubled_in_script() {
-        // Verifies the escape rule we apply before passing `path` into a
-        // PowerShell single-quoted string literal: each `'` must become `''`.
         let raw = r"C:\Users\bob's stuff\hi.wav";
         let escaped = raw.replace('\'', "''");
         assert_eq!(escaped, r"C:\Users\bob''s stuff\hi.wav");

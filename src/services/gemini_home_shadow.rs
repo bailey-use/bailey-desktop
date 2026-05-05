@@ -17,11 +17,16 @@
 //!      `google-gemini/gemini-cli:packages/cli/src/core/initializer.ts`).
 //!      Merging (rather than overwriting) preserves theme, telemetry,
 //!      MCP config, and every other pref the user set.
-//! 3. Symlink user-state files/dirs from the real `~/.gemini/` into the
-//!    shadow `.gemini/`: `tmp/`, `history/`, `commands/`, `GEMINI.md`,
-//!    `trustedFolders.json`, `mcp-oauth-tokens-v2.json`, `projects.json`,
-//!    `state.json`, `installation_id`, `user_id`. Reads find prior
-//!    state and writes persist back to the real home.
+//! 3. Symlink user-state files/dirs from the real home into the shadow
+//!    so reads find prior state and writes persist back. Inside `.gemini/`:
+//!    `tmp/`, `history/`, `commands/`, `extensions/`, `agents/`, `skills/`,
+//!    `policies/`, `acknowledgments/`, `GEMINI.md`, `trustedFolders.json`,
+//!    `mcp-oauth-tokens-v2.json`, `projects.json`, `state.json`,
+//!    `installation_id`, `user_id`, `keybindings.json`, `memory.md`. Plus
+//!    `.agents/` next to `.gemini/` — gemini-cli's internal `homedir()` is
+//!    overridden by `GEMINI_CLI_HOME`, so `Storage.getGlobalAgentsDir()`
+//!    (`<home>/.agents/`) and any other `homedir()`-rooted path resolves
+//!    inside the shadow.
 //! 4. Caller sets `GEMINI_CLI_HOME=<tempdir>` (the *parent* of `.gemini/`
 //!    — the gemini CLI appends `.gemini/` itself in
 //!    `Storage.getGlobalGeminiDir`) and spawns gemini.
@@ -244,13 +249,31 @@ async fn merged_settings(real_home: Option<&Path>) -> serde_json::Value {
     base
 }
 
-/// Best-effort: link the user-state files of `~/.gemini/` into the
-/// shadow `.gemini/` so chat resume, memory, trust state, MCP tokens,
-/// and project bookkeeping all work as if the user launched gemini
-/// directly — and writes during this session persist back to the real
-/// home. Each link is independent; failures are silent.
+/// Best-effort: link the user-state files of the real home into the
+/// shadow so chat resume, memory, trust state, MCP tokens, skills,
+/// extensions, and project bookkeeping all work as if the user launched
+/// gemini directly — and writes during this session persist back to the
+/// real home. Each link is independent; failures are silent.
+///
+/// Two scopes:
+/// - Subpaths of `~/.gemini/` → linked under the shadow's `.gemini/`.
+/// - `~/.agents/` → linked at the shadow root (next to `.gemini/`).
+///   gemini-cli's `homedir()` is overridden by `GEMINI_CLI_HOME` (see
+///   `bundle/chunk-UHHRGNIO.js:homedir`), so any `homedir()`-rooted path
+///   outside `.gemini/` — notably `Storage.getGlobalAgentsDir()`, which
+///   sources user agent skills from `~/.agents/skills/` — resolves under
+///   the shadow root.
 async fn link_user_state(real_home: &Path, shadow_gemini: &Path) {
-    for dir in ["tmp", "history", "commands"] {
+    for dir in [
+        "tmp",
+        "history",
+        "commands",
+        "extensions",
+        "agents",
+        "skills",
+        "policies",
+        "acknowledgments",
+    ] {
         let real = real_home.join(dir);
         let _ = tokio::fs::create_dir_all(&real).await;
         if real.is_dir() {
@@ -266,10 +289,20 @@ async fn link_user_state(real_home: &Path, shadow_gemini: &Path) {
         "state.json",
         "installation_id",
         "user_id",
+        "keybindings.json",
+        "memory.md",
     ] {
         let real = real_home.join(file);
         if real.exists() {
             let _ = symlink_file(&real, &shadow_gemini.join(file)).await;
+        }
+    }
+
+    if let (Some(real_root), Some(shadow_root)) = (real_home.parent(), shadow_gemini.parent()) {
+        let real_agents = real_root.join(".agents");
+        let _ = tokio::fs::create_dir_all(&real_agents).await;
+        if real_agents.is_dir() {
+            let _ = symlink_dir(&real_agents, &shadow_root.join(".agents")).await;
         }
     }
 }
@@ -492,6 +525,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(in_real, b"new");
+    }
+
+    #[tokio::test]
+    async fn shadow_exposes_user_agent_skills() {
+        // `~/.agents/skills/` lives outside `.gemini/`. gemini-cli reads it
+        // via `Storage.getGlobalAgentsDir() = homedir() + .agents/`, and
+        // `homedir()` is overridden by `GEMINI_CLI_HOME`. Without a link at
+        // the shadow root, the CLI would see zero user skills.
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        let real_skill = real.path().join(".agents/skills/foo");
+        tokio::fs::create_dir_all(&real_gemini).await.unwrap();
+        tokio::fs::create_dir_all(&real_skill).await.unwrap();
+        tokio::fs::write(real_skill.join("SKILL.md"), b"my skill")
+            .await
+            .unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini.clone()))
+            .await
+            .unwrap();
+
+        let body = tokio::fs::read(shadow.path().join(".agents/skills/foo/SKILL.md"))
+            .await
+            .unwrap();
+        assert_eq!(body, b"my skill");
+    }
+
+    #[tokio::test]
+    async fn shadow_exposes_extensions_and_workspace_dirs() {
+        // Regression guard: `extensions/`, `skills/`, `agents/`,
+        // `policies/`, `acknowledgments/`, and `keybindings.json` /
+        // `memory.md` under `~/.gemini/` are all routed via the overridden
+        // `homedir()`, so they must be reachable through the shadow.
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let real_gemini = real.path().join(".gemini");
+        tokio::fs::create_dir_all(real_gemini.join("extensions/foo"))
+            .await
+            .unwrap();
+        tokio::fs::write(real_gemini.join("extensions/foo/marker"), b"ext")
+            .await
+            .unwrap();
+        tokio::fs::write(real_gemini.join("keybindings.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(real_gemini.join("memory.md"), b"m")
+            .await
+            .unwrap();
+
+        let shadow = GeminiHomeShadow::create_with_real_home(&c, Some(real_gemini.clone()))
+            .await
+            .unwrap();
+        let dot = shadow.path().join(".gemini");
+
+        assert_eq!(
+            tokio::fs::read(dot.join("extensions/foo/marker"))
+                .await
+                .unwrap(),
+            b"ext"
+        );
+        assert!(dot.join("keybindings.json").exists());
+        assert_eq!(tokio::fs::read(dot.join("memory.md")).await.unwrap(), b"m");
     }
 
     #[tokio::test]

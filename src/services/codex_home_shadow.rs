@@ -11,8 +11,10 @@
 //!    (see `openai/codex: codex-rs/login/src/token_data.rs`).
 //! 3. Copy the user's `config.toml` into the shadow.
 //! 4. Symlink user-state files/dirs from the real `~/.codex/`:
-//!    `sessions/`, `memories/`, `history.jsonl`, `AGENTS.md`. Reads
-//!    find prior state and writes persist back to the real home.
+//!    `sessions/`, `memories/`, `skills/`, `plugins/`, `rules/`,
+//!    `prompts/`, `history.jsonl`, `AGENTS.md`, `installation_id`,
+//!    `models_cache.json`, `.codex-global-state.json`. Reads find prior
+//!    state and writes persist back to the real home.
 //! 5. Caller sets `CODEX_HOME=<dir>` on the child env and spawns codex.
 //! 6. On exit, `read_back` reads the (possibly-rotated) auth.json so the
 //!    refreshed tokens can be persisted back into aivo's store.
@@ -167,24 +169,34 @@ fn real_codex_home() -> Option<std::path::PathBuf> {
 
 /// Best-effort: link the user-state pieces of `~/.codex/` into the shadow
 /// so codex sees prior `/resume` rollouts, ↑-arrow input history, the
-/// user-level `AGENTS.md`, and the `/memory` store — and any new entries
+/// user-level `AGENTS.md`, the `/memory` store, installed skills/plugins,
+/// execpolicy rules, and slash-command prompts — and any new entries
 /// written during this launch persist back to the real home. Each link is
 /// independent; failures are silent so codex falls back to a fresh shadow
 /// location for the missing piece.
+///
+/// We deliberately don't link the codex state DBs (`state_*.sqlite`,
+/// `logs_*.sqlite`); codex rebuilds them by scanning the symlinked
+/// `sessions/`, and skipping them avoids cross-process SQLite WAL/SHM
+/// hazards.
 async fn link_session_state(real_home: &Path, shadow: &Path) {
-    let real_sessions = real_home.join("sessions");
-    let _ = tokio::fs::create_dir_all(&real_sessions).await;
-    if real_sessions.is_dir() {
-        let _ = symlink_dir(&real_sessions, &shadow.join("sessions")).await;
+    for dir in [
+        "sessions", "memories", "skills", "plugins", "rules", "prompts",
+    ] {
+        let real = real_home.join(dir);
+        let _ = tokio::fs::create_dir_all(&real).await;
+        if real.is_dir() {
+            let _ = symlink_dir(&real, &shadow.join(dir)).await;
+        }
     }
 
-    let real_memories = real_home.join("memories");
-    let _ = tokio::fs::create_dir_all(&real_memories).await;
-    if real_memories.is_dir() {
-        let _ = symlink_dir(&real_memories, &shadow.join("memories")).await;
-    }
-
-    for file in ["history.jsonl", "AGENTS.md"] {
+    for file in [
+        "history.jsonl",
+        "AGENTS.md",
+        "installation_id",
+        "models_cache.json",
+        ".codex-global-state.json",
+    ] {
         let real = real_home.join(file);
         if real.exists() {
             let _ = symlink_file(&real, &shadow.join(file)).await;
@@ -389,6 +401,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(in_real, b"new");
+    }
+
+    #[tokio::test]
+    async fn shadow_exposes_user_skills_plugins_rules() {
+        // Skills, plugins, and execpolicy rules all live under
+        // `$CODEX_HOME` and are missed if not explicitly symlinked.
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        let skill_path = real.path().join("skills/my-skill/SKILL.md");
+        let plugin_path = real.path().join("plugins/my-plugin/manifest.json");
+        let rule_path = real.path().join("rules/default.rules");
+        for p in [&skill_path, &plugin_path, &rule_path] {
+            tokio::fs::create_dir_all(p.parent().unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(&skill_path, b"skill").await.unwrap();
+        tokio::fs::write(&plugin_path, b"plugin").await.unwrap();
+        tokio::fs::write(&rule_path, b"rule").await.unwrap();
+
+        let shadow = CodexHomeShadow::create_with_real_home(&c, Some(real.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(shadow.path().join("skills/my-skill/SKILL.md"))
+                .await
+                .unwrap(),
+            b"skill"
+        );
+        assert_eq!(
+            tokio::fs::read(shadow.path().join("plugins/my-plugin/manifest.json"))
+                .await
+                .unwrap(),
+            b"plugin"
+        );
+        assert_eq!(
+            tokio::fs::read(shadow.path().join("rules/default.rules"))
+                .await
+                .unwrap(),
+            b"rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_exposes_installation_id_and_global_state() {
+        let c = sample_cred();
+        let real = tempfile::tempdir().unwrap();
+        tokio::fs::write(real.path().join("installation_id"), b"abc")
+            .await
+            .unwrap();
+        tokio::fs::write(real.path().join("models_cache.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(real.path().join(".codex-global-state.json"), b"{\"x\":1}")
+            .await
+            .unwrap();
+
+        let shadow = CodexHomeShadow::create_with_real_home(&c, Some(real.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(shadow.path().join("installation_id"))
+                .await
+                .unwrap(),
+            b"abc"
+        );
+        assert!(shadow.path().join("models_cache.json").exists());
+        assert_eq!(
+            tokio::fs::read(shadow.path().join(".codex-global-state.json"))
+                .await
+                .unwrap(),
+            b"{\"x\":1}"
+        );
     }
 
     #[tokio::test]

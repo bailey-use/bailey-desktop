@@ -80,6 +80,12 @@ pub struct ResponsesToChatRouterConfig {
     pub responses_api_supported: Option<bool>,
     /// Whether this is the aivo starter provider (requires device fingerprint headers).
     pub is_starter: bool,
+    /// Bare model ids whose upstream catalog entry has an `aivo/` prefix the
+    /// caller's SDK strips (e.g. opencode's `@ai-sdk/openai-compatible`
+    /// strips the provider name `aivo/` so `aivo/starter` arrives as
+    /// `starter`). When the body's outgoing model matches an entry here,
+    /// the router prepends `aivo/` so the upstream resolves the alias.
+    pub aivo_prefix_models: Vec<String>,
 }
 
 pub struct ResponsesToChatRouter {
@@ -1145,6 +1151,15 @@ fn apply_selected_model(
         config.actual_model.as_deref(),
         protocol,
     );
+    let selected_model = if config
+        .aivo_prefix_models
+        .iter()
+        .any(|m| m == &selected_model)
+    {
+        format!("aivo/{selected_model}")
+    } else {
+        selected_model
+    };
     body["model"] = Value::String(selected_model);
 
     if protocol == ProviderProtocol::Openai {
@@ -1269,6 +1284,7 @@ mod tests {
             max_tokens_cap: None,
             responses_api_supported: None,
             is_starter: false,
+            aivo_prefix_models: Vec::new(),
         };
         let body = json!({
             "model": "gpt-4o",
@@ -1300,6 +1316,7 @@ mod tests {
             max_tokens_cap: None,
             responses_api_supported: None,
             is_starter: false,
+            aivo_prefix_models: Vec::new(),
         };
         let body = json!({
             "model": "gpt-4o",
@@ -1438,6 +1455,56 @@ mod tests {
             Some("@cf/"),
         );
         assert_eq!(body["model"], "@cf/llama-3.1-8b");
+    }
+
+    fn test_router_config(
+        target: &str,
+        aivo_prefix_models: Vec<String>,
+    ) -> ResponsesToChatRouterConfig {
+        ResponsesToChatRouterConfig {
+            target_base_url: target.to_string(),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+            aivo_prefix_models,
+        }
+    }
+
+    #[test]
+    fn apply_selected_model_re_adds_aivo_prefix_when_listed() {
+        // Regression: opencode's SDK strips `aivo/` from `aivo/starter` so
+        // the body arrives as `starter`. Without re-prefix the upstream
+        // returns "model not found: starter".
+        let config = test_router_config("https://api.getaivo.dev", vec!["starter".to_string()]);
+        let mut body = json!({"model": "starter"});
+        apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
+        assert_eq!(body["model"], "aivo/starter");
+    }
+
+    #[test]
+    fn apply_selected_model_passes_through_non_aivo_prefixed_models() {
+        // Vendor-namespaced ids (e.g. `minimax/minimax-m2.7`) ride through
+        // unchanged — only the bare names listed in `aivo_prefix_models`
+        // get re-prefixed.
+        let config = test_router_config("https://api.getaivo.dev", vec!["starter".to_string()]);
+        let mut body = json!({"model": "minimax/minimax-m2.7"});
+        apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
+        assert_eq!(body["model"], "minimax/minimax-m2.7");
+    }
+
+    #[test]
+    fn apply_selected_model_noop_without_starter_catalog() {
+        let config = test_router_config("https://api.example.com", vec![]);
+        let mut body = json!({"model": "starter"});
+        apply_selected_model(&mut body, &config, ProviderProtocol::Openai);
+        assert_eq!(body["model"], "starter");
     }
 
     // ── URL building ───────────────────────────────────────────────────────────

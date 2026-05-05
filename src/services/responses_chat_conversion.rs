@@ -1054,6 +1054,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
 
@@ -1086,6 +1087,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1118,6 +1120,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1163,6 +1166,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1206,6 +1210,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1238,6 +1243,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let tools = chat["tools"].as_array().unwrap();
@@ -1262,6 +1268,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["model"], "openai/gpt-5.2-codex");
@@ -1288,6 +1295,7 @@ mod tests {
                 max_tokens_cap: Some(8192),
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1314,6 +1322,7 @@ mod tests {
                 max_tokens_cap: Some(8192),
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         assert_eq!(chat["max_tokens"], 8192);
@@ -1559,6 +1568,7 @@ mod tests {
             max_tokens_cap: None,
             responses_api_supported: None,
             is_starter: false,
+            aivo_prefix_models: Vec::new(),
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "gpt-4o");
@@ -1597,6 +1607,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         assert!(chat.get("model").is_some());
@@ -1619,6 +1630,7 @@ mod tests {
                 max_tokens_cap: None,
                 responses_api_supported: None,
                 is_starter: false,
+                aivo_prefix_models: Vec::new(),
             },
         );
         let msgs = chat["messages"].as_array().unwrap();
@@ -1749,6 +1761,7 @@ mod tests {
             max_tokens_cap: None,
             responses_api_supported: None,
             is_starter: false,
+            aivo_prefix_models: Vec::new(),
         };
         let chat = convert_responses_to_chat_request(&body, &config);
         assert_eq!(chat["model"], "kimi-k2.5");

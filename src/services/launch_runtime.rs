@@ -1176,6 +1176,15 @@ async fn start_responses_to_chat_router(
         _ => None,
     };
 
+    let aivo_prefix_models = env
+        .get("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS")
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
         target_base_url: base_url,
         api_key,
@@ -1191,6 +1200,7 @@ async fn start_responses_to_chat_router(
             .get("AIVO_IS_STARTER")
             .map(|v| v == "1")
             .unwrap_or(false),
+        aivo_prefix_models,
     });
     let (
         port,
@@ -1368,6 +1378,7 @@ async fn start_responses_to_chat_copilot_router(env: &HashMap<String, String>) -
         max_tokens_cap: None,
         responses_api_supported: None,
         is_starter: false,
+        aivo_prefix_models: Vec::new(),
     });
     let (
         port,

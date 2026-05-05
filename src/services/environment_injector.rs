@@ -727,12 +727,27 @@ impl EnvironmentInjector {
                 .inject(&mut env, "AIVO_RESPONSES_TO_CHAT_ROUTER");
             if profile.serve_flags.is_starter {
                 env.insert("AIVO_IS_STARTER".to_string(), "1".to_string());
-                // OpenCode's SDK strips the provider prefix (aivo/starter → starter),
-                // but the API expects the full model name. Override via actual_model.
-                env.insert(
-                    "AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL".to_string(),
-                    "aivo/starter".to_string(),
-                );
+                // OpenCode's SDK strips the `aivo/` provider prefix from
+                // outgoing body models, so the upstream sees `starter`
+                // instead of `aivo/starter`. Pass the bare ids of catalog
+                // entries that originally had the `aivo/` prefix so the
+                // local router re-adds it per-request — this preserves
+                // mid-session model switching (each request reflects the
+                // user's current pick rather than a launch-time pin).
+                let aivo_prefix_models: Vec<&str> = discovered_models
+                    .map(|catalog| {
+                        catalog
+                            .iter()
+                            .filter_map(|m| m.strip_prefix("aivo/"))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !aivo_prefix_models.is_empty() {
+                    env.insert(
+                        "AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS".to_string(),
+                        aivo_prefix_models.join(","),
+                    );
+                }
             }
             (PLACEHOLDER_LOOPBACK_URL.to_string(), auth)
         } else {
@@ -2357,6 +2372,60 @@ mod tests {
             config["provider"]["aivo"]["models"]["claude-sonnet-4"]["name"],
             "claude-sonnet-4"
         );
+    }
+
+    #[test]
+    fn test_for_opencode_starter_does_not_pin_actual_model() {
+        // Regression: starter+opencode used to hardcode actual_model to
+        // `aivo/starter`, which clobbered the body model on every request.
+        // Now there is no static pin — the body's per-request model is
+        // preserved (then dynamically re-prefixed by the router), which
+        // restores mid-session model switching inside opencode.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), None);
+
+        assert_eq!(env.get("AIVO_IS_STARTER"), Some(&"1".to_string()));
+        assert!(
+            !env.contains_key("AIVO_RESPONSES_TO_CHAT_ROUTER_ACTUAL_MODEL"),
+            "starter+opencode must not pin actual_model — let the body's \
+             per-request model flow through so UI model switches take effect",
+        );
+    }
+
+    #[test]
+    fn test_for_opencode_starter_publishes_aivo_prefix_models_for_router() {
+        // The router needs the bare ids of catalog entries that originally
+        // had the `aivo/` prefix so it can re-add the prefix on each
+        // request. Without this, opencode's SDK strips `aivo/starter` to
+        // `starter` and the upstream replies "model not found: starter".
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        let catalog = vec![
+            "aivo/starter".to_string(),
+            "minimax/minimax-m2.7".to_string(),
+        ];
+
+        let env = injector.for_opencode(&key, Some("starter"), Some(&catalog));
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"),
+            Some(&"starter".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_for_opencode_starter_omits_aivo_prefix_env_when_catalog_has_none() {
+        // No env var if no catalog entry uses the `aivo/` prefix — keeps
+        // the env clean for providers that don't need re-prefixing.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        let catalog = vec!["minimax/minimax-m2.7".to_string()];
+
+        let env = injector.for_opencode(&key, Some("minimax/minimax-m2.7"), Some(&catalog));
+        assert!(!env.contains_key("AIVO_RESPONSES_TO_CHAT_ROUTER_AIVO_PREFIX_MODELS"));
     }
 
     #[test]

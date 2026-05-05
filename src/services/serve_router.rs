@@ -686,6 +686,7 @@ fn responses_router_config(state: &ServeState) -> ResponsesToChatRouterConfig {
         max_tokens_cap: None,
         responses_api_supported: None,
         is_starter: state.config.is_starter,
+        aivo_prefix_models: Vec::new(),
     }
 }
 

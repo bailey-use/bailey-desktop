@@ -9,8 +9,8 @@ use clap::Parser;
 
 use crate::cli::{self, Cli, Commands};
 use crate::cli_args::{
-    extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, resolve_alias_in_memory,
-    rewrite_cli_args,
+    extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
+    resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
     self, AliasCommand, AudioCommand, ChatCommand, ContextCommand, ImageCommand, InfoCommand,
@@ -318,18 +318,20 @@ pub async fn run() -> ! {
             // double-append the suffix and the env injector would emit
             // `foo[1m][1m]`.
             let (model, max_context) = lift_context_suffix(resolved_model, extracted.max_context);
-            // Validate --max-context before any picker UI runs (key picker,
-            // model picker). Otherwise the user picks a key + model and
-            // *then* gets told their flag is invalid.
-            if let Some(value) = max_context.as_deref() {
-                if !matches!(value, "1m" | "2m") {
+            // Validate shape (must be `<digits>m`) and tool restriction before
+            // any picker UI runs — otherwise the user picks a key + model and
+            // *then* gets told their flag is malformed. The tier itself
+            // (1m/2m/12m/…) isn't validated; aivo passes whatever the user
+            // gave through to Claude as a `[<N>m]` model-name suffix.
+            let max_context = if let Some(value) = max_context.as_deref() {
+                let Some(canonical) = parse_context_token(value) else {
                     eprintln!(
-                        "{} --max-context only accepts '1m' or '2m' (got {:?}).",
+                        "{} --max-context expects a value like '1m' or '12m' (got {:?}).",
                         style::red("Error:"),
                         value
                     );
                     process::exit(ExitCode::UserError.code());
-                }
+                };
                 let tool_is_claude = run_args
                     .tool
                     .as_deref()
@@ -344,7 +346,10 @@ pub async fn run() -> ! {
                     );
                     process::exit(ExitCode::UserError.code());
                 }
-            }
+                Some(canonical)
+            } else {
+                None
+            };
             let key_flag = extracted.key_flag;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;

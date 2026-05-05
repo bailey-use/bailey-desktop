@@ -239,7 +239,8 @@ pub struct RunArgs {
     /// matching context window. Equivalent to passing
     /// `--model your-model[<size>]` directly, but fans out to every slot.
     /// Per-slot overrides (`--haiku-model`, `--sonnet-model`, …) are left
-    /// verbatim. Accepted values: `1m`, `2m`.
+    /// verbatim. Accepts any `<N>m` (e.g. `1m`, `2m`, `12m`); aivo only
+    /// validates shape — Claude Code decides which tiers it actually honors.
     #[arg(long = "max-context", value_name = "SIZE")]
     pub max_context: Option<String>,
 

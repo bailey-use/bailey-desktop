@@ -97,18 +97,30 @@ pub fn anthropic_native_model_name(model: &str) -> String {
     stripped.to_string()
 }
 
-/// Strip the `[1m]` / `[2m]` UI-hint suffix aivo's env injector appends
-/// when `--max-context=1m` (or `--1m`/`--2m`) is set. The suffix is
-/// meaningful to Claude Code's status-bar logic but not to the upstream
-/// API; bridges should drop it before forwarding so non-Claude providers
-/// don't see an unrecognized model name.
+/// Strip the `[<N>m]` UI-hint suffix aivo's env injector appends when
+/// `--max-context=<N>m` (or `--<N>m`) is set. The suffix is meaningful to
+/// Claude Code's status-bar logic but not to the upstream API; bridges
+/// should drop it before forwarding so non-Claude providers don't see an
+/// unrecognized model name.
 pub fn strip_context_suffix(model: &str) -> &str {
-    for tag in ["1m", "2m"] {
-        if let Some(stripped) = model.strip_suffix(["[", tag, "]"].concat().as_str()) {
-            return stripped;
-        }
+    let Some(s_no_close) = model.strip_suffix(']') else {
+        return model;
+    };
+    let Some(bracket_idx) = s_no_close.rfind('[') else {
+        return model;
+    };
+    let inner = &s_no_close[bracket_idx + 1..];
+    let Some(last) = inner.chars().last() else {
+        return model;
+    };
+    if last != 'm' && last != 'M' {
+        return model;
     }
-    model
+    let digits = &inner[..inner.len() - 1];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return model;
+    }
+    &model[..bracket_idx]
 }
 
 pub fn is_gateway_style_endpoint(base_url: &str) -> bool {
@@ -386,9 +398,13 @@ mod tests {
             "deepseek-v4-flash"
         );
         assert_eq!(strip_context_suffix("hello"), "hello");
-        assert_eq!(strip_context_suffix("hello[3m]"), "hello[3m]");
+        assert_eq!(strip_context_suffix("hello[3m]"), "hello");
+        assert_eq!(strip_context_suffix("hello[12m]"), "hello");
         assert_eq!(strip_context_suffix("[1m]"), "");
         assert_eq!(strip_context_suffix("[2m]"), "");
+        // Non-context bracketed suffixes left alone.
+        assert_eq!(strip_context_suffix("model[v2]"), "model[v2]");
+        assert_eq!(strip_context_suffix("model[m]"), "model[m]");
     }
 
     #[test]

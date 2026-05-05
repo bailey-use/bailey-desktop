@@ -6,8 +6,9 @@
 //!    `aivo ping`, `aivo -x`), and Bundle aliases (user's saved
 //!    `aivo run <tool> <args...>` macros) so clap sees a normalized form.
 //! 2. **`extract_aivo_flags`**: post-clap recovery for flags clap's
-//!    `trailing_var_arg` swallowed. Also collapses `[1m]`/`[2m]` suffixes
-//!    and `--1m`/`--2m` shorthands into a single `max_context` signal.
+//!    `trailing_var_arg` swallowed. Also collapses `[<N>m]` suffixes and
+//!    `--<N>m` shorthands (any digits) into a single `max_context` signal.
+//!    Validation that <N> is actually supported (1m/2m today) lives downstream.
 //!
 //! Pure functions over `Vec<String>` and `HashMap` — no I/O.
 
@@ -127,8 +128,10 @@ fn canonical_flag_name(arg: &str) -> Option<String> {
         return None;
     }
     let raw = arg.split_once('=').map(|(f, _)| f).unwrap_or(arg);
+    if parse_context_shorthand(raw).is_some() {
+        return Some("--max-context".to_string());
+    }
     let canon = match raw {
-        "--1m" | "--2m" => "--max-context",
         "-k" => "--key",
         "-m" => "--model",
         "-r" => "--refresh",
@@ -137,6 +140,27 @@ fn canonical_flag_name(arg: &str) -> Option<String> {
         s => s,
     };
     Some(canon.to_string())
+}
+
+/// Recognize `--<digits>m` / `--<digits>M` as a `--max-context` shorthand.
+/// Returns the canonical (lowercased) `<digits>m` value if matched.
+/// The set of *supported* values (e.g. only `1m`/`2m`) is enforced downstream
+/// in `run.rs` — this helper is just about parser shape.
+fn parse_context_shorthand(arg: &str) -> Option<String> {
+    parse_context_token(arg.strip_prefix("--")?)
+}
+
+/// `<digits>m` or `<digits>M` → `Some("<digits>m")`. Anything else → `None`.
+pub(crate) fn parse_context_token(tok: &str) -> Option<String> {
+    let last = tok.chars().last()?;
+    if last != 'm' && last != 'M' {
+        return None;
+    }
+    let digits = &tok[..tok.len() - 1];
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{digits}m"))
 }
 
 /// Returns true if `raw_args[1]` could plausibly be a Bundle alias name —
@@ -197,12 +221,12 @@ pub(crate) struct ExtractedFlags {
     pub(crate) max_context: Option<String>,
 }
 
-/// Strip a trailing `[1m]` or `[2m]` from the model name and lift it into
+/// Strip a trailing `[<digits>m]` from the model name and lift it into
 /// `max_context`, so `-m foo[1m]`, `-m foo --1m`, and `-m foo --max-context=1m`
-/// all collapse into the same internal state (and likewise for 2m). Without
-/// this, mixing the suffix and the flag would produce a double `[Nm][Nm]`
-/// after fan-out. `max_context` is left alone if it was already set —
-/// validation downstream rejects mismatches.
+/// all collapse into the same internal state. Without this, mixing the suffix
+/// and the flag would produce a double `[Nm][Nm]` after fan-out. `max_context`
+/// is left alone if it was already set — validation downstream rejects
+/// mismatches and unsupported sizes.
 pub(crate) fn lift_context_suffix(
     model: Option<String>,
     max_context: Option<String>,
@@ -210,14 +234,20 @@ pub(crate) fn lift_context_suffix(
     let Some(m) = model else {
         return (None, max_context);
     };
-    for tag in ["1m", "2m"] {
-        let suffix_with_brackets = ["[", tag, "]"].concat();
-        if let Some(stripped) = m.strip_suffix(&suffix_with_brackets) {
-            let new_max_context = max_context.or_else(|| Some(tag.to_string()));
-            return (Some(stripped.to_string()), new_max_context);
-        }
-    }
-    (Some(m), max_context)
+    let s_no_close = match m.strip_suffix(']') {
+        Some(s) => s,
+        None => return (Some(m), max_context),
+    };
+    let Some(bracket_idx) = s_no_close.rfind('[') else {
+        return (Some(m), max_context);
+    };
+    let inner = &s_no_close[bracket_idx + 1..];
+    let Some(tag) = parse_context_token(inner) else {
+        return (Some(m), max_context);
+    };
+    let stripped = m[..bracket_idx].to_string();
+    let new_max_context = max_context.or(Some(tag));
+    (Some(stripped), new_max_context)
 }
 
 /// Extracts aivo-owned flags (`--model`/`-m`, `--key`/`-k`, `--debug`, `--dry-run`, `--refresh`/`-r`, `--env`/`-e`) from
@@ -448,13 +478,9 @@ pub(crate) fn extract_aivo_flags(
             } else {
                 remaining_args.push(arg.clone());
             }
-        } else if arg == "--1m" {
+        } else if let Some(value) = parse_context_shorthand(arg) {
             if max_context.is_none() {
-                max_context = Some("1m".to_string());
-            }
-        } else if arg == "--2m" {
-            if max_context.is_none() {
-                max_context = Some("2m".to_string());
+                max_context = Some(value);
             }
         } else {
             remaining_args.push(arg.clone());
@@ -987,6 +1013,79 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_m_shorthand_resolves_to_max_context() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--12m", "file.ts"]),
+        );
+        assert_eq!(r.max_context, Some("12m".to_string()));
+        assert_eq!(r.remaining_args, args(&["file.ts"]));
+    }
+
+    #[test]
+    fn uppercase_m_shorthand_normalizes_to_lowercase() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--3M"]),
+        );
+        assert_eq!(r.max_context, Some("3m".to_string()));
+    }
+
+    #[test]
+    fn non_digit_dash_dash_passes_through() {
+        // `--foo` and `--ma` (looks shorthand-ish but isn't) should not be
+        // captured as max_context; they fall through to remaining_args.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--foo", "--ma", "--m", "--1mb"]),
+        );
+        assert_eq!(r.max_context, None);
+        assert_eq!(r.remaining_args, args(&["--foo", "--ma", "--m", "--1mb"]));
+    }
+
+    #[test]
+    fn lift_context_suffix_handles_dynamic_sizes() {
+        let (m, mc) = lift_context_suffix(Some("deepseek[12m]".to_string()), None);
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, Some("12m".to_string()));
+
+        let (m, mc) = lift_context_suffix(Some("deepseek[3M]".to_string()), None);
+        assert_eq!(m, Some("deepseek".to_string()));
+        assert_eq!(mc, Some("3m".to_string()));
+    }
+
+    #[test]
+    fn lift_context_suffix_ignores_non_context_brackets() {
+        let (m, mc) = lift_context_suffix(Some("model[v2]".to_string()), None);
+        assert_eq!(m, Some("model[v2]".to_string()));
+        assert_eq!(mc, None);
+    }
+
+    #[test]
     fn unknown_args_pass_through() {
         let r = extract_aivo_flags(
             None,
@@ -1208,6 +1307,14 @@ mod tests {
         );
         assert_eq!(
             canonical_flag_name("--2m"),
+            Some("--max-context".to_string())
+        );
+        assert_eq!(
+            canonical_flag_name("--12m"),
+            Some("--max-context".to_string())
+        );
+        assert_eq!(
+            canonical_flag_name("--3M"),
             Some("--max-context".to_string())
         );
         assert_eq!(

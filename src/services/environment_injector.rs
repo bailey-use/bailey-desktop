@@ -74,10 +74,11 @@ impl ClaudeSlotFlags {
 /// intentionally absent; users override haiku-class routing via `haiku`.
 ///
 /// `max_context` is the `--max-context` runtime flag, piggybacked here to
-/// avoid a parallel parameter on every launch path. `Some("1m")` / `Some("2m")`
-/// append the canonical `[1m]` / `[2m]` suffix Claude Code parses to opt into
-/// the matching context window; only the fanned-out default slots get it,
-/// per-slot overrides stay verbatim.
+/// avoid a parallel parameter on every launch path. `Some("<N>m")` appends a
+/// canonical `[<N>m]` suffix to the model name; Claude Code recognizes
+/// specific tiers (1m, 2m). aivo doesn't validate the tier — it passes
+/// whatever digits the user supplied. Only the fanned-out default slots get
+/// the suffix; per-slot overrides stay verbatim.
 #[derive(Debug, Clone, Default)]
 pub struct ClaudeModelOverrides {
     pub reasoning: Option<String>,
@@ -440,8 +441,8 @@ impl EnvironmentInjector {
                 model.to_string()
             };
             let anthropic_model = match overrides.max_context.as_deref() {
-                Some(tag @ ("1m" | "2m")) => format!("{normalized}[{tag}]"),
-                _ => normalized,
+                Some(tag) => format!("{normalized}[{tag}]"),
+                None => normalized,
             };
             for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
                 env.insert(slot.to_string(), anthropic_model.clone());

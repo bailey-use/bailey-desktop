@@ -291,6 +291,7 @@ async fn main() {
                 run_args.debug,
                 run_args.dry_run,
                 run_args.refresh,
+                run_args.relogin,
                 run_args.envs,
                 // `--1m`/`--2m` shorthands collapsed into max_context up
                 // front so every downstream consumer sees a single signal.
@@ -352,6 +353,7 @@ async fn main() {
             let key_flag = extracted.key_flag;
             let dry_run = extracted.dry_run;
             let refresh = extracted.refresh;
+            let relogin = extracted.relogin;
             // Context selector: prefer clap-parsed value, fall back to passthrough-recovered.
             let context_selector = run_args.context.or(extracted.context);
             let env_strings = extracted.env_strings;
@@ -401,6 +403,30 @@ async fn main() {
                     )
                     .await,
                 );
+
+                // --relogin: drive the OAuth flow up front so the launch sees
+                // a fresh credential. Done after key resolution (so the user
+                // sees the picker if they didn't pass `-k`) and before any
+                // model picker (so a stale token doesn't lead to a model list
+                // the user can't actually use).
+                let key_override = if relogin {
+                    let Some(key) = key_override else {
+                        eprintln!(
+                            "{} --relogin requires a key — none selected.",
+                            style::red("Error:")
+                        );
+                        process::exit(ExitCode::UserError.code());
+                    };
+                    match crate::services::oauth_relogin::relogin_key(&session_store, &key).await {
+                        Ok(updated) => Some(updated),
+                        Err(e) => {
+                            eprintln!("{} {e}", style::red("Error:"));
+                            process::exit(ExitCode::UserError.code());
+                        }
+                    }
+                } else {
+                    key_override
+                };
 
                 // Resolve model using last selection when no explicit flags given.
                 // When -k is used without -m, normally force the model picker —
@@ -795,14 +821,13 @@ fn print_help() {
     print_shortcut("claude/codex/gemini/opencode/pi", " run <tool>");
     println!();
     println!("{}", style::bold("Examples:"));
-    println!("  {}", style::dim("aivo claude -m kimi-k2.5"));
-    println!("  {}", style::dim("aivo chat -x \"hello\""));
+    println!("  {}", style::dim("aivo claude -k aivo"));
+    println!("  {}", style::dim("aivo -x \"hello\""));
     println!(
         "  {}",
         style::dim("git diff | aivo -x \"summarize changes\"")
     );
     println!("  {}", style::dim("aivo gemini -k mykey -m minimax-m2.7"));
-    println!("  {}", style::dim("aivo info --ping"));
     println!();
     println!("{}", style::bold("Options:"));
     let print_opt = |flag: &str, desc: &str| {
@@ -1135,6 +1160,7 @@ struct ExtractedFlags {
     debug: Option<String>,
     dry_run: bool,
     refresh: bool,
+    relogin: bool,
     env_strings: Vec<String>,
     remaining_args: Vec<String>,
     /// `None` = flag absent. `Some("")` = bare flag (interactive picker).
@@ -1180,6 +1206,7 @@ fn extract_aivo_flags(
     initial_debug: Option<String>,
     initial_dry_run: bool,
     initial_refresh: bool,
+    initial_relogin: bool,
     initial_envs: Vec<String>,
     initial_max_context: Option<String>,
     passthrough_args: &[String],
@@ -1204,6 +1231,7 @@ fn extract_aivo_flags(
     let mut debug = initial_debug;
     let mut dry_run = initial_dry_run;
     let mut refresh = initial_refresh;
+    let mut relogin = initial_relogin;
     let mut context: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
     let mut env_strings = initial_envs;
@@ -1293,6 +1321,8 @@ fn extract_aivo_flags(
             dry_run = true;
         } else if arg == "--refresh" || arg == "-r" {
             refresh = true;
+        } else if arg == "--relogin" {
+            relogin = true;
         } else if let Some(value) = arg
             .strip_prefix("--context=")
             .or_else(|| arg.strip_prefix("-c="))
@@ -1418,6 +1448,7 @@ fn extract_aivo_flags(
         debug,
         dry_run,
         refresh,
+        relogin,
         env_strings,
         remaining_args,
         context,
@@ -1442,6 +1473,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--model=gpt-4o", "file.ts"]),
@@ -1457,6 +1489,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1476,6 +1509,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["-m", "gpt-4o"]),
@@ -1493,6 +1527,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--model"]),
@@ -1508,6 +1543,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1528,6 +1564,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--model", "other"]),
@@ -1543,6 +1580,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1561,6 +1599,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--key", "mykey"]),
@@ -1577,6 +1616,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["-k", "mykey"]),
@@ -1591,6 +1631,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             Some("--something".to_string()),
             None,
+            false,
             false,
             false,
             vec![],
@@ -1610,6 +1651,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["-k"]),
@@ -1624,6 +1666,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1643,6 +1686,7 @@ mod tests {
             Some(String::new()),
             false,
             false,
+            false,
             vec![],
             None,
             &[],
@@ -1657,6 +1701,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1675,6 +1720,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--env=FOO=bar"]),
@@ -1689,6 +1735,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1707,6 +1754,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--env", "FOO=bar"]),
@@ -1723,11 +1771,50 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["-e", "FOO=bar"]),
         );
         assert_eq!(r.env_strings, vec!["FOO=bar"]);
+    }
+
+    #[test]
+    fn relogin_flag_in_passthrough_position() {
+        // `aivo run codex --relogin` puts --relogin after the tool name, so
+        // clap's trailing_var_arg captures it into passthrough. This must
+        // round-trip into ExtractedFlags::relogin.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--relogin"]),
+        );
+        assert!(r.relogin);
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn relogin_flag_carried_through_when_set_by_clap() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            None,
+            None,
+            false,
+            false,
+            true, // initial_relogin from clap
+            vec![],
+            None,
+            &args(&[]),
+        );
+        assert!(r.relogin);
     }
 
     #[test]
@@ -1737,6 +1824,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec!["PRE=1".to_string()],
@@ -1753,6 +1841,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1772,6 +1861,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--max-context", "1m"]),
@@ -1788,6 +1878,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1841,6 +1932,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--1m", "file.ts"]),
@@ -1856,6 +1948,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -1875,6 +1968,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--agent-name", "foo", "--resume"]),
@@ -1890,6 +1984,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],
@@ -2092,6 +2187,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["fix the login bug"]),
@@ -2109,6 +2205,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             vec![],
             None,
             &args(&["--model", "gpt-4o", "fix the login bug"]),
@@ -2124,6 +2221,7 @@ mod tests {
             ClaudeSlotFlags::default(),
             None,
             None,
+            false,
             false,
             false,
             vec![],

@@ -45,6 +45,7 @@ pub mod media_io;
 pub mod model_compat;
 pub mod model_names;
 pub mod models_cache;
+pub mod oauth_relogin;
 pub mod ollama;
 pub mod openai_anthropic_bridge;
 pub mod openai_gemini_bridge;

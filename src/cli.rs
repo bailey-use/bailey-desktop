@@ -216,6 +216,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Force a fresh OAuth login for the selected key before launching.
+    /// Only applies to OAuth keys (codex / gemini / claude); errors out
+    /// on plain API keys. Useful when the stored credential has been
+    /// revoked server-side or otherwise can't be refreshed.
+    #[arg(long)]
+    pub relogin: bool,
+
     /// Inject cross-CLI context for this launch. Bare flag opens an
     /// interactive picker; `--context=<session-id>` picks a specific session
     /// (prefix match; see `aivo context` for available ids).

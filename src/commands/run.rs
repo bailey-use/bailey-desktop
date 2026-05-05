@@ -462,6 +462,10 @@ impl RunCommand {
             "--dry-run",
             "Print resolved command and environment without launching",
         );
+        print_opt(
+            "--relogin",
+            "Force OAuth re-login for the selected key (codex / gemini / claude)",
+        );
         println!();
         println!("{}", style::bold("Tools:"));
         let print_tool = |label: &str, desc: &str| {

@@ -52,6 +52,10 @@ pub mod openai_gemini_bridge;
 pub mod openai_models;
 pub mod path_search;
 pub mod percent_codec;
+#[cfg(feature = "audio_playback")]
+pub mod playback;
+#[cfg(not(feature = "audio_playback"))]
+#[path = "playback_stub.rs"]
 pub mod playback;
 pub mod project_id;
 pub mod protocol_fallback;

@@ -363,24 +363,65 @@ async fn prepare_gemini_api_key_settings_override(
 ) -> Result<tempfile::TempDir> {
     use anyhow::Context;
     env.remove("AIVO_GEMINI_FORCE_API_KEY_AUTH");
+    let model_config_model = env.remove("AIVO_GEMINI_MODEL_CONFIG_MODEL");
 
     let dir = tempfile::Builder::new()
         .prefix("aivo-gemini-settings-")
         .tempdir()
         .context("create aivo gemini settings override temp dir")?;
     let path = dir.path().join("settings.json");
-    tokio::fs::write(
-        &path,
-        br#"{"security":{"auth":{"selectedType":"gemini-api-key"}}}"#.as_slice(),
-    )
-    .await
-    .context("write aivo gemini system settings override")?;
+    let mut settings = serde_json::json!({
+        "security": {
+            "auth": {
+                "selectedType": "gemini-api-key"
+            }
+        }
+    });
+    if let Some(model) = model_config_model.filter(|m| !m.trim().is_empty()) {
+        settings["modelConfigs"] = gemini_internal_model_config_override(&model);
+    }
+    tokio::fs::write(&path, serde_json::to_vec(&settings)?)
+        .await
+        .context("write aivo gemini system settings override")?;
 
     env.insert(
         "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
         path.to_string_lossy().to_string(),
     );
     Ok(dir)
+}
+
+fn gemini_internal_model_config_override(model: &str) -> serde_json::Value {
+    let aliases = [
+        // Gemini CLI 0.40.x uses these helper aliases for routing,
+        // completion, edit correction and summarization. Several default to
+        // gemini-2.5-flash-lite, which may be unavailable or irrelevant when
+        // aivo is routing the CLI to a non-Google provider.
+        "gemini-2.5-flash-lite",
+        "classifier",
+        "prompt-completion",
+        "edit-corrector",
+        "summarizer-default",
+        "summarizer-shell",
+        "chat-compression-2.5-flash-lite",
+    ];
+    let custom_aliases = aliases
+        .into_iter()
+        .map(|alias| {
+            (
+                alias.to_string(),
+                serde_json::json!({
+                    "modelConfig": {
+                        "model": model
+                    }
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    serde_json::json!({
+        "customAliases": custom_aliases
+    })
 }
 
 /// Reads the shadow `oauth_creds.json` back after gemini exits and, if any
@@ -1829,16 +1870,23 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_gemini_api_key_settings_override_pins_selected_type() {
-        let mut env = HashMap::from([(
-            "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
-            "1".to_string(),
-        )]);
+        let mut env = HashMap::from([
+            (
+                "AIVO_GEMINI_FORCE_API_KEY_AUTH".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(),
+                "aivo/starter".to_string(),
+            ),
+        ]);
         let dir = prepare_gemini_api_key_settings_override(&mut env)
             .await
             .unwrap();
 
         // Sentinel consumed — must not leak to the spawned child.
         assert!(!env.contains_key("AIVO_GEMINI_FORCE_API_KEY_AUTH"));
+        assert!(!env.contains_key("AIVO_GEMINI_MODEL_CONFIG_MODEL"));
 
         // Child sees a system-scope settings override path. Because
         // system-scope wins over user-scope in gemini-cli's merge, this
@@ -1850,6 +1898,15 @@ mod tests {
         assert_eq!(
             parsed["security"]["auth"]["selectedType"].as_str(),
             Some("gemini-api-key")
+        );
+        assert_eq!(
+            parsed["modelConfigs"]["customAliases"]["prompt-completion"]["modelConfig"]["model"]
+                .as_str(),
+            Some("aivo/starter")
+        );
+        assert_eq!(
+            parsed["modelConfigs"]["customAliases"]["classifier"]["modelConfig"]["model"].as_str(),
+            Some("aivo/starter")
         );
 
         // We deliberately don't redirect GEMINI_CLI_HOME — user's real

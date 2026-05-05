@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};
 
-use crate::constants::{AIVO_STARTER_REAL_URL, AIVO_STARTER_SENTINEL, PLACEHOLDER_LOOPBACK_URL};
+use crate::constants::{
+    AIVO_STARTER_MODEL, AIVO_STARTER_REAL_URL, AIVO_STARTER_SENTINEL, PLACEHOLDER_LOOPBACK_URL,
+};
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::ollama::ollama_openai_base_url;
@@ -637,13 +639,23 @@ impl EnvironmentInjector {
             );
         }
 
-        if let Some(model) = model {
-            let gemini_model = if matches!(mode, ConnectionMode::Direct { .. }) {
-                google_native_model_name(model).to_string()
-            } else {
-                model.to_string()
-            };
-            env.insert("GEMINI_MODEL".to_string(), gemini_model);
+        let gemini_model = model
+            .map(|model| {
+                if matches!(mode, ConnectionMode::Direct { .. }) {
+                    google_native_model_name(model).to_string()
+                } else {
+                    model.to_string()
+                }
+            })
+            .or_else(|| {
+                profile
+                    .serve_flags
+                    .is_starter
+                    .then(|| AIVO_STARTER_MODEL.to_string())
+            });
+        if let Some(gemini_model) = gemini_model {
+            env.insert("GEMINI_MODEL".to_string(), gemini_model.clone());
+            env.insert("AIVO_GEMINI_MODEL_CONFIG_MODEL".to_string(), gemini_model);
         }
 
         // Signal to launch_runtime::prepare_gemini_api_key_settings_override.
@@ -2062,6 +2074,25 @@ mod tests {
         assert_eq!(
             env.get("GOOGLE_GEMINI_BASE_URL"),
             Some(&PLACEHOLDER_LOOPBACK_URL.to_string()),
+        );
+    }
+
+    #[test]
+    fn test_for_gemini_starter_sets_default_model() {
+        // Gemini CLI's own default can be a Google-only model. Starter must
+        // launch with aivo/starter even when the user did not pass -m.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = AIVO_STARTER_SENTINEL.to_string();
+        let env = injector.for_gemini(&key, None);
+
+        assert_eq!(
+            env.get("GEMINI_MODEL"),
+            Some(&AIVO_STARTER_MODEL.to_string())
+        );
+        assert_eq!(
+            env.get("AIVO_GEMINI_MODEL_CONFIG_MODEL"),
+            Some(&AIVO_STARTER_MODEL.to_string())
         );
     }
 

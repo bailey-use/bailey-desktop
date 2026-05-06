@@ -286,16 +286,25 @@ const BEDROCK_REGIONS: &[(&str, &str)] = &[
 ///
 /// Prints a `Region: <id>  <city>` confirmation line after a successful pick
 /// so the chosen region stays visible once the picker UI clears.
-fn pick_bedrock_region() -> Result<Option<String>> {
+///
+/// `current` is the region to pre-select (only meaningful when editing an
+/// existing Bedrock key). When `Some` and the value matches a known region,
+/// the picker opens with that row highlighted; otherwise it defaults to
+/// the first entry.
+fn pick_bedrock_region(current: Option<&str>) -> Result<Option<String>> {
     let labels: Vec<String> = BEDROCK_REGIONS
         .iter()
         .map(|(region, city)| format_picker_choice(region, city))
         .collect();
 
+    let default_idx = current
+        .and_then(|cur| BEDROCK_REGIONS.iter().position(|(r, _)| *r == cur))
+        .unwrap_or(0);
+
     let outcome = FuzzySelect::new()
         .with_prompt("AWS Region")
         .items(&labels)
-        .default(0)
+        .default(default_idx)
         .interact_outcome()?;
     restore_cooked_mode();
 
@@ -1125,6 +1134,16 @@ impl KeysCommand {
             term_read_line(prompt)
         }
 
+        // Bedrock keys: dedicated edit flow that mirrors the add flow's
+        // region picker instead of forcing the user to hand-edit the
+        // `bedrock-runtime.<region>.amazonaws.com` URL string. Detected
+        // by URL pattern (mantle or runtime hosts).
+        if let Some(current_region) =
+            crate::services::provider_profile::parse_aws_region(&key.base_url)
+        {
+            return self.edit_bedrock_key(key, &current_region).await;
+        }
+
         // OAuth entries hold a serialized credential bundle in the encrypted
         // key slot — there is no meaningful base URL or user-editable "API
         // key" to change. Only the display name is safe to edit; everything
@@ -1254,6 +1273,103 @@ impl KeysCommand {
                 .set_key_opencode_mode(&key.id, None)
                 .await?;
         }
+
+        if !updated {
+            eprintln!("{} Key no longer exists", style::red("Error:"));
+            return Ok(ExitCode::UserError);
+        }
+
+        println!(
+            "{} Updated key: {}",
+            style::success_symbol(),
+            style::cyan(if name.is_empty() {
+                key.short_id()
+            } else {
+                &name
+            })
+        );
+
+        Ok(ExitCode::Success)
+    }
+
+    /// Bedrock-aware edit flow that mirrors the add flow's region picker.
+    /// Editing the raw URL is hostile — the user has to know the host
+    /// shape (`bedrock-runtime.<region>.amazonaws.com` vs the mantle
+    /// form) and substitute the region by hand. Instead we extract the
+    /// region from the stored URL, show the same fuzzy picker the add
+    /// flow uses (pre-selected on the current region), and substitute
+    /// the new region back into the existing URL — preserving the
+    /// runtime-vs-mantle form the user originally chose.
+    ///
+    /// ESC on the region picker means "keep current region", consistent
+    /// with the edit flow's "Press Enter to keep" idiom (rather than
+    /// add's "ESC cancels the whole flow"); the user can still abandon
+    /// the edit with Ctrl-C.
+    async fn edit_bedrock_key(&self, key: ApiKey, current_region: &str) -> Result<ExitCode> {
+        // Name (same shape as the generic edit flow).
+        let current_name = if key.name.is_empty() {
+            format!("unnamed; shown as {}", key.short_id())
+        } else {
+            key.name.clone()
+        };
+        let name = {
+            let input = term_read_line(&format!("Name [{}]: ", current_name))?;
+            if input.is_empty() {
+                key.name.clone()
+            } else {
+                input
+            }
+        };
+
+        // Region picker, defaulted to current.
+        let region = match pick_bedrock_region(Some(current_region))? {
+            Some(r) => r,
+            None => {
+                println!("{} {}", style::dim("Region:"), style::cyan(current_region),);
+                current_region.to_string()
+            }
+        };
+
+        // Substitute the region into the existing URL — preserves
+        // runtime vs mantle form. `replacen(.., 1)` is defensive: a
+        // pathological stored URL with the region appearing twice (a
+        // path component) shouldn't get its tail rewritten.
+        let base_url = if region == current_region {
+            key.base_url.clone()
+        } else {
+            key.base_url.replacen(current_region, &region, 1)
+        };
+
+        // API key with masked preview (same shape as generic edit flow).
+        let api_key = loop {
+            let preview = display_secret(&key);
+            let input = term_read_secret(&format!("API Key [{}]: ", preview))?;
+            let value = if input.is_empty() {
+                key.key.as_str().to_string()
+            } else {
+                input
+            };
+            if value.is_empty() {
+                let prompt = style::yellow("Save without an API key?");
+                if confirm(&prompt)? {
+                    break String::new();
+                }
+            } else {
+                break value;
+            }
+        };
+
+        println!();
+
+        if name == key.name && base_url == key.base_url && api_key == key.key.as_str() {
+            println!("{}", style::dim("No changes."));
+            return Ok(ExitCode::Success);
+        }
+
+        let updated = self
+            .session_store
+            .update_key(&key.id, &name, &base_url, key.claude_protocol, &api_key)
+            .await?;
 
         if !updated {
             eprintln!("{} Key no longer exists", style::red("Error:"));
@@ -1477,7 +1593,7 @@ impl KeysCommand {
                 .replace(CLOUDFLARE_ACCOUNT_ID_PLACEHOLDER, &account_id)
         } else if provider.base_url.contains(AWS_REGION_PLACEHOLDER) {
             keys_ui::step_header(3, 3, "Credentials", "AWS region, then Bedrock API key");
-            let Some(region) = pick_bedrock_region()? else {
+            let Some(region) = pick_bedrock_region(None)? else {
                 return Ok(ExitCode::Success);
             };
             provider.base_url.replace(AWS_REGION_PLACEHOLDER, &region)

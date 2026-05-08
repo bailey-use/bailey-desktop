@@ -330,7 +330,7 @@ async fn run_router(
             {
                 Ok(response) => response,
                 Err(e) => {
-                    let error = http_utils::http_error_response(500, &e.to_string());
+                    let error = http_utils::http_error_response(500, &format!("{e:#}"));
                     let _ = socket.write_all(error.as_bytes()).await;
                     return;
                 }

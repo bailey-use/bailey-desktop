@@ -256,15 +256,18 @@ async fn handle_router_request(
         .await
         {
             Ok(r) => r,
-            Err(_) => Some(http_utils::http_error_response(
+            Err(e) => Some(http_utils::http_error_response(
                 500,
-                "Internal Server Error",
+                &format!("Internal Server Error: {e:#}"),
             )),
         }
     } else {
         match forward_request(&path, &request, &state.config, state.client.as_ref()).await {
             Ok(r) => Some(r),
-            Err(_) => Some(http_utils::http_error_response(502, "Bad Gateway")),
+            Err(e) => Some(http_utils::http_error_response(
+                502,
+                &format!("Bad Gateway: {e:#}"),
+            )),
         }
     }
 }

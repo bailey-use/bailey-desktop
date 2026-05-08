@@ -125,8 +125,11 @@ async fn run_router(listener: tokio::net::TcpListener, state: AnthropicRouterSta
                 Ok(resp) => {
                     let _ = write_router_response(&mut socket, resp).await;
                 }
-                Err(_) => {
-                    let err = http_utils::http_error_response(500, "Internal Server Error");
+                Err(e) => {
+                    let err = http_utils::http_error_response(
+                        500,
+                        &format!("Internal Server Error: {e:#}"),
+                    );
                     let _ = socket.write_all(err.as_bytes()).await;
                 }
             }

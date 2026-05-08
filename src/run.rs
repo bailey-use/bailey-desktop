@@ -130,6 +130,7 @@ pub async fn run() -> ! {
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
             Commands::Context(_) => ContextCommand::print_help(),
+            Commands::Amp(_) => crate::commands::AmpCommand::print_help(),
         }
         process::exit(0);
     }
@@ -332,17 +333,28 @@ pub async fn run() -> ! {
                     );
                     process::exit(ExitCode::UserError.code());
                 };
-                let supported = run_args
-                    .tool
-                    .as_deref()
-                    .and_then(AIToolType::parse)
-                    .is_some_and(|t| matches!(t, AIToolType::Claude | AIToolType::Codex));
+                let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
+                let supported = parsed_tool.is_some_and(|t| {
+                    matches!(t, AIToolType::Claude | AIToolType::Codex | AIToolType::Amp)
+                });
                 if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
                     eprintln!(
-                        "{} --max-context only applies to `aivo run claude` and `aivo run codex` (got {}).",
+                        "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run amp` (got {}).",
                         style::red("Error:"),
                         tool_name
+                    );
+                    process::exit(ExitCode::UserError.code());
+                }
+                // Amp's catalog tops out at ~1.05M tokens (gpt-5.5-pro), so
+                // any tag larger than `1m` would be silently dropped by the
+                // bridge's settings override. Reject up front rather than
+                // letting it no-op.
+                if parsed_tool == Some(AIToolType::Amp) && !canonical.eq_ignore_ascii_case("1m") {
+                    eprintln!(
+                        "{} `aivo run amp` only supports --max-context=1m (got {:?}). Amp's built-in catalog has no entry larger than ~1.05M tokens.",
+                        style::red("Error:"),
+                        canonical
                     );
                     process::exit(ExitCode::UserError.code());
                 }
@@ -498,6 +510,14 @@ pub async fn run() -> ! {
                     None
                 };
 
+                let amp_modes = services::environment_injector::AmpModeModels {
+                    rush: resolve(run_args.rush_model),
+                    smart: resolve(run_args.smart_model),
+                    deep: resolve(run_args.deep_model),
+                    large: resolve(run_args.large_model),
+                    disable_tools: run_args.disable_tool,
+                };
+
                 command
                     .execute(
                         run_args.tool.as_deref(),
@@ -507,6 +527,7 @@ pub async fn run() -> ! {
                         model,
                         model_flag_explicit,
                         slots,
+                        amp_modes,
                         env,
                         key_override,
                         context_selector,
@@ -602,6 +623,12 @@ pub async fn run() -> ! {
             command.execute(context_args).await
         }
 
+        Commands::Amp(amp_args) => {
+            use crate::commands::AmpCommand;
+            let command = AmpCommand::new();
+            command.execute(amp_args).await
+        }
+
         Commands::Update(update_args) if update_args.rollback => {
             commands::update::execute_rollback().await
         }
@@ -678,7 +705,7 @@ fn print_help() {
     print_shortcut("use", "keys use");
     print_shortcut("ping", "keys ping");
     print_shortcut("-x", "chat -x (one-shot; reads stdin when no value)");
-    print_shortcut("claude/codex/gemini/opencode/pi", " run <tool>");
+    print_shortcut("claude/codex/gemini/opencode/pi/amp", " run <tool>");
     println!();
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo claude -k aivo"));

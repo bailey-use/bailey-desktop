@@ -13,7 +13,7 @@ use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::context_ingest::{IngestOptions, ingest_project};
 use crate::services::context_render::{RenderedContext, render_single_session};
-use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
+use crate::services::environment_injector::{AmpModeModels, ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
 use crate::services::models_cache::ModelsCache;
 use crate::services::project_id::Thread;
@@ -191,6 +191,7 @@ impl RunCommand {
         model: Option<String>,
         explicit_model_flag: bool,
         slots: ClaudeSlotFlags,
+        amp_modes: AmpModeModels,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -205,6 +206,7 @@ impl RunCommand {
                 model,
                 explicit_model_flag,
                 slots,
+                amp_modes,
                 env,
                 key_override,
                 context_selector,
@@ -230,6 +232,7 @@ impl RunCommand {
         model: Option<String>,
         explicit_model_flag: bool,
         slots: ClaudeSlotFlags,
+        amp_modes: AmpModeModels,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -265,6 +268,7 @@ impl RunCommand {
                 eprintln!("  {}    {}", style::cyan("gemini"), style::dim("Gemini"));
                 eprintln!("  {}  {}", style::cyan("opencode"), style::dim("OpenCode"));
                 eprintln!("  {}        {}", style::cyan("pi"), style::dim("Pi"));
+                eprintln!("  {}       {}", style::cyan("amp"), style::dim("Amp"));
                 eprintln!();
                 eprintln!(
                     "{}",
@@ -417,6 +421,7 @@ impl RunCommand {
             args,
             model: launch_model,
             claude_overrides,
+            amp_modes,
             env,
             key_override,
         };
@@ -434,23 +439,48 @@ impl RunCommand {
         })
     }
 
-    /// Shows usage information. When `tool` is `Some("claude")` (or `None`,
-    /// generic help) the Claude-only slot flags are listed; for other tools
-    /// they're hidden because `--haiku-model` etc. only apply to Claude.
+    /// Shows usage information. When `tool` names a specific CLI, only the
+    /// flags that actually apply to that CLI are listed; bare `aivo run --help`
+    /// (no tool) shows the union. Each option's visibility is gated on which
+    /// tools the run pipeline actually honors:
+    ///   - Claude slot flags (`--reasoning-model`, `--{haiku,sonnet,opus}-model`,
+    ///     `--subagent-model`) → claude
+    ///   - Amp mode-model flags (`--{rush,smart,deep,large}-model`) → amp
+    ///   - `--max-context`/`--1m`/`--2m` → claude, codex, amp (amp: 1m only)
+    ///   - `--relogin` → claude, codex, gemini (the OAuth-backed keys)
+    ///   - `-c, --context` → every tool except amp (no flat prompt-flag path)
     pub fn print_help(tool: Option<&str>) {
-        let show_claude_slots = tool.map(|t| t == "claude").unwrap_or(true);
-        println!("{} aivo run [tool] [args...]", style::bold("Usage:"));
+        let generic = tool.is_none();
+        let is = |name: &str| generic || tool == Some(name);
+
+        if let Some(t) = tool {
+            println!("{} aivo {} [args...]", style::bold("Usage:"), t);
+        } else {
+            println!("{} aivo run [tool] [args...]", style::bold("Usage:"));
+        }
         println!();
-        println!(
-            "{}",
-            style::dim("Launch an AI coding assistant with local API keys.")
-        );
-        println!(
-            "{}",
-            style::dim(
-                "When no tool is provided, `aivo run` falls back to the saved `start` flow."
-            )
-        );
+        match tool {
+            Some("claude") => {
+                println!("{}", style::dim("Launch Claude Code with a local API key."))
+            }
+            Some("codex") => println!("{}", style::dim("Launch Codex with a local API key.")),
+            Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),
+            Some("opencode") => println!("{}", style::dim("Launch OpenCode with a local API key.")),
+            Some("pi") => println!("{}", style::dim("Launch Pi with a local API key.")),
+            Some("amp") => println!("{}", style::dim("Launch Amp through aivo's bridge.")),
+            _ => {
+                println!(
+                    "{}",
+                    style::dim("Launch an AI coding assistant with local API keys.")
+                );
+                println!(
+                    "{}",
+                    style::dim(
+                        "When no tool is provided, `aivo run` falls back to the saved `start` flow."
+                    )
+                );
+            }
+        }
         println!(
             "{}",
             style::dim("All arguments are passed through to the underlying tool.")
@@ -464,34 +494,78 @@ impl RunCommand {
                 style::dim(desc)
             );
         };
+        // Generic help keeps the "Claude only:" / "Amp only:" prefixes so
+        // the union view stays unambiguous; per-tool help drops them since
+        // every flag listed already applies to that tool.
+        let label = |s: &str| -> String {
+            if generic {
+                s.to_string()
+            } else {
+                s.trim_start_matches("Claude only: ")
+                    .trim_start_matches("Codex only: ")
+                    .trim_start_matches("Amp only: ")
+                    .to_string()
+            }
+        };
         print_opt("-m, --model <model>", "Specify AI model to use");
-        if show_claude_slots {
+        if is("claude") {
             print_opt(
                 "--reasoning-model <m>",
-                "Claude only: override reasoning slot (bare = picker)",
+                &label("Claude only: override reasoning slot (bare = picker)"),
             );
             print_opt(
                 "--subagent-model <m>",
-                "Claude only: override subagent slot (bare = picker)",
+                &label("Claude only: override subagent slot (bare = picker)"),
             );
             print_opt(
                 "--haiku-model <m>",
-                "Claude only: what `/model haiku` resolves to (bare = picker)",
+                &label("Claude only: what `/model haiku` resolves to (bare = picker)"),
             );
             print_opt(
                 "--sonnet-model <m>",
-                "Claude only: what `/model sonnet` resolves to (bare = picker)",
+                &label("Claude only: what `/model sonnet` resolves to (bare = picker)"),
             );
             print_opt(
                 "--opus-model <m>",
-                "Claude only: what `/model opus` resolves to (bare = picker)",
+                &label("Claude only: what `/model opus` resolves to (bare = picker)"),
+            );
+        }
+        if is("amp") {
+            print_opt(
+                "--rush-model <m>",
+                &label("Amp only: model for `rush` mode (fast/cheap, small tasks)"),
             );
             print_opt(
-                "--max-context <size>",
-                "Claude only: opt every model slot into 1m/2m context window",
+                "--smart-model <m>",
+                &label("Amp only: model for `smart` mode (default; most capable)"),
             );
-            print_opt("--1m", "Claude only: shorthand for --max-context=1m");
-            print_opt("--2m", "Claude only: shorthand for --max-context=2m");
+            print_opt(
+                "--deep-model <m>",
+                &label("Amp only: model for `deep` mode (deep reasoning)"),
+            );
+            print_opt(
+                "--large-model <m>",
+                &label("Amp only: model for `large` mode (biggest context window)"),
+            );
+            print_opt(
+                "--disable-tool <name>",
+                &label(
+                    "Amp only: strip a tool by name (repeatable; Task auto-disabled in bridge mode; web_search/read_web_page get rewritten descriptions pointing at Bash)",
+                ),
+            );
+        }
+        if is("claude") || is("codex") || is("amp") {
+            let max_ctx_desc = match tool {
+                Some("amp") => "Opt model slots into a larger context window (amp: 1m only)",
+                _ => "Opt every model slot into a larger context window (e.g. 1m, 2m)",
+            };
+            print_opt("--max-context <size>", max_ctx_desc);
+            if tool != Some("amp") {
+                print_opt("--1m", "Shorthand for --max-context=1m");
+                print_opt("--2m", "Shorthand for --max-context=2m");
+            } else {
+                print_opt("--1m", "Shorthand for --max-context=1m");
+            }
         }
         print_opt(
             "-k, --key <id|name>",
@@ -499,42 +573,96 @@ impl RunCommand {
         );
         print_opt("-r, --refresh", "Bypass cache and fetch fresh model list");
         print_opt("--env <k=v>", "Inject environment variable");
-        print_opt(
-            "-c, --context[=<id>]",
-            "Inject one past session (bare = picker; id from `aivo context`)",
-        );
+        if tool != Some("amp") {
+            print_opt(
+                "-c, --context[=<id>]",
+                "Inject one past session (bare = picker; id from `aivo context`)",
+            );
+        }
         print_opt(
             "--dry-run",
             "Print resolved command and environment without launching",
         );
-        print_opt(
-            "--relogin",
-            "Force OAuth re-login for the selected key (codex / gemini / claude)",
-        );
-        println!();
-        println!("{}", style::bold("Tools:"));
-        let print_tool = |label: &str, desc: &str| {
+        if is("claude") || is("codex") || is("gemini") {
+            let relogin_desc = if generic {
+                "Force OAuth re-login for the selected key (codex / gemini / claude)"
+            } else {
+                "Force OAuth re-login for the selected key"
+            };
+            print_opt("--relogin", relogin_desc);
+        }
+
+        if generic {
+            println!();
+            println!("{}", style::bold("Tools:"));
+            let print_tool = |label: &str, desc: &str| {
+                println!(
+                    "  {}{}",
+                    style::cyan(format!("{:<12}", label)),
+                    style::dim(desc)
+                );
+            };
+            print_tool("claude", "Claude Code");
+            print_tool("codex", "Codex");
+            print_tool("gemini", "Gemini");
+            print_tool("opencode", "OpenCode");
+            print_tool("pi", "Pi");
+            print_tool("amp", "Amp");
+        }
+
+        if tool == Some("amp") {
+            println!();
+            println!("{}", style::bold("See also:"));
             println!(
                 "  {}{}",
-                style::cyan(format!("{:<12}", label)),
-                style::dim(desc)
+                style::cyan(format!("{:<26}", "aivo amp trust")),
+                style::dim("Approve workspace MCP servers (run `aivo amp trust --help`)"),
             );
-        };
-        print_tool("claude", "Claude Code");
-        print_tool("codex", "Codex");
-        print_tool("gemini", "Gemini");
-        print_tool("opencode", "OpenCode");
-        print_tool("pi", "Pi");
+        }
+
         println!();
         println!("{}", style::bold("Examples:"));
-        println!("  {}", style::dim("aivo run claude"));
-        println!(
-            "  {}",
-            style::dim("aivo run claude --model claude-sonnet-4.5")
-        );
-        println!("  {}", style::dim("aivo claude \"fix the login bug\""));
-        println!("  {}", style::dim("aivo codex \"refactor this function\""));
-        println!("  {}", style::dim("aivo gemini \"explain this code\""));
+        match tool {
+            Some("claude") => {
+                println!("  {}", style::dim("aivo claude"));
+                println!("  {}", style::dim("aivo claude --model claude-sonnet-4.5"));
+                println!("  {}", style::dim("aivo claude --1m -k work"));
+                println!("  {}", style::dim("aivo claude \"fix the login bug\""));
+            }
+            Some("codex") => {
+                println!("  {}", style::dim("aivo codex"));
+                println!("  {}", style::dim("aivo codex -k mykey -m gpt-5"));
+                println!("  {}", style::dim("aivo codex \"refactor this function\""));
+            }
+            Some("gemini") => {
+                println!("  {}", style::dim("aivo gemini"));
+                println!("  {}", style::dim("aivo gemini -k mykey"));
+                println!("  {}", style::dim("aivo gemini \"explain this code\""));
+            }
+            Some("opencode") => {
+                println!("  {}", style::dim("aivo opencode"));
+                println!("  {}", style::dim("aivo opencode -k mykey"));
+            }
+            Some("pi") => {
+                println!("  {}", style::dim("aivo pi"));
+                println!("  {}", style::dim("aivo pi -k mykey"));
+            }
+            Some("amp") => {
+                println!("  {}", style::dim("aivo amp"));
+                println!("  {}", style::dim("aivo amp --smart-model gpt-5"));
+                println!("  {}", style::dim("aivo amp threads list"));
+            }
+            _ => {
+                println!("  {}", style::dim("aivo run claude"));
+                println!(
+                    "  {}",
+                    style::dim("aivo run claude --model claude-sonnet-4.5")
+                );
+                println!("  {}", style::dim("aivo claude \"fix the login bug\""));
+                println!("  {}", style::dim("aivo codex \"refactor this function\""));
+                println!("  {}", style::dim("aivo gemini \"explain this code\""));
+            }
+        }
     }
 }
 
@@ -623,6 +751,9 @@ async fn maybe_inject_context(tool: AIToolType, args: Vec<String>, selector: &st
         AIToolType::Codex => inject_codex(&rendered, args),
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
+        // Amp has no flat prompt flag (uses `amp threads continue <id>` semantics);
+        // skip injection for v1 — `--context=<id>` is a no-op for amp.
+        AIToolType::Amp => args.to_vec(),
     }
 }
 
@@ -864,6 +995,7 @@ mod tests {
         assert!(AIToolType::parse("gemini").is_some());
         assert!(AIToolType::parse("opencode").is_some());
         assert!(AIToolType::parse("pi").is_some());
+        assert!(AIToolType::parse("amp").is_some());
     }
 
     #[test]
@@ -876,7 +1008,7 @@ mod tests {
     #[test]
     fn test_ai_tool_type_display_names() {
         // Ensure all tools have valid string representations
-        let tools = ["claude", "codex", "gemini", "opencode", "pi"];
+        let tools = ["claude", "codex", "gemini", "opencode", "pi", "amp"];
         for tool in &tools {
             let parsed = AIToolType::parse(tool).unwrap();
             // Roundtrip: parsing should give a valid tool type
@@ -888,6 +1020,7 @@ mod tests {
                         | AIToolType::Gemini
                         | AIToolType::Opencode
                         | AIToolType::Pi
+                        | AIToolType::Amp
                 ),
                 "Tool {} should parse to a valid AIToolType",
                 tool

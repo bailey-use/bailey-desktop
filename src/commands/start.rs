@@ -115,6 +115,7 @@ impl StartCommand {
                     args: Vec::new(),
                     model: launch_model,
                     claude_overrides: Default::default(),
+                    amp_modes: Default::default(),
                     env: (!env.is_empty()).then_some(env),
                     key_override: Some(key.value),
                 })
@@ -146,6 +147,7 @@ impl StartCommand {
                 args: Vec::new(),
                 model: launch_model,
                 claude_overrides: Default::default(),
+                amp_modes: Default::default(),
                 env: (!env.is_empty()).then_some(env),
                 key_override: Some(key.value),
             })

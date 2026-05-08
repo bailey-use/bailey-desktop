@@ -25,9 +25,11 @@ pub struct RenderedContext {
 pub fn render_single_session(tool: AIToolType, thread: &Thread) -> RenderedContext {
     let text = match tool {
         AIToolType::Claude => format_claude_single(thread),
-        AIToolType::Codex | AIToolType::Gemini | AIToolType::Opencode | AIToolType::Pi => {
-            format_markdown_single(thread)
-        }
+        AIToolType::Codex
+        | AIToolType::Gemini
+        | AIToolType::Opencode
+        | AIToolType::Pi
+        | AIToolType::Amp => format_markdown_single(thread),
     };
     let tokens = estimate_tokens(&text);
     RenderedContext { text, tokens }

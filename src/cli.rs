@@ -35,8 +35,9 @@ pub struct Cli {
 
 /// Available commands for the CLI
 #[derive(Subcommand, Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
-    /// Run AI tools (claude, codex, gemini, opencode, pi) - all args passed through
+    /// Run AI tools (claude, codex, gemini, opencode, pi, amp) - all args passed through
     Run(RunArgs),
 
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
@@ -83,6 +84,35 @@ pub enum Commands {
     /// Cross-CLI context — auto-extracted from your sessions; bare command shows your last activity
     #[command(hide = true)]
     Context(ContextArgs),
+
+    /// Amp-specific configuration (workspace MCP server trust, etc.)
+    Amp(AmpArgs),
+}
+
+/// Arguments for `aivo amp`. Currently scoped to the `trust` subcommand
+/// — the workspace MCP approval gate that mirrors `amp mcp approve` for
+/// servers the bridge would otherwise auto-load from a repo's
+/// `.amp/settings.json`.
+#[derive(Args, Debug, Clone)]
+pub struct AmpArgs {
+    /// Subcommand: `trust` (currently the only option). Bare `aivo amp`
+    /// prints help.
+    #[arg(value_name = "ACTION")]
+    pub action: Option<String>,
+
+    /// Approve every pending workspace MCP server without prompting.
+    /// Use only when you've already audited the file by hand.
+    #[arg(long)]
+    pub all: bool,
+
+    /// List approved MCP servers for the current workspace and exit.
+    #[arg(long)]
+    pub list: bool,
+
+    /// Revoke approval for a specific server name in the current
+    /// workspace.
+    #[arg(long, value_name = "NAME")]
+    pub revoke: Option<String>,
 }
 
 /// Arguments for `aivo alias`
@@ -153,10 +183,10 @@ pub struct KeysArgs {
 /// Arguments for the run command
 #[derive(Args, Debug, Clone)]
 pub struct RunArgs {
-    /// The AI tool to run (claude, codex, gemini, opencode, pi)
+    /// The AI tool to run (claude, codex, gemini, opencode, pi, amp)
     #[arg(
         value_name = "TOOL",
-        help = "AI tool to run: claude, codex, gemini, opencode, or pi"
+        help = "AI tool to run: claude, codex, gemini, opencode, pi, or amp"
     )]
     pub tool: Option<String>,
 
@@ -191,6 +221,35 @@ pub struct RunArgs {
     /// Bare flag opens a picker.
     #[arg(long = "opus-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub opus_model: Option<String>,
+
+    /// Amp only: model used by the `rush` agent mode (fast/cheap tier).
+    /// Sets `amp.internal.model.rush` in the bridge's settings override.
+    #[arg(long = "rush-model", value_name = "MODEL")]
+    pub rush_model: Option<String>,
+
+    /// Amp only: model used by the `smart` agent mode (default tier).
+    /// Sets `amp.internal.model.smart` in the bridge's settings override.
+    #[arg(long = "smart-model", value_name = "MODEL")]
+    pub smart_model: Option<String>,
+
+    /// Amp only: model used by the `deep` agent mode (reasoning tier).
+    /// Sets `amp.internal.model.deep` in the bridge's settings override.
+    #[arg(long = "deep-model", value_name = "MODEL")]
+    pub deep_model: Option<String>,
+
+    /// Amp only: model used by the `large` agent mode (long-context tier).
+    /// Sets `amp.internal.model.large` in the bridge's settings override.
+    #[arg(long = "large-model", value_name = "MODEL")]
+    pub large_model: Option<String>,
+
+    /// Amp only: disable an amp tool by name (repeatable). Writes the
+    /// `tools.disable` array into the bridge's settings override so amp
+    /// strips the tool from the request to the upstream. Useful when the
+    /// upstream lacks server-backed tools (`web_search`, `read_web_page`)
+    /// that amp would otherwise advertise. Tool names are not validated
+    /// client-side; unknown names are silently ignored by amp.
+    #[arg(long = "disable-tool", value_name = "NAME")]
+    pub disable_tool: Vec<String>,
 
     /// Select API key by ID or name
     #[arg(
@@ -334,7 +393,7 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
-    /// Show stats for a specific tool (claude, codex, gemini, opencode, pi, chat)
+    /// Show stats for a specific tool (claude, codex, gemini, opencode, pi, amp, chat)
     #[arg(value_name = "TOOL")]
     pub tool: Option<String>,
 
@@ -953,7 +1012,7 @@ mod tests {
 
     /// Helper to simulate the alias rewriting done in main.rs
     fn rewrite_alias(args: &[&str]) -> Vec<String> {
-        let aliases = ["claude", "codex", "gemini", "opencode", "pi"];
+        let aliases = ["claude", "codex", "gemini", "opencode", "pi", "amp"];
         let raw: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         if raw.len() > 1 && aliases.contains(&raw[1].as_str()) {
             let mut rewritten = vec![raw[0].clone(), "run".to_string()];

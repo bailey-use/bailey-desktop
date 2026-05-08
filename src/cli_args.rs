@@ -27,6 +27,14 @@ pub(crate) fn rewrite_cli_args(
     }
 
     if KNOWN_TOOLS.contains(&raw_args[1].as_str()) {
+        // Carve-out: `aivo amp trust ...` belongs to the `Amp` subcommand
+        // (workspace MCP approval), not the `Run` shortcut. Without this
+        // the rewriter would prepend `run`, the launcher would try to
+        // hand `trust` to the amp binary, and the actual subcommand
+        // would be unreachable.
+        if raw_args[1] == "amp" && raw_args.get(2).map(String::as_str) == Some("trust") {
+            return raw_args;
+        }
         let mut rewritten = vec![raw_args[0].clone(), "run".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
@@ -1195,6 +1203,51 @@ mod tests {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "claude", "--model", "gpt-5"]), &no_bundles()),
             args(&["aivo", "run", "claude", "--model", "gpt-5"])
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_amp_trust_subcommand() {
+        // `aivo amp trust` is the workspace MCP approval gate, NOT
+        // a `run amp trust` shortcut. The carve-out keeps the args
+        // intact so clap dispatches to the Amp subcommand.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp", "trust"]), &no_bundles()),
+            args(&["aivo", "amp", "trust"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp", "trust", "--list"]), &no_bundles()),
+            args(&["aivo", "amp", "trust", "--list"])
+        );
+    }
+
+    #[test]
+    fn rewrite_still_runs_amp_for_other_args() {
+        // `aivo amp <anything-but-trust>` is the Run shortcut — the
+        // carve-out is narrowly scoped to `trust`. `threads` and its
+        // subcommands flow through to amp, which talks to the bridge.
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp", "-x", "fix it"]), &no_bundles()),
+            args(&["aivo", "run", "amp", "-x", "fix it"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp"]), &no_bundles()),
+            args(&["aivo", "run", "amp"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp", "threads"]), &no_bundles()),
+            args(&["aivo", "run", "amp", "threads"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "amp", "threads", "list"]), &no_bundles()),
+            args(&["aivo", "run", "amp", "threads", "list"])
+        );
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "amp", "threads", "continue", "T-abc"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "run", "amp", "threads", "continue", "T-abc"])
         );
     }
 

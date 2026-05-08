@@ -35,6 +35,11 @@ pub(crate) fn preview_args(
     if tool == AIToolType::Pi {
         return inject_pi_model(model, &args);
     }
+    if tool == AIToolType::Amp {
+        let args = inject_amp_no_ide(&args, env);
+        let args = inject_amp_dangerously_allow_all(&args, env);
+        return inject_amp_settings_file(&args, env);
+    }
     if tool != AIToolType::Codex {
         return args;
     }
@@ -163,6 +168,41 @@ pub(crate) fn build_preview_notes(
         notes.push("injects `--model <model>` for Pi".to_string());
     }
 
+    if tool == AIToolType::Amp && env.contains_key("AIVO_USE_AMP_BRIDGE") {
+        notes.push(
+            "starts an Amp bridge on a random local port — stubs the management plane locally \
+             (auth/threads/telemetry) and translates LLM calls to the upstream"
+                .to_string(),
+        );
+        if !raw_args.iter().any(|a| a == "--ide" || a == "--no-ide") {
+            notes.push(
+                "injects `--no-ide` so amp doesn't auto-prepend open IDE file/selection to \
+                 messages going to the rerouted upstream (pass `--ide` to opt back in)"
+                    .to_string(),
+            );
+        }
+        if amp_runs_non_interactively(raw_args)
+            && !raw_args.iter().any(|a| a == "--dangerously-allow-all")
+        {
+            notes.push(
+                "injects `--dangerously-allow-all` because amp is in a non-interactive mode \
+                 (`-x` / `--stream-json-input`); without it, tool-approval prompts would hang \
+                 the run with no human to answer them"
+                    .to_string(),
+            );
+        }
+    }
+    if tool == AIToolType::Amp
+        && (env.contains_key("AIVO_AMP_INTERNAL_MODEL")
+            || env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"))
+    {
+        notes.push(
+            "writes a temporary amp settings.json (merged from your ~/.config/amp/settings.json) \
+             with the requested `internal.model` override and passes it via `--settings-file`"
+                .to_string(),
+        );
+    }
+
     notes
 }
 
@@ -176,6 +216,14 @@ pub(crate) async fn build_runtime_args(
     if tool == AIToolType::Pi {
         return Ok(RuntimeArgs {
             args: inject_pi_model(model, &args),
+            codex_model_catalog_path: None,
+        });
+    }
+    if tool == AIToolType::Amp {
+        let args = inject_amp_no_ide(&args, env);
+        let args = inject_amp_dangerously_allow_all(&args, env);
+        return Ok(RuntimeArgs {
+            args: inject_amp_settings_file(&args, env),
             codex_model_catalog_path: None,
         });
     }
@@ -287,6 +335,20 @@ pub(crate) fn rewrite_codex_preview_env(env: &mut HashMap<String, String>) {
     env.remove("OPENAI_BASE_URL");
 }
 
+/// Rewrites env vars for the dry-run preview so it reflects what amp will
+/// actually see at runtime: `AMP_URL` and `AMP_API_KEY` are set by
+/// `start_amp_bridge` after binding the bridge port, so they don't show up
+/// in the env produced by `for_amp`. The preview adds placeholders here
+/// (`http://127.0.0.1:<port>`, `aivo-bridge`) so the user can see at a
+/// glance that amp will talk to a localhost bridge — not directly to
+/// `AIVO_AMP_UPSTREAM_BASE_URL` like the bare env might suggest.
+pub(crate) fn rewrite_amp_preview_env(env: &mut HashMap<String, String>) {
+    if env.contains_key("AIVO_USE_AMP_BRIDGE") {
+        env.insert("AMP_URL".to_string(), "http://127.0.0.1:<port>".to_string());
+        env.insert("AMP_API_KEY".to_string(), "aivo-bridge".to_string());
+    }
+}
+
 /// Preview-only: prepends model_provider `--config` flags for Codex args
 /// without mutating the env map.
 fn preview_codex_provider_config_args(
@@ -370,6 +432,95 @@ fn inject_claude_teammate_mode(tool: AIToolType, args: &[String]) -> Vec<String>
     }
 
     let mut new_args = vec!["--teammate-mode".to_string(), "in-process".to_string()];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
+/// Prepends `--settings-file <path>` to amp's args when the bridge will
+/// write a merged settings override. Triggered by any of: `--1m`, the
+/// per-mode `--rush-model / --smart-model / --deep-model / --large-model`
+/// flags, `--disable-tool`, or — in bridge mode — the always-on
+/// auto-disable of unsupported tools (web_search/read_web_page/Task).
+/// At runtime, the real path is in `AIVO_AMP_SETTINGS_FILE`; for dry-run
+/// preview we substitute a `<temp:aivo-amp-settings.json>` placeholder
+/// since the path is only known after `start_amp_bridge` runs. Skips if
+/// the user already passed `--settings-file` themselves.
+fn inject_amp_settings_file(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    let path = if let Some(p) = env.get("AIVO_AMP_SETTINGS_FILE") {
+        p.clone()
+    } else if env.contains_key("AIVO_AMP_INTERNAL_MODEL")
+        || env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON")
+        || env.contains_key("AIVO_AMP_TOOLS_DISABLE")
+    {
+        "<temp:aivo-amp-settings.json>".to_string()
+    } else {
+        return args.to_vec();
+    };
+    let already_set = args
+        .iter()
+        .any(|a| a == "--settings-file" || a.starts_with("--settings-file="));
+    if already_set {
+        return args.to_vec();
+    }
+    let mut new_args = vec!["--settings-file".to_string(), path];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
+/// Prepends `--no-ide` to amp's args when the bridge is active. Amp's
+/// IDE integration (default on) auto-prepends the open IDE file's path
+/// and current text selection to every user message — useful when amp
+/// is talking to ampcode.com, but a privacy leak when the bridge is
+/// rerouting traffic to a third-party upstream (deepseek/openrouter/etc.).
+/// Native-amp launches (`AIVO_USE_AMP_BRIDGE` unset) keep the default since
+/// the user's data only goes back to Sourcegraph in that case.
+///
+/// Skipped if the user already passed `--ide` or `--no-ide` themselves —
+/// explicit choice wins.
+fn inject_amp_no_ide(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    if !env.contains_key("AIVO_USE_AMP_BRIDGE") {
+        return args.to_vec();
+    }
+    let already_set = args.iter().any(|a| a == "--ide" || a == "--no-ide");
+    if already_set {
+        return args.to_vec();
+    }
+    let mut new_args = vec!["--no-ide".to_string()];
+    new_args.extend_from_slice(args);
+    new_args
+}
+
+/// True when amp's args put it in a non-interactive mode that can't surface
+/// tool-approval prompts to a human:
+/// - `-x` / `--execute "<prompt>"` — one-shot execution
+/// - `--stream-json-input` — programmatic JSON-over-stdin
+fn amp_runs_non_interactively(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        a == "-x" || a == "--execute" || a.starts_with("--execute=") || a == "--stream-json-input"
+    })
+}
+
+/// Prepends `--dangerously-allow-all` to amp's args when the bridge is
+/// active AND amp is in a non-interactive mode (`-x`/`--execute`/
+/// `--stream-json-input`). Without this, amp blocks on every tool-approval
+/// prompt and the one-shot/programmatic call hangs forever — there's no
+/// human at the other end to press a key.
+///
+/// Skipped if the user already passed the flag explicitly, and skipped
+/// for native-amp launches (no bridge) so we don't widen permissions on
+/// runs talking to ampcode.com itself.
+fn inject_amp_dangerously_allow_all(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    if !env.contains_key("AIVO_USE_AMP_BRIDGE") {
+        return args.to_vec();
+    }
+    if !amp_runs_non_interactively(args) {
+        return args.to_vec();
+    }
+    let already_set = args.iter().any(|a| a == "--dangerously-allow-all");
+    if already_set {
+        return args.to_vec();
+    }
+    let mut new_args = vec!["--dangerously-allow-all".to_string()];
     new_args.extend_from_slice(args);
     new_args
 }
@@ -917,5 +1068,120 @@ mod tests {
         let result = preview_codex_provider_config_args(&env, args);
 
         assert_eq!(result, vec!["-m", "gpt-4o"]);
+    }
+
+    #[test]
+    fn test_inject_amp_no_ide_prepends_when_bridge_active() {
+        // Bridge active + user didn't pick a side → prepend `--no-ide` so
+        // amp doesn't auto-prefix open-IDE file content to messages going
+        // through the bridge to a third-party upstream.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["--mode".into(), "smart".into()];
+        let result = inject_amp_no_ide(&args, &env);
+        assert_eq!(result, vec!["--no-ide", "--mode", "smart"]);
+    }
+
+    #[test]
+    fn test_inject_amp_no_ide_skips_for_native_amp() {
+        // Native amp (no bridge) → user's data only goes back to
+        // Sourcegraph, no leak risk. Leave `--ide` behavior at amp's
+        // default rather than silently disabling a useful feature.
+        let env = HashMap::new();
+        let args = vec!["thread".into(), "list".into()];
+        let result = inject_amp_no_ide(&args, &env);
+        assert_eq!(result, vec!["thread", "list"]);
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_fires_for_one_shot_under_bridge() {
+        // Bridge active + amp invoked non-interactively (`-x "..."`) → there
+        // is no human to answer tool-approval prompts, so prepend the flag
+        // so amp actually completes instead of hanging.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["-x".into(), "fix the failing test".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert_eq!(
+            result,
+            vec!["--dangerously-allow-all", "-x", "fix the failing test"]
+        );
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_fires_for_stream_json_input() {
+        // `--stream-json-input` is amp's programmatic path — same story as
+        // `-x`: no human in the loop, so auto-allow.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["--stream-json-input".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert!(
+            result
+                .first()
+                .is_some_and(|a| a == "--dangerously-allow-all")
+        );
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_skips_interactive() {
+        // No `-x` / `--execute` / `--stream-json-input` → user is interactive
+        // and CAN answer tool prompts. Don't widen permissions silently.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["--mode".into(), "smart".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert_eq!(result, vec!["--mode", "smart"]);
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_skips_native_amp() {
+        // No bridge → user is talking directly to ampcode.com; they own the
+        // permissions story, don't auto-widen.
+        let env = HashMap::new();
+        let args = vec!["-x".into(), "ship it".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert_eq!(result, vec!["-x", "ship it"]);
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_idempotent() {
+        // User already passed the flag → don't double-inject.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["--dangerously-allow-all".into(), "-x".into(), "go".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert_eq!(result, args);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|a| *a == "--dangerously-allow-all")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_inject_amp_dangerously_allow_all_handles_execute_with_equals() {
+        // `--execute=hi` (single token) is the same non-interactive mode as
+        // `-x hi` / `--execute hi` — must trigger.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let args = vec!["--execute=hi".into()];
+        let result = inject_amp_dangerously_allow_all(&args, &env);
+        assert!(
+            result
+                .first()
+                .is_some_and(|a| a == "--dangerously-allow-all")
+        );
+    }
+
+    #[test]
+    fn test_inject_amp_no_ide_respects_explicit_user_flag() {
+        // User passed `--ide` explicitly even with the bridge active —
+        // they've made a deliberate choice; don't override.
+        let env = HashMap::from([("AIVO_USE_AMP_BRIDGE".into(), "1".into())]);
+        let with_ide = vec!["--ide".into(), "prompt".into()];
+        assert_eq!(inject_amp_no_ide(&with_ide, &env), with_ide);
+
+        // Same with explicit `--no-ide` — don't double-inject.
+        let with_no_ide = vec!["--no-ide".into(), "prompt".into()];
+        let result = inject_amp_no_ide(&with_no_ide, &env);
+        assert_eq!(result, vec!["--no-ide", "prompt"]);
+        assert_eq!(result.iter().filter(|a| *a == "--no-ide").count(), 1);
     }
 }

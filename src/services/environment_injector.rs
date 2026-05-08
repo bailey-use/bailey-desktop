@@ -89,6 +89,63 @@ pub struct ClaudeModelOverrides {
     pub max_context: Option<String>,
 }
 
+/// Amp-only run overrides. Set from `aivo run amp` flags:
+/// - `--rush-model / --smart-model / --deep-model / --large-model` populate
+///   `rush/smart/deep/large`. When any is non-empty the bridge writes
+///   `amp.internal.model` as an *object* keyed by mode name in the
+///   generated settings.json.
+/// - `--disable-tool <name>` (repeatable) populates `disable_tools`. The
+///   bridge writes `tools.disable: [...]` so amp strips the named tool
+///   from the request to the upstream — useful when the upstream lacks
+///   server-backed tools (`web_search`, `read_web_page`).
+#[derive(Debug, Clone, Default)]
+pub struct AmpModeModels {
+    pub rush: Option<String>,
+    pub smart: Option<String>,
+    pub deep: Option<String>,
+    pub large: Option<String>,
+    pub disable_tools: Vec<String>,
+}
+
+impl AmpModeModels {
+    pub fn is_empty(&self) -> bool {
+        self.rush.is_none()
+            && self.smart.is_none()
+            && self.deep.is_none()
+            && self.large.is_none()
+            && self.disable_tools.is_empty()
+    }
+
+    /// Renders the override as the JSON object form amp expects:
+    /// `{"<mode>": "<provider>:<model>", ...}`. Modes with no override
+    /// are omitted; if the user's value lacks a `provider:` prefix we
+    /// add `openai:` since amp validates the format and the bridge
+    /// rewrites the on-the-wire model name regardless of provider.
+    pub fn to_internal_model_value(&self) -> Option<serde_json::Value> {
+        let mut obj = Map::new();
+        for (mode, value) in [
+            ("rush", &self.rush),
+            ("smart", &self.smart),
+            ("deep", &self.deep),
+            ("large", &self.large),
+        ] {
+            if let Some(m) = value.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                let provider_prefixed = if m.contains(':') {
+                    m.to_string()
+                } else {
+                    format!("openai:{m}")
+                };
+                obj.insert(mode.to_string(), Value::String(provider_prefixed));
+            }
+        }
+        if obj.is_empty() {
+            None
+        } else {
+            Some(Value::Object(obj))
+        }
+    }
+}
+
 /// Slots Claude Code reads to pick the model for each routing class. aivo
 /// fans the user's `--model` value out to all of them so the chosen model
 /// wins everywhere. `ANTHROPIC_SMALL_FAST_MODEL` is intentionally absent —
@@ -922,6 +979,161 @@ impl EnvironmentInjector {
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
 
+        env
+    }
+
+    /// Builds environment variables for launching `amp` (Sourcegraph Amp CLI).
+    ///
+    /// Amp reads `AMP_URL` (default `https://ampcode.com/`) and `AMP_API_KEY`
+    /// from the environment. Two paths:
+    ///
+    /// 1. **Amp-native upstream** (`ampcode.com`, `*.sourcegraph.com`,
+    ///    localhost — typical of Sourcegraph hosted, self-hosted, or a
+    ///    CLIProxyAPI sidecar): inject directly. Amp talks to the upstream
+    ///    using its full protocol; aivo just plumbs the key.
+    /// 2. **Generic LLM upstream** (OpenAI-compat, Anthropic-compat, etc.):
+    ///    set `AIVO_USE_AMP_BRIDGE` so `launch_runtime` spawns a localhost
+    ///    bridge that masks the management surface and forwards
+    ///    `/api/provider/<X>/...` to the real upstream. AMP_URL is then
+    ///    overwritten with the bridge's `http://127.0.0.1:<port>`.
+    ///
+    /// Model selection in Amp is governed by `amp.experimental.modes` in the
+    /// user's settings.json, not an env var, so `_model` is unused.
+    pub fn for_amp(
+        &self,
+        key: &ApiKey,
+        model: Option<&str>,
+        max_context: Option<&str>,
+        amp_modes: &AmpModeModels,
+    ) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+        if crate::services::amp_bridge::is_amp_native_endpoint(&key.base_url) {
+            env.insert("AMP_URL".to_string(), key.base_url.clone());
+            env.insert("AMP_API_KEY".to_string(), key.key.to_string());
+        } else {
+            env.insert("AIVO_USE_AMP_BRIDGE".to_string(), "1".to_string());
+            // Resolve the aivo-starter sentinel to its real backing URL
+            // (api.getaivo.dev). Without this, the at_oai/responses
+            // translators would try to build a request to literally
+            // "aivo-starter/v1/messages" and reqwest fails with a
+            // "builder error".
+            let profile = provider_profile_for_key(key);
+            let (upstream_url, upstream_key) = if profile.serve_flags.is_starter {
+                (
+                    AIVO_STARTER_REAL_URL.to_string(),
+                    AIVO_STARTER_SENTINEL.to_string(),
+                )
+            } else {
+                (key.base_url.clone(), key.key.to_string())
+            };
+            env.insert("AIVO_AMP_UPSTREAM_BASE_URL".to_string(), upstream_url);
+            env.insert("AIVO_AMP_UPSTREAM_KEY".to_string(), upstream_key);
+            if profile.serve_flags.is_starter {
+                env.insert("AIVO_AMP_IS_STARTER".to_string(), "1".to_string());
+            }
+
+            // Amp picks Claude model names internally based on its agent mode;
+            // the upstream (deepseek, openrouter, etc.) won't accept those.
+            // If the user passed `-m <model>`, force-rewrite the request body's
+            // `model` field in the bridge to that value. For the aivo-starter
+            // upstream, default to `aivo/starter` since that's the only model
+            // the starter endpoint accepts.
+            let resolved_force_model =
+                model.filter(|m| !m.trim().is_empty() && *m != "__default__");
+            if let Some(m) = resolved_force_model {
+                env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
+            } else if profile.serve_flags.is_starter {
+                env.insert(
+                    "AIVO_AMP_FORCE_MODEL".to_string(),
+                    AIVO_STARTER_MODEL.to_string(),
+                );
+            }
+
+            // Auto-disable bridge-unsupported tools that have no organic
+            // fallback the model will discover on its own. `Task` is the
+            // only one in this category: amp's Task tool is a server-side
+            // TODO manager that the bridge stubs with `not-supported`, but
+            // the model already knows to track multi-step plans inline as
+            // a markdown checklist — so stripping the schema saves tokens
+            // without breaking behavior.
+            //
+            // `web_search` / `read_web_page` are deliberately NOT in this
+            // list. The bridge rewrites their *descriptions* in
+            // `rewrite_request_body` to point at Bash + curl/wget, so the
+            // model sees the tool exists but routes around it. Stripping
+            // them outright caused the model to apologize and give up
+            // rather than try Bash (2026-05-08 regression — amp's system
+            // prompt frames web access as a tool-only capability).
+            //
+            // The user's `--disable-tool` entries take precedence in
+            // ordering; auto-disables are appended and dedup'd by
+            // `build_amp_settings_override`'s union logic.
+            const BRIDGE_UNSUPPORTED_TOOLS: &[&str] = &["Task"];
+            let mut disable_tools = amp_modes.disable_tools.clone();
+            for tool in BRIDGE_UNSUPPORTED_TOOLS {
+                if !disable_tools.iter().any(|t| t == tool) {
+                    disable_tools.push((*tool).to_string());
+                }
+            }
+            // Always set the env var in bridge mode — the auto-disables
+            // alone are reason enough. Comma is safe — amp's tool names
+            // are identifiers (snake_case / PascalCase), no commas.
+            env.insert(
+                "AIVO_AMP_TOOLS_DISABLE".to_string(),
+                disable_tools.join(","),
+            );
+
+            // Per-mode model overrides (`--rush-model`, `--smart-model`,
+            // `--deep-model`, `--large-model`) take priority over `--1m`.
+            // When any are set, emit the JSON object form for amp's
+            // `internal.model` so each mode picks its own model.
+            if let Some(modes_obj) = amp_modes.to_internal_model_value() {
+                env.insert(
+                    "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
+                    modes_obj.to_string(),
+                );
+            } else if let Some(ctx) = max_context.filter(|c| !c.trim().is_empty())
+                && ctx.eq_ignore_ascii_case("1m")
+            {
+                // `--1m` / `--max-context=1m`: amp's UI shows the model's
+                // hardcoded contextWindow from its built-in catalog, NOT
+                // the upstream's true ceiling. Override `internal.model`
+                // to a 1M-context catalog entry (`gpt-5.5-pro`); the
+                // bridge then rewrites on-the-wire to the upstream
+                // model. Only `1m` is supported — amp's catalog has no
+                // entry larger than ~1.05M.
+                env.insert(
+                    "AIVO_AMP_INTERNAL_MODEL".to_string(),
+                    "openai:gpt-5.5-pro".to_string(),
+                );
+            }
+
+            // Privacy default: stub the management plane locally so no
+            // traffic (auth, threads, telemetry) leaks to ampcode.com.
+            // Users who want their thread history / telemetry on
+            // Sourcegraph can opt in via `AIVO_AMP_PASSTHROUGH=1`, which
+            // forwards management calls to the URL in their existing amp
+            // secrets.json (typically https://ampcode.com/).
+            if std::env::var("AIVO_AMP_PASSTHROUGH").as_deref() == Ok("1")
+                && let Some((amp_url, amp_token)) =
+                    crate::services::amp_bridge::detect_native_amp_credentials()
+            {
+                env.insert("AIVO_AMP_NATIVE_URL".to_string(), amp_url);
+                env.insert("AIVO_AMP_NATIVE_KEY".to_string(), amp_token);
+            }
+            // Pin amp's binary version: aivo's bridge is wired to amp's
+            // current `/api/internal` RPC envelope, getUserInfo schema, SSE
+            // event shapes, and `internal.model` settings key — all
+            // rediscovered via `strings`. If amp self-updates mid-session
+            // any of these can shift and the bridge silently breaks. The
+            // env var disables amp's update probe entirely; the matching
+            // `amp.updates.mode: "disabled"` setting in
+            // `build_amp_settings_override` covers cases where the env
+            // var is stripped (e.g. user wraps with `env -i`).
+            env.insert("AMP_SKIP_UPDATE_CHECK".to_string(), "1".to_string());
+            // AMP_URL / AMP_API_KEY are filled in by `launch_runtime` after
+            // it binds the bridge to a random port.
+        }
         env
     }
 
@@ -2921,5 +3133,72 @@ mod tests {
         let env = injector.for_gemini(&key, None);
         assert!(!env.contains_key("GEMINI_MODEL"));
         assert_eq!(env.get("GOOGLE_GENAI_USE_GCA"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_auto_disables_task_only() {
+        // Non-native upstream → bridge mode. Task is the only tool we
+        // strip outright (model falls back to inline markdown checklists).
+        // web_search / read_web_page are kept in the request body — their
+        // descriptions get rewritten in the bridge to point at Bash+curl,
+        // because amp's system prompt frames web access as a tool-only
+        // capability and stripping the schemas made the model give up.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.deepseek.com");
+        let modes = AmpModeModels::default();
+        let env = injector.for_amp(&key, None, None, &modes);
+        let disable = env
+            .get("AIVO_AMP_TOOLS_DISABLE")
+            .expect("bridge mode should always set AIVO_AMP_TOOLS_DISABLE");
+        let tools: Vec<&str> = disable.split(',').collect();
+        assert!(tools.contains(&"Task"), "got {disable:?}");
+        assert!(
+            !tools.contains(&"web_search"),
+            "web_search must stay enabled (description-rewrite handles it): {disable:?}"
+        );
+        assert!(
+            !tools.contains(&"read_web_page"),
+            "read_web_page must stay enabled (description-rewrite handles it): {disable:?}"
+        );
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_dedups_user_disables_with_auto() {
+        // User passed `--disable-tool Task --disable-tool foo`. The env
+        // var must contain `foo` and `Task` exactly once each (no double
+        // Task from the auto-disable), with user entries first.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.deepseek.com");
+        let modes = AmpModeModels {
+            disable_tools: vec!["Task".to_string(), "foo".to_string()],
+            ..Default::default()
+        };
+        let env = injector.for_amp(&key, None, None, &modes);
+        let disable = env.get("AIVO_AMP_TOOLS_DISABLE").unwrap();
+        let tools: Vec<&str> = disable.split(',').collect();
+        // User entries first (insertion order), auto-disables appended.
+        assert_eq!(tools[0], "Task");
+        assert_eq!(tools[1], "foo");
+        // No duplicate Task anywhere downstream.
+        assert_eq!(
+            tools.iter().filter(|t| **t == "Task").count(),
+            1,
+            "auto-disable must dedup user-supplied entries: {disable:?}"
+        );
+    }
+
+    #[test]
+    fn for_amp_native_mode_skips_tools_disable_entirely() {
+        // ampcode.com (and any sourcegraph.com / localhost native amp)
+        // serves web_search/Task for real. Auto-disable would break those.
+        // The native branch in `for_amp` returns before the disable logic.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://ampcode.com");
+        let modes = AmpModeModels::default();
+        let env = injector.for_amp(&key, None, None, &modes);
+        assert!(
+            !env.contains_key("AIVO_AMP_TOOLS_DISABLE"),
+            "native amp should never get auto-disables — broke web_search/Task on the real endpoint"
+        );
     }
 }

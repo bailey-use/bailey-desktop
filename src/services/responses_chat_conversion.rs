@@ -775,9 +775,32 @@ fn chat_usage_to_responses_usage(chat: &Value) -> Option<Value> {
         json!(input + output)
     });
 
+    // Map OpenAI chat-completion's `prompt_tokens_details.cached_tokens` (and
+    // Anthropic's `cache_read_input_tokens`) to the Responses API shape.
+    // Some clients (Amp, recent OpenAI SDKs) crash on `usage.input_tokens_details.
+    // cached_tokens` being absent, so emit a zeroed object even when the
+    // upstream didn't return cache info.
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+
     let mut response_usage = json!({
         "input_tokens": input_tokens,
+        "input_tokens_details": {
+            "cached_tokens": cached_tokens,
+        },
         "output_tokens": output_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": reasoning_tokens,
+        },
         "total_tokens": total_tokens
     });
 

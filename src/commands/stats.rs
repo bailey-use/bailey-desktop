@@ -297,7 +297,7 @@ impl StatsCommand {
         let tool = tool.to_lowercase();
         if !is_valid_tool(&tool) {
             eprintln!(
-                "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, chat",
+                "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, amp, chat",
                 style::red("Error:"),
                 tool
             );
@@ -525,7 +525,7 @@ impl StatsCommand {
             "  {}{}",
             style::cyan(format!("{:<26}", "[tool]")),
             style::dim(
-                "Show stats for a specific tool (claude, codex, gemini, opencode, pi, chat)"
+                "Show stats for a specific tool (claude, codex, gemini, opencode, pi, amp, chat)"
             )
         );
         println!();
@@ -1533,6 +1533,7 @@ mod tests {
         assert!(is_valid_tool("gemini"));
         assert!(is_valid_tool("opencode"));
         assert!(is_valid_tool("pi"));
+        assert!(is_valid_tool("amp"));
         assert!(is_valid_tool("chat"));
         assert!(!is_valid_tool("unknown"));
         assert!(!is_valid_tool(""));

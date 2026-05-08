@@ -166,12 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn opencode_and_pi_disable_all_oauth() {
+    fn opencode_pi_and_amp_disable_all_oauth() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
         let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
 
-        for tool in [AIToolType::Opencode, AIToolType::Pi] {
+        for tool in [AIToolType::Opencode, AIToolType::Pi, AIToolType::Amp] {
             let ctx = KeyCompatContext::Tool(tool);
             assert!(ctx.incompat_reason(&claude).is_some());
             assert!(ctx.incompat_reason(&codex).is_some());

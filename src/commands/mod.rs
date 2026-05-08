@@ -122,6 +122,7 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
 }
 
 pub mod alias;
+pub mod amp;
 pub mod audio;
 pub mod chat;
 pub(crate) mod chat_request_builder;
@@ -142,6 +143,7 @@ pub mod update;
 pub mod video;
 
 pub use alias::AliasCommand;
+pub use amp::AmpCommand;
 pub use audio::AudioCommand;
 pub use chat::ChatCommand;
 pub use context::ContextCommand;

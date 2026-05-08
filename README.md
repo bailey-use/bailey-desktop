@@ -1,19 +1,39 @@
+[![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
+
 # aivo
 
-A command-line tool that connects coding agents to any compatible model provider. Includes a free starter provider for first-run use.
+Aivo is a command-line tool that connects your coding agent to almost any model. It also includes built-in models out of the box — no API keys, no signup.
 
 ## Features
 
 - AES-256-GCM encrypted storage for multiple provider keys.
-- Launches `claude`, `codex`, `gemini`, `opencode`, and `pi` against any saved key.
+- Launches `claude`, `codex`, `gemini`, `opencode`, `pi`, and `amp` against any saved key.
 - Chat TUI, one-shot `-x` mode, and a local OpenAI-compatible HTTP server.
 
 ## Install
 
+Install script (macOS, Linux):
+
 ```bash
-brew install yuanchuan/tap/aivo                      # Homebrew
-curl -fsSL https://getaivo.dev/install.sh | bash     # install script
-npm install -g @yuanchuan/aivo                       # npm (recommended on Windows)
+curl -fsSL https://getaivo.dev/install.sh | bash
+```
+
+PowerShell (Windows):
+
+```powershell
+irm https://getaivo.dev/install.ps1 | iex
+```
+
+Homebrew:
+
+```bash
+brew install yuanchuan/tap/aivo
+```
+
+npm (recommended on Windows):
+
+```bash
+npm install -g @yuanchuan/aivo
 ```
 
 ## Quick Start
@@ -63,6 +83,7 @@ Supported tools:
 - `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - `opencode` [OpenCode](https://github.com/anomalyco/opencode)
 - `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+- `amp` [Amp](https://ampcode.com)
 
 ```bash
 aivo claude                                  # launch with active key

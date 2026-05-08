@@ -1035,18 +1035,20 @@ impl EnvironmentInjector {
             // Amp picks Claude model names internally based on its agent mode;
             // the upstream (deepseek, openrouter, etc.) won't accept those.
             // If the user passed `-m <model>`, force-rewrite the request body's
-            // `model` field in the bridge to that value. For the aivo-starter
-            // upstream, default to `aivo/starter` since that's the only model
-            // the starter endpoint accepts.
-            let resolved_force_model =
-                model.filter(|m| !m.trim().is_empty() && *m != "__default__");
-            if let Some(m) = resolved_force_model {
-                env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
-            } else if profile.serve_flags.is_starter {
-                env.insert(
-                    "AIVO_AMP_FORCE_MODEL".to_string(),
-                    AIVO_STARTER_MODEL.to_string(),
-                );
+            // `model` field in the bridge to that value. However, when per-mode
+            // model overrides are set (--rush-model, --smart-model, etc.), those
+            // take priority and force_model is not needed.
+            if amp_modes.to_internal_model_value().is_none() {
+                let resolved_force_model =
+                    model.filter(|m| !m.trim().is_empty() && *m != "__default__");
+                if let Some(m) = resolved_force_model {
+                    env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
+                } else if profile.serve_flags.is_starter {
+                    env.insert(
+                        "AIVO_AMP_FORCE_MODEL".to_string(),
+                        AIVO_STARTER_MODEL.to_string(),
+                    );
+                }
             }
 
             // Auto-disable bridge-unsupported tools that have no organic

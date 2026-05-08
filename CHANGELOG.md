@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.20.0
+
+### Features
+
+- `aivo amp`: Amp (Sourcegraph) is now a first-class supported tool, alongside `claude`, `codex`, `gemini`, `opencode`, and `pi`. Per-mode model overrides, `--max-context=1m`, and an on-the-fly bridge that routes the LLM plane to your configured upstream while stubbing management traffic locally for privacy. `aivo amp trust` gates workspace MCP servers so a hostile checkout can't auto-launch them.
+
+### Fixes
+
+- Router: pass through the user-agent header from tool clients.
+
+
 ## v0.19.20
 
 ### Features

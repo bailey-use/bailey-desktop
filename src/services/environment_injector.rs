@@ -1035,20 +1035,22 @@ impl EnvironmentInjector {
             // Amp picks Claude model names internally based on its agent mode;
             // the upstream (deepseek, openrouter, etc.) won't accept those.
             // If the user passed `-m <model>`, force-rewrite the request body's
-            // `model` field in the bridge to that value. However, when per-mode
-            // model overrides are set (--rush-model, --smart-model, etc.), those
-            // take priority and force_model is not needed.
-            if amp_modes.to_internal_model_value().is_none() {
-                let resolved_force_model =
-                    model.filter(|m| !m.trim().is_empty() && *m != "__default__");
-                if let Some(m) = resolved_force_model {
-                    env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
-                } else if profile.serve_flags.is_starter {
-                    env.insert(
-                        "AIVO_AMP_FORCE_MODEL".to_string(),
-                        AIVO_STARTER_MODEL.to_string(),
-                    );
-                }
+            // `model` field in the bridge to that value. When per-mode overrides
+            // are set (--rush-model, --smart-model, etc.), the user's `-m` is
+            // suppressed so per-mode routing reaches the wire — but the
+            // aivo-starter fallback still applies, since the starter endpoint
+            // only accepts `aivo/starter` regardless of which mode amp picks.
+            let suppress_user_force = amp_modes.to_internal_model_value().is_some();
+            let resolved_force_model = model
+                .filter(|_| !suppress_user_force)
+                .filter(|m| !m.trim().is_empty() && *m != "__default__");
+            if let Some(m) = resolved_force_model {
+                env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
+            } else if profile.serve_flags.is_starter {
+                env.insert(
+                    "AIVO_AMP_FORCE_MODEL".to_string(),
+                    AIVO_STARTER_MODEL.to_string(),
+                );
             }
 
             // Auto-disable bridge-unsupported tools that have no organic
@@ -3202,5 +3204,69 @@ mod tests {
             !env.contains_key("AIVO_AMP_TOOLS_DISABLE"),
             "native amp should never get auto-disables — broke web_search/Task on the real endpoint"
         );
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_per_mode_overrides_suppress_user_force_model() {
+        // -m + per-mode flags: previously both env vars were set and the
+        // bridge's force_model rewrote every request body's `model` field
+        // to the -m value, defeating per-mode routing entirely. The
+        // suppress_user_force gate must drop AIVO_AMP_FORCE_MODEL when any
+        // per-mode override is present so amp's mode dispatch wins.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.deepseek.com");
+        let modes = AmpModeModels {
+            smart: Some("deepseek-v4-pro".into()),
+            ..Default::default()
+        };
+        let env = injector.for_amp(&key, Some("kimi-k2.6"), None, &modes);
+        assert!(
+            !env.contains_key("AIVO_AMP_FORCE_MODEL"),
+            "per-mode flags must suppress -m's force_model: {env:?}"
+        );
+        assert!(
+            env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"),
+            "per-mode JSON should still be emitted: {env:?}"
+        );
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_starter_force_model_survives_per_mode_overrides() {
+        // The aivo-starter upstream only accepts the literal model name
+        // `aivo/starter`. Even when the user provides per-mode overrides,
+        // the bridge must still rewrite outgoing model fields to
+        // `aivo/starter` or the upstream returns 400. Only the user's `-m`
+        // is suppressed by per-mode flags; the starter sentinel fallback
+        // is independent.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key(AIVO_STARTER_SENTINEL);
+        let modes = AmpModeModels {
+            smart: Some("deepseek-v4-pro".into()),
+            ..Default::default()
+        };
+        let env = injector.for_amp(&key, None, None, &modes);
+        assert_eq!(
+            env.get("AIVO_AMP_FORCE_MODEL"),
+            Some(&AIVO_STARTER_MODEL.to_string()),
+            "starter fallback must survive per-mode flags: {env:?}"
+        );
+        assert!(env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"));
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_user_force_model_set_without_per_mode() {
+        // -m without per-mode flags: AIVO_AMP_FORCE_MODEL must be set so
+        // the bridge rewrites amp's claude-named requests to the user's
+        // chosen upstream model. Sanity check that the suppression gate
+        // doesn't fire when amp_modes is empty.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.deepseek.com");
+        let modes = AmpModeModels::default();
+        let env = injector.for_amp(&key, Some("kimi-k2.6"), None, &modes);
+        assert_eq!(
+            env.get("AIVO_AMP_FORCE_MODEL"),
+            Some(&"kimi-k2.6".to_string())
+        );
+        assert!(!env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"));
     }
 }

@@ -1,14 +1,11 @@
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
-# aivo
+> Aivo is a command-line tool that connects your coding agent to almost any model. It also includes built-in models out of the box — no API keys, no signup.
 
-Aivo is a command-line tool that connects your coding agent to almost any model. It also includes built-in models out of the box — no API keys, no signup.
+## Docs
 
-## Features
+https://getaivo.dev
 
-- AES-256-GCM encrypted storage for multiple provider keys.
-- Launches `claude`, `codex`, `gemini`, `opencode`, `pi`, and `amp` against any saved key.
-- Chat TUI, one-shot `-x` mode, and a local OpenAI-compatible HTTP server.
 
 ## Install
 
@@ -18,19 +15,19 @@ Install script (macOS, Linux):
 curl -fsSL https://getaivo.dev/install.sh | bash
 ```
 
-PowerShell (Windows):
-
-```powershell
-irm https://getaivo.dev/install.ps1 | iex
-```
-
 Homebrew:
 
 ```bash
 brew install yuanchuan/tap/aivo
 ```
 
-npm (recommended on Windows):
+PowerShell (Windows):
+
+```powershell
+irm https://getaivo.dev/install.ps1 | iex
+```
+
+Npm
 
 ```bash
 npm install -g @yuanchuan/aivo
@@ -52,25 +49,6 @@ aivo keys add                                # interactive picker
 aivo claude
 aivo claude --model moonshotai/kimi-k2.5     # pin a model
 ```
-
-`aivo keys add` supports OpenAI-compatible endpoints (OpenRouter, Groq, DeepSeek, and others), native APIs (Anthropic, Google AI Studio, Amazon Bedrock, Cloudflare Workers AI), local Ollama, and OAuth flows for GitHub Copilot, OpenAI Codex, Claude Code, and Gemini.
-
-## Commands
-
-| Command | Description |
-| ------- | ----------- |
-| [run](#run) | Launch an AI tool (claude, codex, gemini, opencode, pi) |
-| [keys](#keys) | Manage API keys (add, use, rm, cat, edit, ping) |
-| [models](#models) | List models from the active provider |
-| [alias](#alias) | Create short names for models or launch presets |
-| [chat](#chat) | Interactive chat TUI or one-shot `-x` mode |
-| [serve](#serve) | Local OpenAI-compatible API server |
-| [info](#info) | Show keys, tools, and directory state |
-| [logs](#logs) | Query local SQLite logs for chat, run, and serve |
-| [stats](#stats) | Show usage statistics |
-| [update](#update) | Update to the latest version |
-
-Run `aivo <command> --help` for the full flag list.
 
 ## run
 

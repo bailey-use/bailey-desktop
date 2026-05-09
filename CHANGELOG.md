@@ -2,68 +2,84 @@
 
 ## v0.20.2
 
-### Fixes
+## Fixes
 
 - Router: normalize Claude Code 2.x thinking config per model.
+- Router: forward the originating tool client's `User-Agent` to upstream providers instead of reqwest's default.
+- `aivo pi`: preserve user customization (packages, MCP servers, rules, themes, settings) by symlinking the real `~/.pi/agent/` state instead of overwriting it with a fresh temp dir.
+- Gemini: preserve `reasoning_content` across deepseek-thinking turns.
 - `aivo models`: respect the model cache instead of refetching on every invocation.
+- `aivo models`: always show the spinner during fetch.
+- `aivo models`: surface a friendly message ("No models found...", "Invalid API key...") on fetch failure instead of dumping raw HTML.
 
-### Performance
+## Performance
 
 - `aivo models`: faster model display, with table output batched into a single stdout write.
 
-### Polish
+## Polish
 
 - TUI: tidy disabled rows in the fuzzy picker.
+- Providers: drop the MiniMax hardcoded model list (now served via `/v1/models`) and the `anthropic_path_prefix` quirk.
 
+
+---
 
 ## v0.20.1
 
-### Features
+## Features
 
 - `aivo amp`: `--mode <smart|rush|large|deep>` flag, with the model picker now honoring per-mode model overrides.
 
-### Fixes
+## Fixes
 
 - `aivo amp`: per-mode model flags take precedence over `-m`.
 - `aivo amp`: honor per-mode models without invoking the picker.
 
 
+---
+
 ## v0.20.0
 
-### Features
+## Features
 
 - `aivo amp`: Amp (Sourcegraph) is now a first-class supported tool, alongside `claude`, `codex`, `gemini`, `opencode`, and `pi`. Per-mode model overrides, `--max-context=1m`, and an on-the-fly bridge that routes the LLM plane to your configured upstream while stubbing management traffic locally for privacy. `aivo amp trust` gates workspace MCP servers so a hostile checkout can't auto-launch them.
 
-### Fixes
+## Fixes
 
 - Router: pass through the user-agent header from tool clients.
 
 
+---
+
 ## v0.19.20
 
-### Features
+## Features
 
 - `aivo image`: inline preview in supported terminals.
 - `aivo run` (codex): `--max-context` now drives Codex via `model_context_window`.
 - Keys: editing a Bedrock entry reuses the add flow's region picker.
 
-### Fixes
+## Fixes
 
 - Router: bail on 429 instead of probing fallback paths.
 - CLI: `--<N>m` accepted as a generic max-context shorthand.
 - Refactor: split `main.rs` into `cli_args` + `run` modules.
 
 
+---
+
 ## v0.19.19
 
-### Fixes
+## Fixes
 
 - Audio: preserve external playback on `--no-default-features` builds.
 
 
+---
+
 ## v0.19.18
 
-### Improvements
+## Improvements
 
 - `aivo speak` replaces `aivo audio`: cached TTS, file/stdin input, streaming playback, `--list` picker.
 - `aivo run --relogin`: refresh expired Codex/Gemini/Claude OAuth keys in place.
@@ -73,75 +89,91 @@
 - TUI: fuzzy picker handles multiline paste and trims outer whitespace from filter queries.
 
 
+---
+
 ## v0.19.17
 
-### Fixes
+## Fixes
 
 - xAI / OpenAI-compatible providers: usage stats now flow through correctly. Some providers (xAI/Grok especially) emit `input_tokens` / `output_tokens` instead of `prompt_tokens` / `completion_tokens`; the router and bridges now accept both aliases and preserve them end-to-end through the Anthropic bridge so Claude Code sees real token counts instead of zeros.
 
-### Internal
+## Internal
 
 - Tests: `claude` setup-token spawn retries on transient `Other` errors to de-flake CI.
 
 
+---
+
 ## v0.19.16
 
-### Features
+## Features
 
 - `aivo run`: auto-detect 1m / 2m context windows so users don't have to pass the flag.
 - Claude gateway: `/v1/models` endpoint backs the model picker and accepts `x-api-key` auth alongside bearer tokens.
 - Stats: per-model cache breakdown with a new `-d` / `--detailed` view (input / output / cached / total), and `--since` now counts one-shot `aivo -x` chat turns with per-session token totals.
 
-### Fixes
+## Fixes
 
 - Stats `--since`: window is now actually windowed. Suppresses lifetime aivo-proxy and per-key counters from leaking into the cutoff, applies the cutoff to event timestamps, surfaces every model the user launched in-window (even when the upstream withheld usage), and records chat tokens under the upstream model name to match `claude-code`.
 - Pi: reuse session history when relaunching under `aivo pi`.
 
 
+---
+
 ## v0.19.15
 
-### Features
+## Features
 
 - New media-generation subcommands `aivo video`, `aivo audio`, and `aivo speak` join the existing `aivo image`, sharing a `services::media_io` module for output path parsing, overwrite policy, atomic writes, and error extraction. Hidden from `--help` for now while the surface stabilizes.
 
-### Internal
+## Internal
 
 - CI: scope concurrency cancellation to `ci.yml` and run the test workflow on `main` pushes / PRs so the matrix validates before tagging.
 
 
+---
+
 ## v0.19.14
 
-### Fixes
+## Fixes
 
 - Launcher: skip extension-less PATH entries when looking up tool binaries on Windows — npm drops both `claude.cmd` and a bash-style `claude` (no extension) into `%APPDATA%\npm`; the lookup matched the unspawnable bash shim first. `aivo claude` / `aivo codex` / `aivo gemini` now resolve to the `.cmd` shim and spawn correctly even when the tool was already installed
 
 (v0.19.12 and v0.19.13 carried the same fix but failed CI — v0.19.12 on a `PATHEXT` casing mismatch in tests, v0.19.13 on a `clippy::needless_return` lint that only fires on the newer Rust shipped to `windows-latest`. No binaries were published for either.)
 
 
+---
+
 ## v0.19.11
 
-### Fixes
+## Fixes
 
 - Launcher: pin the resolved binary path before spawning so npm `.cmd` shims (`claude.cmd`, `codex.cmd`, etc.) launch on Windows — `CreateProcessW` does not honor PATHEXT for non-`.exe` files, so spawning the bare `claude`/`codex` name failed after install
 
 
+---
+
 ## v0.19.10
 
-### Fixes
+## Fixes
 
 - Chat TUI / `keys add` secret prompt: filter Windows key Release events so typed characters aren't doubled — crossterm emits both Press and Release on Windows for every keystroke; we now only process Press
 
 
+---
+
 ## v0.19.9
 
-### Fixes
+## Fixes
 
 - Build: statically link the MSVC C runtime for Windows targets so `aivo.exe` no longer depends on `VCRUNTIME140.dll` — fixes silent load failure (`STATUS_DLL_NOT_FOUND`) on Windows ARM64 systems without the Visual C++ Redistributable installed, where `aivo --version` printed nothing
 
 
+---
+
 ## v0.19.8
 
-### Improvements
+## Improvements
 
 - Bridge: propagate cached input tokens from OpenAI-shape upstreams — Claude Code now records `cache_read_input_tokens` correctly so cached usage shows up in `aivo stats` instead of being silently dropped
 - Bridge: coalesce parallel function_calls into one assistant message
@@ -152,9 +184,11 @@
 - Build: add `win32-arm64` target
 
 
+---
+
 ## v0.19.7
 
-### Improvements
+## Improvements
 
 - `aivo update` and `install.sh` now fetch binaries from `getaivo.dev` (R2) instead of GitHub Releases — faster in regions with poor GitHub connectivity
 - Fixed text selection and session list in chat TUI
@@ -165,17 +199,21 @@
 - Removed Chat TUI thinking toggle and think-tag detection
 
 
+---
+
 ## v0.19.6
 
-### Fixes
+## Fixes
 
 - Fix handling `reasoning_content` in deepseek learn the config
 - Reorder `--help` command listing (keys, models, chat, serve, image, stats)
 
 
+---
+
 ## v0.19.5
 
-### Improvements
+## Improvements
 
 - Extended `alias` support to launch tool, not only model
 - Added Poolside provider preset
@@ -184,9 +222,11 @@
 - Fixed `alias rm <name>` parsing
 
 
+---
+
 ## v0.19.4
 
-### Improvements
+## Improvements
 
 - Fallback: persistent learned protocol/path routing with smarter Responses-API detection
 - Bridge: forward image/file parts and dropped sampling params; safer `tool_use` IDs, stop-reason mapping, and `cache_control` handling
@@ -195,9 +235,11 @@
 - `aivo keys reset-route <name>` to clear learned routing; `--debug` rewritten as JSONL HTTP logger
 
 
+---
+
 ## v0.19.3
 
-### Improvements
+## Improvements
 
 - `aivo stats --since DURATION`: time-windowed reports (e.g. `--since 7d`, `--since 24h`)
 - Claude Code: per-task model overrides for individual slots
@@ -205,13 +247,15 @@
 - Gemini: handle `thoughtSignature` for gemini-3
 
 
+---
+
 ## v0.19.2
 
-### Features
+## Features
 
 - `aivo image`: experimental image generation command
 
-### Fixes
+## Fixes
 
 - Router: try native `/v1/messages` when `target_protocol` is anthropic; respect learned `PathVariant` on fast paths
 - Router: prefer CLI-native protocol and force aivo-starter through the router
@@ -221,46 +265,54 @@
 - `aivo chat` no longer injects `max_tokens: 8192` for DeepSeek / aivo-starter; matches `curl`
 - `opencode`: default to an OpenAI-style model instead of `claude-sonnet`
 
+---
+
 ## v0.19.1
 
-### UX
+## UX
 
 - Improve key pickers and status prints for `--as`.
 
-### Bug Fixes
+## Bug Fixes
 
 - Preserve Codex trust settings across launches
 - Reject for disable OAuth keys for `models` and `serve` instead of error
 
+---
+
 ## v0.19.0
 
-### Features
+## Features
 
 - Multi-account OAuth for Codex, Gemini and Claude Code
 
-### Bug Fixes
+## Bug Fixes
 
 - Align `ctx`, `out`, and price columns in `aivo models`
 
-### Refactors
+## Refactors
 
 - Drop reserved-name shortcuts in `aivo keys`; preselect in the picker instead
 - Rework `Ctrl+C` / `Ctrl+L` handling and drop the `/clear` command
+
+---
 
 ## v0.18.1
 
 - Fix build on windows.
 
+---
+
 ## v0.18.0
 
-### Features
+## Features
 
 - **Cross-tool MCP communication via `--as <name>`**: Run a tool under a custom identity so peers can query it live
 - **`aivo context` and `--context` injection**: Export recent session context as Markdown and inject it into any launched CLI for cross-tool handoffs
 - **Copilot premium-request multiplier**: Surfaced in `aivo models` so you can see which Copilot models cost more
 - **Chat TUI keybinding swap**: `Ctrl+C` and `Ctrl+L` swapped to match other agents
 
-### Bug Fixes
+## Bug Fixes
 
 - Bypass HTTP proxy for the loopback router when launching CLIs
 - Cancel in-flight chat requests when the user exits
@@ -275,20 +327,24 @@
 - Align `aivo stats` Claude totals with Claude Code's `/stats` UI
 - Prevent update download from timing out on slow connections
 
+---
+
 ## v0.17.0
 
-### Features
+## Features
 
 - **Improved the ux of adding keys**: Interactive provider picker backed by the full known-provider catalog
 - **Added JSON output via `--json`**: Enables scripting and `| jq` pipelines
 
-### Refactors
+## Refactors
 
 - Streamline `logs` command and redesign the status output
 
+---
+
 ## v0.16.2
 
-### Bug Fixes
+## Bug Fixes
 
 - Normalize `input_tokens` to fresh-only across all stats parsers for consistent accounting
 - Exclude subagent sidechain files from Claude session count
@@ -297,15 +353,19 @@
 - Refresh PATH from login shell after tool install
 - Move `--version` and `--help` before service init and improve smoke test diagnostics
 
+---
+
 ## v0.16.1
 
-### Bug Fixes
+## Bug Fixes
 
 - Fix `ETXTBSY` on Linux during self-update: close write file descriptor before smoke test
 
+---
+
 ## v0.16.0
 
-### Features
+## Features
 
 - **Google Gemini native API**: Direct support for `generativelanguage.googleapis.com` as a provider across all tools
 - **Open aivo-starter model list**: aivo-starter users can now access the full model catalog
@@ -313,7 +373,7 @@
 - **Prompt to install missing tools**: Interactively offer to install tool binaries when not found on PATH, with cross-platform support
 - **R2 download mirror**: GitHub-first binary downloads with Cloudflare R2 fallback for faster installs and updates
 
-### Bug Fixes
+## Bug Fixes
 
 - Clear `last_selection` on key add so the newly added key is actually used
 - Resolve aivo-starter sentinel URL in serve router and model picker
@@ -321,9 +381,11 @@
 - Reduce GitHub download timeout and deduplicate mirror fallback messages
 - Fix mirror fallback for self-update flow
 
+---
+
 ## v0.15.0
 
-### Features
+## Features
 
 - **aivo-starter**: Zero-config provider — start using aivo without any API key setup
 - **Update rollback**: Automatically roll back failed updates; added config migration tests and CI clippy gate
@@ -334,7 +396,7 @@
 - **DeepSeek reasoning streaming**: Stream `reasoning_content` through routers for DeepSeek-reasoner models
 - **Conditional default model option**: Only show "default model" in the picker when the selected tool supports it
 
-### Bug Fixes
+## Bug Fixes
 
 - Cap `max_tokens` for aivo-starter and DeepSeek in chat requests
 - Remove last two production `unwrap()` calls for safer error handling
@@ -344,22 +406,24 @@
 - Resolve tilde paths and add PDF/binary support for chat attachments
 - Remove tool name from active key display, show only key and model
 
-### Performance
+## Performance
 
 - Avoid PBKDF2 decryption when displaying active selection label
 - Warm model cache in background after adding API key
 
-### Refactors
+## Refactors
 
 - Redesign key/model selection: per-directory → global last-selection
 - Replace `sqlite3` CLI with `rusqlite` for OpenCode stats reading
 - Route OpenCode through router for providers with quirks
 
+---
+
 ## v0.14.5
 
 Major update with stats aggregation, better tool support
 
-### Improvements
+## Improvements
 
 - Global stats aggregation across all AI tools (Claude, Codex,
   Gemini, OpenCode, Pi).
@@ -371,7 +435,7 @@ Major update with stats aggregation, better tool support
 - Remove redundant token stats recording from run tool
 - Bump GitHub Actions to v5 for Node.js 24 compatibility
 
-### Fixes
+## Fixes
 
 - Remove custom User-Agent headers from API requests
 - Use Codex `model_provider` config to bypass `auth.json` and
@@ -381,16 +445,22 @@ Major update with stats aggregation, better tool support
 - Auto-strip `anthropic-beta` headers for Bedrock/Vertex providers
 
 
+---
+
 ## v0.14.4
 
 Stability hardening. Fixed panics from char-boundary slicing
 and API response handling. Switched Linux builds to musl
 targets for better portability.
 
+---
+
 ## v0.14.3
 
 Added Responses API fallback for models that require the
 /v1/responses endpoint. Fixed /attach command autocomplete.
+
+---
 
 ## v0.14.2
 

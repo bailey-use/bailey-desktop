@@ -91,7 +91,7 @@ pub struct ClaudeModelOverrides {
 
 /// Amp-only run overrides. Set from `aivo run amp` flags:
 /// - `--rush-model / --smart-model / --deep-model / --large-model` populate
-///   `rush/smart/deep/large`. When any is non-empty the bridge writes
+///   `rush/smart/deep/large`. When any is non-empty, the bridge writes
 ///   `amp.internal.model` as an *object* keyed by mode name in the
 ///   generated settings.json.
 /// - `--disable-tool <name>` (repeatable) populates `disable_tools`. The
@@ -1037,16 +1037,17 @@ impl EnvironmentInjector {
             // If the user passed `-m <model>`, force-rewrite the request body's
             // `model` field in the bridge to that value. When per-mode overrides
             // are set (--rush-model, --smart-model, etc.), the user's `-m` is
-            // suppressed so per-mode routing reaches the wire — but the
-            // aivo-starter fallback still applies, since the starter endpoint
-            // only accepts `aivo/starter` regardless of which mode amp picks.
-            let suppress_user_force = amp_modes.to_internal_model_value().is_some();
+            // suppressed so per-mode routing reaches the wire. For aivo-starter,
+            // only default to `aivo/starter` when no per-mode override exists;
+            // otherwise force_model would clobber the selected mode's model.
+            let internal_mode_model = amp_modes.to_internal_model_value();
+            let suppress_user_force = internal_mode_model.is_some();
             let resolved_force_model = model
                 .filter(|_| !suppress_user_force)
                 .filter(|m| !m.trim().is_empty() && *m != "__default__");
             if let Some(m) = resolved_force_model {
                 env.insert("AIVO_AMP_FORCE_MODEL".to_string(), m.to_string());
-            } else if profile.serve_flags.is_starter {
+            } else if profile.serve_flags.is_starter && !suppress_user_force {
                 env.insert(
                     "AIVO_AMP_FORCE_MODEL".to_string(),
                     AIVO_STARTER_MODEL.to_string(),
@@ -1091,7 +1092,7 @@ impl EnvironmentInjector {
             // `--deep-model`, `--large-model`) take priority over `--1m`.
             // When any are set, emit the JSON object form for amp's
             // `internal.model` so each mode picks its own model.
-            if let Some(modes_obj) = amp_modes.to_internal_model_value() {
+            if let Some(modes_obj) = internal_mode_model {
                 env.insert(
                     "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
                     modes_obj.to_string(),
@@ -3231,13 +3232,11 @@ mod tests {
     }
 
     #[test]
-    fn for_amp_bridge_mode_starter_force_model_survives_per_mode_overrides() {
-        // The aivo-starter upstream only accepts the literal model name
-        // `aivo/starter`. Even when the user provides per-mode overrides,
-        // the bridge must still rewrite outgoing model fields to
-        // `aivo/starter` or the upstream returns 400. Only the user's `-m`
-        // is suppressed by per-mode flags; the starter sentinel fallback
-        // is independent.
+    fn for_amp_bridge_mode_starter_per_mode_overrides_suppress_default_force_model() {
+        // Starter exposes a catalog, with `aivo/starter` as the default model.
+        // When per-mode overrides are present, force_model must be absent:
+        // the bridge rewrites every request body model when force_model is set,
+        // so leaving the starter default there would clobber every mode.
         let injector = EnvironmentInjector::new();
         let key = test_api_key(AIVO_STARTER_SENTINEL);
         let modes = AmpModeModels {
@@ -3245,12 +3244,26 @@ mod tests {
             ..Default::default()
         };
         let env = injector.for_amp(&key, None, None, &modes);
-        assert_eq!(
-            env.get("AIVO_AMP_FORCE_MODEL"),
-            Some(&AIVO_STARTER_MODEL.to_string()),
-            "starter fallback must survive per-mode flags: {env:?}"
+        assert!(
+            !env.contains_key("AIVO_AMP_FORCE_MODEL"),
+            "starter default force_model would override all per-mode models: {env:?}"
         );
         assert!(env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"));
+    }
+
+    #[test]
+    fn for_amp_bridge_mode_starter_defaults_force_model_without_per_mode() {
+        // No user model and no per-mode flags: keep the starter default so amp's
+        // internal Claude-ish model names are rewritten to a valid starter model.
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key(AIVO_STARTER_SENTINEL);
+        let modes = AmpModeModels::default();
+        let env = injector.for_amp(&key, None, None, &modes);
+        assert_eq!(
+            env.get("AIVO_AMP_FORCE_MODEL"),
+            Some(&AIVO_STARTER_MODEL.to_string())
+        );
+        assert!(!env.contains_key("AIVO_AMP_INTERNAL_MODEL_JSON"));
     }
 
     #[test]

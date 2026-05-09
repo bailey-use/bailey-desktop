@@ -299,6 +299,14 @@ impl RunCommand {
             }
         }
 
+        // Amp per-mode model flags (`--rush-model`, `--smart-model`, ...)
+        // provide the model selection through `amp.internal.model`. If the
+        // user did not explicitly pass `-m`, ignore the synthetic picker
+        // trigger inserted by the generic run flow; otherwise `aivo run amp
+        // --rush-model ...` still opens an unrelated main-model picker.
+        let model =
+            suppress_implicit_amp_model_picker(ai_tool, explicit_model_flag, &amp_modes, model);
+
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
             let outcome = self
@@ -666,6 +674,22 @@ impl RunCommand {
     }
 }
 
+fn suppress_implicit_amp_model_picker(
+    tool: AIToolType,
+    explicit_model_flag: bool,
+    amp_modes: &AmpModeModels,
+    model: Option<String>,
+) -> Option<String> {
+    if matches!(tool, AIToolType::Amp)
+        && !explicit_model_flag
+        && amp_modes.to_internal_model_value().is_some()
+    {
+        None
+    } else {
+        model
+    }
+}
+
 /// Emits one stderr line per Claude-only slot flag set when running a
 /// non-Claude tool. Forgiving by design — preserves the launch.
 fn warn_slot_flags_ignored(tool: AIToolType, slots: &ClaudeSlotFlags) {
@@ -1026,6 +1050,32 @@ mod tests {
                 tool
             );
         }
+    }
+
+    #[test]
+    fn amp_per_mode_flags_suppress_implicit_model_picker() {
+        let modes = AmpModeModels {
+            rush: Some("deepseek-v4-flash".into()),
+            ..Default::default()
+        };
+        let out =
+            suppress_implicit_amp_model_picker(AIToolType::Amp, false, &modes, Some(String::new()));
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn amp_per_mode_flags_preserve_explicit_model_flag() {
+        let modes = AmpModeModels {
+            rush: Some("deepseek-v4-flash".into()),
+            ..Default::default()
+        };
+        let out = suppress_implicit_amp_model_picker(
+            AIToolType::Amp,
+            true,
+            &modes,
+            Some("kimi-k2.6".into()),
+        );
+        assert_eq!(out.as_deref(), Some("kimi-k2.6"));
     }
 
     use crate::services::models_cache::{ModelMetadata, full_catalog_key};

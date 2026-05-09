@@ -252,7 +252,7 @@ impl ModelsCommand {
         {
             Ok(code) => code,
             Err(e) => {
-                eprintln!("{} {}", style::red("Error:"), e);
+                eprintln!("{}", style::yellow(e.to_string()));
                 ExitCode::UserError
             }
         }
@@ -485,6 +485,95 @@ fn format_token_count(n: u64) -> String {
     }
 }
 
+/// Build a friendly error for a non-2xx response from a model-listing endpoint.
+/// Leads with the user's intent ("No models found" for 404, "Could not fetch
+/// models" otherwise), then explains why — extracting JSON `error.message`
+/// when present and dropping HTML payloads. Replaces the raw multi-KB HTML
+/// page that providers return for missing endpoints.
+fn friendly_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let lead = if status == reqwest::StatusCode::NOT_FOUND {
+        "No models found"
+    } else {
+        "Could not fetch models"
+    };
+    let detail = extract_error_detail(body);
+    let hint = status_hint(status);
+    let reason = match (detail, hint) {
+        (Some(d), Some(h)) => format!("{} ({})", d, h),
+        (Some(d), None) => d,
+        (None, Some(h)) => h.to_string(),
+        (None, None) => format!("server returned {}", status),
+    };
+    anyhow::anyhow!("{} — {}", lead, reason)
+}
+
+/// Pull a one-line message out of an upstream error body. Recognizes common
+/// JSON shapes (OpenAI/Anthropic `error.message`, Cloudflare `errors[0].message`,
+/// generic `message`). Returns `None` for HTML payloads or empty bodies so the
+/// caller can fall back to a status-only hint.
+fn extract_error_detail(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(msg) = value
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(truncate_message(msg));
+        }
+        if let Some(msg) = value.get("error").and_then(|e| e.as_str()) {
+            return Some(truncate_message(msg));
+        }
+        if let Some(msg) = value
+            .get("errors")
+            .and_then(|e| e.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(truncate_message(msg));
+        }
+        if let Some(msg) = value.get("message").and_then(|m| m.as_str()) {
+            return Some(truncate_message(msg));
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<!doctype") || lower.starts_with("<html") || lower.starts_with("<?xml") {
+        return None;
+    }
+    Some(truncate_message(trimmed))
+}
+
+fn truncate_message(s: &str) -> String {
+    let s = s.trim();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= 200 {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn status_hint(status: reqwest::StatusCode) -> Option<&'static str> {
+    match status.as_u16() {
+        401 => Some("authentication failed — check the API key with `aivo keys`"),
+        403 => Some("this API key may not have permission to list models"),
+        404 => {
+            Some("the base URL may be wrong, or this provider doesn't expose a model listing API")
+        }
+        405 => Some("this provider does not expose a model listing API"),
+        429 => Some("rate limited — try again shortly"),
+        500..=599 => Some("the provider returned a server error — try again later"),
+        _ => None,
+    }
+}
+
 /// Convert a per-token price string (e.g. "0.000003") to per-1M display (e.g. "$3").
 fn format_price_per_million(per_token: &str) -> Option<String> {
     let price: f64 = per_token.parse().ok()?;
@@ -701,7 +790,7 @@ async fn fetch_models_detailed_filtered(
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
+                return Err(friendly_api_error(status, &body));
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
@@ -728,7 +817,7 @@ async fn fetch_models_detailed_filtered(
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("Copilot API returned {} — {}", status, body);
+                return Err(friendly_api_error(status, &body));
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
@@ -750,7 +839,7 @@ async fn fetch_models_detailed_filtered(
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
+                return Err(friendly_api_error(status, &body));
             }
 
             let resp: GeminiModelsResponse = response.json().await?;
@@ -792,7 +881,7 @@ async fn fetch_models_detailed_filtered(
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                anyhow::bail!("API returned {} — {}", status, body);
+                return Err(friendly_api_error(status, &body));
             }
 
             let resp: OpenAIModelsResponse = response.json().await?;
@@ -820,7 +909,7 @@ async fn fetch_models_detailed_filtered(
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    anyhow::bail!("API returned {} from {} — {}", status, url, body);
+                    return Err(friendly_api_error(status, &body));
                 }
 
                 let resp: CloudflareModelsResponse = response.json().await?;
@@ -865,7 +954,7 @@ async fn fetch_models_detailed_filtered(
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response.text().await.unwrap_or_default();
-                    last_err = format!("API returned {} from {} — {}", status, url, body);
+                    last_err = friendly_api_error(status, &body).to_string();
                     continue;
                 }
 
@@ -1261,6 +1350,125 @@ mod tests {
     fn test_tool_supports_default_gemini_without_gemini_models() {
         let models = vec!["gpt-4o".into(), "claude-sonnet-4-6".into()];
         assert!(!tool_supports_default_model(AIToolType::Gemini, &models));
+    }
+
+    #[test]
+    fn extract_error_detail_openai_shape() {
+        let body = r#"{"error":{"message":"Invalid API key","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            extract_error_detail(body).as_deref(),
+            Some("Invalid API key")
+        );
+    }
+
+    #[test]
+    fn extract_error_detail_cloudflare_shape() {
+        let body = r#"{"success":false,"errors":[{"code":7000,"message":"No route for the URI"}],"messages":[],"result":null}"#;
+        assert_eq!(
+            extract_error_detail(body).as_deref(),
+            Some("No route for the URI")
+        );
+    }
+
+    #[test]
+    fn extract_error_detail_simple_error_string() {
+        let body = r#"{"error":"unauthorized"}"#;
+        assert_eq!(extract_error_detail(body).as_deref(), Some("unauthorized"));
+    }
+
+    #[test]
+    fn extract_error_detail_drops_html() {
+        let body = "<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>";
+        assert!(extract_error_detail(body).is_none());
+        let body = "<html><head></head><body>oops</body></html>";
+        assert!(extract_error_detail(body).is_none());
+    }
+
+    #[test]
+    fn extract_error_detail_handles_empty() {
+        assert!(extract_error_detail("").is_none());
+        assert!(extract_error_detail("   \n\t  ").is_none());
+    }
+
+    #[test]
+    fn extract_error_detail_truncates_plain_text() {
+        let body = "x".repeat(500);
+        let out = extract_error_detail(&body).unwrap();
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 201);
+    }
+
+    #[test]
+    fn status_hint_known_codes() {
+        assert!(
+            status_hint(reqwest::StatusCode::UNAUTHORIZED)
+                .unwrap()
+                .contains("API key")
+        );
+        assert!(
+            status_hint(reqwest::StatusCode::FORBIDDEN)
+                .unwrap()
+                .contains("permission")
+        );
+        assert!(
+            status_hint(reqwest::StatusCode::NOT_FOUND)
+                .unwrap()
+                .contains("base URL")
+        );
+        assert!(
+            status_hint(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .unwrap()
+                .contains("rate")
+        );
+        assert!(
+            status_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+                .unwrap()
+                .contains("server")
+        );
+        assert!(status_hint(reqwest::StatusCode::IM_A_TEAPOT).is_none());
+    }
+
+    #[test]
+    fn friendly_api_error_404_leads_with_no_models_found() {
+        let err = friendly_api_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "<!doctype html><html><body>404 page</body></html>",
+        );
+        let s = err.to_string();
+        assert!(s.starts_with("No models found"));
+        assert!(s.contains("base URL may be wrong"));
+        assert!(!s.contains("<html"));
+        assert!(!s.contains("<body"));
+        assert!(!s.contains("404"));
+    }
+
+    #[test]
+    fn friendly_api_error_401_includes_extracted_message() {
+        let err = friendly_api_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"Invalid API key"}}"#,
+        );
+        let s = err.to_string();
+        assert!(s.starts_with("Could not fetch models"));
+        assert!(s.contains("Invalid API key"));
+        assert!(s.contains("aivo keys"));
+        assert!(!s.contains("401"));
+    }
+
+    #[test]
+    fn friendly_api_error_unknown_status_falls_back_to_status_text() {
+        let err = friendly_api_error(reqwest::StatusCode::IM_A_TEAPOT, "");
+        let s = err.to_string();
+        assert!(s.starts_with("Could not fetch models"));
+        assert!(s.contains("server returned 418"));
+    }
+
+    #[test]
+    fn friendly_api_error_500_uses_server_error_hint() {
+        let err = friendly_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "");
+        let s = err.to_string();
+        assert!(s.starts_with("Could not fetch models"));
+        assert!(s.contains("server error"));
     }
 
     #[test]

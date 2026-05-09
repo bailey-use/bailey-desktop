@@ -807,12 +807,24 @@ fn convert_parts_to_messages(
     tool_call_id_counts: &mut HashMap<String, usize>,
 ) {
     let mut text_parts: Vec<&str> = Vec::new();
+    let mut thought_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
 
     for part in parts {
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-            if !text.is_empty() {
+            if text.is_empty() {
+                continue;
+            }
+            // `thought: true` marks Gemini's thinking trace. Route it to
+            // reasoning_content so deepseek-thinking upstreams accept the turn.
+            if part
+                .get("thought")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false)
+            {
+                thought_parts.push(text);
+            } else {
                 text_parts.push(text);
             }
         } else if let Some(fc) = part.get("functionCall") {
@@ -865,13 +877,13 @@ fn convert_parts_to_messages(
             "content": if content_str.is_empty() { Value::Null } else { Value::String(content_str) },
             "tool_calls": tool_calls,
         });
-        if openai_role == "assistant" && requires_reasoning_content {
-            let rc = if text_parts.is_empty() {
-                " "
-            } else {
-                &text_parts.join("\n")
-            };
-            msg["reasoning_content"] = Value::String(rc.to_string());
+        if openai_role == "assistant" {
+            attach_reasoning_content(
+                &mut msg,
+                &thought_parts,
+                &text_parts,
+                requires_reasoning_content,
+            );
         }
         messages.push(msg);
     } else if !text_parts.is_empty() {
@@ -879,11 +891,54 @@ fn convert_parts_to_messages(
         // empty content strings that strict providers / Responses API gateways reject)
         let content = text_parts.join("\n");
         let mut msg = serde_json::json!({"role": openai_role, "content": content});
-        if openai_role == "assistant" && requires_reasoning_content {
-            msg["reasoning_content"] = Value::String(text_parts.join("\n"));
+        if openai_role == "assistant" {
+            attach_reasoning_content(
+                &mut msg,
+                &thought_parts,
+                &text_parts,
+                requires_reasoning_content,
+            );
         }
         messages.push(msg);
+    } else if !thought_parts.is_empty() && openai_role == "assistant" {
+        // Thought-only turn (rare, but Gemini can emit candidates with only
+        // `thought: true` parts). Preserve the reasoning so deepseek doesn't
+        // see an empty assistant turn.
+        let mut msg = serde_json::json!({"role": openai_role, "content": Value::Null});
+        attach_reasoning_content(
+            &mut msg,
+            &thought_parts,
+            &text_parts,
+            requires_reasoning_content,
+        );
+        messages.push(msg);
     }
+}
+
+/// Attaches `reasoning_content` to an assistant message. Real `thought: true`
+/// parts always win — they're the upstream's actual thinking trace and must
+/// round-trip verbatim. Falls back to the previous best-effort behaviour
+/// (whitespace placeholder, or text echo) only when no thoughts exist and the
+/// upstream insists on the field.
+fn attach_reasoning_content(
+    msg: &mut Value,
+    thought_parts: &[&str],
+    text_parts: &[&str],
+    requires_reasoning_content: bool,
+) {
+    if !thought_parts.is_empty() {
+        msg["reasoning_content"] = Value::String(thought_parts.join("\n"));
+        return;
+    }
+    if !requires_reasoning_content {
+        return;
+    }
+    let fallback = if text_parts.is_empty() {
+        " ".to_string()
+    } else {
+        text_parts.join("\n")
+    };
+    msg["reasoning_content"] = Value::String(fallback);
 }
 
 fn extract_part_call_id(part: &Value) -> Option<&str> {
@@ -1042,6 +1097,16 @@ pub fn convert_openai_to_gemini_sse(body: &Value) -> String {
 /// Converts an OpenAI message to Gemini parts array.
 fn message_to_gemini_parts(message: &Value) -> Vec<Value> {
     let mut parts = Vec::new();
+
+    // reasoning_content → leading `thought: true` text part. Without this,
+    // deepseek-reasoner / deepseek-v4-flash thinking models reject the next
+    // turn with "The reasoning_content in the thinking mode must be passed
+    // back to the API" because gemini-cli has no thinking trace to echo.
+    if let Some(reasoning) = message.get("reasoning_content").and_then(|c| c.as_str())
+        && !reasoning.is_empty()
+    {
+        parts.push(serde_json::json!({"text": reasoning, "thought": true}));
+    }
 
     // Text content → text part (preserved alongside tool calls)
     if let Some(text) = message.get("content").and_then(|c| c.as_str())
@@ -1736,6 +1801,75 @@ mod tests {
             parts[0]["functionCall"]["args"].is_object(),
             "malformed arguments should default to empty object"
         );
+    }
+
+    /// Upstream OpenAI responses carrying `reasoning_content`
+    /// (e.g. deepseek-reasoner / deepseek-v4-flash) must surface on the Gemini
+    /// candidate as a `thought: true` part. Without this, gemini-cli has no
+    /// thinking trace to echo on the next turn and deepseek rejects with
+    /// `The reasoning_content in the thinking mode must be passed back to the API`.
+    #[test]
+    fn test_reasoning_content_survives_openai_to_gemini_roundtrip() {
+        let upstream = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!",
+                    "reasoning_content": "User said hi. I should greet back politely."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let gemini_response = convert_openai_to_gemini(&upstream);
+
+        // The model's reasoning trace must surface as a `thought: true` part on
+        // the candidate so a subsequent gemini-cli turn echoes it back.
+        let parts = gemini_response["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts array");
+        let thought_part = parts
+            .iter()
+            .find(|p| p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false))
+            .expect("expected a thought:true part carrying the reasoning trace");
+        assert_eq!(
+            thought_part["text"],
+            "User said hi. I should greet back politely."
+        );
+    }
+
+    /// When gemini-cli echoes a model turn that includes `thought: true`
+    /// parts, `convert_gemini_to_openai` must surface them as
+    /// `reasoning_content` on the assistant message — independent of the
+    /// `requires_reasoning_content` quirk — so deepseek-thinking upstreams
+    /// see the original trace instead of "must be passed back to the API".
+    #[test]
+    fn test_thought_parts_survive_gemini_to_openai_roundtrip() {
+        let gemini_request = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "Hi"}]},
+                {"role": "model", "parts": [
+                    {"text": "User said hi. I should greet back politely.", "thought": true},
+                    {"text": "Hello!"}
+                ]},
+                {"role": "user", "parts": [{"text": "How are you?"}]}
+            ]
+        });
+
+        let openai = convert_gemini_to_openai(&gemini_request, "deepseek-v4-flash", false, None);
+        let messages = openai["messages"].as_array().expect("messages array");
+        let assistant = messages
+            .iter()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .expect("assistant turn");
+
+        // The assistant turn must carry the reasoning trace forward so deepseek
+        // accepts the next request.
+        assert_eq!(
+            assistant["reasoning_content"], "User said hi. I should greet back politely.",
+            "expected thought:true part to surface as reasoning_content"
+        );
+        // Plain text content is untouched.
+        assert_eq!(assistant["content"], "Hello!");
     }
 
     #[test]

@@ -167,9 +167,9 @@ pub struct LaunchOptions {
     /// Per-slot Claude model overrides (six addressable slots) plus the
     /// shared `max_context` tag. The slot fields are Claude-only — set on
     /// other tools they trigger one stderr warning per slot and are then
-    /// dropped. `max_context` is honored by Claude, Codex, and Amp (each
-    /// interprets it differently — see `for_claude_with_overrides`,
-    /// `inject_codex_max_context`, and `for_amp`).
+    /// dropped. `max_context` is honored by Claude and Codex (each
+    /// interprets it differently — see `for_claude_with_overrides` and
+    /// `inject_codex_max_context`); rejected up-front for Amp.
     pub claude_overrides: ClaudeModelOverrides,
     /// Amp-only per-agent-mode model overrides (`--rush-model`,
     /// `--smart-model`, `--deep-model`, `--large-model`). Ignored for
@@ -795,12 +795,7 @@ impl AILauncher {
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
             AIToolType::Pi => self.env_injector.for_pi(key, model),
-            AIToolType::Amp => self.env_injector.for_amp(
-                key,
-                model,
-                claude_overrides.max_context.as_deref(),
-                amp_modes,
-            ),
+            AIToolType::Amp => self.env_injector.for_amp(key, model, amp_modes),
         };
 
         ToolConfig {

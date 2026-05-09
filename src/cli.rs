@@ -224,30 +224,37 @@ pub struct RunArgs {
 
     /// Amp only: model used by the `rush` agent mode (fast/cheap tier).
     /// Sets `amp.internal.model.rush` in the bridge's settings override.
-    #[arg(long = "rush-model", value_name = "MODEL")]
+    /// Bare flag opens a picker.
+    #[arg(long = "rush-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub rush_model: Option<String>,
 
     /// Amp only: model used by the `smart` agent mode (default tier).
     /// Sets `amp.internal.model.smart` in the bridge's settings override.
-    #[arg(long = "smart-model", value_name = "MODEL")]
+    /// Bare flag opens a picker.
+    #[arg(long = "smart-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub smart_model: Option<String>,
 
     /// Amp only: model used by the `deep` agent mode (reasoning tier).
     /// Sets `amp.internal.model.deep` in the bridge's settings override.
-    #[arg(long = "deep-model", value_name = "MODEL")]
+    /// Bare flag opens a picker.
+    #[arg(long = "deep-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub deep_model: Option<String>,
 
     /// Amp only: model used by the `large` agent mode (long-context tier).
     /// Sets `amp.internal.model.large` in the bridge's settings override.
-    #[arg(long = "large-model", value_name = "MODEL")]
+    /// Bare flag opens a picker.
+    #[arg(long = "large-model", value_name = "MODEL", num_args = 0..=1, default_missing_value = "")]
     pub large_model: Option<String>,
 
-    /// Amp only: disable an amp tool by name (repeatable). Writes the
-    /// `tools.disable` array into the bridge's settings override so amp
-    /// strips the tool from the request to the upstream. Useful when the
-    /// upstream lacks server-backed tools (`web_search`, `read_web_page`)
-    /// that amp would otherwise advertise. Tool names are not validated
-    /// client-side; unknown names are silently ignored by amp.
+    /// Amp only: pin the initial agent mode for this thread (rush, smart,
+    /// deep, large). Amp locks the mode after the first message lands in
+    /// the thread, so this matters for the first-message UX. Bare flag
+    /// opens an interactive picker.
+    #[arg(long = "mode", value_name = "MODE", num_args = 0..=1, default_missing_value = "")]
+    pub mode: Option<String>,
+
+    /// Amp only: strip a tool from amp's request to the upstream
+    /// (repeatable). Unknown names are silently ignored by amp.
     #[arg(long = "disable-tool", value_name = "NAME")]
     pub disable_tool: Vec<String>,
 

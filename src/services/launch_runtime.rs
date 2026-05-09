@@ -57,9 +57,10 @@ pub(crate) struct LaunchRuntimeState {
     /// substring list in `ProviderQuirks::for_base_url`.
     pub(crate) learned_requires_reasoning: Option<Arc<AtomicBool>>,
     pub(crate) pi_agent_dir: Option<String>,
-    /// Path of the temp amp settings.json the bridge wrote when `--1m`
-    /// (or any `internal.model` override) was active. Removed at launch
-    /// exit by `cleanup_runtime_artifacts` so the cache dir doesn't grow.
+    /// Path of the temp amp settings.json the bridge wrote when any
+    /// `internal.model` override (per-mode model flags) or `tools.disable`
+    /// was active. Removed at launch exit by `cleanup_runtime_artifacts`
+    /// so the cache dir doesn't grow.
     pub(crate) amp_settings_path: Option<String>,
     pub(crate) codex_oauth_sync: Option<CodexOAuthSync>,
     pub(crate) gemini_oauth_sync: Option<GeminiOAuthSync>,

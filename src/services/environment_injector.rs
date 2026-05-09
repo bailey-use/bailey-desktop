@@ -105,7 +105,25 @@ pub struct AmpModeModels {
     pub deep: Option<String>,
     pub large: Option<String>,
     pub disable_tools: Vec<String>,
+    /// `--mode <smart|rush|deep|large>`: pin the initial agent mode for
+    /// this thread. Amp locks the agent mode after the first message
+    /// lands, so this only applies before the first send. The bridge
+    /// translates this to `--mode <X>` on amp's own CLI (amp's flag is
+    /// also `-m, --mode`, but aivo's `-m` is the model flag — long-only
+    /// here to avoid the collision). Bare flag (`Some("")`) requests an
+    /// interactive picker.
+    pub initial_mode: Option<String>,
 }
+
+/// Canonical amp agent modes. Order matches both amp's own catalog
+/// (rush/smart/deep/large) and the JSON object emitted to
+/// `internal.model`. Used for `--mode` validation and the picker UI.
+pub const AMP_AGENT_MODES: [(&str, &str); 4] = [
+    ("smart", "Default — most capable model + tools"),
+    ("rush", "Fast/cheap for small, well-defined tasks"),
+    ("deep", "Deep reasoning"),
+    ("large", "Biggest context window (1M)"),
+];
 
 impl AmpModeModels {
     pub fn is_empty(&self) -> bool {
@@ -114,6 +132,16 @@ impl AmpModeModels {
             && self.deep.is_none()
             && self.large.is_none()
             && self.disable_tools.is_empty()
+            && self.initial_mode.is_none()
+    }
+
+    /// True when at least one per-mode slot was passed bare (empty string),
+    /// meaning the caller wants an interactive picker. Mirrors the
+    /// `Some("")` sentinel used by the Claude per-slot flags.
+    pub fn has_any_picker_request(&self) -> bool {
+        [&self.rush, &self.smart, &self.deep, &self.large]
+            .iter()
+            .any(|v| matches!(v, Some(s) if s.is_empty()))
     }
 
     /// Renders the override as the JSON object form amp expects:
@@ -1003,7 +1031,6 @@ impl EnvironmentInjector {
         &self,
         key: &ApiKey,
         model: Option<&str>,
-        max_context: Option<&str>,
         amp_modes: &AmpModeModels,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
@@ -1088,28 +1115,28 @@ impl EnvironmentInjector {
                 disable_tools.join(","),
             );
 
+            // `--mode <smart|rush|deep|large>`: pin the thread's initial
+            // agent mode by passing through to amp's own `--mode` CLI flag.
+            // Validation happens in run.rs before reaching here, so any
+            // non-empty value is one of the four canonical modes.
+            if let Some(m) = amp_modes
+                .initial_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                env.insert("AIVO_AMP_INITIAL_MODE".to_string(), m.to_string());
+            }
+
             // Per-mode model overrides (`--rush-model`, `--smart-model`,
-            // `--deep-model`, `--large-model`) take priority over `--1m`.
-            // When any are set, emit the JSON object form for amp's
-            // `internal.model` so each mode picks its own model.
+            // `--deep-model`, `--large-model`) emit the JSON object form
+            // for amp's `internal.model` so each mode picks its own model.
+            // `--max-context` / `--1m` / `--2m` are rejected up-front in
+            // run.rs for amp; use `--mode large` for the catalog's 1M tier.
             if let Some(modes_obj) = internal_mode_model {
                 env.insert(
                     "AIVO_AMP_INTERNAL_MODEL_JSON".to_string(),
                     modes_obj.to_string(),
-                );
-            } else if let Some(ctx) = max_context.filter(|c| !c.trim().is_empty())
-                && ctx.eq_ignore_ascii_case("1m")
-            {
-                // `--1m` / `--max-context=1m`: amp's UI shows the model's
-                // hardcoded contextWindow from its built-in catalog, NOT
-                // the upstream's true ceiling. Override `internal.model`
-                // to a 1M-context catalog entry (`gpt-5.5-pro`); the
-                // bridge then rewrites on-the-wire to the upstream
-                // model. Only `1m` is supported — amp's catalog has no
-                // entry larger than ~1.05M.
-                env.insert(
-                    "AIVO_AMP_INTERNAL_MODEL".to_string(),
-                    "openai:gpt-5.5-pro".to_string(),
                 );
             }
 
@@ -3151,7 +3178,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_api_key("https://api.deepseek.com");
         let modes = AmpModeModels::default();
-        let env = injector.for_amp(&key, None, None, &modes);
+        let env = injector.for_amp(&key, None, &modes);
         let disable = env
             .get("AIVO_AMP_TOOLS_DISABLE")
             .expect("bridge mode should always set AIVO_AMP_TOOLS_DISABLE");
@@ -3178,7 +3205,7 @@ mod tests {
             disable_tools: vec!["Task".to_string(), "foo".to_string()],
             ..Default::default()
         };
-        let env = injector.for_amp(&key, None, None, &modes);
+        let env = injector.for_amp(&key, None, &modes);
         let disable = env.get("AIVO_AMP_TOOLS_DISABLE").unwrap();
         let tools: Vec<&str> = disable.split(',').collect();
         // User entries first (insertion order), auto-disables appended.
@@ -3200,7 +3227,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_api_key("https://ampcode.com");
         let modes = AmpModeModels::default();
-        let env = injector.for_amp(&key, None, None, &modes);
+        let env = injector.for_amp(&key, None, &modes);
         assert!(
             !env.contains_key("AIVO_AMP_TOOLS_DISABLE"),
             "native amp should never get auto-disables — broke web_search/Task on the real endpoint"
@@ -3220,7 +3247,7 @@ mod tests {
             smart: Some("deepseek-v4-pro".into()),
             ..Default::default()
         };
-        let env = injector.for_amp(&key, Some("kimi-k2.6"), None, &modes);
+        let env = injector.for_amp(&key, Some("kimi-k2.6"), &modes);
         assert!(
             !env.contains_key("AIVO_AMP_FORCE_MODEL"),
             "per-mode flags must suppress -m's force_model: {env:?}"
@@ -3243,7 +3270,7 @@ mod tests {
             smart: Some("deepseek-v4-pro".into()),
             ..Default::default()
         };
-        let env = injector.for_amp(&key, None, None, &modes);
+        let env = injector.for_amp(&key, None, &modes);
         assert!(
             !env.contains_key("AIVO_AMP_FORCE_MODEL"),
             "starter default force_model would override all per-mode models: {env:?}"
@@ -3258,7 +3285,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_api_key(AIVO_STARTER_SENTINEL);
         let modes = AmpModeModels::default();
-        let env = injector.for_amp(&key, None, None, &modes);
+        let env = injector.for_amp(&key, None, &modes);
         assert_eq!(
             env.get("AIVO_AMP_FORCE_MODEL"),
             Some(&AIVO_STARTER_MODEL.to_string())
@@ -3275,7 +3302,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let key = test_api_key("https://api.deepseek.com");
         let modes = AmpModeModels::default();
-        let env = injector.for_amp(&key, Some("kimi-k2.6"), None, &modes);
+        let env = injector.for_amp(&key, Some("kimi-k2.6"), &modes);
         assert_eq!(
             env.get("AIVO_AMP_FORCE_MODEL"),
             Some(&"kimi-k2.6".to_string())

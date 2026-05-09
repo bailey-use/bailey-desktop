@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
-use crate::services::environment_injector::ClaudeSlotFlags;
+use crate::services::environment_injector::{AmpModeModels, ClaudeSlotFlags};
 use crate::services::session_store::BundleAlias;
 
 pub(crate) fn rewrite_cli_args(
@@ -223,6 +223,7 @@ pub(crate) fn resolve_alias_in_memory(
 pub(crate) struct ExtractedFlags {
     pub(crate) model: Option<String>,
     pub(crate) slots: ClaudeSlotFlags,
+    pub(crate) amp_modes: AmpModeModels,
     pub(crate) key_flag: Option<String>,
     /// `None` = flag absent. `Some("")` = bare `--debug` (default path).
     /// `Some("/path/to.jsonl")` = explicit log path.
@@ -277,6 +278,7 @@ pub(crate) fn lift_context_suffix(
 pub(crate) fn extract_aivo_flags(
     initial_model: Option<String>,
     initial_slots: ClaudeSlotFlags,
+    initial_amp_modes: AmpModeModels,
     initial_key: Option<String>,
     initial_debug: Option<String>,
     initial_dry_run: bool,
@@ -317,6 +319,14 @@ pub(crate) fn extract_aivo_flags(
         sonnet: mut sonnet_model,
         opus: mut opus_model,
     } = initial_slots;
+    let AmpModeModels {
+        rush: mut rush_model,
+        smart: mut smart_model,
+        deep: mut deep_model,
+        large: mut large_model,
+        mut disable_tools,
+        initial_mode: mut amp_mode,
+    } = initial_amp_modes;
     let mut remaining_args: Vec<String> = Vec::new();
 
     // Flush flag-lookalike values back into remaining_args before processing passthrough.
@@ -345,6 +355,10 @@ pub(crate) fn extract_aivo_flags(
     sanitize_slot(&mut haiku_model);
     sanitize_slot(&mut sonnet_model);
     sanitize_slot(&mut opus_model);
+    sanitize_slot(&mut rush_model);
+    sanitize_slot(&mut smart_model);
+    sanitize_slot(&mut deep_model);
+    sanitize_slot(&mut large_model);
 
     let mut model: Option<String> = model.map(|(_, v)| v);
     let mut key_flag: Option<String> = key_flag.map(|(_, v)| v);
@@ -483,6 +497,81 @@ pub(crate) fn extract_aivo_flags(
             } else {
                 opus_model = Some(String::new());
             }
+        } else if let Some(value) = arg.strip_prefix("--rush-model=") {
+            if !value.is_empty() && rush_model.is_none() {
+                rush_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--rush-model" && rush_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                rush_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                rush_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--smart-model=") {
+            if !value.is_empty() && smart_model.is_none() {
+                smart_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--smart-model" && smart_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                smart_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                smart_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--deep-model=") {
+            if !value.is_empty() && deep_model.is_none() {
+                deep_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--deep-model" && deep_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                deep_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                deep_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--large-model=") {
+            if !value.is_empty() && large_model.is_none() {
+                large_model = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--large-model" && large_model.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                large_model = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                large_model = Some(String::new());
+            }
+        } else if let Some(value) = arg.strip_prefix("--disable-tool=") {
+            if !value.is_empty() {
+                disable_tools.push(value.to_string());
+            }
+        } else if arg == "--disable-tool"
+            && i + 1 < passthrough_args.len()
+            && !passthrough_args[i + 1].starts_with('-')
+        {
+            disable_tools.push(passthrough_args[i + 1].clone());
+            i += 1;
+        } else if let Some(value) = arg.strip_prefix("--mode=") {
+            if !value.is_empty() && amp_mode.is_none() {
+                amp_mode = Some(value.to_string());
+            } else {
+                remaining_args.push(arg.clone());
+            }
+        } else if arg == "--mode" && amp_mode.is_none() {
+            if i + 1 < passthrough_args.len() && !passthrough_args[i + 1].starts_with('-') {
+                amp_mode = Some(passthrough_args[i + 1].clone());
+                i += 1;
+            } else {
+                amp_mode = Some(String::new());
+            }
         } else if let Some(value) = arg.strip_prefix("--max-context=") {
             if !value.is_empty() && max_context.is_none() {
                 max_context = Some(value.to_string());
@@ -515,6 +604,14 @@ pub(crate) fn extract_aivo_flags(
             sonnet: sonnet_model,
             opus: opus_model,
         },
+        amp_modes: AmpModeModels {
+            rush: rush_model,
+            smart: smart_model,
+            deep: deep_model,
+            large: large_model,
+            disable_tools,
+            initial_mode: amp_mode,
+        },
         key_flag,
         debug,
         dry_run,
@@ -540,6 +637,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -558,6 +656,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -576,6 +675,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -594,6 +694,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -612,6 +713,7 @@ mod tests {
         let r = extract_aivo_flags(
             Some("--resume".to_string()),
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -631,6 +733,7 @@ mod tests {
         let r = extract_aivo_flags(
             Some("gpt-4o".to_string()),
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -649,6 +752,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -666,6 +770,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -683,6 +788,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -700,6 +806,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             Some("--something".to_string()),
             None,
             false,
@@ -718,6 +825,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -735,6 +843,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -753,6 +862,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             Some(String::new()),
             false,
@@ -770,6 +880,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -787,6 +898,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -804,6 +916,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -821,6 +934,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -838,6 +952,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -858,6 +973,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -876,6 +992,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -893,6 +1010,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -910,6 +1028,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -928,6 +1047,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -947,6 +1067,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -999,6 +1120,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1017,6 +1139,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1035,6 +1158,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1053,6 +1177,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1072,6 +1197,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1119,6 +1245,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1137,6 +1264,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1403,6 +1531,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1421,6 +1550,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1439,6 +1569,7 @@ mod tests {
         let r = extract_aivo_flags(
             None,
             ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
             None,
             None,
             false,
@@ -1523,5 +1654,131 @@ mod tests {
         // Anything that *could* be a user-defined bundle name triggers the lookup.
         assert!(needs_bundle_lookup(&args(&["aivo", "quick"])));
         assert!(needs_bundle_lookup(&args(&["aivo", "myproject"])));
+    }
+
+    #[test]
+    fn amp_smart_model_inline_form_extracted_from_passthrough() {
+        // Post-positional `--smart-model X` (clap pushed it into `args`)
+        // gets re-parsed into the amp_modes slot.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--smart-model", "claude-opus-4-7"]),
+        );
+        assert_eq!(r.amp_modes.smart, Some("claude-opus-4-7".to_string()));
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn amp_per_mode_bare_flag_triggers_picker_sentinel() {
+        // Bare `--rush-model` followed by another flag → empty-string sentinel
+        // (the picker trigger). Mirrors the Claude per-slot bare-flag pattern.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--rush-model", "--unrelated"]),
+        );
+        assert_eq!(r.amp_modes.rush, Some(String::new()));
+        assert_eq!(r.remaining_args, args(&["--unrelated"]));
+    }
+
+    #[test]
+    fn amp_disable_tool_repeatable_extracted() {
+        // `--disable-tool` was previously dropped after the tool positional;
+        // now it's re-parsed and accumulates across appearances.
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&[
+                "--disable-tool",
+                "Task",
+                "--disable-tool=web_search",
+                "remaining",
+            ]),
+        );
+        assert_eq!(
+            r.amp_modes.disable_tools,
+            vec!["Task".to_string(), "web_search".to_string()]
+        );
+        assert_eq!(r.remaining_args, args(&["remaining"]));
+    }
+
+    #[test]
+    fn amp_mode_inline_value_extracted() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--mode", "rush"]),
+        );
+        assert_eq!(r.amp_modes.initial_mode, Some("rush".to_string()));
+        assert!(r.remaining_args.is_empty());
+    }
+
+    #[test]
+    fn amp_mode_bare_flag_triggers_picker_sentinel() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--mode"]),
+        );
+        assert_eq!(r.amp_modes.initial_mode, Some(String::new()));
+    }
+
+    #[test]
+    fn amp_mode_equals_form_extracted() {
+        let r = extract_aivo_flags(
+            None,
+            ClaudeSlotFlags::default(),
+            AmpModeModels::default(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            vec![],
+            None,
+            &args(&["--mode=deep"]),
+        );
+        assert_eq!(r.amp_modes.initial_mode, Some("deep".to_string()));
     }
 }

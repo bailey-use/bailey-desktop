@@ -283,6 +283,14 @@ pub async fn run() -> ! {
                     sonnet: run_args.sonnet_model,
                     opus: run_args.opus_model,
                 },
+                services::environment_injector::AmpModeModels {
+                    rush: run_args.rush_model,
+                    smart: run_args.smart_model,
+                    deep: run_args.deep_model,
+                    large: run_args.large_model,
+                    disable_tools: run_args.disable_tool,
+                    initial_mode: run_args.mode,
+                },
                 run_args.key,
                 run_args.debug,
                 run_args.dry_run,
@@ -334,28 +342,22 @@ pub async fn run() -> ! {
                     process::exit(ExitCode::UserError.code());
                 };
                 let parsed_tool = run_args.tool.as_deref().and_then(AIToolType::parse);
-                let supported = parsed_tool.is_some_and(|t| {
-                    matches!(t, AIToolType::Claude | AIToolType::Codex | AIToolType::Amp)
-                });
+                let supported = parsed_tool
+                    .is_some_and(|t| matches!(t, AIToolType::Claude | AIToolType::Codex));
                 if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
-                    eprintln!(
-                        "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run amp` (got {}).",
-                        style::red("Error:"),
-                        tool_name
-                    );
-                    process::exit(ExitCode::UserError.code());
-                }
-                // Amp's catalog tops out at ~1.05M tokens (gpt-5.5-pro), so
-                // any tag larger than `1m` would be silently dropped by the
-                // bridge's settings override. Reject up front rather than
-                // letting it no-op.
-                if parsed_tool == Some(AIToolType::Amp) && !canonical.eq_ignore_ascii_case("1m") {
-                    eprintln!(
-                        "{} `aivo run amp` only supports --max-context=1m (got {:?}). Amp's built-in catalog has no entry larger than ~1.05M tokens.",
-                        style::red("Error:"),
-                        canonical
-                    );
+                    if parsed_tool == Some(AIToolType::Amp) {
+                        eprintln!(
+                            "{} --max-context / --1m / --2m don't apply to `aivo run amp`. Use `--mode large` for amp's built-in 1M-context tier, or `--smart-model` / `--large-model` to swap the upstream model.",
+                            style::red("Error:"),
+                        );
+                    } else {
+                        eprintln!(
+                            "{} --max-context only applies to `aivo run claude` and `aivo run codex` (got {}).",
+                            style::red("Error:"),
+                            tool_name
+                        );
+                    }
                     process::exit(ExitCode::UserError.code());
                 }
                 Some(canonical)
@@ -511,11 +513,12 @@ pub async fn run() -> ! {
                 };
 
                 let amp_modes = services::environment_injector::AmpModeModels {
-                    rush: resolve(run_args.rush_model),
-                    smart: resolve(run_args.smart_model),
-                    deep: resolve(run_args.deep_model),
-                    large: resolve(run_args.large_model),
-                    disable_tools: run_args.disable_tool,
+                    rush: resolve(extracted.amp_modes.rush),
+                    smart: resolve(extracted.amp_modes.smart),
+                    deep: resolve(extracted.amp_modes.deep),
+                    large: resolve(extracted.amp_modes.large),
+                    disable_tools: extracted.amp_modes.disable_tools,
+                    initial_mode: extracted.amp_modes.initial_mode,
                 };
 
                 command

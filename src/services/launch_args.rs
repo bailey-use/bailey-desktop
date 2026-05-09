@@ -38,6 +38,7 @@ pub(crate) fn preview_args(
     if tool == AIToolType::Amp {
         let args = inject_amp_no_ide(&args, env);
         let args = inject_amp_dangerously_allow_all(&args, env);
+        let args = inject_amp_initial_mode(&args, env);
         return inject_amp_settings_file(&args, env);
     }
     if tool != AIToolType::Codex {
@@ -222,6 +223,7 @@ pub(crate) async fn build_runtime_args(
     if tool == AIToolType::Amp {
         let args = inject_amp_no_ide(&args, env);
         let args = inject_amp_dangerously_allow_all(&args, env);
+        let args = inject_amp_initial_mode(&args, env);
         return Ok(RuntimeArgs {
             args: inject_amp_settings_file(&args, env),
             codex_model_catalog_path: None,
@@ -498,6 +500,32 @@ fn amp_runs_non_interactively(args: &[String]) -> bool {
     args.iter().any(|a| {
         a == "-x" || a == "--execute" || a.starts_with("--execute=") || a == "--stream-json-input"
     })
+}
+
+/// Prepends `--mode <X>` to amp's args when aivo's `--mode` flag is set
+/// (carried via `AIVO_AMP_INITIAL_MODE`). Amp accepts the same flag and
+/// pins the thread's initial agent mode; aivo translates because aivo's
+/// `-m` is the model flag and would collide with amp's short alias.
+///
+/// Skipped if the user already passed `--mode` (or `-m` with a recognized
+/// mode value) directly to amp — explicit choice wins. Note: the simpler
+/// `args.iter().any(|a| a == "-m")` check would misfire because `-m` is
+/// also aivo's model short flag; by the time we reach this injection
+/// point aivo's flags have been stripped, so any `-m` left in args is
+/// destined for amp.
+fn inject_amp_initial_mode(args: &[String], env: &HashMap<String, String>) -> Vec<String> {
+    let Some(mode) = env.get("AIVO_AMP_INITIAL_MODE") else {
+        return args.to_vec();
+    };
+    let already_set = args
+        .iter()
+        .any(|a| a == "--mode" || a == "-m" || a.starts_with("--mode="));
+    if already_set {
+        return args.to_vec();
+    }
+    let mut new_args = vec!["--mode".to_string(), mode.clone()];
+    new_args.extend_from_slice(args);
+    new_args
 }
 
 /// Prepends `--dangerously-allow-all` to amp's args when the bridge is
@@ -1183,5 +1211,36 @@ mod tests {
         let result = inject_amp_no_ide(&with_no_ide, &env);
         assert_eq!(result, vec!["--no-ide", "prompt"]);
         assert_eq!(result.iter().filter(|a| *a == "--no-ide").count(), 1);
+    }
+
+    #[test]
+    fn test_inject_amp_initial_mode_prepends_when_env_set() {
+        let env = HashMap::from([("AIVO_AMP_INITIAL_MODE".into(), "rush".into())]);
+        let args = vec!["prompt text".into()];
+        let result = inject_amp_initial_mode(&args, &env);
+        assert_eq!(result, vec!["--mode", "rush", "prompt text"]);
+    }
+
+    #[test]
+    fn test_inject_amp_initial_mode_skips_when_user_already_passed_mode() {
+        // User typed `aivo amp -- --mode smart`; their explicit pick wins
+        // even if `--mode <X>` was set on aivo's side.
+        let env = HashMap::from([("AIVO_AMP_INITIAL_MODE".into(), "rush".into())]);
+        let args = vec!["--mode".into(), "smart".into()];
+        let result = inject_amp_initial_mode(&args, &env);
+        assert_eq!(result, vec!["--mode", "smart"]);
+        assert_eq!(result.iter().filter(|a| *a == "--mode").count(), 1);
+
+        let args_eq = vec!["--mode=deep".into()];
+        let result_eq = inject_amp_initial_mode(&args_eq, &env);
+        assert_eq!(result_eq, vec!["--mode=deep"]);
+    }
+
+    #[test]
+    fn test_inject_amp_initial_mode_noop_when_env_unset() {
+        let env = HashMap::new();
+        let args = vec!["prompt".into()];
+        let result = inject_amp_initial_mode(&args, &env);
+        assert_eq!(result, vec!["prompt"]);
     }
 }

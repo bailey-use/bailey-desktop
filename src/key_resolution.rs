@@ -72,7 +72,7 @@ pub(crate) async fn resolve_key_override(
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
-    resolve_key_override_scoped(
+    resolve_with_view(
         session_store,
         key_flag,
         mode,
@@ -90,7 +90,7 @@ pub(crate) async fn resolve_image_key_override(
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
-    resolve_key_override_scoped(
+    resolve_with_view(
         session_store,
         key_flag,
         mode,
@@ -108,7 +108,7 @@ pub(crate) async fn resolve_audio_key_override(
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
-    resolve_key_override_scoped(
+    resolve_with_view(
         session_store,
         key_flag,
         mode,
@@ -126,7 +126,7 @@ pub(crate) async fn resolve_video_key_override(
     mode: KeyLookupMode,
     compat: KeyCompatContext,
 ) -> anyhow::Result<KeyResolution> {
-    resolve_key_override_scoped(
+    resolve_with_view(
         session_store,
         key_flag,
         mode,
@@ -134,6 +134,41 @@ pub(crate) async fn resolve_video_key_override(
         LastSelectionView::Video,
     )
     .await
+}
+
+/// Like `resolve_key_override` but returns the key with its secret still
+/// encrypted; caller decrypts on demand via `SessionStore::decrypt_key_secret`.
+pub(crate) async fn resolve_key_override_info(
+    session_store: &SessionStore,
+    key_flag: Option<&str>,
+    mode: KeyLookupMode,
+    compat: KeyCompatContext,
+) -> anyhow::Result<KeyResolution> {
+    resolve_key_override_scoped(
+        session_store,
+        key_flag,
+        mode,
+        compat,
+        LastSelectionView::Default,
+    )
+    .await
+}
+
+async fn resolve_with_view(
+    session_store: &SessionStore,
+    key_flag: Option<&str>,
+    mode: KeyLookupMode,
+    compat: KeyCompatContext,
+    view: LastSelectionView,
+) -> anyhow::Result<KeyResolution> {
+    let resolved = resolve_key_override_scoped(session_store, key_flag, mode, compat, view).await?;
+    match resolved {
+        KeyResolution::Selected(mut key) => {
+            SessionStore::decrypt_key_secret(&mut key)?;
+            Ok(KeyResolution::Selected(key))
+        }
+        other => Ok(other),
+    }
 }
 
 async fn resolve_key_override_scoped(
@@ -156,11 +191,11 @@ async fn resolve_key_override_scoped(
             KeyLookupMode::PreferActiveAllowNone => {
                 // Try last-used selection first (scoped to the view).
                 if let Some(last_sel) = view.read(session_store).await
-                    && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+                    && let Ok(Some(key)) = session_store.get_key_by_id_info(&last_sel.key_id).await
                 {
                     return Ok(KeyResolution::Selected(key));
                 }
-                match session_store.get_active_key().await? {
+                match session_store.get_active_key_info().await? {
                     Some(key) => Ok(KeyResolution::Selected(key)),
                     None => Ok(KeyResolution::MissingAuth),
                 }
@@ -177,7 +212,7 @@ pub(crate) async fn resolve_by_id_or_name_or_pick(
     key_id_or_name: &str,
 ) -> anyhow::Result<KeyResolution> {
     let matches = session_store
-        .find_keys_by_id_or_name(key_id_or_name)
+        .find_keys_by_id_or_name_info(key_id_or_name)
         .await?;
     match matches.len() {
         0 => {
@@ -263,12 +298,12 @@ async fn resolve_active_key_or_prompt(
 ) -> Option<ApiKey> {
     // Try last-used selection first (scoped to the view).
     if let Some(last_sel) = view.read(session_store).await
-        && let Ok(Some(key)) = session_store.get_key_by_id(&last_sel.key_id).await
+        && let Ok(Some(key)) = session_store.get_key_by_id_info(&last_sel.key_id).await
     {
         return Some(key);
     }
     // Then active key
-    if let Ok(Some(key)) = session_store.get_active_key().await {
+    if let Ok(Some(key)) = session_store.get_active_key_info().await {
         return Some(key);
     }
 

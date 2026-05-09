@@ -265,9 +265,9 @@ impl ModelsCommand {
         search: Option<String>,
         json: bool,
     ) -> Result<ExitCode> {
-        let key = match key_override {
+        let mut key = match key_override {
             Some(k) => k,
-            None => match self.session_store.get_active_key().await? {
+            None => match self.session_store.get_active_key_info().await? {
                 Some(k) => k,
                 None => {
                     eprintln!(
@@ -293,7 +293,6 @@ impl ModelsCommand {
             return Ok(ExitCode::UserError);
         }
 
-        let client = http_utils::router_http_client();
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
         let all_cache_key = full_catalog_key(&key.base_url);
 
@@ -311,6 +310,8 @@ impl ModelsCommand {
         let mut models = if let Some((ids, meta)) = cached_entry {
             models_from_cache(ids, meta)
         } else {
+            SessionStore::decrypt_key_secret(&mut key)?;
+            let client = http_utils::router_http_client();
             let started_at = Instant::now();
             let (spinning, spinner_handle) = style::start_spinner(Some(" Fetching models..."));
             let result = fetch_models_detailed_filtered(&client, &key, false).await;

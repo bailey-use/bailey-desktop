@@ -20,7 +20,8 @@ use crate::commands::{
 use crate::errors::ExitCode;
 use crate::key_resolution::{
     KeyLookupMode, KeyResolution, key_or_exit, resolve_audio_key_override,
-    resolve_image_key_override, resolve_key_override, resolve_video_key_override,
+    resolve_image_key_override, resolve_key_override, resolve_key_override_info,
+    resolve_video_key_override,
 };
 use crate::services::ai_launcher::AIToolType;
 use crate::services::environment_injector::ClaudeSlotFlags;
@@ -542,7 +543,7 @@ pub async fn run() -> ! {
 
         Commands::Models(models_args) => {
             let key_override = key_or_exit(
-                resolve_key_override(
+                resolve_key_override_info(
                     &session_store,
                     models_args.key.as_deref(),
                     KeyLookupMode::RequireActiveOrPrompt,

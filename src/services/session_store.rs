@@ -1296,7 +1296,8 @@ impl SessionStore {
         self.api_keys.get_keys().await
     }
 
-    /// Decrypts a single key's secret in place.
+    /// Decrypts a single key's secret in place. No-op if already decrypted.
+    /// Pairs with the `_info` lookup variants for deferred decryption.
     pub fn decrypt_key_secret(key: &mut ApiKey) -> Result<()> {
         ApiKeyStore::decrypt_key_secret(key)
     }
@@ -1304,6 +1305,11 @@ impl SessionStore {
     /// Gets a specific API key by ID with its secret decrypted.
     pub async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
         self.api_keys.get_key_by_id(id).await
+    }
+
+    /// Like `get_key_by_id` but skips secret decryption.
+    pub async fn get_key_by_id_info(&self, id: &str) -> Result<Option<ApiKey>> {
+        self.api_keys.get_key_by_id_info(id).await
     }
 
     /// Deletes an API key by ID
@@ -1433,6 +1439,11 @@ impl SessionStore {
     /// See `ApiKeyStore::find_keys_by_id_or_name`.
     pub async fn find_keys_by_id_or_name(&self, id_or_name: &str) -> Result<Vec<ApiKey>> {
         self.api_keys.find_keys_by_id_or_name(id_or_name).await
+    }
+
+    /// See `ApiKeyStore::find_keys_by_id_or_name_info`.
+    pub async fn find_keys_by_id_or_name_info(&self, id_or_name: &str) -> Result<Vec<ApiKey>> {
+        self.api_keys.find_keys_by_id_or_name_info(id_or_name).await
     }
 
     /// Gets the currently active API key with its secret decrypted.

@@ -141,13 +141,18 @@ impl ApiKeyStore {
 
     /// Gets a specific API key by ID with its secret decrypted.
     pub(crate) async fn get_key_by_id(&self, id: &str) -> Result<Option<ApiKey>> {
+        let mut key = match self.get_key_by_id_info(id).await? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        Self::decrypt_key_secret(&mut key)?;
+        Ok(Some(key))
+    }
+
+    /// Gets a specific API key by ID without decrypting its secret.
+    pub(crate) async fn get_key_by_id_info(&self, id: &str) -> Result<Option<ApiKey>> {
         let keys = self.get_keys().await?;
-        if let Some(mut key) = keys.into_iter().find(|k| k.id == id) {
-            Self::decrypt_key_secret(&mut key)?;
-            Ok(Some(key))
-        } else {
-            Ok(None)
-        }
+        Ok(keys.into_iter().find(|k| k.id == id))
     }
 
     /// Deletes a key from config.json. Returns true if found and deleted.
@@ -344,24 +349,32 @@ impl ApiKeyStore {
     /// Callers that want picker-on-ambiguity use this and branch on
     /// `matches.len()`.
     pub(crate) async fn find_keys_by_id_or_name(&self, id_or_name: &str) -> Result<Vec<ApiKey>> {
+        let mut matches = self.find_keys_by_id_or_name_info(id_or_name).await?;
+        for key in &mut matches {
+            Self::decrypt_key_secret(key)?;
+        }
+        Ok(matches)
+    }
+
+    /// Like `find_keys_by_id_or_name` but skips PBKDF2 decryption — the
+    /// returned `ApiKey.key` may still hold the encrypted ciphertext.
+    /// Use when only metadata (id, name, base_url) is needed; callers that
+    /// later need the secret can decrypt on demand.
+    pub(crate) async fn find_keys_by_id_or_name_info(
+        &self,
+        id_or_name: &str,
+    ) -> Result<Vec<ApiKey>> {
         let keys = self.get_keys().await?;
 
-        if let Some(mut key) = keys
+        if let Some(key) = keys
             .iter()
             .find(|k| k.id == id_or_name || k.short_id() == id_or_name)
             .cloned()
         {
-            Self::decrypt_key_secret(&mut key)?;
             return Ok(vec![key]);
         }
 
-        keys.into_iter()
-            .filter(|k| k.name == id_or_name)
-            .map(|mut k| {
-                Self::decrypt_key_secret(&mut k)?;
-                Ok(k)
-            })
-            .collect()
+        Ok(keys.into_iter().filter(|k| k.name == id_or_name).collect())
     }
 
     pub(crate) async fn get_active_key(&self) -> Result<Option<ApiKey>> {

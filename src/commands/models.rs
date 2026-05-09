@@ -261,7 +261,7 @@ impl ModelsCommand {
     async fn execute_internal(
         &self,
         key_override: Option<ApiKey>,
-        refresh: bool,
+        _refresh: bool,
         search: Option<String>,
         json: bool,
     ) -> Result<ExitCode> {
@@ -302,14 +302,14 @@ impl ModelsCommand {
         let client = http_utils::router_http_client();
         let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
         let all_cache_key = full_catalog_key(&key.base_url);
-        let cache_warm = !refresh && self.cache.get(&all_cache_key).await.is_some();
 
         // `aivo models` shows the provider's full catalog, including image,
         // audio, and embedding models. Chat pickers filter/annotate at their
-        // own call sites.
-        let mut models = if cache_warm {
-            fetch_models_detailed_filtered(&client, &key, false).await?
-        } else {
+        // own call sites. The fetch always hits the network — the metadata
+        // cache only carries context_window, so we can't satisfy this command
+        // from cache. Always show the spinner so a warm cache doesn't leave
+        // the terminal silent during the roundtrip.
+        let mut models = {
             let started_at = Instant::now();
             let (spinning, spinner_handle) = style::start_spinner(Some(" Fetching models..."));
             let result = fetch_models_detailed_filtered(&client, &key, false).await;

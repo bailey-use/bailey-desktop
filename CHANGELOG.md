@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.21.0
+
+## Features
+
+- `aivo share`: new command to share an aivo session via a tunneled web viewer.
+
+## Fixes
+- Windows: terminate the ollama server on shutdown and harden secure file writes.
+- Help: hide `info`, `image`, `video`, and `speak` from the top-level help to reduce noise.
+
+---
+
 ## v0.20.2
 
 ## Fixes

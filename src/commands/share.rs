@@ -88,17 +88,29 @@ impl ShareCommand {
         let (port, handle) = start_local_server("127.0.0.1:0", state, shutdown.clone()).await?;
         let local_base = format!("http://127.0.0.1:{port}");
 
+        // Single Ctrl+C watcher fires `shutdown` for everyone — tunnel +
+        // local share. The tunnel's main loop selects on it; the local
+        // share's parked long-polls do too. One signal, two consumers,
+        // no per-component signal handling drift.
+        {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                shutdown.notify_waiters();
+            });
+        }
+
         let exit_code = if args.debug_local_only {
             let state_url = format!("{local_base}/state");
             print_share_started(&state_url);
             if args.open {
                 let _ = crate::services::browser_open::open_url(&state_url);
             }
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown.notified().await;
             println!();
             ExitCode::Success
         } else {
-            match share_tunnel::run_tunnel(local_base, args.open).await {
+            match share_tunnel::run_tunnel(local_base, args.open, shutdown.clone()).await {
                 Ok(()) => ExitCode::Success,
                 Err(e) => {
                     eprintln!("{} {e}", style::red("Tunnel error:"));

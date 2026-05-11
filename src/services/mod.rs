@@ -70,6 +70,7 @@ pub mod serve_stream_converters;
 pub mod serve_upstream;
 pub mod session_crypto;
 pub mod session_store;
+pub mod share_codec;
 pub mod share_local_server;
 pub mod share_payload;
 pub mod share_picker;

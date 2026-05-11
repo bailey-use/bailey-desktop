@@ -1,25 +1,49 @@
-//! Tiny HTTP/1.1 server that serves a single `SharePayload` for one share
-//! session. Hand-rolled on `tokio::net::TcpListener`, mirroring the pattern
-//! used by `serve_router.rs`. Reuses `http_utils` for request reading and
-//! response formatting.
+//! Tiny HTTP/1.1 server that serves a `SharePayload` over the v2 contract:
+//! `GET /state?wait=<secs>&since=<cursor>` with long-poll and cursor deltas.
+//! See `s.getaivo.dev/protocol.md`.
 //!
 //! Routes:
-//! - `GET /state` — combined `{ meta, payload }` JSON, with ETag for cheap polling.
-//! - `HEAD /state` — ETag-only freshness check (returns 304 when matched).
+//! - `GET /state` — long-poll endpoint. Returns either `200` with
+//!   `{meta, cursor, payload: {replace_from, messages, meta, schema_version}}`
+//!   when the transcript advanced past `since`, or `304` when `wait` seconds
+//!   elapse with no change.
+//! - `HEAD /state` — head-only response (same status logic, empty body).
 //!
-//! In `--live` mode the payload is re-resolved + re-redacted on each
-//! `GET /state` call so the recipient sees ongoing updates. Snapshot mode
-//! serves the cached bytes verbatim.
+//! ## Long-poll mechanics
+//!
+//! A request whose `since` matches the current cursor parks on the shared
+//! `wake` notify with `tokio::select!`-d wait deadline. The notify fires
+//! from two sources:
+//!
+//! - In `--live` mode, a background refresher re-resolves the transcript
+//!   every `LIVE_REFRESH_INTERVAL` and notifies on any cursor advance.
+//! - On shutdown, every parked handler wakes immediately and returns 304
+//!   so the proxy can close out the request promptly. This is what makes
+//!   `aivo logs share` Ctrl+C close in milliseconds instead of waiting on
+//!   in-flight long-polls.
+//!
+//! ## Delta shape
+//!
+//! Cursor format: `"<message_count>:<last_message_json_byte_len>"`. From
+//! the cursor + the current snapshot we derive `replace_from`:
+//!
+//! - `since.count == current.count` and `since.last_len != current.last_len`
+//!   → last message is being streamed; `replace_from = count - 1`, the
+//!   delta carries just the in-flight last message.
+//! - `since.count <  current.count` → new turns appended;
+//!   `replace_from = since.count`, delta carries the tail.
+//! - `since.count >  current.count`, or `since` missing/invalid → reset;
+//!   `replace_from = 0`, delta carries the full message list.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
-use crate::services::device_fingerprint::hex_sha256;
 use crate::services::http_utils::{
     self, http_error_response, http_response_head_with_extra, read_full_request,
 };
@@ -27,22 +51,25 @@ use crate::services::share_payload::SharePayload;
 use crate::services::share_redact::{RedactCtx, redact};
 use crate::services::share_resolver::{ResolverContext, resolve_session};
 
-/// CORS allowlist origin for the share viewer. Matches `DEFAULT_SHARE_BASE_URL`
-/// at the protocol+host level.
 const VIEWER_ORIGIN: &str = "https://s.getaivo.dev";
+const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_WAIT_SECS: u64 = 30;
 
-/// What the local server has loaded. The cached snapshot bytes are pre-
-/// serialized so a hot polling loop doesn't re-format JSON on every request.
+/// What the local server has loaded. `messages_json` caches per-message
+/// serialized bytes so a delta response is just a slice + concatenation,
+/// not a re-serialize. `cursor` derives from `messages_json` exactly so
+/// the streaming-last-message case (`last_len` advance) is detected.
 pub struct LiveState {
-    /// Source of truth for re-resolving in live mode.
     session_id: String,
-    /// Cached redacted payload (also held in `cached_bytes`'s parsed form).
     snapshot: SharePayload,
-    cached_bytes: Vec<u8>,
-    cached_etag: String,
+    messages_json: Vec<Vec<u8>>,
+    cursor: String,
     live: bool,
     redact_ctx: RedactCtx,
     resolver_ctx: Option<Arc<ResolverContext>>,
+    /// Notified by the live refresher every time the cursor advances. Parked
+    /// long-poll handlers select on this + shutdown + their wait timer.
+    wake: Arc<Notify>,
 }
 
 impl LiveState {
@@ -54,59 +81,79 @@ impl LiveState {
         resolver_ctx: Option<Arc<ResolverContext>>,
     ) -> Self {
         snapshot.meta.live = live;
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize SharePayload");
-        let etag = etag_for(&bytes);
+        let (messages_json, cursor) = serialize_messages(&snapshot);
         Self {
             session_id,
             snapshot,
-            cached_bytes: bytes,
-            cached_etag: etag,
+            messages_json,
+            cursor,
             live,
             redact_ctx,
             resolver_ctx,
+            wake: Arc::new(Notify::new()),
         }
     }
 
-    /// Re-resolve and re-redact in live mode; cache the result. Snapshot
-    /// mode is a no-op.
-    async fn refresh_if_live(&mut self) -> Result<()> {
+    /// Re-resolve + re-redact in live mode. Returns `true` if the cursor
+    /// changed (the caller fires `wake` on `true`).
+    async fn refresh_if_live(&mut self) -> Result<bool> {
         if !self.live {
-            return Ok(());
+            return Ok(false);
         }
         let Some(resolver) = self.resolver_ctx.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         let resolved = resolve_session(&self.session_id, &resolver).await?;
         let mut payload = resolved.payload;
         payload.meta.live = true;
         let (mut redacted, _) = redact(payload, &self.redact_ctx);
         redacted.meta.served_at = chrono::Utc::now();
-        self.cached_bytes = serde_json::to_vec(&redacted)?;
-        self.cached_etag = etag_for(&self.cached_bytes);
+        let (messages_json, cursor) = serialize_messages(&redacted);
+        let changed = cursor != self.cursor;
+        self.messages_json = messages_json;
+        self.cursor = cursor;
         self.snapshot = redacted;
-        Ok(())
+        Ok(changed)
     }
 }
 
-fn etag_for(bytes: &[u8]) -> String {
-    let hex = hex_sha256(bytes);
-    // 16-char prefix is plenty of entropy for change detection; full sha256
-    // would be overkill for a polled JSON blob.
-    format!("\"{}\"", &hex[..16.min(hex.len())])
+fn serialize_messages(snapshot: &SharePayload) -> (Vec<Vec<u8>>, String) {
+    let messages_json: Vec<Vec<u8>> = snapshot
+        .messages
+        .iter()
+        .map(|m| serde_json::to_vec(m).expect("serialize message"))
+        .collect();
+    let n = messages_json.len();
+    let last_len = messages_json.last().map(|v| v.len()).unwrap_or(0);
+    (messages_json, format!("{n}:{last_len}"))
 }
 
-/// Bind a local listener and run the share server until `shutdown` fires or
-/// the listener errors. Returns the bound port (when host is `127.0.0.1:0`)
-/// alongside the join handle so the caller can print the URL and await
-/// shutdown via Ctrl+C.
+fn parse_cursor(s: &str) -> Option<(usize, usize)> {
+    let (a, b) = s.split_once(':')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Bind a local listener and run the share server until `shutdown` fires.
+/// In live mode also spawns a background refresher that notifies `wake` on
+/// every cursor advance. Returns the bound port (when host is
+/// `127.0.0.1:0`) alongside the join handle so the caller can print the
+/// URL and await shutdown via Ctrl+C.
 pub async fn start_local_server(
     bind_addr: &str,
     state: LiveState,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: Arc<Notify>,
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let port = listener.local_addr()?.port();
+    let live = state.live;
     let state = Arc::new(RwLock::new(state));
+
+    if live {
+        let refresher_state = state.clone();
+        let refresher_shutdown = shutdown.clone();
+        tokio::spawn(live_refresher(refresher_state, refresher_shutdown));
+    }
+
     let handle = tokio::spawn(run_loop(listener, state, shutdown));
     Ok((port, handle))
 }
@@ -123,45 +170,68 @@ pub fn build_state(
     LiveState::from_snapshot(session_id, snapshot, live, redact_ctx, resolver_ctx)
 }
 
-async fn run_loop(
-    listener: TcpListener,
-    state: Arc<RwLock<LiveState>>,
-    shutdown: Arc<tokio::sync::Notify>,
-) {
+async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: Arc<Notify>) {
+    let mut ticker = tokio::time::interval(LIVE_REFRESH_INTERVAL);
+    ticker.tick().await; // skip immediate first tick — initial state is already fresh
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = shutdown.notified() => return,
+        }
+        let mut guard = state.write().await;
+        match guard.refresh_if_live().await {
+            Ok(true) => guard.wake.notify_waiters(),
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!("aivo: live refresh failed (non-fatal): {err}");
+            }
+        }
+    }
+}
+
+async fn run_loop(listener: TcpListener, state: Arc<RwLock<LiveState>>, shutdown: Arc<Notify>) {
     loop {
         let accept = tokio::select! {
             result = listener.accept() => result,
-            _ = shutdown.notified() => return,
+            _ = shutdown.notified() => {
+                // Wake every parked long-poll so connections drain promptly.
+                state.read().await.wake.notify_waiters();
+                return;
+            }
         };
         let Ok((mut socket, _peer)) = accept else {
             continue;
         };
         let state = state.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let request_bytes = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                read_full_request(&mut socket),
-            )
-            .await
-            {
-                Ok(Ok(b)) => b,
-                _ => {
-                    let _ = socket
-                        .write_all(http_error_response(400, "bad request").as_bytes())
-                        .await;
-                    return;
-                }
-            };
+            let request_bytes =
+                match tokio::time::timeout(Duration::from_secs(60), read_full_request(&mut socket))
+                    .await
+                {
+                    Ok(Ok(b)) => b,
+                    _ => {
+                        let _ = socket
+                            .write_all(http_error_response(400, "bad request").as_bytes())
+                            .await;
+                        return;
+                    }
+                };
             let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let response = handle_request(&request, &state).await;
+            let response = handle_request(&request, &state, &shutdown).await;
             let _ = socket.write_all(&response).await;
         });
     }
 }
 
-async fn handle_request(request: &str, state: &Arc<RwLock<LiveState>>) -> Vec<u8> {
+async fn handle_request(
+    request: &str,
+    state: &Arc<RwLock<LiveState>>,
+    shutdown: &Notify,
+) -> Vec<u8> {
     let path = http_utils::extract_request_path(request);
     let path_no_query = path.split('?').next().unwrap_or(&path);
+    let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let method_is_head = request.starts_with("HEAD ");
     let method_is_get = request.starts_with("GET ") || method_is_head;
     let method_is_options = request.starts_with("OPTIONS ");
@@ -169,60 +239,133 @@ async fn handle_request(request: &str, state: &Arc<RwLock<LiveState>>) -> Vec<u8
     if method_is_options {
         return cors_preflight();
     }
-
     if !method_is_get {
         return http_error_response(405, "method not allowed").into_bytes();
     }
 
     match path_no_query {
-        "/state" => serve_state(request, state, method_is_head).await,
+        "/state" => serve_state(query, state, shutdown, method_is_head).await,
         _ => http_error_response(404, "not found").into_bytes(),
     }
 }
 
-async fn serve_state(request: &str, state: &Arc<RwLock<LiveState>>, head_only: bool) -> Vec<u8> {
-    // Snapshot mode is the common case and never mutates — keep concurrent
-    // polls non-serialized by skipping the write lock entirely.
-    if state.read().await.live {
-        let mut guard = state.write().await;
-        if let Err(err) = guard.refresh_if_live().await {
-            return http_error_response(500, &format!("refresh failed: {err}")).into_bytes();
+async fn serve_state(
+    query: &str,
+    state: &Arc<RwLock<LiveState>>,
+    shutdown: &Notify,
+    head_only: bool,
+) -> Vec<u8> {
+    let wait_secs = query_u64(query, "wait").unwrap_or(0).min(MAX_WAIT_SECS);
+    let since = query_string(query, "since").map(percent_decode);
+
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+
+    loop {
+        // Arm the wake-notify BEFORE reading the cursor so we don't miss a
+        // refresh that lands between read and await. Notify::notified()
+        // "subscribes" at creation time, not at first poll.
+        let wake = state.read().await.wake.clone();
+        let notified = wake.notified();
+        tokio::pin!(notified);
+
+        let current_cursor = state.read().await.cursor.clone();
+        if since.as_deref() != Some(current_cursor.as_str()) {
+            // Advanced (or first request). Serialize the delta + return.
+            let guard = state.read().await;
+            return build_state_200(&guard, since.as_deref(), head_only);
+        }
+
+        if Instant::now() >= deadline {
+            return build_state_304(&current_cursor, head_only);
+        }
+        let remaining = deadline - Instant::now();
+
+        tokio::select! {
+            _ = notified.as_mut() => continue,
+            _ = shutdown.notified() => return build_state_304(&current_cursor, head_only),
+            _ = tokio::time::sleep(remaining) => return build_state_304(&current_cursor, head_only),
         }
     }
-    let guard = state.read().await;
+}
 
-    let if_none_match = http_utils::header_value(request, "If-None-Match");
-    if if_none_match == Some(guard.cached_etag.as_str()) {
-        let head = http_response_head_with_extra(304, "application/json", 0, &cors_extra());
-        return head.into_bytes();
-    }
+fn build_state_200(state: &LiveState, since: Option<&str>, head_only: bool) -> Vec<u8> {
+    let count = state.messages_json.len();
+    let (replace_from, slice_from) = match since.and_then(parse_cursor) {
+        Some((s_count, s_last_len)) if s_count == count => {
+            // Same count: either streaming last message (last_len differs)
+            // or a no-op we would've caught above. If equal, we shouldn't
+            // be here — but if we are (race), send back the last message.
+            let last_len = state.messages_json.last().map(|v| v.len()).unwrap_or(0);
+            if count == 0 || last_len == s_last_len {
+                (0usize, 0usize)
+            } else {
+                (count - 1, count - 1)
+            }
+        }
+        Some((s_count, _)) if s_count < count => (s_count, s_count),
+        // Reset cases: count went backward (rare), or no/invalid since.
+        _ => (0, 0),
+    };
 
-    // Combined `{ meta, payload }` body. `cached_bytes` is the payload JSON;
-    // splice it in raw to avoid re-serializing on every poll.
-    let meta_json = serde_json::to_vec(&meta_value(&guard)).expect("serialize meta");
-    let mut body = Vec::with_capacity(meta_json.len() + guard.cached_bytes.len() + 24);
+    let messages_array = concat_json_array(&state.messages_json[slice_from..]);
+    let payload_meta = serde_json::to_vec(&state.snapshot.meta).expect("serialize ShareMeta");
+    let envelope_meta = serde_json::to_vec(&meta_value(state)).expect("serialize meta");
+
+    // Hand-assemble the JSON envelope to splice in the pre-serialized
+    // message array without an intermediate Value tree. Shape:
+    //   {"meta": <meta>, "cursor": "<c>", "payload": {
+    //     "replace_from": N, "messages": <array>,
+    //     "meta": <payload_meta>, "schema_version": "<v>"}}
+    let mut body = Vec::with_capacity(envelope_meta.len() + messages_array.len() + 256);
     body.extend_from_slice(b"{\"meta\":");
-    body.extend_from_slice(&meta_json);
-    body.extend_from_slice(b",\"payload\":");
-    body.extend_from_slice(&guard.cached_bytes);
-    body.extend_from_slice(b"}");
+    body.extend_from_slice(&envelope_meta);
+    body.extend_from_slice(b",\"cursor\":");
+    body.extend_from_slice(json_string(&state.cursor).as_bytes());
+    body.extend_from_slice(b",\"payload\":{\"replace_from\":");
+    body.extend_from_slice(replace_from.to_string().as_bytes());
+    body.extend_from_slice(b",\"messages\":");
+    body.extend_from_slice(&messages_array);
+    body.extend_from_slice(b",\"meta\":");
+    body.extend_from_slice(&payload_meta);
+    body.extend_from_slice(b",\"schema_version\":");
+    body.extend_from_slice(json_string(&state.snapshot.schema_version).as_bytes());
+    body.extend_from_slice(b"}}");
 
-    let extra = format!(
-        "ETag: {}\r\nCache-Control: no-store\r\n{}",
-        guard.cached_etag,
-        cors_extra()
-    );
-    let head = http_response_head_with_extra(
-        200,
-        "application/json",
-        body.len(),
-        extra.trim_end_matches("\r\n"),
-    );
+    let head = http_response_head_with_extra(200, "application/json", body.len(), &cors_extra());
     let mut out = head.into_bytes();
     if !head_only {
         out.extend_from_slice(&body);
     }
     out
+}
+
+fn build_state_304(cursor: &str, _head_only: bool) -> Vec<u8> {
+    // Include the cursor as an ETag-style hint so log lines / debugging can
+    // see what cursor the parked poll was watching. The public proxy
+    // doesn't use it — cursor-on-304 is implicitly "same as the request's
+    // ?since=".
+    let extra = format!("X-Aivo-Cursor: {cursor}\r\n{}", cors_extra());
+    let head =
+        http_response_head_with_extra(304, "application/json", 0, extra.trim_end_matches("\r\n"));
+    head.into_bytes()
+}
+
+fn concat_json_array(items: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = items.iter().map(|v| v.len()).sum();
+    let mut out = Vec::with_capacity(total + items.len() + 2);
+    out.push(b'[');
+    for (i, bytes) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(bytes);
+    }
+    out.push(b']');
+    out
+}
+
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| String::from("\"\""))
 }
 
 fn meta_value(state: &LiveState) -> serde_json::Value {
@@ -235,14 +378,13 @@ fn meta_value(state: &LiveState) -> serde_json::Value {
         "updated_at": state.snapshot.updated_at,
         "live": state.live,
         "message_count": state.snapshot.messages.len(),
-        "size_bytes": state.cached_bytes.len(),
         "schema_version": state.snapshot.schema_version,
     })
 }
 
 fn cors_extra() -> String {
     format!(
-        "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: If-None-Match",
+        "Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Methods: GET, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Accept",
         VIEWER_ORIGIN
     )
 }
@@ -253,13 +395,58 @@ fn cors_preflight() -> Vec<u8> {
     head.into_bytes()
 }
 
+fn query_string<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == key
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn query_u64(query: &str, key: &str) -> Option<u64> {
+    query_string(query, key).and_then(|v| v.parse().ok())
+}
+
+/// Minimal percent-decoder for cursor values. Only handles `%XX` escapes;
+/// any malformed sequence is passed through (the cursor's worst case is
+/// "doesn't match current" → falls through to full snapshot, which is safe).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::share_payload::{
         ContentBlock, ProjectInfo, SHARE_SCHEMA_VERSION, ShareMessage, SharePayload,
     };
-    use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
 
@@ -289,22 +476,14 @@ mod tests {
     }
 
     async fn http_get(port: u16, path: &str) -> (u16, Vec<u8>) {
-        http_request(port, "GET", path, None).await
+        http_request(port, "GET", path).await
     }
 
-    async fn http_request(
-        port: u16,
-        method: &str,
-        path: &str,
-        if_none_match: Option<&str>,
-    ) -> (u16, Vec<u8>) {
+    async fn http_request(port: u16, method: &str, path: &str) -> (u16, Vec<u8>) {
         let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let mut req =
-            format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
-        if let Some(etag) = if_none_match {
-            req.push_str(&format!("If-None-Match: {etag}\r\n"));
-        }
-        req.push_str("\r\n");
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
         tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes())
             .await
             .unwrap();
@@ -317,25 +496,8 @@ mod tests {
         (status, body)
     }
 
-    async fn read_etag(port: u16, path: &str) -> String {
-        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!("HEAD {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-        tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes())
-            .await
-            .unwrap();
-        let mut buf = Vec::new();
-        sock.read_to_end(&mut buf).await.unwrap();
-        let head = String::from_utf8_lossy(&buf);
-        for line in head.lines() {
-            if let Some(rest) = line.strip_prefix("ETag: ") {
-                return rest.to_string();
-            }
-        }
-        panic!("no ETag in HEAD response: {head}");
-    }
-
     #[tokio::test]
-    async fn serves_state_and_head() {
+    async fn first_request_returns_full_snapshot() {
         let state = build_state(
             "T-test".into(),
             fake_payload(),
@@ -343,7 +505,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(Notify::new());
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -354,21 +516,89 @@ mod tests {
         assert_eq!(parsed["meta"]["source_cli"], "amp");
         assert_eq!(parsed["meta"]["message_count"], 1);
         assert_eq!(parsed["meta"]["live"], false);
-        assert_eq!(parsed["payload"]["source_cli"], "amp");
-        assert_eq!(parsed["payload"]["session_id"], "T-test");
-
-        // HEAD /state → empty body, ETag header present.
-        let etag = read_etag(port, "/state").await;
-        assert!(etag.starts_with('"') && etag.ends_with('"'));
-
-        // 304 path: same etag → no body.
-        let (status, body) = http_request(port, "GET", "/state", Some(&etag)).await;
-        assert_eq!(status, 304);
-        assert!(body.is_empty());
+        assert_eq!(parsed["cursor"].as_str().unwrap().contains(':'), true);
+        assert_eq!(parsed["payload"]["replace_from"], 0);
+        assert_eq!(parsed["payload"]["messages"][0]["role"], "user");
+        assert_eq!(parsed["payload"]["schema_version"], "1");
 
         shutdown.notify_waiters();
-        // give the loop a tick to break out
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn cursor_matches_returns_304_after_wait() {
+        let state = build_state(
+            "T-test".into(),
+            fake_payload(),
+            false,
+            RedactCtx::default(),
+            None,
+        );
+        let shutdown = Arc::new(Notify::new());
+        let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
+            .await
+            .unwrap();
+
+        // First fetch to learn the cursor.
+        let (_, body) = http_get(port, "/state").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cursor = v["cursor"].as_str().unwrap().to_string();
+
+        // Re-poll with that cursor + wait=1; snapshot mode never changes,
+        // so we should get 304 after ~1s.
+        let started = Instant::now();
+        let path = format!("/state?wait=1&since={cursor}");
+        let (status, body) = http_get(port, &path).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, 304);
+        assert!(body.is_empty());
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected ~1s long-poll, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "long-poll overshot: {elapsed:?}"
+        );
+
+        shutdown.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_unblocks_parked_long_poll() {
+        let state = build_state(
+            "T-test".into(),
+            fake_payload(),
+            false,
+            RedactCtx::default(),
+            None,
+        );
+        let shutdown = Arc::new(Notify::new());
+        let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
+            .await
+            .unwrap();
+
+        let (_, body) = http_get(port, "/state").await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cursor = v["cursor"].as_str().unwrap().to_string();
+
+        // Start a wait=30 long-poll, then fire shutdown after 100ms. The
+        // poll must return well under the wait window — this is the cancel
+        // speed contract.
+        let path = format!("/state?wait=30&since={cursor}");
+        let started = Instant::now();
+        let poll = tokio::spawn(async move { http_get(port, &path).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify_waiters();
+
+        let (status, _) = poll.await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(status, 304);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "long-poll didn't unblock on shutdown: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -380,7 +610,7 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(Notify::new());
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
@@ -388,7 +618,7 @@ mod tests {
         let (status, _) = http_get(port, "/nope").await;
         assert_eq!(status, 404);
 
-        let (status, _) = http_request(port, "POST", "/state", None).await;
+        let (status, _) = http_request(port, "POST", "/state").await;
         assert_eq!(status, 405);
 
         shutdown.notify_waiters();
@@ -404,13 +634,53 @@ mod tests {
             RedactCtx::default(),
             None,
         );
-        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let shutdown = Arc::new(Notify::new());
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
             .unwrap();
-        let (status, _) = http_request(port, "OPTIONS", "/state", None).await;
+        let (status, _) = http_request(port, "OPTIONS", "/state").await;
         assert_eq!(status, 204);
         shutdown.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn cursor_changes_on_appended_message() {
+        let mut payload = fake_payload();
+        let (_, c1) = serialize_messages(&payload);
+        payload.messages.push(ShareMessage {
+            role: "assistant".into(),
+            timestamp: None,
+            model: None,
+            reasoning: None,
+            content: vec![ContentBlock::Text {
+                text: "hi back".into(),
+            }],
+        });
+        let (_, c2) = serialize_messages(&payload);
+        assert_ne!(c1, c2);
+        // Cursor format is "<count>:<last_len>".
+        assert!(c2.starts_with("2:"));
+    }
+
+    #[test]
+    fn cursor_changes_on_streaming_last_message() {
+        let mut payload = fake_payload();
+        let (_, c1) = serialize_messages(&payload);
+        // Mutate the last message (simulating mid-stream growth).
+        payload.messages.last_mut().unwrap().content = vec![ContentBlock::Text {
+            text: "hello world".into(),
+        }];
+        let (_, c2) = serialize_messages(&payload);
+        assert_ne!(c1, c2);
+        // Same count, different last_len.
+        assert!(c1.starts_with("1:") && c2.starts_with("1:"));
+    }
+
+    #[test]
+    fn percent_decode_handles_colon() {
+        assert_eq!(percent_decode("3%3A7"), "3:7");
+        assert_eq!(percent_decode("3:7"), "3:7");
+        assert_eq!(percent_decode("plain"), "plain");
     }
 }

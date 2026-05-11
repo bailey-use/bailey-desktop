@@ -600,6 +600,7 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     // the matching cli. Lifting `max_age_days` so old runs still resolve.
     let opts = IngestOptions {
         max_age_days: None,
+        min_updated_at: None,
         max_per_source: Some(50),
     };
     let threads = context_ingest::ingest_project(std::path::Path::new(&run_cwd), opts).await?;

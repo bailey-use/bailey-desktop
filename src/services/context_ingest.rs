@@ -77,6 +77,11 @@ const AIVO_CONTEXT_MARKERS: &[&str] = &[
 pub struct IngestOptions {
     /// `Some(days)` filters threads older than this; `None` = unlimited.
     pub max_age_days: Option<i64>,
+    /// Absolute lower bound on `updated_at`. Combined with `max_age_days`:
+    /// when both are set, the more restrictive (later) cutoff wins. Set by
+    /// `aivo logs --since` so the global ingester can skip files by mtime
+    /// before parsing them.
+    pub min_updated_at: Option<DateTime<Utc>>,
     /// `Some(n)` early-exits each source after `n` extractions; `None` = all.
     pub max_per_source: Option<usize>,
 }
@@ -85,6 +90,7 @@ impl Default for IngestOptions {
     fn default() -> Self {
         Self {
             max_age_days: Some(DEFAULT_THREAD_MAX_AGE_DAYS),
+            min_updated_at: None,
             max_per_source: Some(DEFAULT_MAX_THREADS_PER_SOURCE),
         }
     }
@@ -95,8 +101,24 @@ impl IngestOptions {
     pub fn unlimited() -> Self {
         Self {
             max_age_days: None,
+            min_updated_at: None,
             max_per_source: None,
         }
+    }
+}
+
+/// Resolve the effective lower-bound timestamp from both filter knobs. When
+/// both are set, the more restrictive (later) cutoff wins so callers can't
+/// accidentally widen a date filter by also setting an age cap.
+fn effective_cutoff(opts: &IngestOptions) -> Option<DateTime<Utc>> {
+    let from_days = opts
+        .max_age_days
+        .map(|d| Utc::now() - chrono::Duration::days(d));
+    match (from_days, opts.min_updated_at) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
     }
 }
 
@@ -128,8 +150,7 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
     threads.extend(opencode);
 
     // Optional age filter (replaces the old `gc` command — evaluated lazily).
-    if let Some(days) = opts.max_age_days {
-        let cutoff = Utc::now() - chrono::Duration::days(days);
+    if let Some(cutoff) = effective_cutoff(&opts) {
         threads.retain(|t| t.updated_at >= cutoff);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
@@ -143,12 +164,18 @@ pub async fn ingest_project(project_root: &Path, opts: IngestOptions) -> Result<
 /// `updated_at`.
 pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Thread>> {
     let cap = opts.max_per_source;
+    // Push the time cutoff down to the file walks: each per-source ingester
+    // drops jsonl files whose mtime is already older than the cutoff before
+    // touching them. mtime ≥ last-message-ts for an append-only jsonl, so a
+    // file failing the mtime check can't produce a thread that would pass.
+    let cutoff = effective_cutoff(&opts);
+    let cutoff_st = cutoff.map(SystemTime::from);
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
-        ingest_claude_global(cap),
-        ingest_codex_global(cap),
-        ingest_gemini_global(cap),
-        ingest_pi_global(cap),
-        ingest_opencode_global(cap),
+        ingest_claude_global(cap, cutoff_st),
+        ingest_codex_global(cap, cutoff_st),
+        ingest_gemini_global(cap, cutoff_st),
+        ingest_pi_global(cap, cutoff_st),
+        ingest_opencode_global(cap, cutoff),
     );
 
     let mut threads: Vec<Thread> =
@@ -159,15 +186,17 @@ pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Th
     threads.extend(pi);
     threads.extend(opencode);
 
-    if let Some(days) = opts.max_age_days {
-        let cutoff = Utc::now() - chrono::Duration::days(days);
+    // Some files have mtime later than their last message ts (e.g. metadata
+    // touch). Re-check thread updated_at to be safe — pushdown is a parsing
+    // optimization, not a correctness shortcut.
+    if let Some(cutoff) = cutoff {
         threads.retain(|t| t.updated_at >= cutoff);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     Ok(threads)
 }
 
-async fn ingest_claude_global(cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_claude_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -198,6 +227,11 @@ async fn ingest_claude_global(cap: Option<usize>) -> Vec<Thread> {
                 .await
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            if let Some(c) = after
+                && mtime < c
+            {
+                continue;
+            }
             all_paths.push((p, mtime));
         }
     }
@@ -217,7 +251,7 @@ async fn ingest_claude_global(cap: Option<usize>) -> Vec<Thread> {
     out
 }
 
-async fn ingest_codex_global(cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_codex_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -225,7 +259,7 @@ async fn ingest_codex_global(cap: Option<usize>) -> Vec<Thread> {
     if !codex_root.exists() {
         return Vec::new();
     }
-    let files = walk_jsonl_newest_first(&codex_root).await;
+    let files = walk_jsonl_newest_first(&codex_root, after).await;
     let mut out = Vec::new();
     for path in files {
         if let Some(n) = cap
@@ -311,7 +345,7 @@ async fn extract_codex_thread_any(path: &Path) -> Option<Thread> {
     })
 }
 
-async fn ingest_gemini_global(cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_gemini_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -340,6 +374,11 @@ async fn ingest_gemini_global(cap: Option<usize>) -> Vec<Thread> {
                 .await
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            if let Some(c) = after
+                && mtime < c
+            {
+                continue;
+            }
             all_paths.push((p, mtime));
         }
     }
@@ -359,7 +398,7 @@ async fn ingest_gemini_global(cap: Option<usize>) -> Vec<Thread> {
     out
 }
 
-async fn ingest_pi_global(cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_pi_global(cap: Option<usize>, after: Option<SystemTime>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -387,6 +426,11 @@ async fn ingest_pi_global(cap: Option<usize>) -> Vec<Thread> {
                 .await
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            if let Some(c) = after
+                && mtime < c
+            {
+                continue;
+            }
             all_paths.push((p, mtime));
         }
     }
@@ -406,7 +450,7 @@ async fn ingest_pi_global(cap: Option<usize>) -> Vec<Thread> {
     out
 }
 
-async fn ingest_opencode_global(cap: Option<usize>) -> Vec<Thread> {
+async fn ingest_opencode_global(cap: Option<usize>, after: Option<DateTime<Utc>>) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
     };
@@ -419,13 +463,16 @@ async fn ingest_opencode_global(cap: Option<usize>) -> Vec<Thread> {
         return Vec::new();
     }
     let cap_i = cap.unwrap_or(1_000) as i64;
+    // opencode stores `time_updated` as unix-millis; bind 0 when there's no
+    // cutoff so the SQL doesn't need two prepared statements.
+    let after_ms = after.map(|dt| dt.timestamp_millis()).unwrap_or(0);
 
-    tokio::task::spawn_blocking(move || opencode_query_global(&db_path, cap_i))
+    tokio::task::spawn_blocking(move || opencode_query_global(&db_path, cap_i, after_ms))
         .await
         .unwrap_or_default()
 }
 
-fn opencode_query_global(db_path: &Path, cap: i64) -> Vec<Thread> {
+fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64) -> Vec<Thread> {
     let conn = match rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -442,6 +489,7 @@ fn opencode_query_global(db_path: &Path, cap: i64) -> Vec<Thread> {
         "SELECT s.id, s.time_updated, p.worktree
            FROM session s
            JOIN project p ON p.id = s.project_id
+           WHERE s.time_updated >= ?2
            ORDER BY s.time_updated DESC
            LIMIT ?1",
     ) {
@@ -449,7 +497,9 @@ fn opencode_query_global(db_path: &Path, cap: i64) -> Vec<Thread> {
         Err(_) => return Vec::new(),
     };
     let rows: Vec<(String, i64, String)> = stmt
-        .query_map([cap], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .query_map([cap, after_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
         .unwrap_or_default();
 
@@ -481,7 +531,7 @@ async fn ingest_claude(canonical_root: &Path, cap: Option<usize>) -> Vec<Thread>
         return Vec::new();
     }
 
-    let files = list_jsonl_newest_first(&session_dir).await;
+    let files = list_jsonl_newest_first(&session_dir, None).await;
     let mut out = Vec::new();
     for path in files {
         if let Some(n) = cap
@@ -510,7 +560,7 @@ async fn ingest_codex(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
         return Vec::new();
     }
 
-    let files = walk_jsonl_newest_first(&codex_root).await;
+    let files = walk_jsonl_newest_first(&codex_root, None).await;
     let mut out = Vec::new();
     for path in files {
         if let Some(n) = cap
@@ -758,7 +808,7 @@ async fn ingest_pi(canonical_root: &str, cap: Option<usize>) -> Vec<Thread> {
         _ => return Vec::new(),
     };
 
-    let files = list_jsonl_newest_first(&session_dir).await;
+    let files = list_jsonl_newest_first(&session_dir, None).await;
     let mut out = Vec::new();
     for path in files {
         if let Some(n) = cap
@@ -1023,7 +1073,7 @@ fn opencode_extract_session(
 // Filesystem walking — newest-first
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
+pub(crate) async fn list_jsonl_newest_first(dir: &Path, after: Option<SystemTime>) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut read_dir = match fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -1039,13 +1089,21 @@ pub(crate) async fn list_jsonl_newest_first(dir: &Path) -> Vec<PathBuf> {
             .await
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
+        if let Some(c) = after
+            && mtime < c
+        {
+            continue;
+        }
         entries.push((path, mtime));
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.into_iter().map(|(p, _)| p).collect()
 }
 
-pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
+pub(crate) async fn walk_jsonl_newest_first(
+    root: &Path,
+    after: Option<SystemTime>,
+) -> Vec<PathBuf> {
     let mut entries: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -1063,6 +1121,11 @@ pub(crate) async fn walk_jsonl_newest_first(root: &Path) -> Vec<PathBuf> {
                     .await
                     .and_then(|m| m.modified())
                     .unwrap_or(SystemTime::UNIX_EPOCH);
+                if let Some(c) = after
+                    && mtime < c
+                {
+                    continue;
+                }
                 entries.push((path, mtime));
             }
         }
@@ -1128,6 +1191,7 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
     let mut last_assistant: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut last_timestamp: Option<DateTime<Utc>> = None;
+    let mut event_cwd: Option<String> = None;
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.is_empty() {
@@ -1142,6 +1206,15 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
             && let Some(sid) = v.get("sessionId").and_then(|s| s.as_str())
         {
             session_id = Some(sid.to_string());
+        }
+
+        // Claude events carry the original cwd verbatim; prefer it over the
+        // lossy dir-name decoder, which collapses `.` and `/` to the same `-`.
+        if event_cwd.is_none()
+            && let Some(c) = v.get("cwd").and_then(|s| s.as_str())
+            && !c.is_empty()
+        {
+            event_cwd = Some(c.to_string());
         }
 
         if v.get("isSidechain")
@@ -1186,16 +1259,16 @@ async fn extract_claude_thread(path: &Path) -> Option<Thread> {
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
-        cwd: decode_claude_cwd(path),
+        cwd: event_cwd.or_else(|| decode_claude_cwd(path)),
     })
 }
 
 /// Reverse the encoded-dir convention used by Claude Code under
 /// `~/.claude/projects/`. `-Users-alice-foo` → `/Users/alice/foo`. Lossy when the
-/// original cwd contained literal hyphens (we can't tell an encoded path
-/// separator from a real `-`); acceptable for display + substring filtering.
-/// Windows paths (`C--Users-...`) round-trip cosmetically only — kept for
-/// at-a-glance display.
+/// original cwd contained literal hyphens or dots (both encode to `-`);
+/// callers should prefer the event-level `cwd` field when present, and only
+/// fall back to this for empty/legacy files. Windows paths (`C--Users-...`)
+/// round-trip cosmetically only — kept for at-a-glance display.
 fn decode_claude_cwd(path: &Path) -> Option<String> {
     let parent = path.parent()?.file_name()?.to_str()?;
     Some(parent.replace('-', "/"))
@@ -1560,9 +1633,58 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         fs::write(&new, "y").await.unwrap();
 
-        let ordered = list_jsonl_newest_first(dir.path()).await;
+        let ordered = list_jsonl_newest_first(dir.path(), None).await;
         assert_eq!(ordered.len(), 2);
         assert_eq!(ordered[0].file_name().unwrap(), "new.jsonl");
         assert_eq!(ordered[1].file_name().unwrap(), "old.jsonl");
+    }
+
+    #[tokio::test]
+    async fn list_jsonl_newest_first_skips_files_older_than_cutoff() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.jsonl");
+        let new = dir.path().join("new.jsonl");
+        fs::write(&old, "x").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let cutoff = SystemTime::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        fs::write(&new, "y").await.unwrap();
+
+        let filtered = list_jsonl_newest_first(dir.path(), Some(cutoff)).await;
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].file_name().unwrap(), "new.jsonl");
+    }
+
+    #[test]
+    fn effective_cutoff_picks_more_restrictive_bound() {
+        // max_age_days = 1 ⇒ cutoff ≈ now - 1d
+        // min_updated_at = now - 30d
+        // The 1-day bound is later (more restrictive) and wins.
+        let recent = IngestOptions {
+            max_age_days: Some(1),
+            min_updated_at: Some(Utc::now() - chrono::Duration::days(30)),
+            max_per_source: None,
+        };
+        let cutoff = effective_cutoff(&recent).unwrap();
+        assert!(cutoff > Utc::now() - chrono::Duration::days(2));
+
+        // Reverse: explicit min_updated_at is more restrictive than days bound.
+        let explicit = IngestOptions {
+            max_age_days: Some(30),
+            min_updated_at: Some(Utc::now() - chrono::Duration::days(1)),
+            max_per_source: None,
+        };
+        let cutoff = effective_cutoff(&explicit).unwrap();
+        assert!(cutoff > Utc::now() - chrono::Duration::days(2));
+    }
+
+    #[test]
+    fn effective_cutoff_none_when_both_unset() {
+        let opts = IngestOptions {
+            max_age_days: None,
+            min_updated_at: None,
+            max_per_source: None,
+        };
+        assert!(effective_cutoff(&opts).is_none());
     }
 }

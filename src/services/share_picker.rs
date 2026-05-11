@@ -148,6 +148,7 @@ pub async fn pick_session_id(
     tokio::spawn(async move {
         let opts = IngestOptions {
             max_age_days: None,
+            min_updated_at: None,
             max_per_source: Some(3),
         };
         load_native_items(&pp_quick, all, opts, tx_nq).await;
@@ -162,6 +163,7 @@ pub async fn pick_session_id(
     tokio::spawn(async move {
         let opts = IngestOptions {
             max_age_days: None,
+            min_updated_at: None,
             max_per_source: Some(50),
         };
         load_native_items(&project_path, all, opts, tx2).await;

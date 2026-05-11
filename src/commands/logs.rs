@@ -58,18 +58,6 @@ impl AmpRow {
     }
 }
 
-impl UnifiedRow {
-    fn ts(&self) -> DateTime<Utc> {
-        match self {
-            UnifiedRow::Log(e) => DateTime::parse_from_rfc3339(&e.ts_utc)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
-            UnifiedRow::Native(t) => t.updated_at,
-            UnifiedRow::Amp(a) => a.updated_at,
-        }
-    }
-}
-
 const SEPARATOR: &str = "\u{00b7}";
 
 pub struct LogsCommand {
@@ -337,8 +325,9 @@ impl LogsCommand {
         }
     }
 
-    /// Pulls rows from all three data sources, applies the user's filters,
-    /// merges, sorts desc by ts, and trims to `--limit`.
+    /// Pulls rows from all three data sources concurrently, then k-way-merges
+    /// the already-newest-first streams to take only `--limit` rows. No full
+    /// union, no global sort.
     async fn fetch_unified_rows(&self, args: &LogsArgs) -> Result<Vec<UnifiedRow>> {
         let plan = SourcePlan::from_args(args);
         // Default = current cwd. `--all` opts out, `--cwd <path>` overrides.
@@ -351,87 +340,16 @@ impl LogsCommand {
             system_env::current_dir().map(|p| p.to_string_lossy().to_string())
         };
 
-        // Logs.db rows. Over-fetch to compensate for run-pair collapsing.
-        let log_rows: Vec<LogEntry> = if plan.include_logs() {
-            let query_limit = if args.watch {
-                args.limit.saturating_mul(5)
-            } else if args.json {
-                args.limit
-            } else {
-                args.limit.saturating_mul(3)
-            };
-            let mut entries = self
-                .session_store
-                .logs()
-                .list(LogQuery {
-                    limit: query_limit,
-                    search: args.search.clone(),
-                    by: args.by.clone(),
-                    model: args.model.clone(),
-                    key_query: args.key.clone(),
-                    cwd: cwd_filter.clone(),
-                    since: args.since.clone(),
-                    until: args.until.clone(),
-                    errors_only: args.errors,
-                })
-                .await?;
-            // Run events are emitted as start+finish pairs sharing an
-            // event_group_id; collapse here too so the unified listing
-            // doesn't show both halves.
-            entries = collapse_run_events(entries, args.limit.saturating_mul(3));
-            entries
-        } else {
-            Vec::new()
-        };
+        // Run the three source fetches concurrently — they touch disjoint
+        // backends (sqlite, native session jsonl files, amp's thread dir),
+        // so the prior sequential awaits cost us ~3× the slowest source.
+        let (log_rows, native_rows, amp_rows) = tokio::try_join!(
+            fetch_logs_rows(&self.session_store, args, &plan, cwd_filter.clone()),
+            fetch_native_rows(args, &plan, cwd_filter.clone()),
+            fetch_amp_rows(args, &plan, cwd_filter.as_deref()),
+        )?;
 
-        // Native CLI sessions. Filters that don't apply (--errors, --model,
-        // --key) cause us to skip native rows entirely; user clearly wants
-        // logs.db-only output.
-        //
-        // Perf: counter-intuitively, the project-scoped ingester is slower
-        // than global on a multi-project machine — codex/gemini walk the
-        // same global tree either way, but scoped *rejects* every non-
-        // matching file (forcing the walk to continue past the cap).
-        // Global stops at cap quickly. So we always walk globally and
-        // post-filter by cwd. The 14-day age cap bounds the worst case.
-        let native_rows: Vec<Thread> = if plan.include_native() {
-            let opts = IngestOptions {
-                max_age_days: if args.since.is_some() || args.until.is_some() {
-                    None // explicit time filter takes over
-                } else {
-                    Some(14) // matches the previous `aivo context` default
-                },
-                max_per_source: Some(args.limit.saturating_mul(2).max(50)),
-            };
-            let mut all = context_ingest::ingest_native_sessions_global(opts).await?;
-            all.retain(|t| native_passes_filters(t, args, cwd_filter.as_deref()));
-            all
-        } else {
-            Vec::new()
-        };
-
-        // Amp threads: amp has no cwd concept. If the user filtered by --cwd,
-        // exclude amp from the listing entirely (it can't possibly match).
-        let amp_rows: Vec<AmpRow> = if plan.include_amp() && cwd_filter.is_none() {
-            let amp_dir = amp_threads::default_threads_dir();
-            let raw =
-                amp_threads::list_threads(&amp_dir, args.limit.saturating_mul(2).max(50)).await;
-            raw.iter()
-                .filter_map(AmpRow::from_value)
-                .filter(|a| amp_passes_filters(a, args))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        let mut merged: Vec<UnifiedRow> =
-            Vec::with_capacity(log_rows.len() + native_rows.len() + amp_rows.len());
-        merged.extend(log_rows.into_iter().map(|e| UnifiedRow::Log(Box::new(e))));
-        merged.extend(native_rows.into_iter().map(UnifiedRow::Native));
-        merged.extend(amp_rows.into_iter().map(UnifiedRow::Amp));
-        merged.sort_by_key(|r| std::cmp::Reverse(r.ts()));
-        merged.truncate(args.limit);
-        Ok(merged)
+        Ok(merge_unified(log_rows, native_rows, amp_rows, args.limit))
     }
 
     pub fn print_help() {
@@ -968,6 +886,139 @@ fn collapse_run_events(entries: Vec<LogEntry>, limit: usize) -> Vec<LogEntry> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-source fetchers. Each returns rows already sorted newest-first so the
+// k-way merge below can pop the global newest without a full sort.
+// ---------------------------------------------------------------------------
+
+async fn fetch_logs_rows(
+    store: &SessionStore,
+    args: &LogsArgs,
+    plan: &SourcePlan,
+    cwd_filter: Option<String>,
+) -> Result<Vec<LogEntry>> {
+    if !plan.include_logs() {
+        return Ok(Vec::new());
+    }
+    // Over-fetch to compensate for run-pair collapsing.
+    let query_limit = if args.watch {
+        args.limit.saturating_mul(5)
+    } else if args.json {
+        args.limit
+    } else {
+        args.limit.saturating_mul(3)
+    };
+    let entries = store
+        .logs()
+        .list(LogQuery {
+            limit: query_limit,
+            search: args.search.clone(),
+            by: args.by.clone(),
+            model: args.model.clone(),
+            key_query: args.key.clone(),
+            cwd: cwd_filter,
+            since: normalize_time_filter(args.since.as_deref()),
+            until: normalize_time_filter(args.until.as_deref()),
+            errors_only: args.errors,
+        })
+        .await?;
+    // Run events are emitted as start+finish pairs sharing an event_group_id;
+    // collapse here too so the unified listing doesn't show both halves.
+    Ok(collapse_run_events(entries, args.limit.saturating_mul(3)))
+}
+
+// Perf: counter-intuitively, the project-scoped ingester is slower than global
+// on a multi-project machine — codex/gemini walk the same global tree either
+// way, but scoped *rejects* every non-matching file (forcing the walk to
+// continue past the cap). Global stops at cap quickly. So we always walk
+// globally and post-filter by cwd. The 14-day age cap bounds the worst case.
+async fn fetch_native_rows(
+    args: &LogsArgs,
+    plan: &SourcePlan,
+    cwd_filter: Option<String>,
+) -> Result<Vec<Thread>> {
+    if !plan.include_native() {
+        return Ok(Vec::new());
+    }
+    let opts = IngestOptions {
+        max_age_days: if args.since.is_some() || args.until.is_some() {
+            None // explicit time filter takes over
+        } else {
+            Some(14) // matches the previous `aivo context` default
+        },
+        // Push --since down to the ingester so jsonl files whose mtime is
+        // older than the cutoff can be skipped without parsing. --until can't
+        // be pushed down (mtime is an upper bound on updated_at).
+        min_updated_at: args.since.as_deref().and_then(parse_loose_time),
+        max_per_source: Some(args.limit.saturating_mul(2).max(50)),
+    };
+    let mut all = context_ingest::ingest_native_sessions_global(opts).await?;
+    all.retain(|t| native_passes_filters(t, args, cwd_filter.as_deref()));
+    Ok(all)
+}
+
+// Amp threads have no cwd concept. If the user filtered by --cwd, exclude amp
+// from the listing entirely (it can't possibly match).
+async fn fetch_amp_rows(
+    args: &LogsArgs,
+    plan: &SourcePlan,
+    cwd_filter: Option<&str>,
+) -> Result<Vec<AmpRow>> {
+    if !plan.include_amp() || cwd_filter.is_some() {
+        return Ok(Vec::new());
+    }
+    let amp_dir = amp_threads::default_threads_dir();
+    let raw = amp_threads::list_threads(&amp_dir, args.limit.saturating_mul(2).max(50)).await;
+    Ok(raw
+        .iter()
+        .filter_map(AmpRow::from_value)
+        .filter(|a| amp_passes_filters(a, args))
+        .collect())
+}
+
+/// Three-way merge of newest-first streams. Pops the source with the newest
+/// head until `limit` rows are emitted — never materializes the full union.
+fn merge_unified(
+    logs: Vec<LogEntry>,
+    native: Vec<Thread>,
+    amp: Vec<AmpRow>,
+    limit: usize,
+) -> Vec<UnifiedRow> {
+    let mut logs = logs.into_iter().peekable();
+    let mut native = native.into_iter().peekable();
+    let mut amp = amp.into_iter().peekable();
+    let mut out: Vec<UnifiedRow> = Vec::with_capacity(limit);
+
+    while out.len() < limit {
+        let heads = [
+            logs.peek().map(|e| parse_log_ts(&e.ts_utc)),
+            native.peek().map(|t| t.updated_at),
+            amp.peek().map(|a| a.updated_at),
+        ];
+        let winner = heads
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, ts)| ts.map(|t| (t, i)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, i)| i);
+
+        match winner {
+            None => break,
+            Some(0) => out.push(UnifiedRow::Log(Box::new(logs.next().unwrap()))),
+            Some(1) => out.push(UnifiedRow::Native(native.next().unwrap())),
+            Some(2) => out.push(UnifiedRow::Amp(amp.next().unwrap())),
+            Some(_) => unreachable!(),
+        }
+    }
+    out
+}
+
+fn parse_log_ts(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+// ---------------------------------------------------------------------------
 // SourcePlan — translates `--by` and the strict-logs.db filters into a
 // per-source eligibility set. Centralizes the "which sources can this query
 // possibly include" decision so fetch_unified_rows stays readable.
@@ -1135,16 +1186,50 @@ fn amp_passes_filters(a: &AmpRow, args: &LogsArgs) -> bool {
     true
 }
 
-/// Best-effort time parse: tries RFC3339 first, falls back to a date-only
-/// `YYYY-MM-DD` parse. Matches the loose semantics LogStore already accepts.
+/// Best-effort time parse: tries relative durations (`2h`, `30m`, `1d`, `1w`,
+/// `45s`) first, then RFC3339, then a date-only `YYYY-MM-DD` parse. Relative
+/// values are interpreted as "ago" so `--since 2h` means "in the last 2 hours".
 fn parse_loose_time(s: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+    let trimmed = s.trim();
+    if let Some(dur) = parse_relative_duration(trimmed) {
+        return Some(Utc::now() - dur);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         return Some(dt.with_timezone(&Utc));
     }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
         return d.and_hms_opt(0, 0, 0).map(|n| Utc.from_utc_datetime(&n));
     }
     None
+}
+
+/// Parse `<int><unit>` where unit ∈ {s, m, h, d, w}. Returns None for any
+/// other shape so callers fall through to absolute-time parsers.
+fn parse_relative_duration(s: &str) -> Option<chrono::Duration> {
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    if num.is_empty() {
+        return None;
+    }
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(chrono::Duration::seconds(n)),
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        "w" => Some(chrono::Duration::weeks(n)),
+        _ => None,
+    }
+}
+
+/// Normalize a user-supplied `--since`/`--until` value to an RFC3339 string
+/// so LogStore's SQL `ts_utc >= ?` comparison works. Leaves unparsable input
+/// alone — the SQL string compare will then just match nothing, which beats
+/// silently treating `2h` as "everything".
+fn normalize_time_filter(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    parse_loose_time(raw)
+        .map(|dt| dt.to_rfc3339())
+        .or_else(|| Some(raw.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,6 +1275,7 @@ fn unified_row_to_json(row: &UnifiedRow) -> Value {
 async fn native_session_counts() -> Vec<(String, u64)> {
     let opts = IngestOptions {
         max_age_days: None,
+        min_updated_at: None,
         max_per_source: Some(10_000),
     };
     let threads = context_ingest::ingest_native_sessions_global(opts)
@@ -1350,6 +1436,76 @@ mod tests {
         assert_eq!(format_bytes(2_147_483_648), "2 GB");
         // Boundary: would round to "1024 KB" under naive formatting — promote to MB.
         assert_eq!(format_bytes(1_048_575), "1 MB");
+    }
+
+    fn test_thread(session_id: &str, ts: DateTime<Utc>) -> Thread {
+        Thread {
+            cli: "claude".into(),
+            session_id: session_id.into(),
+            source_path: String::new(),
+            topic: String::new(),
+            last_response: String::new(),
+            updated_at: ts,
+            cwd: None,
+        }
+    }
+
+    fn test_amp(id: &str, ts: DateTime<Utc>) -> AmpRow {
+        AmpRow {
+            id: id.into(),
+            title: None,
+            updated_at: ts,
+            message_count: 0,
+        }
+    }
+
+    fn unified_key(row: &UnifiedRow) -> String {
+        match row {
+            UnifiedRow::Log(e) => format!("log:{}", e.id),
+            UnifiedRow::Native(t) => format!("native:{}", t.session_id),
+            UnifiedRow::Amp(a) => format!("amp:{}", a.id),
+        }
+    }
+
+    #[test]
+    fn merge_unified_interleaves_newest_first_across_sources() {
+        let logs = vec![
+            test_entry("L1", "2026-05-01T10:00:00Z", "chat"),
+            test_entry("L2", "2026-05-01T08:00:00Z", "chat"),
+        ];
+        let native = vec![
+            test_thread("N1", "2026-05-01T09:30:00Z".parse().unwrap()),
+            test_thread("N2", "2026-05-01T07:00:00Z".parse().unwrap()),
+        ];
+        let amp = vec![test_amp("A1", "2026-05-01T09:00:00Z".parse().unwrap())];
+
+        let merged = merge_unified(logs, native, amp, 10);
+        let order: Vec<String> = merged.iter().map(unified_key).collect();
+        assert_eq!(
+            order,
+            vec!["log:L1", "native:N1", "amp:A1", "log:L2", "native:N2",]
+        );
+    }
+
+    #[test]
+    fn merge_unified_caps_at_limit() {
+        let logs = vec![
+            test_entry("L1", "2026-05-01T10:00:00Z", "chat"),
+            test_entry("L2", "2026-05-01T09:00:00Z", "chat"),
+            test_entry("L3", "2026-05-01T08:00:00Z", "chat"),
+        ];
+        let native = vec![test_thread("N1", "2026-05-01T07:00:00Z".parse().unwrap())];
+
+        let merged = merge_unified(logs, native, Vec::new(), 2);
+        assert_eq!(merged.len(), 2);
+        let order: Vec<String> = merged.iter().map(unified_key).collect();
+        assert_eq!(order, vec!["log:L1", "log:L2"]);
+    }
+
+    #[test]
+    fn merge_unified_handles_empty_sources() {
+        let merged: Vec<UnifiedRow> = merge_unified(Vec::new(), Vec::new(), Vec::new(), 5);
+        assert!(merged.is_empty());
     }
 
     #[test]

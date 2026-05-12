@@ -2257,6 +2257,13 @@ mod tests {
     /// older session in the same cwd — so two distinct run events both
     /// resolved to the same stale session. The new enumerator must
     /// include the short-prompt session.
+    ///
+    /// Unix-only: pi's per-cwd dir encoding (`list_pi_sessions_for_cwd`)
+    /// uses a Unix-path-shaped scheme (`trim '/'`, `replace '/' → '-'`).
+    /// Windows-canonicalized paths (`\\?\C:\…`) yield directory names with
+    /// `\`, `:`, `?` — invalid on NTFS — so the test can't even set up its
+    /// fixture there. Pi itself runs Unix-only so production never hits this.
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_pi_sessions_for_cwd_includes_short_prompt_session() {
         let pi_root = TempDir::new().unwrap();
@@ -2509,6 +2516,10 @@ mod tests {
 
     /// Different-cwd dirs must not leak in — pi's per-cwd encoded dir
     /// scoping must keep working with the new enumerator.
+    ///
+    /// Unix-only for the same reason as the sibling test above:
+    /// the encoded-cwd scheme is Unix-path-shaped.
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_pi_sessions_for_cwd_skips_other_cwds() {
         let pi_root = TempDir::new().unwrap();

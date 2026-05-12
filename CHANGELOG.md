@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.21.1
+
+## Fixes
+
+- `aivo share`: resolve native-CLI runs whose turns are all short.
+- `aivo share`: resolve claude runs whose turns are all short.
+
+## Improvements
+
+- `aivo share`: stream `/state` via chunked ND-JSON for end-to-end token-level live mode.
+
+---
+
 ## v0.21.0
 
 ## Features

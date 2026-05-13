@@ -8,6 +8,7 @@
 //! This module consolidates the version conversion logic that was previously
 //! duplicated across Anthropic router code, copilot_router, and chat.rs.
 
+use crate::services::provider_profile::is_openrouter_base;
 use crate::services::provider_protocol::ProviderProtocol;
 
 /// Converts Claude model version separators from hyphens to dots.
@@ -62,7 +63,7 @@ pub fn transform_model_for_openrouter(model: &str) -> String {
 /// Transforms a model name based on the provider's base URL.
 /// Currently, only OpenRouter requires transformation.
 pub fn transform_model_for_provider(base_url: &str, model: &str) -> String {
-    if base_url.contains("openrouter") {
+    if is_openrouter_base(base_url) {
         transform_model_for_openrouter(model)
     } else {
         model.to_string()

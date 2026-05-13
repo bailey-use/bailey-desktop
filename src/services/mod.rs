@@ -1,5 +1,12 @@
-//! Core services module for the aivo CLI.
-//! Provides session management and AI tool launching.
+//! Core services for the aivo CLI. The folder is flat; tiers below.
+//!
+//! - Spine: session/key storage, crypto, http, system_env.
+//! - Launch: ai_launcher + env injection + shadow homes for OAuth tools.
+//! - Routers / bridges: local HTTP proxies and protocol shape translation.
+//! - Provider metadata: known_providers, provider_protocol, provider_profile,
+//!   model_names, model_compat, models_cache. Check these before adding a
+//!   new `base_url.contains(...)` branch.
+//! - Provider glue, optional features (audio/image/video/share), utilities.
 
 pub mod ai_launcher;
 pub mod amp_bridge;

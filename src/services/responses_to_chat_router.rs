@@ -34,6 +34,7 @@ use crate::services::openai_gemini_bridge::{
 use crate::services::protocol_fallback::{
     AttemptOutcome, classify_attempt, commit_protocol_switch, protocol_candidates,
 };
+use crate::services::provider_profile::is_openrouter_base;
 use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, decode_route, is_endpoint_missing,
 };
@@ -1130,7 +1131,7 @@ pub(crate) fn transform_model_str(
     };
 
     // Then apply OpenRouter prefix if needed
-    if base_url.contains("openrouter") && !with_prefix.contains('/') {
+    if is_openrouter_base(base_url) && !with_prefix.contains('/') {
         format!("openai/{}", with_prefix)
     } else {
         with_prefix

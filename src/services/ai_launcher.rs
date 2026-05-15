@@ -820,8 +820,18 @@ impl AILauncher {
         args: &[String],
         env: HashMap<String, String>,
     ) -> Result<tokio::process::Child> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
+        // On Termux, musl-static aivo bypasses the `termux-exec` LD_PRELOAD
+        // shebang shim — so npm-installed CLIs (`#!/usr/bin/env node` …)
+        // would fail `execve()` with ENOENT on `/usr/bin/env`. Rewrite the
+        // shebang ourselves before spawning.
+        let (effective_command, effective_args_owned) =
+            match crate::services::termux_exec::rewrite_shebang(command, args) {
+                Some((c, a)) => (c, Some(a)),
+                None => (command.to_string(), None),
+            };
+        let effective_args: &[String] = effective_args_owned.as_deref().unwrap_or(args);
+        let mut cmd = Command::new(&effective_command);
+        cmd.args(effective_args)
             .envs(&env)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -836,7 +846,7 @@ impl AILauncher {
         cmd.kill_on_drop(true);
         let child = cmd
             .spawn()
-            .with_context(|| format!("Failed to spawn {}", command))?;
+            .with_context(|| format!("Failed to spawn {}", effective_command))?;
         Ok(child)
     }
 

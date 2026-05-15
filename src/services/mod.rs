@@ -91,6 +91,7 @@ pub mod stdin_io;
 pub mod symlink_util;
 pub mod system_env;
 pub mod terminal_graphics;
+pub mod termux_exec;
 pub mod usage_stats_store;
 pub mod video_gen;
 

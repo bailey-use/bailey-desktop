@@ -684,7 +684,31 @@ pub fn router_http_client_with_timeout(secs: u64) -> reqwest::Client {
     if secs > 0 {
         builder = builder.timeout(std::time::Duration::from_secs(secs));
     }
+    if should_force_ipv4() {
+        // Bind to a v4 unspecified address so the kernel rejects v6
+        // destinations immediately (EAFNOSUPPORT). reqwest+hyper then move
+        // on to the next resolved address — effectively `curl -4`. Termux
+        // on cellular routinely advertises AAAA but routes v6 poorly,
+        // hanging connect for seconds; reqwest has no Happy Eyeballs.
+        builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
+    }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Whether outbound HTTP traffic from aivo's routers should bind to IPv4
+/// only. Defaults to true on Termux; override either way with
+/// `AIVO_HTTP_IPV4_ONLY=1` / `=0`.
+fn should_force_ipv4() -> bool {
+    let env = std::env::var("AIVO_HTTP_IPV4_ONLY").ok();
+    should_force_ipv4_with(env.as_deref(), crate::services::termux_exec::is_termux())
+}
+
+fn should_force_ipv4_with(env_override: Option<&str>, is_termux: bool) -> bool {
+    match env_override.map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some(_) => false,
+        None => is_termux,
+    }
 }
 
 /// Creates a `reqwest::Client` with connection pooling for router use.
@@ -1330,5 +1354,20 @@ mod tests {
         assert!(!is_beta_header_rejection(
             r#"{"error":"rate limit exceeded"}"#
         ));
+    }
+
+    #[test]
+    fn force_ipv4_defaults_to_termux_when_env_unset() {
+        assert!(super::should_force_ipv4_with(None, true));
+        assert!(!super::should_force_ipv4_with(None, false));
+    }
+
+    #[test]
+    fn force_ipv4_env_overrides_termux_default() {
+        assert!(super::should_force_ipv4_with(Some("1"), false));
+        assert!(super::should_force_ipv4_with(Some("true"), false));
+        assert!(!super::should_force_ipv4_with(Some("0"), true));
+        assert!(!super::should_force_ipv4_with(Some("no"), true));
+        assert!(!super::should_force_ipv4_with(Some(""), true));
     }
 }

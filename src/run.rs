@@ -628,6 +628,9 @@ pub async fn run() -> ! {
             } else {
                 Vec::new()
             };
+            // Snapshot aliases at startup; edits made while serve is running
+            // require a restart (matches `aivo run`'s behavior).
+            let aliases = session_store.get_aliases().await.unwrap_or_default();
             let command = ServeCommand::new(session_store.logs());
             command
                 .execute(ServeParams {
@@ -639,6 +642,7 @@ pub async fn run() -> ! {
                     cors: serve_args.cors,
                     timeout: serve_args.timeout,
                     auth_token: serve_args.auth_token,
+                    aliases,
                 })
                 .await
         }

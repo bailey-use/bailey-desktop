@@ -1,6 +1,7 @@
 //! ServeCommand — starts a local OpenAI-compatible HTTP server.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::errors::ExitCode;
@@ -20,6 +21,7 @@ pub struct ServeParams {
     pub cors: bool,
     pub timeout: u64,
     pub auth_token: Option<String>,
+    pub aliases: HashMap<String, String>,
 }
 
 pub struct ServeCommand {
@@ -51,6 +53,7 @@ impl ServeCommand {
             cors,
             timeout,
             auth_token,
+            aliases,
         } = params;
 
         // Resolve auth token: None → no auth, Some("") → generate, Some(t) → use as-is
@@ -146,6 +149,7 @@ impl ServeCommand {
             cors,
             timeout,
             auth_token,
+            aliases,
         };
 
         let logger = match log {

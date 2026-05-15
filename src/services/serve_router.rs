@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -50,6 +51,11 @@ pub struct ServeRouterConfig {
     pub cors: bool,
     pub timeout: u64,
     pub auth_token: Option<String>,
+    /// Snapshot of model aliases taken at startup. The router rewrites
+    /// `body["model"]` against this map before any protocol-specific handler
+    /// runs; clients that POST `{"model": "<alias>", ...}` reach the real
+    /// upstream model. Edits to aliases after launch require a restart.
+    pub aliases: HashMap<String, String>,
 }
 
 pub struct ServeRouter {
@@ -152,6 +158,8 @@ impl ServeRouter {
                         cors: false,
                         timeout,
                         auth_token: None,
+                        // aliases resolved on primary before failover runs
+                        aliases: HashMap::new(),
                     }),
                     key: fk,
                     copilot_tokens: ct,
@@ -411,10 +419,15 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 
 async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     let models = fetch_models(&state.client, &state.key).await?;
-    let data: Vec<Value> = models
+    let mut data: Vec<Value> = models
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "owned_by": "aivo"}))
         .collect();
+    let mut alias_names: Vec<&String> = state.config.aliases.keys().collect();
+    alias_names.sort();
+    for name in alias_names {
+        data.push(json!({"id": name, "object": "model", "owned_by": "aivo-alias"}));
+    }
     let resp = json!({"object": "list", "data": data});
     Ok(RouterResponse::buffered(
         200,
@@ -435,9 +448,27 @@ fn parse_json_body(body_str: &str) -> std::result::Result<Value, RouterResponse>
     })
 }
 
+/// Rewrites `body["model"]` against the alias snapshot, in place. No-op when
+/// the field is missing, non-string, empty, or not an alias. Cycles are
+/// detected by `resolve_alias_in_memory` and leave the original value.
+fn apply_alias(body: &mut Value, aliases: &HashMap<String, String>) {
+    if aliases.is_empty() {
+        return;
+    }
+    let Some(model) = body.get("model").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if let Some(resolved) =
+        crate::cli_args::resolve_alias_in_memory(aliases, Some(model.to_string()))
+        && resolved != model
+    {
+        body["model"] = Value::String(resolved);
+    }
+}
+
 async fn handle_chat(request: &str, state: &ServeState) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
-    let body = match parse_json_body(body_str) {
+    let mut body = match parse_json_body(body_str) {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
@@ -450,12 +481,13 @@ async fn handle_chat(request: &str, state: &ServeState) -> Result<RouterResponse
         ));
     }
 
+    apply_alias(&mut body, &state.config.aliases);
     handle_chat_body(body, state).await
 }
 
 async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterResponse> {
     let body_str = http_utils::extract_request_body(request)?;
-    let body = match parse_json_body(body_str) {
+    let mut body = match parse_json_body(body_str) {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
@@ -467,6 +499,7 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
             br#"{"error":{"message":"Missing required field: input"}}"#.to_vec(),
         ));
     }
+    apply_alias(&mut body, &state.config.aliases);
     let original_model = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -583,11 +616,12 @@ async fn handle_embeddings(request: &str, state: &ServeState) -> Result<RouterRe
     }
 
     let body_str = http_utils::extract_request_body(request)?;
-    let body = match parse_json_body(body_str) {
+    let mut body = match parse_json_body(body_str) {
         Ok(v) => v,
         Err(r) => return Ok(r),
     };
 
+    apply_alias(&mut body, &state.config.aliases);
     send_openai_embeddings(&body, &upstream_context(state)).await
 }
 
@@ -971,6 +1005,7 @@ mod tests {
                 cors: false,
                 timeout: 300,
                 auth_token: None,
+                aliases: HashMap::new(),
             }),
             client: http_utils::router_http_client(),
             key: test_key(),
@@ -1104,6 +1139,7 @@ mod tests {
                 cors: false,
                 timeout: 300,
                 auth_token: None,
+                aliases: HashMap::new(),
             }),
             client: http_utils::router_http_client(),
             key: test_key(),
@@ -1270,6 +1306,7 @@ mod tests {
                 cors: false,
                 timeout: 300,
                 auth_token: None,
+                aliases: HashMap::new(),
             }),
             key: test_key(),
             copilot_tokens: None,
@@ -1300,6 +1337,7 @@ mod tests {
             cors: false,
             timeout: 300,
             auth_token: None,
+            aliases: HashMap::new(),
         });
 
         let entry = FailoverEntry {
@@ -1329,6 +1367,7 @@ mod tests {
                 cors: false,
                 timeout: 300,
                 auth_token: None,
+                aliases: HashMap::new(),
             }),
             key: test_key(),
             copilot_tokens: None,
@@ -1427,5 +1466,52 @@ mod tests {
         assert!(config.actual_model.is_none());
         assert!(config.max_tokens_cap.is_none());
         assert!(config.responses_api_supported.is_none());
+    }
+
+    #[test]
+    fn apply_alias_rewrites_known_alias() {
+        let aliases = HashMap::from([("fast".to_string(), "gpt-4o-mini".to_string())]);
+        let mut body = json!({"model": "fast", "messages": []});
+        apply_alias(&mut body, &aliases);
+        assert_eq!(body["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn apply_alias_passes_through_unknown_model() {
+        let aliases = HashMap::from([("fast".to_string(), "gpt-4o-mini".to_string())]);
+        let mut body = json!({"model": "claude-sonnet-4-6", "messages": []});
+        apply_alias(&mut body, &aliases);
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn apply_alias_follows_chain() {
+        let aliases = HashMap::from([
+            ("fast".to_string(), "quick".to_string()),
+            ("quick".to_string(), "gpt-4o-mini".to_string()),
+        ]);
+        let mut body = json!({"model": "fast"});
+        apply_alias(&mut body, &aliases);
+        assert_eq!(body["model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn apply_alias_no_op_when_field_missing_or_empty() {
+        let aliases = HashMap::from([("fast".to_string(), "gpt-4o-mini".to_string())]);
+
+        let mut body = json!({"messages": []});
+        apply_alias(&mut body, &aliases);
+        assert!(body.get("model").is_none());
+
+        let mut body = json!({"model": "", "messages": []});
+        apply_alias(&mut body, &aliases);
+        assert_eq!(body["model"], "");
+    }
+
+    #[test]
+    fn apply_alias_no_op_when_alias_map_empty() {
+        let mut body = json!({"model": "fast"});
+        apply_alias(&mut body, &HashMap::new());
+        assert_eq!(body["model"], "fast");
     }
 }

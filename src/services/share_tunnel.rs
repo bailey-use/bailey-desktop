@@ -154,7 +154,7 @@ pub async fn run_tunnel(
 
     // One reqwest client reused across all proxied requests; reqwest pools
     // connections to the local server so this is cheap.
-    let http = reqwest::Client::builder()
+    let http = crate::services::http_utils::aivo_http_client_builder()
         .no_proxy()
         .build()
         .context("build local http client")?;

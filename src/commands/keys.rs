@@ -544,7 +544,7 @@ async fn probe_key(key: &ApiKey) -> Result<PingStatus> {
     }
 
     let profile = provider_profile_for_key(key);
-    let client = reqwest::Client::builder()
+    let client = crate::services::http_utils::aivo_http_client_builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(PING_TIMEOUT)
         .build()?;

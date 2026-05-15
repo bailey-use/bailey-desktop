@@ -66,12 +66,12 @@ impl UpdateCommand {
 
     /// Creates a new UpdateCommand instance
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
+        let client = crate::services::http_utils::aivo_http_client_builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .context("Failed to create HTTP client")?;
 
-        let download_client = Client::builder()
+        let download_client = crate::services::http_utils::aivo_http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .read_timeout(std::time::Duration::from_secs(60))
             .build()

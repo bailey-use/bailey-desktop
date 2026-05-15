@@ -96,7 +96,7 @@ impl CopilotTokenManager {
         }
 
         // Exchange GitHub token for Copilot token
-        let client = reqwest::Client::builder()
+        let client = crate::services::http_utils::aivo_http_client_builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -145,7 +145,7 @@ impl CopilotTokenManager {
 pub async fn device_flow_login() -> Result<String> {
     use crate::style;
 
-    let client = reqwest::Client::builder()
+    let client = crate::services::http_utils::aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(30))
         .build()

@@ -674,41 +674,46 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim_start)
 }
 
+/// Shared `reqwest::ClientBuilder` for every outbound HTTP client in aivo.
+///
+/// Applies the v4-bind escape hatch: defaults on under Termux (cellular
+/// DNS64 routinely surfaces only AAAA and v6 connect stalls), overridable
+/// with `AIVO_HTTP_IPV4_ONLY=1` / `=0`. Callers layer their own timeouts,
+/// headers, and proxy settings on top.
+pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder();
+    if force_ipv4_enabled() {
+        builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
+    }
+    builder
+}
+
+fn force_ipv4_enabled() -> bool {
+    force_ipv4_with(
+        std::env::var("AIVO_HTTP_IPV4_ONLY").ok().as_deref(),
+        crate::services::termux_exec::is_termux(),
+    )
+}
+
+fn force_ipv4_with(env: Option<&str>, is_termux: bool) -> bool {
+    match env.map(str::trim) {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some(_) => false,
+        None => is_termux,
+    }
+}
+
 /// Creates a `reqwest::Client` with a configurable overall timeout.
 /// If `secs` is 0, no overall timeout is applied.
 pub fn router_http_client_with_timeout(secs: u64) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = aivo_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(std::time::Duration::from_secs(60));
     if secs > 0 {
         builder = builder.timeout(std::time::Duration::from_secs(secs));
     }
-    if should_force_ipv4() {
-        // Bind to a v4 unspecified address so the kernel rejects v6
-        // destinations immediately (EAFNOSUPPORT). reqwest+hyper then move
-        // on to the next resolved address — effectively `curl -4`. Termux
-        // on cellular routinely advertises AAAA but routes v6 poorly,
-        // hanging connect for seconds; reqwest has no Happy Eyeballs.
-        builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
-    }
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
-/// Whether outbound HTTP traffic from aivo's routers should bind to IPv4
-/// only. Defaults to true on Termux; override either way with
-/// `AIVO_HTTP_IPV4_ONLY=1` / `=0`.
-fn should_force_ipv4() -> bool {
-    let env = std::env::var("AIVO_HTTP_IPV4_ONLY").ok();
-    should_force_ipv4_with(env.as_deref(), crate::services::termux_exec::is_termux())
-}
-
-fn should_force_ipv4_with(env_override: Option<&str>, is_termux: bool) -> bool {
-    match env_override.map(str::trim) {
-        Some("1" | "true" | "yes" | "on") => true,
-        Some(_) => false,
-        None => is_termux,
-    }
 }
 
 /// Creates a `reqwest::Client` with connection pooling for router use.
@@ -1358,16 +1363,16 @@ mod tests {
 
     #[test]
     fn force_ipv4_defaults_to_termux_when_env_unset() {
-        assert!(super::should_force_ipv4_with(None, true));
-        assert!(!super::should_force_ipv4_with(None, false));
+        assert!(super::force_ipv4_with(None, true));
+        assert!(!super::force_ipv4_with(None, false));
     }
 
     #[test]
     fn force_ipv4_env_overrides_termux_default() {
-        assert!(super::should_force_ipv4_with(Some("1"), false));
-        assert!(super::should_force_ipv4_with(Some("true"), false));
-        assert!(!super::should_force_ipv4_with(Some("0"), true));
-        assert!(!super::should_force_ipv4_with(Some("no"), true));
-        assert!(!super::should_force_ipv4_with(Some(""), true));
+        assert!(super::force_ipv4_with(Some("1"), false));
+        assert!(super::force_ipv4_with(Some("true"), false));
+        assert!(!super::force_ipv4_with(Some("0"), true));
+        assert!(!super::force_ipv4_with(Some("no"), true));
+        assert!(!super::force_ipv4_with(Some(""), true));
     }
 }

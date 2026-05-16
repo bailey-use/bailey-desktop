@@ -50,7 +50,14 @@ impl ShareCommand {
         // out, they don't need a wall of flags).
         let session_id = match args.session_id.as_deref().filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
-            None => match share_picker::pick_session_id(&self.session_store, &cwd, args.all).await?
+            None => match share_picker::pick_session_id(
+                &self.session_store,
+                &cwd,
+                args.all,
+                "Share which session?",
+                "aivo logs share <id>",
+            )
+            .await?
             {
                 Some(id) => id,
                 None => return Ok(ExitCode::Success),

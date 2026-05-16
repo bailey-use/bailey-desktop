@@ -426,10 +426,31 @@ impl LogsCommand {
     }
 
     async fn show_entry(&self, args: &LogsArgs) -> Result<ExitCode> {
-        let id = args
-            .target
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Usage: aivo logs show <id>"))?;
+        // No id passed → open the picker, same UX as `aivo logs share`.
+        // Honors --all so users can scope to the current project or every
+        // project. Clean cancel exits quietly.
+        let picked;
+        let id = match args.target.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => id,
+            None => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                match crate::services::share_picker::pick_session_id(
+                    &self.session_store,
+                    &cwd,
+                    args.all,
+                    "Show which entry?",
+                    "aivo logs show <id>",
+                )
+                .await?
+                {
+                    Some(id) => {
+                        picked = id;
+                        picked.as_str()
+                    }
+                    None => return Ok(ExitCode::Success),
+                }
+            }
+        };
 
         // 1. Try logs.db first with prefix matching — `aivo logs` displays
         //    8-char ids and copy-pasting one needs to find the full row.
@@ -611,8 +632,8 @@ fn print_help_overview() {
         "List recent rows from all sources (newest first)",
     );
     logs_help_row(
-        "show <id>",
-        "Show one row in detail; accepts logs.db ids, native session ids, or T-…",
+        "show [id]",
+        "Show one row in detail; omit id to open the picker",
     );
     logs_help_row(
         "share [id]",
@@ -702,7 +723,7 @@ fn print_help_overview() {
 }
 
 fn print_help_show() {
-    println!("{} aivo logs show <ID>", style::bold("Usage:"));
+    println!("{} aivo logs show [ID]", style::bold("Usage:"));
     println!();
     println!(
         "{}",
@@ -714,8 +735,13 @@ fn print_help_show() {
         "{}",
         style::dim("Any unique id prefix works (matches the prefix shown in `aivo logs`).")
     );
+    println!("{}", style::dim("Omit the id to open the picker."));
     println!();
     println!("{}", style::bold("Examples:"));
+    println!(
+        "  {}",
+        style::dim("aivo logs show               # pick from this project")
+    );
     println!("  {}", style::dim("aivo logs show 1335c631"));
     println!("  {}", style::dim("aivo logs show T-abc123"));
 }

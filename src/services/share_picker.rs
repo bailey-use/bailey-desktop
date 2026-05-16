@@ -1,4 +1,4 @@
-//! Inline session picker for `aivo logs share` (no id passed).
+//! Inline session picker for `aivo logs share` / `aivo logs show` (no id passed).
 //!
 //! Draws straight from `fetch_unified_rows`, which already excludes `[run]`
 //! launch records and `[serve]` HTTP events from its default output — the
@@ -26,15 +26,18 @@ use crate::tui::FuzzySelect;
 const PICKER_FETCH_LIMIT: usize = 500;
 
 /// Public entrypoint. `Ok(Some(id))` = user selected, `Ok(None)` = cancelled
-/// or no items, `Err(_)` = setup or I/O failure.
+/// or no items, `Err(_)` = setup or I/O failure. `prompt` is the FuzzySelect
+/// header; `cmd_hint` is the example shown in the non-TTY error.
 pub async fn pick_session_id(
     session_store: &SessionStore,
     project_root: &Path,
     all: bool,
+    prompt: &str,
+    cmd_hint: &str,
 ) -> Result<Option<String>> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         anyhow::bail!(
-            "`aivo logs share` needs a terminal to show the picker. Pass an explicit session id, e.g. `aivo logs share <id>`."
+            "A terminal is required to show the picker. Pass an explicit id, e.g. `{cmd_hint}`."
         );
     }
 
@@ -58,17 +61,14 @@ pub async fn pick_session_id(
 
     if rows.is_empty() {
         let scope = if all { "any project" } else { "this project" };
-        println!(
-            "{}",
-            style::dim(format!("No shareable sessions found in {scope}."))
-        );
+        println!("{}", style::dim(format!("No sessions found in {scope}.")));
         return Ok(None);
     }
 
     let prompt = if all {
-        "Share which session? (all projects)".to_string()
+        format!("{prompt} (all projects)")
     } else {
-        "Share which session?".to_string()
+        prompt.to_string()
     };
 
     let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize);

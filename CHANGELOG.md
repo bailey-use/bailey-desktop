@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.21.4
+
+## Features
+
+- `aivo logs show`: open the picker when called without an id (mirrors `aivo logs share`).
+
+## Fixes
+
+- HTTP: honor system proxies (`HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`) for all outbound clients.
+- HTTP: drop the Termux IPv4-only default (let happy-eyeballs pick v6 where it's faster); keep `AIVO_HTTP_IPV4_ONLY=1` as opt-in. Surface the underlying error chain on `aivo -x` and `aivo update`.
+- TUI: keep the `FuzzySelect` redraw clean when rows contain CJK / wide characters (share, logs, run pickers).
+
+---
+
 ## v0.21.3
 
 ## Features

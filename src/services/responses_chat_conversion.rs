@@ -120,10 +120,38 @@ pub fn convert_responses_to_chat_request(
         messages.push(json!({"role": "system", "content": instructions}));
     }
 
+    // Standard Responses-API `type:"reasoning"` items sit on their own,
+    // immediately before the assistant message or function_call they belong
+    // to. Buffer their text and attach as `reasoning_content` on the next
+    // assistant-side Chat message so deepseek-thinking and similar upstreams
+    // don't reject the turn with "The reasoning_content in the thinking mode
+    // must be passed back to the API." Falls back to the non-standard
+    // `item.reasoning_content` field carried by aivo's own Chat → Responses
+    // round-trip when no standalone reasoning item was provided.
+    let mut pending_reasoning: String = String::new();
+    fn take_pending(buf: &mut String) -> Option<String> {
+        if buf.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(buf))
+        }
+    }
+
     // Convert "input" array items
     if let Some(input) = body.get("input").and_then(|v| v.as_array()) {
         for item in input {
             match item.get("type").and_then(|v| v.as_str()) {
+                Some("reasoning") => {
+                    let text = extract_reasoning_text(item);
+                    if !text.is_empty() {
+                        if pending_reasoning.is_empty() {
+                            pending_reasoning = text;
+                        } else {
+                            pending_reasoning.push('\n');
+                            pending_reasoning.push_str(&text);
+                        }
+                    }
+                }
                 Some("message") => {
                     // Validate role - only allow valid OpenAI chat completion roles
                     let role = item
@@ -139,7 +167,15 @@ pub fn convert_responses_to_chat_request(
                     let content = convert_responses_content_to_chat(item.get("content"));
                     let mut msg = json!({"role": role, "content": content});
                     if role == "assistant" {
-                        attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
+                        if let Some(rc) = take_pending(&mut pending_reasoning) {
+                            msg["reasoning_content"] = json!(rc);
+                        } else {
+                            attach_reasoning_content(
+                                &mut msg,
+                                item,
+                                config.requires_reasoning_content,
+                            );
+                        }
                     }
                     messages.push(msg);
                 }
@@ -173,7 +209,15 @@ pub fn convert_responses_to_chat_request(
                     {
                         arr.push(tool_call);
                         if last.get("reasoning_content").is_none() {
-                            attach_reasoning_content(last, item, config.requires_reasoning_content);
+                            if let Some(rc) = take_pending(&mut pending_reasoning) {
+                                last["reasoning_content"] = json!(rc);
+                            } else {
+                                attach_reasoning_content(
+                                    last,
+                                    item,
+                                    config.requires_reasoning_content,
+                                );
+                            }
                         }
                     } else {
                         let mut msg = json!({
@@ -181,7 +225,15 @@ pub fn convert_responses_to_chat_request(
                             "content": null,
                             "tool_calls": [tool_call]
                         });
-                        attach_reasoning_content(&mut msg, item, config.requires_reasoning_content);
+                        if let Some(rc) = take_pending(&mut pending_reasoning) {
+                            msg["reasoning_content"] = json!(rc);
+                        } else {
+                            attach_reasoning_content(
+                                &mut msg,
+                                item,
+                                config.requires_reasoning_content,
+                            );
+                        }
                         messages.push(msg);
                     }
                 }
@@ -283,6 +335,45 @@ fn attach_reasoning_content(msg: &mut Value, source: &Value, requires: bool) {
     if let Some(rc) = rc {
         msg["reasoning_content"] = json!(rc);
     }
+}
+
+/// Extract reasoning text from a standard Responses-API `type:"reasoning"` item.
+/// Canonical shape is `summary: [{type:"summary_text", text}]`; some upstreams
+/// place the trace in `content[*].text` or a bare `text` field, so accept both.
+/// `encrypted_content` is opaque and provider-specific — skip it.
+fn extract_reasoning_text(item: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let collect = |arr: &Value, out: &mut Vec<String>| {
+        if let Some(items) = arr.as_array() {
+            for part in items {
+                if let Some(s) = part.as_str() {
+                    if !s.is_empty() {
+                        out.push(s.to_string());
+                    }
+                } else if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    out.push(text.to_string());
+                } else if let Some(text) = part.get("reasoning").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    out.push(text.to_string());
+                }
+            }
+        }
+    };
+    if let Some(summary) = item.get("summary") {
+        collect(summary, &mut parts);
+    }
+    if let Some(content) = item.get("content") {
+        collect(content, &mut parts);
+    }
+    if let Some(text) = item.get("text").and_then(|v| v.as_str())
+        && !text.is_empty()
+    {
+        parts.push(text.to_string());
+    }
+    parts.join("\n")
 }
 
 /// Convert a Responses-API content value (string or array of `input_text` /
@@ -569,9 +660,82 @@ pub fn convert_chat_response_to_responses_sse(
         String::new()
     };
 
+    // Emit a standard `type:"reasoning"` output item before any message or
+    // function_call items. Codex CLI parses output items with typed structs,
+    // so a stray `reasoning_content` field tucked onto a function_call would
+    // be stripped on the round-trip; only a real reasoning item survives.
+    // Provider quirk fixes still rely on the non-standard field below — emit
+    // both so legacy paths and Codex both work.
+    let mut next_output_index: usize = 0;
+    if !reasoning_content.is_empty() {
+        let rs_id = gen_id("rs");
+        sse.push_str(&sse_event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "response_id": resp_id, "output_index": next_output_index,
+                "item": {
+                    "id": rs_id, "type": "reasoning",
+                    "summary": []
+                }
+            }),
+        ));
+        sse.push_str(&sse_event(
+            "response.reasoning_summary_part.added",
+            &json!({
+                "type": "response.reasoning_summary_part.added",
+                "response_id": resp_id, "item_id": rs_id,
+                "output_index": next_output_index, "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}
+            }),
+        ));
+        sse.push_str(&sse_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "response_id": resp_id, "item_id": rs_id,
+                "output_index": next_output_index, "summary_index": 0,
+                "delta": reasoning_content
+            }),
+        ));
+        sse.push_str(&sse_event(
+            "response.reasoning_summary_text.done",
+            &json!({
+                "type": "response.reasoning_summary_text.done",
+                "response_id": resp_id, "item_id": rs_id,
+                "output_index": next_output_index, "summary_index": 0,
+                "text": reasoning_content
+            }),
+        ));
+        sse.push_str(&sse_event(
+            "response.reasoning_summary_part.done",
+            &json!({
+                "type": "response.reasoning_summary_part.done",
+                "response_id": resp_id, "item_id": rs_id,
+                "output_index": next_output_index, "summary_index": 0,
+                "part": {"type": "summary_text", "text": reasoning_content}
+            }),
+        ));
+        let reasoning_done_item = json!({
+            "id": rs_id, "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning_content}]
+        });
+        sse.push_str(&sse_event(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "response_id": resp_id, "output_index": next_output_index,
+                "item": reasoning_done_item.clone()
+            }),
+        ));
+        output_items.push(reasoning_done_item);
+        next_output_index += 1;
+    }
+
     if !tool_calls.is_empty() {
         // Tool call response — each tool call becomes a function_call output item
-        for (i, tc) in tool_calls.iter().enumerate() {
+        for (offset, tc) in tool_calls.iter().enumerate() {
+            let i = next_output_index + offset;
             // call_id = the Chat Completions tool call ID (referenced in tool results)
             let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
             // item_id = a fresh item identifier within this response
@@ -639,12 +803,13 @@ pub fn convert_chat_response_to_responses_sse(
         // Text message response
         let msg_id = gen_id("msg");
         let has_reasoning = !reasoning_content.is_empty();
+        let i = next_output_index;
 
         sse.push_str(&sse_event(
             "response.output_item.added",
             &json!({
                 "type": "response.output_item.added",
-                "response_id": resp_id, "output_index": 0,
+                "response_id": resp_id, "output_index": i,
                 "item": {
                     "id": msg_id, "type": "message",
                     "status": "in_progress", "role": "assistant", "content": []
@@ -657,7 +822,7 @@ pub fn convert_chat_response_to_responses_sse(
             &json!({
                 "type": "response.content_part.added",
                 "response_id": resp_id, "item_id": msg_id,
-                "output_index": 0, "content_index": 0,
+                "output_index": i, "content_index": 0,
                 "part": {"type": "output_text", "text": ""}
             }),
         ));
@@ -667,7 +832,7 @@ pub fn convert_chat_response_to_responses_sse(
                 &json!({
                     "type": "response.output_text.delta",
                     "response_id": resp_id, "item_id": msg_id,
-                    "output_index": 0, "content_index": 0, "delta": content
+                    "output_index": i, "content_index": 0, "delta": content
                 }),
             ));
         }
@@ -676,7 +841,7 @@ pub fn convert_chat_response_to_responses_sse(
             &json!({
                 "type": "response.output_text.done",
                 "response_id": resp_id, "item_id": msg_id,
-                "output_index": 0, "content_index": 0, "text": content
+                "output_index": i, "content_index": 0, "text": content
             }),
         ));
         sse.push_str(&sse_event(
@@ -684,19 +849,21 @@ pub fn convert_chat_response_to_responses_sse(
             &json!({
                 "type": "response.content_part.done",
                 "response_id": resp_id, "item_id": msg_id,
-                "output_index": 0, "content_index": 0,
+                "output_index": i, "content_index": 0,
                 "part": {"type": "output_text", "text": content}
             }),
         ));
 
-        // Reasoning part (if present)
+        // Legacy non-standard reasoning content part. Kept so existing aivo
+        // round-trips that look for it keep working; Codex CLI ignores it and
+        // reads from the standalone reasoning item emitted above.
         if has_reasoning {
             sse.push_str(&sse_event(
                 "response.content_part.added",
                 &json!({
                     "type": "response.content_part.added",
                     "response_id": resp_id, "item_id": msg_id,
-                    "output_index": 0, "content_index": 1,
+                    "output_index": i, "content_index": 1,
                     "part": {"type": "reasoning", "reasoning": ""}
                 }),
             ));
@@ -705,7 +872,7 @@ pub fn convert_chat_response_to_responses_sse(
                 &json!({
                     "type": "response.content_part.done",
                     "response_id": resp_id, "item_id": msg_id,
-                    "output_index": 0, "content_index": 1,
+                    "output_index": i, "content_index": 1,
                     "part": {"type": "reasoning", "reasoning": reasoning_content}
                 }),
             ));
@@ -725,7 +892,7 @@ pub fn convert_chat_response_to_responses_sse(
             "response.output_item.done",
             &json!({
                 "type": "response.output_item.done",
-                "response_id": resp_id, "output_index": 0, "item": done_item
+                "response_id": resp_id, "output_index": i, "item": done_item
             }),
         ));
         output_items.push(json!({
@@ -1208,6 +1375,197 @@ mod tests {
         assert_eq!(msgs[2]["tool_call_id"], "call_a");
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "call_b");
+    }
+
+    fn default_test_config() -> ResponsesToChatRouterConfig {
+        ResponsesToChatRouterConfig {
+            target_base_url: "https://example.com/v1".to_string(),
+            api_key: String::new(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+            aivo_prefix_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_reasoning_item_attaches_to_following_function_call() {
+        // Codex emits `type:"reasoning"` items immediately before the
+        // function_call they belong to. The converter must lift the summary
+        // text onto the assistant tool_call message as `reasoning_content`,
+        // or deepseek-thinking 400s with "must be passed back to the API".
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "step by step plan"}]
+                },
+                {"type": "function_call", "call_id": "call_x", "name": "shell", "arguments": "{}"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["tool_calls"][0]["id"], "call_x");
+        assert_eq!(msgs[0]["reasoning_content"], "step by step plan");
+    }
+
+    #[test]
+    fn test_convert_request_reasoning_item_attaches_to_following_assistant_message() {
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "reasoned"}]
+                },
+                {"type": "message", "role": "assistant", "content": "final answer"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(msgs[0]["content"], "final answer");
+        assert_eq!(msgs[0]["reasoning_content"], "reasoned");
+    }
+
+    #[test]
+    fn test_convert_request_multiple_reasoning_items_join_with_newline() {
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["reasoning_content"], "first\nsecond");
+    }
+
+    #[test]
+    fn test_convert_request_reasoning_only_attaches_to_first_following_turn() {
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "trace"}]},
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "ok"},
+                {"type": "message", "role": "assistant", "content": "follow up"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        // First assistant turn carries reasoning; later assistant turn must not inherit it.
+        assert_eq!(msgs[0]["reasoning_content"], "trace");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert!(msgs[2].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn test_convert_request_reasoning_falls_back_to_content_array() {
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "fallback"}]
+                },
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["reasoning_content"], "fallback");
+    }
+
+    #[test]
+    fn test_convert_request_reasoning_attaches_to_first_of_parallel_tool_calls() {
+        // Parallel function_calls coalesce into one assistant message. The
+        // buffered reasoning attaches to the coalesced message via the first
+        // function_call only — subsequent appends must not overwrite it.
+        let body = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "shared trace"}]},
+                {"type": "function_call", "call_id": "a", "name": "f", "arguments": "{}"},
+                {"type": "function_call", "call_id": "b", "name": "g", "arguments": "{}"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &default_test_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let tool_calls = msgs[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(msgs[0]["reasoning_content"], "shared trace");
+    }
+
+    #[test]
+    fn test_convert_response_sse_emits_standard_reasoning_item_before_tool_calls() {
+        // Codex CLI parses output items with typed structs; reasoning must
+        // travel as a standalone `type:"reasoning"` item so it survives the
+        // round-trip. The legacy `function_call.reasoning_content` field is
+        // still emitted (Codex ignores it), driving aivo's own self-bridged
+        // path when no separate reasoning item is read.
+        let chat = json!({
+            "id": "chatcmpl-r",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_content": "let me think...",
+                    "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "run", "arguments": "{}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        });
+
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "deepseek-reasoner");
+
+        // The first `output_item.added` is a reasoning item with summary text,
+        // at output_index 0. function_call comes after at output_index 1.
+        assert!(
+            sse.contains("\"type\":\"reasoning\""),
+            "expected standalone reasoning item in SSE stream"
+        );
+        assert!(sse.contains("response.reasoning_summary_text.delta"));
+        assert!(sse.contains("response.reasoning_summary_text.done"));
+        assert!(sse.contains("\"text\":\"let me think...\""));
+
+        // function_call follows at output_index 1
+        assert!(
+            sse.contains("\"output_index\":1") && sse.contains("\"type\":\"function_call\""),
+            "function_call must appear at output_index 1 after the reasoning item"
+        );
+    }
+
+    #[test]
+    fn test_convert_response_sse_no_reasoning_item_when_empty() {
+        let chat = json!({
+            "id": "chatcmpl-nr",
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4");
+        assert!(
+            !sse.contains("response.reasoning_summary_text"),
+            "no reasoning events expected when message has no reasoning_content"
+        );
+        // Text message item still appears at output_index 0
+        assert!(sse.contains("\"output_index\":0") && sse.contains("\"type\":\"message\""));
     }
 
     #[test]

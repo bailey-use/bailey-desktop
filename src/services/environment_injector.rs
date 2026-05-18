@@ -599,6 +599,18 @@ impl EnvironmentInjector {
             for slot in CLAUDE_DEFAULT_MODEL_SLOTS {
                 env.insert(slot.to_string(), anthropic_model.clone());
             }
+            // Surface the routed model in /model picker. Skip Direct mode —
+            // slot values are already claude-* ids the picker labels natively.
+            if !matches!(mode, ConnectionMode::Direct { .. }) {
+                env.insert(
+                    "ANTHROPIC_CUSTOM_MODEL_OPTION".to_string(),
+                    anthropic_model.clone(),
+                );
+                env.insert(
+                    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION".to_string(),
+                    format!("Routed via aivo ({})", key.display_name()),
+                );
+            }
         }
 
         // Per-slot overrides win over the fan-out from `model`. Each slot is
@@ -2157,6 +2169,79 @@ mod tests {
             Some(&"claude-sonnet-4-6".to_string()),
             "dotted version should be normalized for Direct mode",
         );
+    }
+
+    #[test]
+    fn for_claude_routed_mode_surfaces_model_in_picker() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.example.com/v1");
+        let env = injector.for_claude(&key, Some("deepseek-chat"));
+
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+            Some(&"deepseek-chat".to_string()),
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"),
+            Some(&"Routed via aivo (test-key)".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_routed_mode_includes_max_context_suffix_in_picker() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.example.com/v1");
+        let overrides = ClaudeModelOverrides {
+            max_context: Some("1m".to_string()),
+            ..Default::default()
+        };
+        let env = injector.for_claude_with_overrides(&key, Some("deepseek-chat"), &overrides);
+
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION"),
+            Some(&"deepseek-chat[1m]".to_string()),
+        );
+    }
+
+    #[test]
+    fn for_claude_direct_anthropic_mode_skips_custom_model_option() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.anthropic.com");
+        let env = injector.for_claude(&key, Some("claude-sonnet-4-6"));
+
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"));
+    }
+
+    #[test]
+    fn for_claude_oauth_skips_custom_model_option() {
+        use crate::services::claude_oauth::{CLAUDE_OAUTH_SENTINEL, ClaudeOAuthCredential};
+        let creds = ClaudeOAuthCredential {
+            token: "sk-ant-oat01-TEST".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let key = ApiKey::new_with_protocol(
+            "id".into(),
+            "work".into(),
+            CLAUDE_OAUTH_SENTINEL.into(),
+            None,
+            creds.to_json().unwrap(),
+        );
+        let env = EnvironmentInjector::new().for_claude(&key, Some("claude-opus-4-7"));
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
+    }
+
+    #[test]
+    fn for_claude_routed_mode_without_model_skips_custom_model_option() {
+        let _guard = debug_off_guard();
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.example.com/v1");
+        let env = injector.for_claude(&key, None);
+
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
     }
 
     #[test]

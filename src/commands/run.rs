@@ -356,7 +356,7 @@ impl RunCommand {
         // synthesize a loopback key pinned to OpenAI Chat Completions on
         // every tool's protocol (llama-server speaks nothing else).
         let hf_active = match model.as_deref() {
-            Some(m) if huggingface::is_huggingface_ref(m) => {
+            Some(m) if huggingface::is_hf_or_local_gguf(m) => {
                 let hf_ref = huggingface::parse_hf_ref(m)?;
                 let port = if dry_run {
                     eprintln!(

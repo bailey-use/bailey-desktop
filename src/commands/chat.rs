@@ -221,7 +221,7 @@ impl ChatCommand {
 
         // HF takeover: bypass key resolution + last_selection persistence.
         let (mut key, model_flag, hf_active) = match model_flag.as_deref() {
-            Some(m) if huggingface::is_huggingface_ref(m) => {
+            Some(m) if huggingface::is_hf_or_local_gguf(m) => {
                 let hf_ref = huggingface::parse_hf_ref(m)?;
                 let port = huggingface::ensure_ready(&hf_ref).await?;
                 let synthetic = ApiKey::new_with_protocol(

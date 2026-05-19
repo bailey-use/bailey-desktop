@@ -164,10 +164,17 @@ pub struct HfListArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct HfPullArgs {
-    /// `hf:<owner>/<repo>[:<quant>]` short ref or a full
-    /// `https://huggingface.co/<owner>/<repo>` URL.
-    #[arg(value_name = "REF")]
+    /// `hf:<owner>/<repo>[:<quant>]` short ref, a full
+    /// `https://huggingface.co/<owner>/<repo>` URL, or a local `.gguf`
+    /// path to import into the cache.
+    #[arg(value_name = "REF_OR_PATH")]
     pub reference: String,
+
+    /// When importing a local file, override the auto-derived
+    /// `<owner>/<repo>` cache name (default: `local/<filename-stem>`).
+    /// Ignored for `hf:` / URL refs.
+    #[arg(long = "as", value_name = "OWNER/REPO")]
+    pub as_repo: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

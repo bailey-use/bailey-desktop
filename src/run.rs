@@ -67,7 +67,7 @@ fn fast_crypto_guard() {}
 fn is_hf_takeover(model: Option<&str>) -> bool {
     use services::huggingface;
     match model {
-        Some(m) => huggingface::is_huggingface_ref(m) || huggingface::is_bare_hf_picker_trigger(m),
+        Some(m) => huggingface::is_hf_or_local_gguf(m) || huggingface::is_bare_hf_picker_trigger(m),
         None => false,
     }
 }
@@ -198,12 +198,12 @@ pub async fn run() -> ! {
         Commands::Chat(chat_args) => {
             maybe_init_http_debug(&chat_args.debug).await;
             let key_explicit = chat_args.key.is_some();
-            // Reject non-HF positionals up-front, matching `aivo serve`.
+            // Reject non-HF, non-local-path positionals up-front, matching `aivo serve`.
             if let Some(ref raw) = chat_args.reference
                 && !is_hf_takeover(Some(raw.as_str()))
             {
                 eprintln!(
-                    "{} `aivo chat <REF>` only accepts a HuggingFace ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`). Got: {}",
+                    "{} `aivo chat <REF>` only accepts a HuggingFace ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`) or a local `.gguf` path. Got: {}",
                     style::red("Error:"),
                     raw,
                 );

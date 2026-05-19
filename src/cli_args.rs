@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::constants::{KNOWN_TOOLS, RESERVED_ALIAS_NAMES};
 use crate::services::environment_injector::{AmpModeModels, ClaudeSlotFlags};
-use crate::services::huggingface::is_huggingface_ref;
+use crate::services::huggingface::is_hf_or_local_gguf;
 use crate::services::session_store::BundleAlias;
 
 pub(crate) fn rewrite_cli_args(
@@ -683,10 +683,8 @@ pub(crate) fn extract_aivo_flags(
             if max_context.is_none() {
                 max_context = Some(value);
             }
-        } else if model.is_none() && is_huggingface_ref(arg) {
-            // Positional HF ref → lift it into `-m`. Lets users type
-            // `aivo codex hf:Qwen/...` instead of `aivo codex -m hf:...`.
-            // Explicit `-m` wins (covered by the `model.is_none()` guard).
+        } else if model.is_none() && is_hf_or_local_gguf(arg) {
+            // Lift positional `hf:`/URL/local-path into `-m`. Explicit `-m` wins.
             model = Some(arg.clone());
         } else {
             remaining_args.push(arg.clone());

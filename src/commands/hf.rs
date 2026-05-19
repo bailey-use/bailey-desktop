@@ -8,7 +8,7 @@ use crate::cli::{HfArgs, HfCleanArgs, HfListArgs, HfPullArgs, HfRmArgs, HfSubcom
 use crate::errors::ExitCode;
 use crate::services::huggingface::{
     self, CachedModel, CachedRepo, ensure_cached, format_modified_ago, format_size,
-    is_huggingface_ref, list_cached_models, list_cached_repos, parse_hf_ref, remove_all_cached,
+    is_hf_or_local_gguf, list_cached_models, list_cached_repos, parse_hf_ref, remove_all_cached,
     remove_cached_repo,
 };
 use crate::style;
@@ -58,7 +58,10 @@ impl HfCommand {
             "list [--verbose]",
             "Show cached repos (default; or files with --verbose)",
         );
-        row("pull <ref>", "Pre-download a GGUF for future runs");
+        row(
+            "pull <ref|path>",
+            "Download a HF GGUF, or import a local `.gguf` into the cache",
+        );
         row(
             "rm <repo> [--quant <q>]",
             "Delete one quant (or whole repo with --all)",
@@ -71,6 +74,8 @@ impl HfCommand {
             "aivo hf list --verbose",
             "aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
             "aivo hf pull hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M",
+            "aivo hf pull ~/Downloads/Llama-3.2-3B-Instruct-Q5_K_M.gguf",
+            "aivo hf pull ./my-model.gguf --as me/my-model",
             "aivo hf rm bartowski/Llama-3.2-3B-Instruct-GGUF --quant Q5_K_M",
             "aivo hf rm bartowski/Llama-3.2-3B-Instruct-GGUF --all -y",
             "aivo hf clean -y",
@@ -220,12 +225,18 @@ fn quant_summary(r: &CachedRepo) -> String {
 
 async fn pull_action(args: HfPullArgs) -> Result<ExitCode> {
     let reference = args.reference;
-    if !is_huggingface_ref(&reference) {
+    if !is_hf_or_local_gguf(&reference) {
         anyhow::bail!(
-            "`{reference}` is not a HuggingFace reference. Pass `hf:<owner>/<repo>[:<quant>]` or a https://huggingface.co/<owner>/<repo> URL."
+            "`{reference}` is not a HuggingFace reference or local `.gguf` path. \
+             Pass `hf:<owner>/<repo>[:<quant>]`, a https://huggingface.co/<owner>/<repo> URL, or a path ending in `.gguf`."
         );
     }
-    let hf_ref = parse_hf_ref(&reference)?;
+    let mut hf_ref = parse_hf_ref(&reference)?;
+    if let Some(as_repo) = args.as_repo {
+        apply_as_repo(&mut hf_ref, as_repo)?;
+    }
+
+    let was_local = hf_ref.is_local();
     let cached = ensure_cached(&hf_ref).await?;
     let launch_ref = cached.launch_ref();
     if cached.was_cached {
@@ -237,8 +248,9 @@ async fn pull_action(args: HfPullArgs) -> Result<ExitCode> {
         );
     } else {
         eprintln!(
-            "  {} Cached `{}` ({}).",
+            "  {} {} `{}` ({}).",
             style::success_symbol(),
+            if was_local { "Imported" } else { "Cached" },
             cached.repo,
             format_size(cached.size_bytes),
         );
@@ -249,6 +261,18 @@ async fn pull_action(args: HfPullArgs) -> Result<ExitCode> {
         style::cyan(format!("-m {launch_ref}"))
     );
     Ok(ExitCode::Success)
+}
+
+fn apply_as_repo(hf_ref: &mut huggingface::HfModelRef, as_repo: String) -> Result<()> {
+    if !hf_ref.is_local() {
+        anyhow::bail!("`--as` only applies to local file imports, not `hf:` / URL refs");
+    }
+    let segments: Vec<&str> = as_repo.split('/').collect();
+    if segments.len() != 2 || segments[0].is_empty() || segments[1].is_empty() {
+        anyhow::bail!("`--as` expects `<owner>/<repo>`, got `{as_repo}`");
+    }
+    hf_ref.repo = as_repo;
+    Ok(())
 }
 
 fn rm_action(args: HfRmArgs) -> Result<ExitCode> {

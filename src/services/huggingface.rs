@@ -37,6 +37,9 @@ pub struct HfModelRef {
     pub file: Option<String>,
     /// `None` collapses to `main`.
     pub revision: Option<String>,
+    /// `Some` for local `.gguf` paths; `None` for `hf:` / URL refs.
+    /// Read via `is_local()`; `ensure_cached` dispatches on it.
+    pub(crate) local_source: Option<PathBuf>,
 }
 
 impl HfModelRef {
@@ -47,17 +50,88 @@ impl HfModelRef {
             .unwrap_or(&self.repo)
             .to_string()
     }
+
+    pub fn is_local(&self) -> bool {
+        self.local_source.is_some()
+    }
 }
 
 pub fn is_huggingface_ref(model: &str) -> bool {
     model.starts_with(HF_URL_PREFIX) || model.starts_with(HF_SHORT_PREFIX)
 }
 
+/// True for arguments that should be resolved as a filesystem path
+/// rather than an `hf:` / URL ref. Anchored by either a path-like
+/// prefix (`/`, `./`, `../`, `~/`, `~`, or `C:\`-style on Windows) or
+/// a `.gguf` suffix.
+pub fn looks_like_local_gguf_path(s: &str) -> bool {
+    if s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
+        || s == "~"
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if s.starts_with(".\\") || s.starts_with("..\\") || s.contains(":\\") {
+            return true;
+        }
+    }
+    is_gguf_name(s)
+}
+
+/// True for any string that should route through the HF/llama-server
+/// flow — `hf:` short refs, `https://huggingface.co/...` URLs, and
+/// local `.gguf` paths.
+pub fn is_hf_or_local_gguf(s: &str) -> bool {
+    is_huggingface_ref(s) || looks_like_local_gguf_path(s)
+}
+
 pub fn parse_hf_ref(input: &str) -> Result<HfModelRef> {
+    // HF-form check wins over `looks_like_local_gguf_path` because a
+    // URL like `.../resolve/main/foo.gguf` matches both predicates.
     if let Some(rest) = input.strip_prefix(HF_SHORT_PREFIX) {
         return parse_hf_short(rest, input);
     }
+    if input.starts_with(HF_URL_PREFIX) {
+        return parse_hf_url(input);
+    }
+    if looks_like_local_gguf_path(input) {
+        return parse_local_path(input);
+    }
     parse_hf_url(input)
+}
+
+/// Build an HF ref pointing at a user-supplied `.gguf` on disk. The
+/// returned `repo` defaults to `local/<filename-stem-minus-quant>`;
+/// callers (e.g. `aivo hf pull --as`) can mutate it before `ensure_cached`.
+fn parse_local_path(input: &str) -> Result<HfModelRef> {
+    let path = system_env::expand_tilde(input);
+    if !path.exists() {
+        anyhow::bail!("No such file: {}", path.display());
+    }
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Path has no filename: {}", path.display()))?;
+    if !is_gguf_name(basename) {
+        anyhow::bail!(
+            "Only `.gguf` files can be imported (got `{basename}`). \
+             Pi-style consolidated models or safetensors aren't supported."
+        );
+    }
+    let (derived_stem, quant) = split_repo_and_quant(basename);
+    let basename = basename.to_string();
+    let repo = format!("local/{derived_stem}");
+    Ok(HfModelRef {
+        repo,
+        quant,
+        file: Some(basename),
+        revision: None,
+        local_source: Some(path),
+    })
 }
 
 fn parse_hf_short(rest: &str, original: &str) -> Result<HfModelRef> {
@@ -86,6 +160,7 @@ fn parse_hf_short(rest: &str, original: &str) -> Result<HfModelRef> {
         quant,
         file: None,
         revision: None,
+        local_source: None,
     })
 }
 
@@ -118,6 +193,7 @@ fn parse_hf_url(url: &str) -> Result<HfModelRef> {
             quant: None,
             file: None,
             revision: None,
+            local_source: None,
         });
     }
 
@@ -141,7 +217,7 @@ fn parse_hf_url(url: &str) -> Result<HfModelRef> {
         .copied()
         .filter(|s| !s.is_empty())
         .with_context(|| format!("HuggingFace file URL is missing the filename: {url}"))?;
-    if !basename.to_ascii_lowercase().ends_with(".gguf") {
+    if !is_gguf_name(basename) {
         anyhow::bail!(
             "Only GGUF files are supported for direct HuggingFace runs (got `{basename}`). \
              v1 doesn't auto-convert safetensors."
@@ -153,22 +229,36 @@ fn parse_hf_url(url: &str) -> Result<HfModelRef> {
         quant: quant_from_filename(basename),
         file: Some(file_path),
         revision: (!revision.is_empty() && revision != "main").then(|| revision.to_string()),
+        local_source: None,
     })
 }
 
-/// Splits on `-` and `.` to catch both `Model-Q4_K_M.gguf` and
-/// `Model.Q4_K_M.gguf` naming conventions.
-pub fn quant_from_filename(file: &str) -> Option<String> {
-    let stem = file
+/// Allocation-free `.gguf`/`.GGUF` suffix check.
+fn is_gguf_name(s: &str) -> bool {
+    s.len() >= 5 && s[s.len() - 5..].eq_ignore_ascii_case(".gguf")
+}
+
+/// Splits `Model-Q5_K_M.gguf` → (`Model`, Some(`Q5_K_M`)). Handles both
+/// `-` and `.` separators. Returns `(stem, None)` when no quant tag is
+/// recognized.
+fn split_repo_and_quant(filename: &str) -> (&str, Option<String>) {
+    let stem = filename
         .strip_suffix(".gguf")
-        .or_else(|| file.strip_suffix(".GGUF"))?;
-    let last = stem.rsplit(['-', '.']).next()?;
-    let upper = last.to_ascii_uppercase();
+        .or_else(|| filename.strip_suffix(".GGUF"))
+        .unwrap_or(filename);
+    let Some(idx) = stem.rfind(['-', '.']) else {
+        return (stem, None);
+    };
+    let upper = stem[idx + 1..].to_ascii_uppercase();
     if upper.starts_with('Q') || upper.starts_with("IQ") || upper == "F16" || upper == "BF16" {
-        Some(upper)
+        (&stem[..idx], Some(upper))
     } else {
-        None
+        (stem, None)
     }
+}
+
+pub fn quant_from_filename(file: &str) -> Option<String> {
+    split_repo_and_quant(file).1
 }
 
 pub fn detect_binary() -> Option<PathBuf> {
@@ -310,8 +400,12 @@ pub fn local_openai_base_url(port: u16) -> String {
 
 /// Cache-first: skips the HF tree API call when the file is already on
 /// disk. Separate from [`ensure_ready`] so `aivo hf pull` can populate
-/// the cache without spawning anything.
+/// the cache without spawning anything. For local-path refs, imports
+/// from disk instead of downloading.
 pub async fn ensure_cached(model: &HfModelRef) -> Result<CachedFile> {
+    if let Some(src) = &model.local_source {
+        return import_into_cache(src, &model.repo);
+    }
     if let Some(cached) = lookup_cached(model) {
         return Ok(cached);
     }
@@ -367,6 +461,63 @@ pub async fn ensure_cached(model: &HfModelRef) -> Result<CachedFile> {
     })
 }
 
+/// The local-source arm of [`ensure_cached`]. Hardlinks the source
+/// into the cache under `<repo>/<basename>`; falls back to a copy
+/// across filesystems. Refuses to overwrite a different file of the
+/// same name (likely a separate model) with a clear `aivo hf rm` hint.
+fn import_into_cache(src: &Path, repo: &str) -> Result<CachedFile> {
+    let basename = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Path has no filename: {}", src.display()))?
+        .to_string();
+    let meta =
+        std::fs::metadata(src).with_context(|| format!("Cannot stat `{}`", src.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("`{}` is not a regular file", src.display());
+    }
+    let size_bytes = meta.len();
+
+    let dest = local_cache_path(repo, "main", &basename)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create cache dir {}", parent.display()))?;
+    }
+
+    let already_there = match std::fs::metadata(&dest) {
+        Ok(m) if m.len() == size_bytes => true,
+        Ok(m) => {
+            anyhow::bail!(
+                "A different `{basename}` ({} bytes) already exists at {}. \
+                 Remove it first with `aivo hf rm {repo} --all -y`.",
+                m.len(),
+                dest.display()
+            );
+        }
+        Err(_) => false,
+    };
+
+    if !already_there {
+        // Same-filesystem hardlink is instant and disk-free. Falls back
+        // to a regular copy across filesystems or on filesystems that
+        // reject cross-directory links (e.g. some FUSE mounts).
+        if std::fs::hard_link(src, &dest).is_err() {
+            std::fs::copy(src, &dest).with_context(|| {
+                format!("Failed to copy {} → {}", src.display(), dest.display())
+            })?;
+        }
+    }
+
+    Ok(CachedFile {
+        repo: repo.to_string(),
+        revision: "main".to_string(),
+        filename: basename,
+        size_bytes,
+        path: dest,
+        was_cached: already_there,
+    })
+}
+
 /// Synchronous, silent local-cache probe; the fast path inside
 /// `ensure_cached`/`ensure_ready`.
 pub fn lookup_cached(model: &HfModelRef) -> Option<CachedFile> {
@@ -397,7 +548,7 @@ pub fn lookup_cached(model: &HfModelRef) -> Option<CachedFile> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            !name.starts_with('@') && name.to_ascii_lowercase().ends_with(".gguf")
+            !name.starts_with('@') && is_gguf_name(&name)
         })
         .collect();
     if entries.is_empty() {
@@ -611,7 +762,7 @@ async fn resolve_gguf_file(model: &HfModelRef) -> Result<ResolvedGgufFile> {
 
         let gguf: Vec<&TreeEntry> = entries
             .iter()
-            .filter(|e| e.kind == "file" && e.path.to_ascii_lowercase().ends_with(".gguf"))
+            .filter(|e| e.kind == "file" && is_gguf_name(&e.path))
             .collect();
         if gguf.is_empty() {
             let basename = current
@@ -1060,7 +1211,7 @@ pub fn list_cached_models() -> Vec<CachedModel> {
         };
         for file_entry in files.flatten() {
             let on_disk = file_entry.file_name().to_string_lossy().into_owned();
-            if !on_disk.to_ascii_lowercase().ends_with(".gguf") {
+            if !is_gguf_name(&on_disk) {
                 continue;
             }
             let (revision, logical_filename) = parse_on_disk_filename(&on_disk);
@@ -1506,6 +1657,7 @@ mod tests {
             quant: None,
             file: None,
             revision: None,
+            local_source: None,
         };
         assert_eq!(r.display_model_name(), "Llama-3.2-3B-Instruct-GGUF");
     }
@@ -1701,6 +1853,87 @@ mod tests {
             m.launch_ref(),
             "https://huggingface.co/owner/repo/resolve/main/subdir/model-Q4_K_M.gguf"
         );
+    }
+
+    #[test]
+    fn split_repo_and_quant_extracts_dash_suffix() {
+        let (stem, q) = split_repo_and_quant("Llama-3.2-3B-Instruct-Q5_K_M.gguf");
+        assert_eq!(stem, "Llama-3.2-3B-Instruct");
+        assert_eq!(q.as_deref(), Some("Q5_K_M"));
+    }
+
+    #[test]
+    fn split_repo_and_quant_extracts_dot_suffix() {
+        let (stem, q) = split_repo_and_quant("Model.Q4_K_M.gguf");
+        assert_eq!(stem, "Model");
+        assert_eq!(q.as_deref(), Some("Q4_K_M"));
+    }
+
+    #[test]
+    fn split_repo_and_quant_no_quant_tag() {
+        let (stem, q) = split_repo_and_quant("custom-model.gguf");
+        assert_eq!(stem, "custom-model");
+        assert_eq!(q, None);
+    }
+
+    #[test]
+    fn split_repo_and_quant_accepts_iq_and_f16() {
+        assert_eq!(
+            split_repo_and_quant("Phi-IQ3_M.gguf").1.as_deref(),
+            Some("IQ3_M")
+        );
+        assert_eq!(
+            split_repo_and_quant("Tiny-F16.gguf").1.as_deref(),
+            Some("F16")
+        );
+    }
+
+    #[test]
+    fn looks_like_local_gguf_path_recognizes_anchors() {
+        assert!(looks_like_local_gguf_path("/abs/path.gguf"));
+        assert!(looks_like_local_gguf_path("./rel/model.gguf"));
+        assert!(looks_like_local_gguf_path("../up.gguf"));
+        assert!(looks_like_local_gguf_path("~/in-home.gguf"));
+        assert!(looks_like_local_gguf_path("bare-file.gguf"));
+        assert!(!looks_like_local_gguf_path("hf:owner/repo"));
+        assert!(!looks_like_local_gguf_path("https://huggingface.co/x/y"));
+        assert!(!looks_like_local_gguf_path("gpt-4o"));
+        assert!(!looks_like_local_gguf_path(""));
+    }
+
+    #[test]
+    fn parse_hf_ref_errors_on_missing_local_file() {
+        let result = parse_hf_ref("/tmp/aivo-definitely-does-not-exist.gguf");
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("No such file"), "got {err}");
+    }
+
+    #[test]
+    fn parse_hf_ref_rejects_non_gguf_local_file() {
+        let tmp = std::env::temp_dir().join("aivo-parse-not-gguf.bin");
+        std::fs::write(&tmp, b"x").unwrap();
+        let result = parse_hf_ref(tmp.to_str().unwrap());
+        let _ = std::fs::remove_file(&tmp);
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("Only `.gguf`"), "got {err}");
+    }
+
+    #[test]
+    fn parse_hf_ref_local_path_derives_repo_and_quant() {
+        let tmp = std::env::temp_dir().join("aivo-parse-Q4_K_M.gguf");
+        std::fs::write(&tmp, b"x").unwrap();
+        let result = parse_hf_ref(tmp.to_str().unwrap());
+        let _ = std::fs::remove_file(&tmp);
+        let r = result.unwrap();
+        assert_eq!(r.repo, "local/aivo-parse");
+        assert_eq!(r.quant.as_deref(), Some("Q4_K_M"));
+        assert_eq!(r.local_source.as_deref(), Some(tmp.as_path()));
+    }
+
+    #[test]
+    fn parse_hf_ref_hf_short_has_no_local_source() {
+        let r = parse_hf_ref("hf:owner/repo").unwrap();
+        assert!(r.local_source.is_none());
     }
 
     #[test]

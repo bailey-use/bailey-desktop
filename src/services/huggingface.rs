@@ -1096,8 +1096,18 @@ async fn stream_to_file(
     Ok(())
 }
 
-const HF_CACHE_REL: &str = ".config/aivo/cache/huggingface";
-const LEGACY_HF_CACHE_REL: &str = ".aivo/cache/huggingface";
+/// Segments rather than a literal `"a/b/c"` so Windows `PathBuf::join`
+/// produces backslash-separated paths instead of mixing `/` and `\`.
+const HF_CACHE_SEGMENTS: &[&str] = &[".config", "aivo", "cache", "huggingface"];
+const LEGACY_HF_CACHE_SEGMENTS: &[&str] = &[".aivo", "cache", "huggingface"];
+
+fn join_segments(base: &Path, segments: &[&str]) -> PathBuf {
+    let mut p = base.to_path_buf();
+    for seg in segments {
+        p.push(seg);
+    }
+    p
+}
 
 /// One-shot migration from the pre-0.23 cache location (`~/.aivo/cache/huggingface`)
 /// to the new one under `~/.config/aivo/`. Skips silently if the new directory
@@ -1108,8 +1118,8 @@ fn migrate_legacy_cache_once() {
         let Some(home) = system_env::home_dir() else {
             return;
         };
-        let old = home.join(LEGACY_HF_CACHE_REL);
-        let new = home.join(HF_CACHE_REL);
+        let old = join_segments(&home, LEGACY_HF_CACHE_SEGMENTS);
+        let new = join_segments(&home, HF_CACHE_SEGMENTS);
         if !old.is_dir() || new.exists() {
             return;
         }
@@ -1125,7 +1135,7 @@ fn migrate_legacy_cache_once() {
                 old.display(),
                 new.display()
             );
-            let _ = std::fs::remove_dir(home.join(".aivo/cache"));
+            let _ = std::fs::remove_dir(home.join(".aivo").join("cache"));
             let _ = std::fs::remove_dir(home.join(".aivo"));
         }
     });
@@ -1147,12 +1157,14 @@ fn local_cache_path(repo: &str, revision: &str, filename: &str) -> Result<PathBu
     } else {
         format!("@{revision}__{flat}")
     };
-    Ok(home.join(HF_CACHE_REL).join(sanitized_repo).join(on_disk))
+    Ok(join_segments(&home, HF_CACHE_SEGMENTS)
+        .join(sanitized_repo)
+        .join(on_disk))
 }
 
 pub fn cache_root() -> Option<PathBuf> {
     migrate_legacy_cache_once();
-    system_env::home_dir().map(|h| h.join(HF_CACHE_REL))
+    system_env::home_dir().map(|h| join_segments(&h, HF_CACHE_SEGMENTS))
 }
 
 #[derive(Debug, Clone)]

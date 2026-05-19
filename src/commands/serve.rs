@@ -227,7 +227,10 @@ impl ServeCommand {
         // SIGTERM gets the same graceful shutdown as Ctrl-C. Without
         // this, `kill <aivo-pid>` from outside (or pkill, or a process
         // manager) would terminate aivo without running cleanup, leaking
-        // any HF-mode llama-server child.
+        // any HF-mode llama-server child. On Windows `signal_terminate`
+        // returns `()`; the lint about a unit binding is the cost of
+        // sharing one code path.
+        #[allow(clippy::let_unit_value)]
         let mut sigterm = signal_terminate()?;
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {

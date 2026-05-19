@@ -1485,17 +1485,21 @@ mod tests {
     fn local_cache_path_keeps_main_revision_at_existing_layout() {
         // Backwards-compatible: existing caches at .../<repo>/<file>.gguf
         // continue to resolve to the same path when revision is main / empty.
+        let sep = std::path::MAIN_SEPARATOR;
+        let expected = format!("owner__repo{sep}x.gguf");
         let main_path = local_cache_path("owner/repo", "main", "x.gguf").unwrap();
         let empty_path = local_cache_path("owner/repo", "", "x.gguf").unwrap();
-        assert!(main_path.to_string_lossy().ends_with("owner__repo/x.gguf"));
-        assert!(empty_path.to_string_lossy().ends_with("owner__repo/x.gguf"));
+        assert!(main_path.to_string_lossy().ends_with(&expected));
+        assert!(empty_path.to_string_lossy().ends_with(&expected));
     }
 
     #[test]
     fn local_cache_path_isolates_non_main_revision() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let expected = format!("owner__repo{sep}@v1.0__x.gguf");
         let p = local_cache_path("owner/repo", "v1.0", "x.gguf").unwrap();
         assert!(
-            p.to_string_lossy().ends_with("owner__repo/@v1.0__x.gguf"),
+            p.to_string_lossy().ends_with(&expected),
             "got {}",
             p.display()
         );
@@ -1503,9 +1507,11 @@ mod tests {
 
     #[test]
     fn local_cache_path_flattens_nested_filename() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let expected = format!("owner__repo{sep}subdir__x.gguf");
         let p = local_cache_path("owner/repo", "main", "subdir/x.gguf").unwrap();
         assert!(
-            p.to_string_lossy().ends_with("owner__repo/subdir__x.gguf"),
+            p.to_string_lossy().ends_with(&expected),
             "got {}",
             p.display()
         );
@@ -1665,12 +1671,11 @@ mod tests {
 
     #[test]
     fn local_cache_path_is_under_aivo_cache() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let file_segment = format!("bartowski__Llama-3.2-3B-Instruct-GGUF{sep}x.gguf");
         let p = local_cache_path("bartowski/Llama-3.2-3B-Instruct-GGUF", "main", "x.gguf").unwrap();
         let s = p.to_string_lossy();
         assert!(s.contains(".aivo/cache/huggingface"), "got {s}");
-        assert!(
-            s.contains("bartowski__Llama-3.2-3B-Instruct-GGUF/x.gguf"),
-            "got {s}"
-        );
+        assert!(s.contains(&file_segment), "got {s}");
     }
 }

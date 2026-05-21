@@ -332,6 +332,7 @@ pub(crate) struct ExtractedFlags {
     pub(crate) context: Option<String>,
     /// `None` = flag absent. `Some("1m")` = activate the 1M-context spoof.
     pub(crate) max_context: Option<String>,
+    pub(crate) transform: bool,
 }
 
 /// Strip a trailing `[<digits>m]` from the model name and lift it into
@@ -405,6 +406,7 @@ pub(crate) fn extract_aivo_flags(
     let mut relogin = initial_relogin;
     let mut context: Option<String> = None;
     let mut max_context: Option<String> = initial_max_context;
+    let mut transform = false;
     let mut env_strings = initial_envs;
     let ClaudeSlotFlags {
         reasoning: mut reasoning_model,
@@ -683,6 +685,8 @@ pub(crate) fn extract_aivo_flags(
             if max_context.is_none() {
                 max_context = Some(value);
             }
+        } else if arg == "--transform" {
+            transform = true;
         } else if model.is_none() && is_hf_or_local_gguf(arg) {
             // Lift positional `hf:`/URL/local-path into `-m`. Explicit `-m` wins.
             model = Some(arg.clone());
@@ -718,6 +722,7 @@ pub(crate) fn extract_aivo_flags(
         remaining_args,
         context,
         max_context,
+        transform,
     }
 }
 

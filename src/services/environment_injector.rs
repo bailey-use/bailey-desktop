@@ -1219,11 +1219,12 @@ impl EnvironmentInjector {
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL".to_string(),
                 AIVO_STARTER_REAL_URL.to_string(),
             );
-        } else if crate::services::http_debug::is_debug_active() {
-            // Under --debug, route pi through the local responses-to-chat
-            // bridge so outbound traffic is captured by the JSONL logger.
-            // Pi's native HTTP client doesn't go through aivo's `send_logged`
-            // instrumentation, so the direct path below records nothing.
+        } else if crate::services::transform_mode::is_active()
+            || crate::services::http_debug::is_debug_active()
+        {
+            // Force the local router. `--transform` does this explicitly to
+            // normalize buggy SSE; `--debug` does it so the JSONL logger sees
+            // traffic that pi's native HTTP client would otherwise skip.
             let models_json = build_pi_models_json(
                 PLACEHOLDER_LOOPBACK_URL,
                 AIVO_STARTER_SENTINEL,
@@ -3816,6 +3817,29 @@ mod tests {
 
         assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
         assert!(!env.contains_key("AIVO_USE_PI_ROUTER"));
+    }
+
+    #[test]
+    fn test_for_pi_transform_forces_router_without_debug() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+        crate::services::transform_mode::set_active(true);
+
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://openrouter.ai/api/v1".to_string();
+        let env = injector.for_pi(&key, Some("claude-sonnet-4-6"));
+
+        assert_eq!(env.get("AIVO_USE_PI_ROUTER"), Some(&"1".to_string()));
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_BASE_URL"),
+            Some(&"https://openrouter.ai/api/v1".to_string())
+        );
+        assert!(!env.contains_key("AIVO_SETUP_PI_AGENT_DIR"));
+
+        crate::services::transform_mode::set_active(false);
     }
 
     #[test]

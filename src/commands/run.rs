@@ -556,6 +556,18 @@ impl RunCommand {
             args
         };
 
+        // `--transform` only changes pi's launch path. On other tools the
+        // flag is meaningless — warn and clear the global so `for_pi`
+        // never sees it on a subsequent call in the same process.
+        if crate::services::transform_mode::is_active() && ai_tool != AIToolType::Pi {
+            eprintln!(
+                "  {} --transform is ignored for {}",
+                style::yellow("!"),
+                ai_tool.as_str(),
+            );
+            crate::services::transform_mode::set_active(false);
+        }
+
         // Launch the AI tool
         let options = LaunchOptions {
             tool: ai_tool,
@@ -746,6 +758,12 @@ impl RunCommand {
             "--dry-run",
             "Print resolved command and environment without launching",
         );
+        if is("pi") {
+            print_opt(
+                "--transform",
+                &label("Pi only: route via aivo (normalizes SSE)"),
+            );
+        }
 
         if generic {
             println!();
@@ -801,6 +819,7 @@ impl RunCommand {
             Some("pi") => {
                 println!("  {}", style::dim("aivo pi"));
                 println!("  {}", style::dim("aivo pi -k mykey"));
+                println!("  {}", style::dim("aivo pi --transform -k openrouter"));
             }
             Some("amp") => {
                 println!("  {}", style::dim("aivo amp"));

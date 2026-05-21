@@ -467,6 +467,13 @@ pub struct RunArgs {
     #[arg(long = "2m")]
     pub two_m: bool,
 
+    /// Pi only: route through aivo's responses-to-chat router. Applies
+    /// model-name + protocol transforms and normalizes the SSE stream, so
+    /// upstreams that emit malformed chunks (e.g. newapi omitting
+    /// `finish_reason`) still parse. Same path as `--debug`, no JSONL log.
+    #[arg(long)]
+    pub transform: bool,
+
     /// Additional arguments to pass through to the AI tool
     #[arg(
         value_name = "ARGS",

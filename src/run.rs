@@ -356,6 +356,7 @@ pub async fn run() -> ! {
                     .or_else(|| run_args.two_m.then(|| "2m".to_string())),
                 &run_args.args,
             );
+            services::transform_mode::set_active(run_args.transform || extracted.transform);
             // After extract_aivo_flags so `--debug` after the tool name
             // (recovered from passthrough) activates the logger too.
             maybe_init_http_debug(&extracted.debug).await;

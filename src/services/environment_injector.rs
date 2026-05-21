@@ -806,6 +806,9 @@ impl EnvironmentInjector {
         } else if !Self::use_direct_openai_for_codex(key) || profile.serve_flags.is_starter {
             // See for_claude: starter must route through the local router so
             // device_fingerprint headers attach.
+            // Why ResponsesApi: seeds the router's cascade with `/v1/responses`
+            // first so codex's native protocol is a pass-through; chat
+            // completions remains in the fallback chain for legacy hosts.
             ConnectionMode::Routed {
                 protocol: profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
             }
@@ -2929,6 +2932,29 @@ mod tests {
         key.base_url = "https://api.example-gateway.dev".to_string();
         let env = injector.for_codex(&key, None);
 
+        assert_eq!(
+            env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL"),
+            Some(&"responses".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_for_codex_routed_openai_host_still_seeds_responses_first() {
+        // Pin: when codex spawns in routed mode against a host whose detected
+        // protocol is Openai (api.openai.com), the cascade must still seed
+        // `/v1/responses` first. Guards against a future "simplify
+        // upstream_protocol_for_cli" change silently flipping the seed back
+        // to the detected protocol.
+        let injector = EnvironmentInjector::new();
+        let mut key = test_key();
+        key.base_url = "https://api.openai.com/v1".to_string();
+        key.codex_mode = Some(OpenAICompatibilityMode::Router);
+        let env = injector.for_codex(&key, None);
+
+        assert_eq!(
+            env.get("AIVO_USE_RESPONSES_TO_CHAT_ROUTER"),
+            Some(&"1".to_string()),
+        );
         assert_eq!(
             env.get("AIVO_RESPONSES_TO_CHAT_ROUTER_UPSTREAM_PROTOCOL"),
             Some(&"responses".to_string()),

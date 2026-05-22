@@ -1,7 +1,9 @@
 use super::*;
 
 use crate::services::acp_client::PromptEvent;
-use crate::services::cursor_acp::{self, CursorAcpSession, CursorChunk, CursorTurnResult};
+use crate::services::cursor_acp::{
+    self, CursorAcpSession, CursorChunk, CursorTurnResult, ToolPolicy,
+};
 use anyhow::Context;
 
 impl ChatTuiApp {
@@ -163,7 +165,20 @@ impl ChatTuiApp {
             let (client, session_id, model_id, capabilities) = match existing {
                 Some(handles) => handles,
                 None => {
-                    match CursorAcpSession::open(&key, requested_model.as_deref(), &cwd).await {
+                    // Chat is a pure conversation surface — reject all
+                    // permission requests so cursor-agent's built-in
+                    // Read/grep/execute tools can't fire from a chat turn.
+                    // Bridged routes (/v1/messages etc.) keep the
+                    // env-default policy and aren't affected.
+                    match CursorAcpSession::open_with_options(
+                        &key,
+                        requested_model.as_deref(),
+                        &cwd,
+                        None,
+                        ToolPolicy::Reject,
+                    )
+                    .await
+                    {
                         Ok(session) => {
                             let handles = (
                                 session.client_handle(),

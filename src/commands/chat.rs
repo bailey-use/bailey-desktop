@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::constants::CONTENT_TYPE_JSON;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,23 @@ enum ChatFormat {
     Responses,
     /// Google Gemini native: POST /models/{model}:streamGenerateContent
     Google,
+}
+
+/// Lazily create (or reuse) a per-process sandbox directory under
+/// `$TMPDIR/aivo-chat-<pid>/`. Returned as an absolute path. Empty
+/// directory; backends that auto-index the workspace see nothing.
+fn chat_sandbox_dir() -> Result<std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static SANDBOX: OnceLock<std::path::PathBuf> = OnceLock::new();
+    if let Some(path) = SANDBOX.get() {
+        return Ok(path.clone());
+    }
+    let pid = std::process::id();
+    let path = std::env::temp_dir().join(format!("aivo-chat-{pid}"));
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("create chat sandbox dir at {}", path.display()))?;
+    let _ = SANDBOX.set(path.clone());
+    Ok(path)
 }
 
 fn detect_initial_chat_format(base_url: &str) -> ChatFormat {
@@ -179,6 +196,7 @@ impl ChatCommand {
         model_names::transform_model_for_provider(base_url, model)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         model: Option<String>,
@@ -269,8 +287,12 @@ impl ChatCommand {
         }
 
         let client = crate::services::http_utils::router_http_client();
-        let cwd =
-            crate::services::system_env::current_dir_string().unwrap_or_else(|| ".".to_string());
+        // `aivo chat` always runs in an isolated sandbox dir so backends
+        // that accept a `cwd` (cursor ACP today) can't auto-pull
+        // surrounding project files into the conversation. Chat is a
+        // pure conversation surface; if you need project access, use
+        // `aivo run claude` / `aivo run codex` / etc.
+        let cwd = chat_sandbox_dir()?.to_string_lossy().into_owned();
 
         // HF mode already has the model set; skip `resolve_model` to
         // avoid persisting it under the ephemeral synthetic key id.

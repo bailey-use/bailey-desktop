@@ -11,7 +11,9 @@ use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
 
-use crate::services::acp_client::{AcpClient, PermissionDecision, PromptEvent, PromptStream};
+use crate::services::acp_client::{
+    AcpClient, PermissionDecision, PermissionFn, PromptEvent, PromptStream,
+};
 use crate::services::cursor_home_shadow::CursorShadow;
 use crate::services::session_store::{ApiKey, AttachmentStorage, MessageAttachment};
 
@@ -37,6 +39,16 @@ pub fn is_legacy_cursor_login_secret(secret: &str) -> bool {
 /// (Claude/Codex/etc.) can delegate through Cursor's agent normally; set to
 /// `0`, `false`, `no`, or `reject` to force graceful rejection.
 pub const CURSOR_ALLOW_TOOLS_ENV: &str = "AIVO_CURSOR_ALLOW_TOOLS";
+
+/// Per-session override for cursor-agent's tool-execution policy. The
+/// chat path pins this to [`Reject`] so cursor's built-in
+/// `Read`/`grep`/`execute` tools can't fire during a conversation;
+/// other call sites use [`EnvDefault`] to honor the global env var.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolPolicy {
+    EnvDefault,
+    Reject,
+}
 
 fn cursor_permission_decision(_params: &Value) -> PermissionDecision {
     match std::env::var(CURSOR_ALLOW_TOOLS_ENV) {
@@ -746,13 +758,22 @@ impl PromptCapabilities {
 
 impl CursorAcpSession {
     /// Spawn `cursor-agent acp`, run the initialize/authenticate/session/new
-    /// handshake, and optionally lock in a starting model.
+    /// handshake, and optionally lock in a starting model. Uses the
+    /// env-var-controlled default permission policy (allow by default;
+    /// see [`CURSOR_ALLOW_TOOLS_ENV`]).
     pub async fn open(
         key: &ApiKey,
         requested_model: Option<&str>,
         workspace_cwd: &str,
     ) -> Result<Self> {
-        Self::open_with_mcp(key, requested_model, workspace_cwd, None).await
+        Self::open_with_options(
+            key,
+            requested_model,
+            workspace_cwd,
+            None,
+            ToolPolicy::EnvDefault,
+        )
+        .await
     }
 
     /// Variant of [`Self::open`] that registers an MCP server in
@@ -765,14 +786,36 @@ impl CursorAcpSession {
         workspace_cwd: &str,
         mcp_url: Option<&str>,
     ) -> Result<Self> {
+        Self::open_with_options(
+            key,
+            requested_model,
+            workspace_cwd,
+            mcp_url,
+            ToolPolicy::EnvDefault,
+        )
+        .await
+    }
+
+    /// Most general open: callers can pin a [`ToolPolicy`] independent of
+    /// the env-var default. `aivo chat` uses [`ToolPolicy::Reject`] so
+    /// cursor-agent's built-in `Read`/`grep`/`execute` tools can't fire
+    /// during a chat turn — chat is a pure conversation surface.
+    pub async fn open_with_options(
+        key: &ApiKey,
+        requested_model: Option<&str>,
+        workspace_cwd: &str,
+        mcp_url: Option<&str>,
+        tool_policy: ToolPolicy,
+    ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
         cmd.arg("acp");
 
-        let client = Arc::new(
-            AcpClient::spawn_with_permission_policy(cmd, Arc::new(cursor_permission_decision))
-                .await?,
-        );
+        let permission_fn: PermissionFn = match tool_policy {
+            ToolPolicy::Reject => Arc::new(|_| PermissionDecision::Reject),
+            ToolPolicy::EnvDefault => Arc::new(cursor_permission_decision),
+        };
+        let client = Arc::new(AcpClient::spawn_with_permission_policy(cmd, permission_fn).await?);
 
         let init = client
             .request(

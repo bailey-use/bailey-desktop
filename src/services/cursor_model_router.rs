@@ -4950,8 +4950,15 @@ mod tests {
             .await
             .unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
+        // Half-close so the server stops trying to read more from this
+        // direction; on Windows that avoids the abortive close (WSAECONNRESET)
+        // that surfaces when the server drops the socket with unread data
+        // still in its receive buffer.
+        let _ = stream.shutdown().await;
         let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
+        // Tolerate ConnectionReset on Windows: any bytes we did receive
+        // before the RST are still the server's response.
+        let _ = stream.read_to_end(&mut buf).await;
         handle.abort();
         String::from_utf8(buf).unwrap()
     }

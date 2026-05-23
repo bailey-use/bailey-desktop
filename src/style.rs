@@ -1,7 +1,5 @@
-/**
- * Terminal styling utility using the console crate.
- * Provides cross-platform styling with ANSI fallback support.
- */
+//! Terminal styling utility using the console crate.
+//! Provides cross-platform styling with ANSI fallback support.
 use console::style;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

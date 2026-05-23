@@ -1,6 +1,4 @@
-/**
- * KeysCommand handler for managing API keys.
- */
+//! KeysCommand handler for managing API keys.
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;

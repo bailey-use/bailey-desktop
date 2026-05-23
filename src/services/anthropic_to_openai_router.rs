@@ -1,13 +1,11 @@
-/**
- * Anthropic-to-OpenAI router service
- *
- * Acts as an HTTP proxy that accepts Anthropic-format requests and routes them
- * to OpenAI-compatible providers (like Cloudflare Workers AI), handling the
- * required request and response transformations.
- *
- * Flow:
- * Anthropic /v1/messages → Router → OpenAI /v1/chat/completions
- */
+//! Anthropic-to-OpenAI router service
+//!
+//! Acts as an HTTP proxy that accepts Anthropic-format requests and routes them
+//! to OpenAI-compatible providers (like Cloudflare Workers AI), handling the
+//! required request and response transformations.
+//!
+//! Flow:
+//! Anthropic /v1/messages → Router → OpenAI /v1/chat/completions
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};

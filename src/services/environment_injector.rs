@@ -1,7 +1,5 @@
-/**
- * EnvironmentInjector service for preparing tool-specific environment variables.
- * Maps API keys to the correct environment variables per AI tool.
- */
+//! EnvironmentInjector service for preparing tool-specific environment variables.
+//! Maps API keys to the correct environment variables per AI tool.
 use std::collections::HashMap;
 
 use serde_json::{Map, Value, json};

@@ -1,6 +1,4 @@
-/**
- * UpdateCommand handler for CLI self-update functionality.
- */
+//! UpdateCommand handler for CLI self-update functionality.
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;

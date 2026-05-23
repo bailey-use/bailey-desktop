@@ -1,9 +1,7 @@
-/**
- * InfoCommand handler — unified system info and health check for aivo.
- *
- * `aivo info` shows config, keys, tools, directory state, and active defaults.
- * `aivo info --check` additionally pings all keys and shows a pass/fail summary.
- */
+//! InfoCommand handler — unified system info and health check for aivo.
+//!
+//! `aivo info` shows config, keys, tools, directory state, and active defaults.
+//! `aivo info --check` additionally pings all keys and shows a pass/fail summary.
 use anyhow::Result;
 
 use serde_json::{Value, json};

@@ -1,7 +1,5 @@
-/**
- * Request building for chat: construct HTTP request bodies for OpenAI and
- * Anthropic chat completion APIs, including multimodal attachment encoding.
- */
+//! Request building for chat: construct HTTP request bodies for OpenAI and
+//! Anthropic chat completion APIs, including multimodal attachment encoding.
 use anyhow::Result;
 
 use crate::commands::chat::is_document_mime;

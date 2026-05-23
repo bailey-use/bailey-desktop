@@ -1,9 +1,7 @@
-/**
- * ChatCommand handler. Interactive sessions launch the full-screen TUI
- * (chat_tui). One-shot queries (-x flag) stream directly to stdout using
- * OpenAI-compatible /v1/chat/completions, falling back to Anthropic
- * /v1/messages on 404/405.
- */
+//! ChatCommand handler. Interactive sessions launch the full-screen TUI
+//! (chat_tui). One-shot queries (-x flag) stream directly to stdout using
+//! OpenAI-compatible /v1/chat/completions, falling back to Anthropic
+//! /v1/messages on 404/405.
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;

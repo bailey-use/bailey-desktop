@@ -1,7 +1,5 @@
-/**
- * Centralized error handling module for the aivo CLI.
- * Defines error types, exit codes, and error classification utilities.
- */
+//! Centralized error handling module for the aivo CLI.
+//! Defines error types, exit codes, and error classification utilities.
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

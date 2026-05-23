@@ -1,7 +1,5 @@
-/**
- * ModelsCommand handler for listing available models from the active provider.
- * Calls provider-specific model listing endpoints (OpenAI, Gemini, Cloudflare).
- */
+//! ModelsCommand handler for listing available models from the active provider.
+//! Calls provider-specific model listing endpoints (OpenAI, Gemini, Cloudflare).
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

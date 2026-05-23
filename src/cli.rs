@@ -1,7 +1,5 @@
-/**
- * CLI argument parsing and command routing.
- * Uses clap for argument parsing.
- */
+//! CLI argument parsing and command routing.
+//! Uses clap for argument parsing.
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;

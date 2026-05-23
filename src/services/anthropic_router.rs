@@ -1,9 +1,7 @@
-/**
- * Built-in Anthropic-compatible Router service
- *
- * Acts as an HTTP proxy that intercepts Claude requests and routes them
- * to OpenRouter, handling all necessary API transformations.
- */
+//! Built-in Anthropic-compatible Router service
+//!
+//! Acts as an HTTP proxy that intercepts Claude requests and routes them
+//! to OpenRouter, handling all necessary API transformations.
 use anyhow::Result;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde_json::Value;

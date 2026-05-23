@@ -1,16 +1,14 @@
-/**
- * Main entry point for the aivo CLI.
- *
- * The actual dispatch lives in `aivo::run::run` so internal helpers can stay
- * `pub(crate)`. Keep this file a thin wrapper.
- *
- * We run the tokio current-thread runtime on a dedicated worker thread with an
- * 8 MiB stack. Windows' default main-thread stack is ~1 MiB, which is not
- * enough for `aivo::run::run`'s async state machine after v0.21.0 — bare
- * `aivo --version` overflowed the stack on the Windows CI runner. Linux and
- * macOS default to 8 MiB; pinning the worker explicitly normalizes that
- * across platforms.
- */
+//! Main entry point for the aivo CLI.
+//!
+//! The actual dispatch lives in `aivo::run::run` so internal helpers can stay
+//! `pub(crate)`. Keep this file a thin wrapper.
+//!
+//! We run the tokio current-thread runtime on a dedicated worker thread with an
+//! 8 MiB stack. Windows' default main-thread stack is ~1 MiB, which is not
+//! enough for `aivo::run::run`'s async state machine after v0.21.0 — bare
+//! `aivo --version` overflowed the stack on the Windows CI runner. Linux and
+//! macOS default to 8 MiB; pinning the worker explicitly normalizes that
+//! across platforms.
 fn main() {
     let worker = std::thread::Builder::new()
         .name("aivo-main".into())

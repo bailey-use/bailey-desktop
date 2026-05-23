@@ -1,6 +1,4 @@
-/**
- * RunCommand handler for unified AI tool launching.
- */
+//! RunCommand handler for unified AI tool launching.
 use std::collections::HashMap;
 
 use anyhow::Result;

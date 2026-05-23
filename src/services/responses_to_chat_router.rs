@@ -1,19 +1,17 @@
-/**
- * Responses-to-Chat router service
- *
- * Acts as an HTTP proxy that accepts OpenAI Responses API requests and forwards
- * them to upstreams that may only support Chat Completions or other protocols.
- *
- * 1. Tool filtering: strips built-in tool types (computer_use, file_search,
- *    web_search, code_interpreter) that most non-OpenAI providers reject.
- *
- * 2. Responses API conversion: clients like Codex CLI use `/v1/responses`
- *    with `input` items. Providers that only support `/v1/chat/completions`
- *    need a full request/response conversion. This router handles that automatically.
- *
- * Conversion logic (Responses API ↔ Chat Completions) lives in
- * `responses_chat_conversion.rs` and is re-exported here for backwards compatibility.
- */
+//! Responses-to-Chat router service
+//!
+//! Acts as an HTTP proxy that accepts OpenAI Responses API requests and forwards
+//! them to upstreams that may only support Chat Completions or other protocols.
+//!
+//! 1. Tool filtering: strips built-in tool types (computer_use, file_search,
+//!    web_search, code_interpreter) that most non-OpenAI providers reject.
+//!
+//! 2. Responses API conversion: clients like Codex CLI use `/v1/responses`
+//!    with `input` items. Providers that only support `/v1/chat/completions`
+//!    need a full request/response conversion. This router handles that automatically.
+//!
+//! Conversion logic (Responses API ↔ Chat Completions) lives in
+//! `responses_chat_conversion.rs` and is re-exported here for backwards compatibility.
 use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::anthropic_chat_request::ensure_assistant_reasoning_content_in_chat_request;
 use crate::services::anthropic_route_pipeline::inject_chat_completions_cache_control;

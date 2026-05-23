@@ -1,10 +1,8 @@
-/**
- * Responses API ↔ Chat Completions conversion logic
- *
- * Converts between OpenAI Responses API format and Chat Completions format.
- * Used by the ResponsesToChatRouter and ServeRouter to bridge clients that
- * speak the Responses API with providers that only support Chat Completions.
- */
+//! Responses API ↔ Chat Completions conversion logic
+//!
+//! Converts between OpenAI Responses API format and Chat Completions format.
+//! Used by the ResponsesToChatRouter and ServeRouter to bridge clients that
+//! speak the Responses API with providers that only support Chat Completions.
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::http_utils::{self, current_unix_ts};
 use crate::services::model_names::select_model_for_provider_attempt;

@@ -1,7 +1,5 @@
-/**
- * Response parsing for chat: SSE chunk parsing, usage extraction, think-tag
- * handling, and content/delta extraction for OpenAI and Anthropic formats.
- */
+//! Response parsing for chat: SSE chunk parsing, usage extraction, think-tag
+//! handling, and content/delta extraction for OpenAI and Anthropic formats.
 use serde::{Deserialize, Serialize};
 
 use crate::services::http_utils::parse_token_u64;

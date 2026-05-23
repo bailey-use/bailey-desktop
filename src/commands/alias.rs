@@ -1,12 +1,10 @@
-/**
- * AliasCommand handler — manage aliases.
- *
- * Two flavors share the same namespace:
- * - Model alias: short name → model name (e.g. "fast" → "claude-haiku-4-5"),
- *   resolved by any command that accepts --model.
- * - Bundle alias: short name → preset launch (tool + args), resolved by
- *   `aivo run <bundle>` and the `aivo <bundle>` shortcut.
- */
+//! AliasCommand handler — manage aliases.
+//!
+//! Two flavors share the same namespace:
+//! - Model alias: short name → model name (e.g. "fast" → "claude-haiku-4-5"),
+//!   resolved by any command that accepts --model.
+//! - Bundle alias: short name → preset launch (tool + args), resolved by
+//!   `aivo run <bundle>` and the `aivo <bundle>` shortcut.
 use anyhow::Result;
 
 use crate::cli::AliasArgs;

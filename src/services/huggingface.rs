@@ -276,6 +276,7 @@ fn well_known_install_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = system_env::home_dir() {
         dirs.push(home.join(".aivo").join("bin"));
+        dirs.push(opt_install_dir_under(&home));
     }
     #[cfg(unix)]
     {
@@ -285,7 +286,17 @@ fn well_known_install_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// macOS auto-installs via brew; other platforms print a manual hint.
+fn opt_install_dir_under(home: &Path) -> PathBuf {
+    home.join(".aivo").join("opt").join("llama.cpp")
+}
+
+fn opt_install_dir() -> Option<PathBuf> {
+    system_env::home_dir().as_deref().map(opt_install_dir_under)
+}
+
+/// On macOS prefer brew; otherwise (and as a fallback on mac without brew) offer
+/// to download the latest prebuilt llama.cpp release into `~/.aivo/opt/llama.cpp`.
+/// Non-interactive callers get a hint that names the exact release asset.
 pub async fn ensure_installed() -> Result<PathBuf> {
     if let Some(p) = detect_binary() {
         return Ok(p);
@@ -296,36 +307,90 @@ pub async fn ensure_installed() -> Result<PathBuf> {
         crate::style::yellow("?")
     );
 
-    let hint = manual_install_hint();
-    #[cfg(target_os = "macos")]
-    let can_auto = which_brew().is_some();
-    #[cfg(not(target_os = "macos"))]
-    let can_auto = false;
-
-    if !can_auto {
-        anyhow::bail!(
-            "llama-server is required to run HuggingFace models directly.\n  Install: {hint}"
-        );
-    }
-
     use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "llama-server is required to run HuggingFace models directly.\n  Install: {hint}"
-        );
+    let interactive = std::io::stdin().is_terminal();
+
+    #[cfg(target_os = "macos")]
+    {
+        if which_brew().is_some()
+            && interactive
+            && prompt_yes("  ? Install via `brew install llama.cpp`? [Y/n] ")?
+        {
+            run_brew_install()?;
+            if let Some(p) = detect_binary() {
+                return Ok(p);
+            }
+        }
     }
 
-    eprint!(
-        "  {} Install via `brew install llama.cpp`? [Y/n] ",
-        crate::style::yellow("?")
+    if let Some(target) = release_asset_target() {
+        let dest = opt_install_dir().context("Cannot resolve home directory")?;
+        if interactive {
+            let msg = format!(
+                "  {} Download latest llama.cpp release for {} into {}? [Y/n] ",
+                crate::style::yellow("?"),
+                target.label,
+                dest.display(),
+            );
+            if prompt_yes(&msg)? {
+                install_from_release(&target, &dest).await?;
+                if let Some(p) = detect_binary() {
+                    return Ok(p);
+                }
+                anyhow::bail!(
+                    "llama-server downloaded but not found at {}. Please file a bug.",
+                    dest.display(),
+                );
+            }
+        }
+    }
+
+    let hint = manual_install_hint();
+    anyhow::bail!(
+        "llama-server is required to run HuggingFace models directly.\n  Install: {hint}"
     );
+}
+
+fn prompt_yes(msg: &str) -> Result<bool> {
+    eprint!("{msg}");
     let _ = std::io::stderr().flush();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    if !matches!(input.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
-        anyhow::bail!("Install: {hint}");
-    }
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "" | "y" | "yes"
+    ))
+}
 
+fn manual_install_hint() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "brew install llama.cpp".to_string()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(target) = release_asset_target() {
+            format!(
+                "download the `*{}` asset from https://github.com/ggml-org/llama.cpp/releases/latest \
+                 and extract it into ~/.aivo/opt/llama.cpp/",
+                target.asset_suffix,
+            )
+        } else {
+            "see https://github.com/ggml-org/llama.cpp/releases for prebuilt binaries".to_string()
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn which_brew() -> Option<PathBuf> {
+    use crate::services::path_search::{collect_path_dirs, find_in_dirs};
+    find_in_dirs("brew", &collect_path_dirs())
+        .or_else(|| Some(PathBuf::from("/opt/homebrew/bin/brew")).filter(|p| p.exists()))
+        .or_else(|| Some(PathBuf::from("/usr/local/bin/brew")).filter(|p| p.exists()))
+}
+
+#[cfg(target_os = "macos")]
+fn run_brew_install() -> Result<()> {
     eprintln!(
         "  {} Installing llama.cpp via Homebrew...",
         crate::style::arrow_symbol()
@@ -341,35 +406,250 @@ pub async fn ensure_installed() -> Result<PathBuf> {
             status.code().unwrap_or(-1)
         );
     }
+    Ok(())
+}
 
-    detect_binary().ok_or_else(|| {
-        anyhow::anyhow!(
-            "llama-server was installed but not found on PATH. You may need to restart your shell."
-        )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    TarGz,
+    Zip,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReleaseTarget {
+    /// Substring that must terminate a release asset's filename
+    /// (e.g. `-bin-ubuntu-x64.tar.gz`). The leading `llama-bXXXX` tag varies.
+    asset_suffix: &'static str,
+    label: &'static str,
+    kind: ArchiveKind,
+}
+
+/// Maps the current `(OS, ARCH)` to a llama.cpp prebuilt release asset.
+/// Returns `None` on unsupported platforms (e.g. freebsd, 32-bit).
+fn release_asset_target() -> Option<ReleaseTarget> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let (asset_suffix, label, kind) = match (os, arch) {
+        ("linux", "x86_64") => ("-bin-ubuntu-x64.tar.gz", "linux x64", ArchiveKind::TarGz),
+        ("linux", "aarch64") => (
+            "-bin-ubuntu-arm64.tar.gz",
+            "linux arm64",
+            ArchiveKind::TarGz,
+        ),
+        ("macos", "x86_64") => ("-bin-macos-x64.tar.gz", "macOS x64", ArchiveKind::TarGz),
+        ("macos", "aarch64") => ("-bin-macos-arm64.tar.gz", "macOS arm64", ArchiveKind::TarGz),
+        ("windows", "x86_64") => ("-bin-win-cpu-x64.zip", "Windows x64", ArchiveKind::Zip),
+        ("windows", "aarch64") => ("-bin-win-cpu-arm64.zip", "Windows arm64", ArchiveKind::Zip),
+        _ => return None,
+    };
+    Some(ReleaseTarget {
+        asset_suffix,
+        label,
+        kind,
     })
 }
 
-fn manual_install_hint() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "brew install llama.cpp"
+const LLAMA_CPP_RELEASES_API: &str =
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
+
+async fn install_from_release(target: &ReleaseTarget, dest_dir: &Path) -> Result<()> {
+    eprintln!(
+        "  {} Fetching latest llama.cpp release...",
+        crate::style::arrow_symbol()
+    );
+
+    let client = http_utils::router_http_client_with_timeout(30);
+    let resp = client
+        .get(LLAMA_CPP_RELEASES_API)
+        .header("User-Agent", "aivo-cli")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .context("Failed to query GitHub for the latest llama.cpp release")?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "GitHub release manifest request failed: HTTP {}",
+            resp.status()
+        );
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        "see https://github.com/ggerganov/llama.cpp/releases for prebuilt binaries"
+    let manifest: serde_json::Value = resp
+        .json()
+        .await
+        .context("Failed to parse llama.cpp release manifest as JSON")?;
+
+    let assets = manifest
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .context("Release manifest is missing the `assets` array")?;
+
+    let asset = assets
+        .iter()
+        .find_map(|a| {
+            let name = a.get("name")?.as_str()?;
+            let url = a.get("browser_download_url")?.as_str()?;
+            let size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+            if name.ends_with(target.asset_suffix) {
+                Some((name.to_string(), url.to_string(), size))
+            } else {
+                None
+            }
+        })
+        .with_context(|| {
+            format!(
+                "No release asset matched `*{}`. The llama.cpp release format may have changed; \
+                 install manually from https://github.com/ggml-org/llama.cpp/releases",
+                target.asset_suffix,
+            )
+        })?;
+
+    let (asset_name, asset_url, asset_size) = asset;
+    eprintln!(
+        "  {} {} ({})",
+        crate::style::arrow_symbol(),
+        asset_name,
+        human_size(asset_size),
+    );
+
+    let tmp_dir = std::env::temp_dir();
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let archive_path = tmp_dir.join(format!("aivo-{}-{}", std::process::id(), &asset_name));
+
+    let download_result = download_release_archive(&asset_url, &archive_path, asset_size).await;
+    if let Err(e) = download_result {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(e);
     }
-    #[cfg(windows)]
-    {
-        "download llama-server.exe from https://github.com/ggerganov/llama.cpp/releases"
+
+    // Wipe any prior install so a stale binary doesn't shadow the new libs
+    // (`$ORIGIN` RPATH means `llama-server` only loads from its own dir).
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir)
+            .with_context(|| format!("Failed to clear {}", dest_dir.display()))?;
     }
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("Failed to create {}", dest_dir.display()))?;
+
+    eprintln!(
+        "  {} Extracting into {}",
+        crate::style::arrow_symbol(),
+        dest_dir.display()
+    );
+    let extract_result = extract_archive(&archive_path, dest_dir, target.kind)
+        .and_then(|()| flatten_single_subdir(dest_dir));
+    let _ = std::fs::remove_file(&archive_path);
+    extract_result?;
+
+    Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn which_brew() -> Option<PathBuf> {
-    use crate::services::path_search::{collect_path_dirs, find_in_dirs};
-    find_in_dirs("brew", &collect_path_dirs())
-        .or_else(|| Some(PathBuf::from("/opt/homebrew/bin/brew")).filter(|p| p.exists()))
-        .or_else(|| Some(PathBuf::from("/usr/local/bin/brew")).filter(|p| p.exists()))
+async fn download_release_archive(url: &str, dest: &Path, expected_size: u64) -> Result<()> {
+    let client = http_utils::router_http_streaming_client(60);
+    let resp = client
+        .get(url)
+        .header("User-Agent", "aivo-cli")
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Download of {url} returned HTTP {}", resp.status());
+    }
+
+    let total = resp.content_length().unwrap_or(expected_size);
+    let mut file = tokio::fs::File::create(dest)
+        .await
+        .with_context(|| format!("Failed to create {}", dest.display()))?;
+    let mut stream = resp.bytes_stream();
+    let mut downloaded: u64 = 0;
+    let mut last_render = Instant::now();
+    render_download_progress(0, total);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .with_context(|| format!("Network error downloading {url} (peer reset or stalled)"))?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("Failed to write {}", dest.display()))?;
+        downloaded += chunk.len() as u64;
+        if last_render.elapsed() >= Duration::from_millis(150) {
+            render_download_progress(downloaded, total);
+            last_render = Instant::now();
+        }
+    }
+    file.flush().await?;
+    drop(file);
+    render_download_progress(downloaded, total);
+    eprintln!();
+    Ok(())
+}
+
+fn render_download_progress(downloaded: u64, total: u64) {
+    if total > 0 {
+        let pct = (downloaded as f64 / total as f64) * 100.0;
+        eprint!(
+            "\r  {} {}/{} ({:.0}%)   ",
+            crate::style::dim("Downloading:"),
+            human_size(downloaded),
+            human_size(total),
+            pct,
+        );
+    } else {
+        eprint!(
+            "\r  {} {}   ",
+            crate::style::dim("Downloading:"),
+            human_size(downloaded),
+        );
+    }
+    let _ = std::io::stderr().flush();
+}
+
+/// Shells out to `tar` (universal on Unix, ships in Windows 10+ as `tar.exe`
+/// backed by libarchive — handles both `.tar.gz` and `.zip`).
+fn extract_archive(archive: &Path, dest_dir: &Path, kind: ArchiveKind) -> Result<()> {
+    let mut cmd = Command::new("tar");
+    match kind {
+        ArchiveKind::TarGz => cmd.arg("-xzf"),
+        ArchiveKind::Zip => cmd.arg("-xf"),
+    };
+    cmd.arg(archive).arg("-C").arg(dest_dir);
+    let output = cmd.output().context(
+        "Failed to invoke `tar` to extract the archive. On Windows ensure tar.exe is on PATH.",
+    )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tar failed to extract {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    Ok(())
+}
+
+/// llama.cpp tarballs extract to a single `llama-bXXXX/` directory containing
+/// the binary + `.so`/`.dylib`/`.dll` files. Move that directory's contents up
+/// one level so `dest_dir/llama-server` is where `detect_binary` expects it.
+fn flatten_single_subdir(dest_dir: &Path) -> Result<()> {
+    let entries: Vec<_> = std::fs::read_dir(dest_dir)
+        .with_context(|| format!("Failed to read {}", dest_dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("Failed to enumerate {}", dest_dir.display()))?;
+
+    let only = match entries.as_slice() {
+        [e] if e.file_type().map(|t| t.is_dir()).unwrap_or(false) => e.path(),
+        _ => return Ok(()),
+    };
+
+    for sub in
+        std::fs::read_dir(&only).with_context(|| format!("Failed to read {}", only.display()))?
+    {
+        let sub = sub.with_context(|| format!("Failed to read entry in {}", only.display()))?;
+        let from = sub.path();
+        let to = dest_dir.join(sub.file_name());
+        std::fs::rename(&from, &to)
+            .with_context(|| format!("Failed to move {} -> {}", from.display(), to.display()))?;
+    }
+    std::fs::remove_dir(&only)
+        .with_context(|| format!("Failed to remove now-empty {}", only.display()))?;
+    Ok(())
 }
 
 fn alloc_free_port() -> Result<u16> {
@@ -2040,6 +2320,49 @@ mod tests {
         assert_eq!(urlencode("Llama-3.1 GGUF"), "Llama-3.1%20GGUF");
         assert_eq!(urlencode("a.b_c-d~e"), "a.b_c-d~e");
         assert_eq!(urlencode("/"), "%2F");
+    }
+
+    #[test]
+    fn release_asset_target_matches_host_platform() {
+        // We can only assert what the current host build target is. A failing
+        // suffix here means the llama.cpp release naming has drifted.
+        let target = release_asset_target().expect("host platform should be supported");
+        assert!(
+            target.asset_suffix.starts_with("-bin-"),
+            "asset suffix must be anchored on `-bin-`: {}",
+            target.asset_suffix,
+        );
+        match target.kind {
+            ArchiveKind::TarGz => assert!(target.asset_suffix.ends_with(".tar.gz")),
+            ArchiveKind::Zip => assert!(target.asset_suffix.ends_with(".zip")),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn manual_install_hint_names_the_platform_asset() {
+        let target = release_asset_target().expect("host platform should be supported");
+        let hint = manual_install_hint();
+        assert!(
+            hint.contains(target.asset_suffix),
+            "manual hint should name the actual asset suffix; got: {hint}",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn manual_install_hint_recommends_brew_on_mac() {
+        assert!(manual_install_hint().contains("brew install llama.cpp"));
+    }
+
+    #[test]
+    fn release_asset_suffix_disambiguates_kleidiai_variant() {
+        // `bin-macos-arm64.tar.gz` must not also match `bin-macos-arm64-kleidiai.tar.gz`.
+        let kleidiai = "llama-b9294-bin-macos-arm64-kleidiai.tar.gz";
+        let plain = "llama-b9294-bin-macos-arm64.tar.gz";
+        let suffix = "-bin-macos-arm64.tar.gz";
+        assert!(plain.ends_with(suffix));
+        assert!(!kleidiai.ends_with(suffix));
     }
 
     #[test]

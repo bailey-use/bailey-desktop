@@ -335,17 +335,20 @@ impl LogsCommand {
         //    (don't auto-drill into chat sessions; that's `aivo logs share`'s
         //    job — `show` is the row-level inspector).
         let logs_hits = self.session_store.logs().find_by_id_prefix(id, 5).await?;
+        // Multiple hits is most often a `session_id` UUID-prefix collision
+        // (e.g. the same native session re-launched produces distinct
+        // event_group_ids that share its session_id). Disambiguate via a
+        // picker in interactive mode; JSON / non-TTY callers still get the
+        // listing so they can re-run with a longer prefix.
         if logs_hits.len() > 1 {
-            let summary = logs_hits
-                .iter()
-                .map(|e| format!("{} [{}]", &e.id, e.source))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "ambiguous logs.db prefix '{}' — matched: {}. Re-run with a longer prefix.",
-                id,
-                summary
-            );
+            if let Some(entry) = pick_ambiguous_log_hit(id, &logs_hits, args.json).await? {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                } else {
+                    print_entry(&entry, &self.session_store).await;
+                }
+            }
+            return Ok(ExitCode::Success);
         }
         if let Some(entry) = logs_hits.into_iter().next() {
             if args.json {
@@ -1010,6 +1013,58 @@ fn format_duration_ms(ms: i64) -> String {
             }
         }
     }
+}
+
+/// Interactive disambiguation for `aivo logs show <prefix>` when more than
+/// one logs.db row matches. Returns `Ok(Some(entry))` on selection, `Ok(None)`
+/// on user cancel, and bails (with the same listing the legacy error showed)
+/// when the picker isn't usable — JSON mode or a non-TTY.
+async fn pick_ambiguous_log_hit(
+    prefix: &str,
+    hits: &[LogEntry],
+    json_mode: bool,
+) -> Result<Option<LogEntry>> {
+    use std::io::IsTerminal;
+    let interactive = !json_mode && io::stdout().is_terminal() && io::stdin().is_terminal();
+    if !interactive {
+        let summary = hits
+            .iter()
+            .map(|e| format!("{} [{}]", &e.id, e.source))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "ambiguous logs.db prefix '{}' — matched: {}. Re-run with a longer prefix.",
+            prefix,
+            summary
+        );
+    }
+
+    let detail_width = picker_detail_width(console::Term::stdout().size().1 as usize);
+    let orphan_chat_ids: HashSet<String> = HashSet::new();
+    let run_meta: RunMetaIndex = RunMetaIndex::new();
+    let labels: Vec<String> = hits
+        .iter()
+        .map(|e| {
+            UnifiedRow::Log(Box::new(e.clone())).picker_label(
+                detail_width,
+                &orphan_chat_ids,
+                &run_meta,
+            )
+        })
+        .collect();
+    let owned: Vec<LogEntry> = hits.to_vec();
+    let prompt = format!("Multiple matches for '{prefix}' — pick one");
+    tokio::task::spawn_blocking(move || -> std::io::Result<Option<LogEntry>> {
+        let selected = crate::tui::FuzzySelect::new()
+            .with_prompt(&prompt)
+            .items(&labels)
+            .default(0)
+            .interact_opt()?;
+        Ok(selected.map(|idx| owned[idx].clone()))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("picker thread panicked: {e}"))?
+    .map_err(|e| anyhow::anyhow!("picker I/O failed: {e}"))
 }
 
 fn display_id(entry: &LogEntry) -> &str {

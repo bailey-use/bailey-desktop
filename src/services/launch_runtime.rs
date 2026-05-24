@@ -136,8 +136,12 @@ pub(crate) async fn prepare_runtime_env(
                     });
             set_local_base_url(&mut env, &base_url_env, port);
         }
-        env.remove("AIVO_USE_CURSOR_ROUTER");
-        env.remove("AIVO_CURSOR_KEY_SECRET");
+        // Note: AIVO_USE_CURSOR_ROUTER is left in `env` here on purpose so
+        // `build_runtime_args` (called next, after `prepare_runtime_env`
+        // returns) can detect cursor mode and route codex through the
+        // non-OpenAI catalog/model-passthrough path. The marker is stripped
+        // later in `ai_launcher` right before spawn. `AIVO_CURSOR_KEY_SECRET`
+        // is already consumed by `start_cursor_router` itself.
     }
 
     if tool == AIToolType::Codex && env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER") {
@@ -1541,7 +1545,8 @@ async fn start_copilot_router(env: &HashMap<String, String>) -> Result<u16> {
 
 async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType) -> Result<u16> {
     use crate::services::cursor_acp::{self, CURSOR_ACP_SENTINEL};
-    use crate::services::cursor_model_router::{CursorModelRouter, CursorRouterConfig};
+    use crate::services::cursor_bridge::mcp::ToolUseIdStyle;
+    use crate::services::cursor_bridge::{CursorModelRouter, CursorRouterConfig};
     use crate::services::session_store::ApiKey;
     use zeroize::Zeroizing;
 
@@ -1595,19 +1600,32 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| ".".to_string());
 
-    // Claude Code fires paired main+subagent prompts concurrently — both
-    // slots prewarmed avoid a cold `session/new` on the subagent. Other
-    // tools (pi, codex, opencode, amp, gemini) send turns sequentially and
-    // would just orphan the second cursor-agent process, so they prewarm 1.
-    let prewarm_count = match tool {
-        AIToolType::Claude => 2,
-        _ => 1,
-    };
+    // Every launched tool that targets cursor sends `stream:true` + a tools
+    // array on every real turn, so they all flow through
+    // `run_*_bridged_fresh`, which opens its own session with the MCP bridge
+    // attached at `session/new` time. MCP-less pool prewarms were dead
+    // weight — observed in debug captures opening two cursor-agent processes
+    // (Claude `prewarm_count=2`) that the bridged path never consumed.
+    // Replace the pool prewarm with a single MCP-attached prewarm keyed to
+    // the protocol's id-style; the first bridged turn picks it up via
+    // `take_mcp_prewarmed`. Claude Code's main+subagent paired burst still
+    // works: title-gen subagents short-circuit before hitting cursor, and
+    // genuine subagent dispatch is internal to cursor-agent (we only see one
+    // `/v1/messages` per main turn).
+    let prewarm_count = 0;
+    let mcp_prewarm_id_style = Some(match tool {
+        AIToolType::Claude => ToolUseIdStyle::Anthropic,
+        AIToolType::Gemini => ToolUseIdStyle::Gemini,
+        AIToolType::Codex | AIToolType::Opencode | AIToolType::Pi | AIToolType::Amp => {
+            ToolUseIdStyle::OpenAi
+        }
+    });
     let router = CursorModelRouter::new(CursorRouterConfig {
         key,
         workspace_cwd,
         models_cache: Some(crate::services::models_cache::ModelsCache::new()),
         prewarm_count,
+        mcp_prewarm_id_style,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {

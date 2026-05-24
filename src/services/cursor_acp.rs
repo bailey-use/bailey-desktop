@@ -791,7 +791,7 @@ impl CursorAcpSession {
     /// Variant of [`Self::open`] that registers an MCP server in
     /// `session/new`'s `mcpServers` array. The cursor router uses this to
     /// expose claude-cli's `/v1/messages` tools to the cursor model via the
-    /// [`mcp_bridge`](crate::services::mcp_bridge) HTTP server.
+    /// [`cursor_bridge::mcp`](crate::services::cursor_bridge::mcp) HTTP server.
     pub async fn open_with_mcp(
         key: &ApiKey,
         requested_model: Option<&str>,

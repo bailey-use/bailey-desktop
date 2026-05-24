@@ -35,6 +35,67 @@ const REDACTED_HEADERS: &[&str] = &[
 
 const REDACTED_QUERY_PARAMS: &[&str] = &["key", "api_key", "token"];
 
+/// Minimum token length we'll treat as a real secret. Short `sk-` / `Bearer`
+/// fragments in unrelated text (e.g. docs, error messages) stay readable.
+const MIN_TOKEN_LEN: usize = 20;
+
+/// Scrub `Bearer <token>` (any case) and bare `sk-<token>` from body text
+/// before logging. Operates on raw bytes so it catches keys buried in
+/// escaped or nested content (codex's approved_command_prefixes etc.).
+pub fn redact_body(body: &str) -> String {
+    if !body
+        .as_bytes()
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"Bearer "))
+        && !body.contains("sk-")
+    {
+        return body.to_string();
+    }
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 7 <= bytes.len() && bytes[i..i + 7].eq_ignore_ascii_case(b"Bearer ") {
+            out.push_str(&body[i..i + 7]);
+            i += 7;
+            let token_start = i;
+            while i < bytes.len() && is_token_char(bytes[i]) {
+                i += 1;
+            }
+            if i - token_start >= MIN_TOKEN_LEN {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(&body[token_start..i]);
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"sk-") && (i == 0 || !is_token_char(bytes[i - 1])) {
+            let token_start = i;
+            i += 3;
+            while i < bytes.len() && is_token_char(bytes[i]) {
+                i += 1;
+            }
+            if i - token_start >= MIN_TOKEN_LEN + 3 {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(&body[token_start..i]);
+            }
+            continue;
+        }
+        let char_start = i;
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+            i += 1;
+        }
+        out.push_str(&body[char_start..i]);
+    }
+    out
+}
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
 /// Returns a copy of `headers` with sensitive values replaced by `[REDACTED]`.
 /// Retained as a pub helper for the in-module unit tests; production code
 /// goes through `collect_and_redact_headers` which operates on
@@ -167,7 +228,13 @@ impl HttpDebugLogger {
         &self.path
     }
 
-    pub(crate) async fn log(&self, entry: DebugEntry) {
+    pub(crate) async fn log(&self, mut entry: DebugEntry) {
+        if let Some(body) = entry.request_body.take() {
+            entry.request_body = Some(redact_body(&body));
+        }
+        if let Some(body) = entry.response_body.take() {
+            entry.response_body = Some(redact_body(&body));
+        }
         let mut line = match serde_json::to_string(&entry) {
             Ok(s) => s,
             Err(_) => return,
@@ -736,6 +803,61 @@ mod tests {
             "username leaked: {out}"
         );
         assert!(out.contains("model=x"), "non-sensitive query lost: {out}");
+    }
+
+    #[test]
+    fn redact_body_scrubs_bearer_token_in_codex_approved_prefixes() {
+        // Real shape pulled from a codex /responses payload: the bearer
+        // sits inside an `approved_command_prefixes` curl literal, so the
+        // scrubber has to find it without parsing JSON.
+        let body = "{\"prefixes\":[\"curl\",\"-H\",\"Authorization: Bearer sk-8OHXJR2LGKlPkGNWa0dp1QVPdTJZO5IP\"]}";
+        let out = redact_body(body);
+        assert!(!out.contains("sk-8OHXJR2"), "token leaked: {out}");
+        assert!(out.contains("Bearer [REDACTED]"), "shape lost: {out}");
+    }
+
+    #[test]
+    fn redact_body_scrubs_bare_sk_key() {
+        let body = "{\"key\":\"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA\"}";
+        let out = redact_body(body);
+        assert!(!out.contains("sk-ant-api03"), "bare key leaked: {out}");
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_body_preserves_short_non_secret_strings() {
+        // "Bearer" mentioned in prose without a long token shouldn't be
+        // scrubbed. Same for short hyphenated identifiers starting with sk-.
+        let body = "see the Bearer auth flow; component id sk-btn";
+        assert_eq!(redact_body(body), body);
+    }
+
+    #[test]
+    fn redact_body_no_match_short_circuits() {
+        let body = "{\"hello\":\"world\"}";
+        assert_eq!(redact_body(body), body);
+    }
+
+    #[test]
+    fn redact_body_preserves_utf8() {
+        let body = "前缀 Bearer sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXX 后缀";
+        let out = redact_body(body);
+        assert!(out.starts_with("前缀 Bearer [REDACTED]"));
+        assert!(out.ends_with(" 后缀"));
+    }
+
+    #[test]
+    fn redact_body_scrubs_lowercase_bearer_in_shell_literal() {
+        let body = "{\"cmd\":\"curl -H 'authorization: bearer xoxb-AAAAAAAAAAAAAAAAAAAAAAAA'\"}";
+        let out = redact_body(body);
+        assert!(
+            !out.contains("xoxb-AAAAAAAAAAAA"),
+            "lowercase bearer leaked: {out}"
+        );
+        assert!(
+            out.contains("bearer [REDACTED]"),
+            "casing should be preserved: {out}"
+        );
     }
 
     #[tokio::test]

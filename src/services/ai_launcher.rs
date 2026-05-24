@@ -264,6 +264,12 @@ impl AILauncher {
             runtime.env.remove("AIVO_AMP_SETTINGS_FILE");
         }
 
+        // The cursor router marker was left in place through
+        // `build_runtime_args` so codex's catalog/model-passthrough branch
+        // could detect cursor mode. Strip it now so it doesn't leak to the
+        // spawned tool.
+        runtime.env.remove("AIVO_USE_CURSOR_ROUTER");
+
         let event_group_id = new_log_id();
         let cwd = crate::services::system_env::current_dir_string();
         let log_args = runtime_args.args.clone();

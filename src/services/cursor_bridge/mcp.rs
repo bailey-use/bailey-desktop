@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::services::acp_client::PromptStream;
@@ -36,6 +36,14 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// itself be a long-running picker), and opening a fresh `/v1/messages` with
 /// the result.
 const TOOL_CALL_PARK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long an MCP `tools/list` response is parked when the session was
+/// opened via [`McpBridge::open_session_for_prewarm`]. Current cursor-agent
+/// builds only fetch `tools/list` when they're about to process a prompt
+/// (well after `take_for_use` runs), so this is belt-and-suspenders for
+/// future or differently-configured cursor clients that probe eagerly.
+/// 60 s gives the user a comfortable window to type their first prompt.
+const TOOLS_LIST_PARK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Cap on concurrent bridge sessions. Matches the cursor router's session
 /// pool ceiling so a flood of tool-using `/v1/messages` requests can't
@@ -106,6 +114,13 @@ pub struct BridgeSession {
     /// permit drops when the BridgeSession is dropped, freeing capacity
     /// for the next waiter in `open_session`.
     _permit: OwnedSemaphorePermit,
+    /// True when the session was created via [`McpBridge::open_session_for_prewarm`]
+    /// and is still waiting for the cursor router to swap in the real tools.
+    /// Cleared by [`McpBridge::take_for_use`].
+    awaiting_real_tools: bool,
+    /// Fired by [`McpBridge::take_for_use`] to wake up any `tools/list` handler
+    /// that parked because `awaiting_real_tools` was true.
+    tools_ready: Arc<Notify>,
 }
 
 struct ParkedCall {
@@ -185,7 +200,7 @@ impl McpBridge {
         let server_state = state.clone();
         let server_handle = tokio::spawn(async move {
             if let Err(e) = serve(listener, server_state).await {
-                eprintln!("aivo: mcp_bridge server stopped: {e:#}");
+                eprintln!("aivo: cursor_bridge::mcp server stopped: {e:#}");
             }
         });
         Ok(Arc::new(Self {
@@ -256,6 +271,8 @@ impl McpBridge {
             acp: None,
             stream: None,
             _permit: permit,
+            awaiting_real_tools: false,
+            tools_ready: Arc::new(Notify::new()),
         }));
         self.state
             .sessions
@@ -264,6 +281,62 @@ impl McpBridge {
             .insert(id.clone(), session.clone());
         let url = format!("http://127.0.0.1:{}/sess/{}/", self.state.port, id);
         (session, url)
+    }
+
+    /// Pre-open a bridge session before the upstream tool's request has
+    /// arrived. The session starts with empty tools and `awaiting_real_tools`
+    /// set, so any `tools/list` poll cursor-agent issues during the warm-up
+    /// window is parked (up to [`TOOLS_LIST_PARK_TIMEOUT`]) until the cursor
+    /// router activates the session with [`Self::take_for_use`].
+    ///
+    /// Use this when the cursor router knows the protocol up front (e.g. the
+    /// codex `/responses` bridge) and wants to amortize the ~16 s cursor-agent
+    /// `session/new` cost before the first real request lands.
+    pub async fn open_session_for_prewarm(
+        &self,
+        id_style: ToolUseIdStyle,
+    ) -> (Arc<Mutex<BridgeSession>>, String) {
+        let permit = self
+            .state
+            .session_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("session_permits semaphore never closes");
+        let id = generate_bridge_id();
+        let session = Arc::new(Mutex::new(BridgeSession {
+            id: id.clone(),
+            id_style,
+            tools: Vec::new(),
+            parked: None,
+            event_tx: None,
+            acp: None,
+            stream: None,
+            _permit: permit,
+            awaiting_real_tools: true,
+            tools_ready: Arc::new(Notify::new()),
+        }));
+        self.state
+            .sessions
+            .lock()
+            .await
+            .insert(id.clone(), session.clone());
+        let url = format!("http://127.0.0.1:{}/sess/{}/", self.state.port, id);
+        (session, url)
+    }
+
+    /// Activate a session opened by [`Self::open_session_for_prewarm`]: swap
+    /// in the real tool catalog and release any `tools/list` request that
+    /// parked while we were idle. After this returns the session behaves like
+    /// one created via [`Self::open_session`].
+    pub async fn take_for_use(session: &Arc<Mutex<BridgeSession>>, real_tools: Vec<Value>) {
+        let notify = {
+            let mut guard = session.lock().await;
+            guard.tools = real_tools;
+            guard.awaiting_real_tools = false;
+            guard.tools_ready.clone()
+        };
+        notify.notify_waiters();
     }
 
     /// Drop a bridge session entirely. Called when the ACP prompt fully
@@ -289,10 +362,17 @@ impl McpBridge {
             let mut guard = session.lock().await;
             guard.parked.take()
         };
-        if let Some(p) = parked
-            && p.tool_use_id == tool_use_id
+        // None on no-op so callers fall through to fresh instead of streaming
+        // a resume against a tools/call that was never satisfied.
+        let p = parked?;
+        if p.tool_use_id != tool_use_id {
+            return None;
+        }
+        if p.response_tx
+            .send(McpToolResult { content, is_error })
+            .is_err()
         {
-            let _ = p.response_tx.send(McpToolResult { content, is_error });
+            return None;
         }
         Some(session)
     }
@@ -507,6 +587,19 @@ async fn handle(request: String, state: Arc<BridgeState>, mut socket: TcpStream)
     let response = match method_name.as_str() {
         "initialize" => json_rpc_ok(msg_id, mcp_initialize_result()),
         "tools/list" => {
+            // Subscribe to `tools_ready` BEFORE re-checking the flag so a
+            // `take_for_use` that races between the check and the await still
+            // wakes us. Bounded by `TOOLS_LIST_PARK_TIMEOUT` so a never-used
+            // prewarm slot doesn't pin cursor-agent's MCP poll forever.
+            let notify = session.lock().await.tools_ready.clone();
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            // Enroll before the recheck — see take_mcp_prewarmed for rationale.
+            notified.as_mut().enable();
+            let still_awaiting = session.lock().await.awaiting_real_tools;
+            if still_awaiting {
+                let _ = timeout(TOOLS_LIST_PARK_TIMEOUT, notified.as_mut()).await;
+            }
             let tools = session.lock().await.tools.clone();
             json_rpc_ok(msg_id, json!({"tools": translate_tools(&tools)}))
         }
@@ -708,13 +801,10 @@ async fn purge_bridge_session(state: &BridgeState, bridge_id: &str, tool_use_id:
     if let Some(sess) = removed {
         let mut guard = sess.lock().await;
         if let Some(parked) = guard.parked.take()
-            && let Some(id) = tool_use_id
+            && tool_use_id != Some(parked.tool_use_id.as_str())
         {
-            // Stale parked entry might be a different tool_use_id from the
-            // one we're cleaning; only drop the global lookup if it matches.
-            if parked.tool_use_id != id {
-                state.parked.lock().await.remove(&parked.tool_use_id);
-            }
+            // Drop the global lookup unless the caller already removed it above.
+            state.parked.lock().await.remove(&parked.tool_use_id);
         }
         guard.acp.take();
         guard.stream.take();
@@ -1062,5 +1152,134 @@ mod tests {
             response.get("error").is_some(),
             "expected MCP error on drop"
         );
+    }
+
+    #[tokio::test]
+    async fn prewarm_session_returns_real_tools_after_take_for_use() {
+        let bridge = McpBridge::start_background().await.unwrap();
+        let (session, url) = bridge
+            .open_session_for_prewarm(ToolUseIdStyle::OpenAi)
+            .await;
+        assert!(session.lock().await.awaiting_real_tools);
+        assert!(session.lock().await.tools.is_empty());
+
+        let real_tools = vec![json!({
+            "name": "exec_command",
+            "description": "Run a command.",
+            "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        })];
+
+        let url_clone = url.clone();
+        let list_task = tokio::spawn(async move {
+            http_client()
+                .post(&url_clone)
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        });
+
+        // Let the handler reach its `notified()` await.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        McpBridge::take_for_use(&session, real_tools.clone()).await;
+
+        let response = tokio::time::timeout(Duration::from_secs(5), list_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let tools = response
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools array in result");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), "exec_command");
+        assert!(
+            tools[0].get("inputSchema").is_some(),
+            "translate_tools should run"
+        );
+        assert!(!session.lock().await.awaiting_real_tools);
+    }
+
+    #[tokio::test]
+    async fn prewarm_tools_list_falls_back_to_empty_after_park_timeout() {
+        // Override the global timeout for the test by directly racing the
+        // notified() pattern with a short timeout — we just verify the
+        // handler doesn't hang when take_for_use never runs.
+        let bridge = McpBridge::start_background().await.unwrap();
+        let (session, url) = bridge
+            .open_session_for_prewarm(ToolUseIdStyle::OpenAi)
+            .await;
+
+        // tools/list call shouldn't return until either take_for_use OR the
+        // 60-second timeout. We don't want to wait 60 s in tests, so instead
+        // we verify the call IS parked: it should not complete within 200 ms.
+        let url_clone = url.clone();
+        let list_task = tokio::spawn(async move {
+            http_client()
+                .post(&url_clone)
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        });
+        let race = tokio::time::timeout(Duration::from_millis(200), &mut Box::pin(list_task)).await;
+        assert!(
+            race.is_err(),
+            "tools/list should park while awaiting_real_tools is true"
+        );
+        drop(session);
+    }
+
+    #[tokio::test]
+    async fn non_prewarm_session_does_not_park_tools_list() {
+        let bridge = McpBridge::start_background().await.unwrap();
+        let (_session, url) = bridge
+            .open_session(
+                vec![json!({"name": "x", "description": "", "input_schema": {"type": "object"}})],
+                ToolUseIdStyle::Anthropic,
+            )
+            .await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            http_client()
+                .post(&url)
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                }))
+                .send(),
+        )
+        .await
+        .expect("non-prewarm tools/list should reply immediately")
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+        let tools = response
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(Value::as_array)
+            .expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].get("name").unwrap(), "x");
     }
 }

@@ -741,7 +741,7 @@ pub(crate) fn full_catalog_cache_key_for_key(key: &ApiKey) -> String {
         // Cursor's `models` listing returns chat-capable ids only — there's no
         // image/audio/embedding catalog to separate. Collapse the `#all`
         // namespace into the bare key so `aivo models cursor`, the model
-        // picker, and the in-router cache (see `cursor_model_router::cached_models`)
+        // picker, and the in-router cache (see `cursor_bridge::cached_models`)
         // all hit a single shared entry on disk.
         return model_cache_key_for_key(key);
     }

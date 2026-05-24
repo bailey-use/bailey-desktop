@@ -37,8 +37,8 @@ pub mod context_window;
 pub mod copilot_auth;
 pub mod copilot_router;
 pub mod cursor_acp;
+pub mod cursor_bridge;
 pub mod cursor_home_shadow;
-pub mod cursor_model_router;
 pub mod device_fingerprint;
 #[cfg(target_env = "musl")]
 pub mod dns_resolver;
@@ -61,7 +61,6 @@ pub mod last_selection;
 pub mod launch_args;
 pub mod launch_runtime;
 pub mod log_store;
-pub mod mcp_bridge;
 pub mod media_io;
 pub mod model_compat;
 pub mod model_names;

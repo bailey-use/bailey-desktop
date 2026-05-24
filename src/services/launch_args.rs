@@ -248,9 +248,17 @@ pub(crate) async fn build_runtime_args(
     })
 }
 
+/// True when codex's upstream is one of aivo's local routers rather than a
+/// real OpenAI-shaped endpoint. In that case the model id is meaningful to
+/// the router (it picks the upstream provider/model), so `inject_codex_model`
+/// must pass the raw name and `maybe_write_codex_model_catalog` must emit a
+/// catalog entry so codex itself accepts the unknown slug. Includes the
+/// cursor router because cursor models like `composer-2.5` would otherwise
+/// hit `map_model_for_codex_cli`'s fallback and be rewritten to `gpt-4o`.
 fn uses_responses_to_chat_router(env: &HashMap<String, String>) -> bool {
     env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_ROUTER")
         || env.contains_key("AIVO_USE_RESPONSES_TO_CHAT_COPILOT_ROUTER")
+        || env.contains_key("AIVO_USE_CURSOR_ROUTER")
 }
 
 /// Converts Codex `OPENAI_BASE_URL` + `OPENAI_API_KEY` env vars into
@@ -675,7 +683,7 @@ fn build_codex_model_catalog_json(model: &str) -> Result<String> {
                 {"effort": "low", "description": "low"},
                 {"effort": "medium", "description": "medium"}
             ],
-            "shell_type": "shell_command",
+            "shell_type": "default",
             "visibility": "list",
             "minimal_client_version": [0, 1, 0],
             "supported_in_api": true,
@@ -699,6 +707,51 @@ fn build_codex_model_catalog_json(model: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_responses_to_chat_router_recognizes_cursor_router() {
+        // Regression: codex + cursor key must take the non-OpenAI router
+        // branch so the raw model id (e.g. `composer-2.5`) is preserved and
+        // a model_catalog_json override is written. Without this,
+        // map_model_for_codex_cli rewrites the slug to `gpt-4o` and codex
+        // shows / requests the wrong model.
+        let env = HashMap::from([("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string())]);
+        assert!(uses_responses_to_chat_router(&env));
+    }
+
+    #[tokio::test]
+    async fn cursor_router_codex_keeps_model_and_writes_catalog() {
+        let env = HashMap::from([("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string())]);
+        let runtime = build_runtime_args(
+            AIToolType::Codex,
+            &["prompt".to_string()],
+            Some("composer-2.5"),
+            &env,
+        )
+        .await
+        .unwrap();
+
+        let m_idx = runtime
+            .args
+            .iter()
+            .position(|a| a == "-m")
+            .expect("-m flag present");
+        assert_eq!(runtime.args[m_idx + 1], "composer-2.5");
+        assert!(
+            runtime.codex_model_catalog_path.is_some(),
+            "cursor router branch must emit a model catalog so codex accepts the slug"
+        );
+        assert!(
+            runtime
+                .args
+                .iter()
+                .any(|a| a.starts_with("model_catalog_json=")),
+            "model_catalog_json --config flag must be injected"
+        );
+        if let Some(path) = runtime.codex_model_catalog_path {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
 
     #[test]
     fn test_inject_claude_teammate_mode_for_claude() {
@@ -849,6 +902,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);
+    }
+
+    #[test]
+    fn build_codex_model_catalog_json_uses_shell_type_default() {
+        // Pin: codex 0.132+ only accepts `"default"` for `shell_type` in
+        // model_catalog_json entries. Anything else (we previously emitted
+        // `"shell_command"`) fails the catalog parse with
+        // `Error: failed to parse model_catalog_json path '...' as JSON: ...`,
+        // codex silently swallows the failure and falls back to its built-in
+        // default model — so the user's `-m <picked>` is ignored and the
+        // banner shows `gpt-4o` instead of the chosen cursor/openrouter slug.
+        let json = build_codex_model_catalog_json("composer-2.5").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["models"][0]["shell_type"], "default");
     }
 
     #[test]

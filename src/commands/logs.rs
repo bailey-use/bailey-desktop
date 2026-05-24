@@ -1336,14 +1336,20 @@ async fn fetch_native_rows(
     Ok(all)
 }
 
-// Amp threads have no cwd concept. If the user filtered by --cwd, exclude amp
-// from the listing entirely (it can't possibly match).
+// Amp threads have no cwd concept. The implicit "current project" scope
+// (auto-set when neither --all nor --cwd is passed) would silently drop every
+// amp row; only an explicit `--cwd X` should hide them, since the user then
+// asked for a directory amp can't match. `--all` overrides --cwd.
 async fn fetch_amp_rows(
     args: &LogsArgs,
     plan: &SourcePlan,
     cwd_filter: Option<&str>,
 ) -> Result<Vec<AmpRow>> {
-    if !plan.include_amp() || cwd_filter.is_some() {
+    if !plan.include_amp() {
+        return Ok(Vec::new());
+    }
+    let _ = cwd_filter; // amp rows have no cwd to compare against
+    if args.cwd.is_some() && !args.all {
         return Ok(Vec::new());
     }
     let amp_dir = amp_threads::default_threads_dir();
@@ -2325,6 +2331,50 @@ mod tests {
     fn merge_unified_handles_empty_sources() {
         let merged: Vec<UnifiedRow> = merge_unified(Vec::new(), Vec::new(), Vec::new(), 5);
         assert!(merged.is_empty());
+    }
+
+    /// Regression: `aivo logs --by amp` and the default `aivo logs` listing
+    /// both used to silently drop every amp thread because `fetch_unified_rows`
+    /// auto-fills `cwd_filter` from `current_dir`, and the old `fetch_amp_rows`
+    /// guard treated that implicit default the same as a user-typed `--cwd`.
+    /// The fix keys the bail on `args.cwd.is_some() && !args.all` so only an
+    /// explicit cwd filter hides amp.
+    fn should_emit_amp(args: &LogsArgs) -> bool {
+        !(args.cwd.is_some() && !args.all)
+    }
+
+    #[test]
+    fn amp_emitted_when_no_explicit_cwd_filter() {
+        // Default `aivo logs` — implicit cwd_filter is applied upstream but
+        // amp must still come through.
+        let args = base_args();
+        assert!(should_emit_amp(&args));
+    }
+
+    #[test]
+    fn amp_emitted_when_by_amp_without_explicit_cwd() {
+        // `aivo logs --by amp` — was broken: returned "No entries found".
+        let mut args = base_args();
+        args.by = Some("amp".into());
+        assert!(should_emit_amp(&args));
+    }
+
+    #[test]
+    fn amp_emitted_when_all_overrides_cwd() {
+        // `aivo logs --all --cwd /foo` — --all wins over --cwd.
+        let mut args = base_args();
+        args.all = true;
+        args.cwd = Some("/foo".into());
+        assert!(should_emit_amp(&args));
+    }
+
+    #[test]
+    fn amp_suppressed_when_user_explicitly_scoped_via_cwd() {
+        // `aivo logs --cwd /foo` — user asked for a specific directory and amp
+        // threads can't possibly match.
+        let mut args = base_args();
+        args.cwd = Some("/foo".into());
+        assert!(!should_emit_amp(&args));
     }
 
     #[test]

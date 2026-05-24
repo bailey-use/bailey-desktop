@@ -351,8 +351,12 @@ fn extract_amp_content(msg: &Value) -> Vec<ContentBlock> {
     out
 }
 
-/// Parse one amp content block. Amp follows Anthropic's content-array shape
-/// closely (`type: "text" | "tool_use" | "tool_result" | "thinking"`).
+/// Parse one amp content block. Amp's `type` discriminator matches
+/// Anthropic's (`text` / `tool_use` / `tool_result` / `thinking`) but the
+/// `tool_result` envelope diverges: amp uses `toolUseID` (camelCase) for
+/// the linkage and nests output under `run.result.{output,diff,error}`
+/// (the per-tool shape varies). We accept both Anthropic and amp shapes
+/// so older fixtures and live amp threads both render.
 fn parse_amp_block(block: &Value) -> Option<ContentBlock> {
     let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match kind {
@@ -384,28 +388,73 @@ fn parse_amp_block(block: &Value) -> Option<ContentBlock> {
                 .cloned()
                 .unwrap_or(Value::Null),
         }),
-        "tool_result" => {
-            let output = block
-                .get("content")
-                .map(stringify_block_text)
-                .unwrap_or_default();
-            let error = block
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .filter(|b| *b)
-                .map(|_| output.clone())
-                .filter(|s| !s.is_empty());
-            Some(ContentBlock::ToolResult {
-                id: block
-                    .get("tool_use_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                ok: error.is_none(),
-                output,
-                error,
-            })
-        }
+        "tool_result" => Some(parse_amp_tool_result(block)),
         _ => None,
+    }
+}
+
+/// Extract id + output + error from amp's `tool_result` block, accepting
+/// both Anthropic's wire shape (`content`/`tool_use_id`/`is_error`) and
+/// amp's native shape (`toolUseID` + `run.result.{output,diff,error,exitCode}`).
+fn parse_amp_tool_result(block: &Value) -> ContentBlock {
+    let id = block
+        .get("tool_use_id")
+        .or_else(|| block.get("toolUseID"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let run_result = block.get("run").and_then(|r| r.get("result"));
+
+    // Per-tool output: Bash → `output`; edit/create → `diff`; many other
+    // tools stuff their payload elsewhere in `result`. Fall back to a
+    // JSON dump of `result` so unknown shapes still surface something
+    // useful instead of an empty box.
+    let amp_output = run_result.and_then(|r| {
+        if let Some(s) = r.get("output").and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
+        }
+        if let Some(s) = r.get("diff").and_then(|v| v.as_str())
+            && !s.is_empty()
+        {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = r.as_object()
+            && !obj.is_empty()
+            && !(obj.len() == 1 && obj.contains_key("error"))
+        {
+            return Some(serde_json::to_string_pretty(r).unwrap_or_default());
+        }
+        None
+    });
+
+    let anthropic_output = block.get("content").map(stringify_block_text);
+    let output = amp_output.or(anthropic_output).unwrap_or_default();
+
+    let amp_error = run_result
+        .and_then(|r| r.get("error"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let exit_code_failed = run_result
+        .and_then(|r| r.get("exitCode"))
+        .and_then(|v| v.as_i64())
+        .is_some_and(|c| c != 0);
+    let anthropic_is_error = block
+        .get("is_error")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let error = amp_error
+        .or_else(|| (exit_code_failed || anthropic_is_error).then(|| output.clone()))
+        .filter(|s| !s.is_empty());
+
+    ContentBlock::ToolResult {
+        id,
+        ok: error.is_none(),
+        output,
+        error,
     }
 }
 
@@ -1382,6 +1431,147 @@ mod tests {
         let payload = extract_amp_value(&raw, None).unwrap();
         assert_eq!(payload.model.as_deref(), Some("rush"));
         assert!(payload.project.root.is_none());
+    }
+
+    #[test]
+    fn extract_amp_tool_result_unwraps_amp_native_bash_shape() {
+        // Real amp threads ship tool_result with `toolUseID` (camelCase)
+        // and the output nested under `run.result.output` — not the
+        // Anthropic `content`/`tool_use_id`/`is_error` shape the old
+        // parser assumed. Both must survive.
+        let raw = json!({
+            "id": "T-amp-bash",
+            "messages": [
+                { "role": "user", "content": "run pwd" },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_x", "name": "Bash",
+                         "input": {"cmd": "pwd"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "toolUseID": "call_x",
+                        "run": {
+                            "status": "done",
+                            "result": {"exitCode": 0, "output": "/tmp/proj"}
+                        }
+                    }]
+                }
+            ]
+        });
+        let payload = extract_amp_value(&raw, None).unwrap();
+        let tool_msg = &payload.messages[2];
+        match &tool_msg.content[0] {
+            ContentBlock::ToolResult {
+                id,
+                ok,
+                output,
+                error,
+            } => {
+                assert_eq!(id.as_deref(), Some("call_x"));
+                assert!(*ok);
+                assert_eq!(output, "/tmp/proj");
+                assert!(error.is_none());
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_amp_tool_result_unwraps_amp_native_edit_shape() {
+        // Edit-tool results live at `run.result.diff` instead of `output`.
+        let raw = json!({
+            "id": "T-amp-edit",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "toolUseID": "call_e",
+                        "run": {
+                            "status": "done",
+                            "result": {"diff": "--- a\n+++ b", "lineRange": [1, 2]}
+                        }
+                    }]
+                }
+            ]
+        });
+        let payload = extract_amp_value(&raw, None).unwrap();
+        match &payload.messages[0].content[0] {
+            ContentBlock::ToolResult { output, ok, .. } => {
+                assert!(output.contains("+++ b"));
+                assert!(*ok);
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_amp_tool_result_marks_failed_exit_code_as_error() {
+        let raw = json!({
+            "id": "T-amp-fail",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "toolUseID": "call_f",
+                        "run": {
+                            "status": "done",
+                            "result": {"exitCode": 1, "output": "permission denied"}
+                        }
+                    }]
+                }
+            ]
+        });
+        let payload = extract_amp_value(&raw, None).unwrap();
+        match &payload.messages[0].content[0] {
+            ContentBlock::ToolResult {
+                ok, output, error, ..
+            } => {
+                assert!(!*ok);
+                assert_eq!(output, "permission denied");
+                assert_eq!(error.as_deref(), Some("permission denied"));
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_amp_tool_result_falls_back_to_json_dump_for_unknown_shape() {
+        // Some tools (todoWrite, read-file with summary, ...) put their
+        // payload in `result` under keys we don't enumerate. We dump the
+        // whole `result` object as a fallback so the viewer never shows
+        // an empty box.
+        let raw = json!({
+            "id": "T-amp-unknown",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "toolUseID": "call_u",
+                        "run": {
+                            "status": "done",
+                            "result": {"todos": ["a", "b"], "removed": 1}
+                        }
+                    }]
+                }
+            ]
+        });
+        let payload = extract_amp_value(&raw, None).unwrap();
+        match &payload.messages[0].content[0] {
+            ContentBlock::ToolResult { output, ok, .. } => {
+                assert!(output.contains("todos"));
+                assert!(output.contains("removed"));
+                assert!(*ok);
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
     }
 
     #[test]

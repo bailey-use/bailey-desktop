@@ -370,7 +370,7 @@ impl LogsCommand {
         if logs_hits.len() > 1 {
             if let Some(entry) = pick_ambiguous_log_hit(id, &logs_hits, args.json).await? {
                 if args.json {
-                    println!("{}", serde_json::to_string_pretty(&entry)?);
+                    print_entry_json(&entry, &self.session_store).await?;
                 } else {
                     print_entry(&entry, &self.session_store).await;
                 }
@@ -379,7 +379,7 @@ impl LogsCommand {
         }
         if let Some(entry) = logs_hits.into_iter().next() {
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&entry)?);
+                print_entry_json(&entry, &self.session_store).await?;
             } else {
                 print_entry(&entry, &self.session_store).await;
             }
@@ -1111,6 +1111,40 @@ fn display_id(entry: &LogEntry) -> &str {
         return sid;
     }
     &entry.id
+}
+
+/// Emit the row's JSON, enriched with the resolved transcript for `run`
+/// rows that reference a native session. The row alone is just launch
+/// metadata (model, key, cwd, exit code) — the actual conversation
+/// lives in the native CLI's session file. Without this, `aivo logs
+/// show T-… --json` returned a row with null tokens and no messages.
+async fn print_entry_json(entry: &LogEntry, store: &SessionStore) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let ctx = crate::services::share_resolver::ResolverContext::from_system(cwd, store.clone());
+    let value = build_entry_json(entry, &ctx).await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn build_entry_json(
+    entry: &LogEntry,
+    ctx: &crate::services::share_resolver::ResolverContext,
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(entry)?;
+    if entry.source == "run"
+        && let Some(session_id) = entry.session_id.as_deref().filter(|s| !s.is_empty())
+        && let Some(obj) = value.as_object_mut()
+    {
+        // Resolver errors are non-fatal — the row metadata is still
+        // useful by itself (e.g. for runs whose native session was
+        // deleted). Just omit the `session` field in that case.
+        if let Ok(resolved) =
+            crate::services::share_resolver::resolve_session(session_id, ctx).await
+        {
+            obj.insert("session".into(), serde_json::to_value(&resolved.payload)?);
+        }
+    }
+    Ok(value)
 }
 
 async fn print_entry(entry: &LogEntry, store: &SessionStore) {
@@ -2141,6 +2175,97 @@ mod tests {
             r"c:\users\yc\project\Src",
             r"C:\Users\yc\project"
         ));
+    }
+
+    #[tokio::test]
+    async fn build_entry_json_attaches_resolved_session_for_amp_run() {
+        // `aivo logs show T-… --json` used to drop just the launch row,
+        // which has null tokens and no transcript. With session_id
+        // enrichment the resolved SharePayload rides along under `session`.
+        use crate::services::amp_threads;
+        use crate::services::share_resolver::ResolverContext;
+        let temp = tempfile::TempDir::new().unwrap();
+        let project_root = temp.path().to_path_buf();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let ctx = ResolverContext {
+            project_root: project_root.clone(),
+            session_store: store,
+            amp_dir: temp.path().join("amp-threads"),
+            chat_sessions_dir: temp.path().join("sessions"),
+            claude_projects_root: temp.path().join("claude_projects"),
+            codex_sessions_root: temp.path().join("codex"),
+            gemini_tmp_root: temp.path().join("gemini"),
+            pi_sessions_root: temp.path().join("pi"),
+            opencode_db_path: temp.path().join("opencode.db"),
+        };
+        tokio::fs::create_dir_all(&ctx.amp_dir).await.unwrap();
+        let thread_id = "T-019e593a-b41f-700b-a3db-ebb54822cb7a";
+        amp_threads::save_thread(
+            &ctx.amp_dir,
+            &serde_json::json!({
+                "id": thread_id,
+                "agentMode": "rush",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut entry = test_entry("rmt4kbcxchmr", "2026-05-24T09:09:03Z", "run");
+        entry.tool = Some("amp".into());
+        entry.model = Some("composer-2.5".into());
+        entry.session_id = Some(thread_id.into());
+        entry.cwd = Some(project_root.to_string_lossy().to_string());
+
+        let value = build_entry_json(&entry, &ctx).await.unwrap();
+        let session = value
+            .get("session")
+            .expect("run rows with a session_id should attach the resolved session");
+        assert_eq!(
+            session.get("source_cli").and_then(|v| v.as_str()),
+            Some("amp")
+        );
+        assert_eq!(
+            session
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        // Row-level fields stay where they were so existing JSON consumers
+        // keep working.
+        assert_eq!(
+            value.get("id").and_then(|v| v.as_str()),
+            Some("rmt4kbcxchmr")
+        );
+        assert_eq!(
+            value.get("model").and_then(|v| v.as_str()),
+            Some("composer-2.5")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_entry_json_skips_session_for_chat_rows() {
+        // Only `run` rows get the transcript drill-through; chat rows
+        // already carry their content in the row itself.
+        use crate::services::share_resolver::ResolverContext;
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp.path().join("config.json"));
+        let ctx = ResolverContext {
+            project_root: temp.path().to_path_buf(),
+            session_store: store,
+            amp_dir: temp.path().join("amp-threads"),
+            chat_sessions_dir: temp.path().join("sessions"),
+            claude_projects_root: temp.path().join("claude_projects"),
+            codex_sessions_root: temp.path().join("codex"),
+            gemini_tmp_root: temp.path().join("gemini"),
+            pi_sessions_root: temp.path().join("pi"),
+            opencode_db_path: temp.path().join("opencode.db"),
+        };
+        let mut entry = test_entry("c1", "2026-05-24T09:00:00Z", "chat");
+        entry.session_id = Some("chat-xyz".into());
+        let value = build_entry_json(&entry, &ctx).await.unwrap();
+        assert!(value.get("session").is_none());
     }
 
     fn test_entry(id: &str, ts: &str, source: &str) -> LogEntry {

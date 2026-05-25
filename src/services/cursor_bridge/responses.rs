@@ -7,6 +7,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -214,6 +215,172 @@ pub(super) fn reduce_responses_request_to_prompt_without_tools(body: &Value) -> 
     parts.join("\n\n")
 }
 
+/// Snapshot of an in-progress `/v1/responses` stream that has already had
+/// its head + `response.created` + pre-opened reasoning item written. Lets
+/// the bridged fresh path commit codex's UI to "in_progress" before paying
+/// cursor-agent spawn / `session/new` / `session/prompt` latency — without
+/// it codex sees a hung HTTP request for 25–60 s on a stalled prewarm and
+/// renders no spinner, reasoning, or token counter, so the user assumes the
+/// turn is done.
+pub(super) struct BridgedResponsesOpen {
+    pub resp_id: String,
+    pub reasoning_id: String,
+    pub reasoning_index: u32,
+    pub reasoning_text: String,
+    pub created: i64,
+}
+
+/// Write the SSE response head and the events codex needs to commit its UI
+/// to an in-progress turn: `response.created` followed by the reasoning
+/// item's `output_item.added` + `reasoning_summary_part.added`. Returns a
+/// handle the caller threads through to the streaming loop.
+pub(super) async fn emit_responses_opening_events(
+    socket: &mut TcpStream,
+    response_model: &str,
+) -> Result<BridgedResponsesOpen> {
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .context("write Responses SSE head")?;
+    let resp_id = new_responses_id();
+    let reasoning_id = new_responses_reasoning_id();
+    let reasoning_index: u32 = 0;
+    let created = current_unix_timestamp();
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": response_model,
+                    "created_at": created,
+                    "status": "in_progress",
+                    "output": [],
+                },
+            }),
+        ),
+    )
+    .await
+    .context("write response.created")?;
+    emit_responses_reasoning_open(socket, &resp_id, &reasoning_id, reasoning_index)
+        .await
+        .context("write reasoning open")?;
+    Ok(BridgedResponsesOpen {
+        resp_id,
+        reasoning_id,
+        reasoning_index,
+        reasoning_text: String::new(),
+        created,
+    })
+}
+
+/// Append `delta` to the pre-opened reasoning item and stream it as a
+/// `response.reasoning_summary_text.delta`. Used by the fresh path to tick
+/// visible activity ("Waking cursor session..") while cursor-agent is
+/// being spawned/initialized.
+async fn write_responses_heartbeat_delta(
+    socket: &mut TcpStream,
+    open: &mut BridgedResponsesOpen,
+    delta: &str,
+) -> Result<()> {
+    open.reasoning_text.push_str(delta);
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "response_id": open.resp_id,
+                "item_id": open.reasoning_id,
+                "output_index": open.reasoning_index,
+                "summary_index": 0,
+                "delta": delta,
+            }),
+        ),
+    )
+    .await
+}
+
+/// Mid-stream failure path used after [`emit_responses_opening_events`] has
+/// committed us to a 200/SSE response. Surfaces the error inside the
+/// reasoning panel and emits a terminating `response.completed` with
+/// `status: failed` so codex marks the turn as errored instead of waiting
+/// forever.
+async fn emit_responses_failure(
+    socket: &mut TcpStream,
+    open: BridgedResponsesOpen,
+    response_model: &str,
+    error_message: &str,
+    input_tokens: u64,
+) {
+    let BridgedResponsesOpen {
+        resp_id,
+        reasoning_id,
+        reasoning_index,
+        mut reasoning_text,
+        created,
+    } = open;
+    let prefix = if reasoning_text.is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    let error_chunk = format!("{prefix}Error: {error_message}");
+    reasoning_text.push_str(&error_chunk);
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.reasoning_summary_text.delta",
+            &json!({
+                "type": "response.reasoning_summary_text.delta",
+                "response_id": resp_id,
+                "item_id": reasoning_id,
+                "output_index": reasoning_index,
+                "summary_index": 0,
+                "delta": error_chunk,
+            }),
+        ),
+    )
+    .await;
+    let _ = emit_responses_reasoning_close(
+        socket,
+        &resp_id,
+        &reasoning_id,
+        reasoning_index,
+        &reasoning_text,
+    )
+    .await;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "response.completed",
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "model": response_model,
+                    "created_at": created,
+                    "status": "failed",
+                    "output": [reasoning_item_done(&reasoning_id, &reasoning_text)],
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "total_tokens": input_tokens,
+                    },
+                    "error": {"message": error_message},
+                },
+            }),
+        ),
+    )
+    .await;
+    let _ = write_chunk_terminator(socket).await;
+}
+
 pub(super) async fn run_responses_bridged(
     socket: &mut TcpStream,
     state: &RouterState,
@@ -252,6 +419,87 @@ pub(super) async fn run_responses_bridged_fresh(
     }
     let input_tokens = estimate_tokens(&prompt);
 
+    // Open the SSE stream BEFORE the slow cursor-agent setup so codex sees
+    // `response.created` (status=in_progress) the moment its POST lands.
+    // Without this, a stalled prewarm + cold-path `session/new` can keep
+    // codex with zero bytes on the wire for 25–60 s, during which its TUI
+    // shows no spinner / reasoning / token counter and the user assumes
+    // the turn has finished. The reasoning item is pre-opened so the
+    // heartbeat below has a target to stream into.
+    let initial_model = requested_model
+        .clone()
+        .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+    let mut open = emit_responses_opening_events(socket, &initial_model).await?;
+
+    let setup = setup_bridged_session_for_responses(
+        state,
+        tools,
+        image_blocks,
+        requested_model.clone(),
+        &prompt,
+    );
+    tokio::pin!(setup);
+    let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // skip the zero-delay first tick
+
+    let setup_outcome = loop {
+        tokio::select! {
+            biased;
+            r = &mut setup => break r,
+            _ = ticker.tick() => {
+                let delta = if open.reasoning_text.is_empty() {
+                    "Waking cursor session"
+                } else {
+                    "."
+                };
+                let _ = write_responses_heartbeat_delta(socket, &mut open, delta).await;
+            }
+        }
+    };
+
+    let (bridge_session, response_model) = match setup_outcome {
+        Ok(s) => s,
+        Err(e) => {
+            emit_responses_failure(
+                socket,
+                open,
+                &initial_model,
+                &format!("{e:#}"),
+                input_tokens,
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    stream_bridged_responses_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+        Some(open),
+    )
+    .await
+}
+
+/// Acquires (or spawns) a cursor-agent ACP session for the fresh-path
+/// `/v1/responses` turn and pins the prompt stream into the bridge session.
+/// Returns the bridge session and the model id cursor settled on (so the
+/// `response.completed` envelope reports the actual model, not the
+/// requested one). Extracted from [`run_responses_bridged_fresh`] so its
+/// slow awaits can be tokio::select'd against a UI heartbeat without
+/// borrowing `socket`.
+async fn setup_bridged_session_for_responses(
+    state: &RouterState,
+    tools: Vec<Value>,
+    image_blocks: Vec<Value>,
+    requested_model: Option<String>,
+    prompt: &str,
+) -> Result<(Arc<tokio::sync::Mutex<BridgeSession>>, String)> {
     let (bridge_session, mut acp) = if let Some(slot) = take_mcp_prewarmed(state).await {
         McpBridge::take_for_use(&slot.bridge_session, tools).await;
         (slot.bridge_session, slot.acp)
@@ -295,10 +543,10 @@ pub(super) async fn run_responses_bridged_fresh(
     let response_model = acp
         .model_id()
         .map(str::to_string)
-        .or(requested_model.clone())
+        .or(requested_model)
         .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
 
-    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let blocks = cursor_acp::assemble_prompt_blocks(prompt, image_blocks);
     let stream = match acp.prompt_with_blocks(blocks).await {
         Ok(s) => s,
         Err(e) => {
@@ -312,15 +560,7 @@ pub(super) async fn run_responses_bridged_fresh(
         guard.attach_session(acp, stream);
     }
 
-    stream_bridged_responses_turn(
-        socket,
-        state,
-        bridge_session,
-        &bridge_id,
-        &response_model,
-        input_tokens,
-    )
-    .await
+    Ok((bridge_session, response_model))
 }
 
 pub(super) async fn run_responses_bridged_resume(
@@ -340,6 +580,7 @@ pub(super) async fn run_responses_bridged_resume(
         &bridge_id,
         &response_model,
         input_tokens,
+        None,
     )
     .await
 }
@@ -351,6 +592,7 @@ pub(super) async fn stream_bridged_responses_turn(
     bridge_id: &str,
     response_model: &str,
     input_tokens: u64,
+    pre_opened: Option<BridgedResponsesOpen>,
 ) -> Result<Option<String>> {
     let (acp, mut stream, mut event_rx) = match async {
         let mut guard = bridge_session.lock().await;
@@ -364,55 +606,52 @@ pub(super) async fn stream_bridged_responses_turn(
         Err(e) => {
             // Race: bridge session is in the sessions map but its ACP
             // session / prompt stream was already taken (or never attached).
-            // Tear it down and surface as a 500 instead of panicking.
             state.mcp_bridge.drop_session(bridge_id).await;
+            if let Some(open) = pre_opened {
+                // We've already committed to a 200 with SSE — surface the
+                // race as a `response.failed` event so codex stops waiting.
+                emit_responses_failure(
+                    socket,
+                    open,
+                    response_model,
+                    &format!("{e:#}"),
+                    input_tokens,
+                )
+                .await;
+                return Ok(None);
+            }
             return Err(e).context("bridge session lost its active ACP slot");
         }
     };
 
-    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
-    if let Err(e) = socket.write_all(head.as_bytes()).await {
-        {
-            let mut guard = bridge_session.lock().await;
-            guard.detach_event_sink();
-        }
-        drop(acp);
-        drop(stream);
-        state.mcp_bridge.drop_session(bridge_id).await;
-        return Err(e).context("write Responses SSE head");
-    }
-
-    let resp_id = new_responses_id();
-    let created = current_unix_timestamp();
-
-    let _ = write_sse_chunk(
-        socket,
-        &sse_named_event(
-            "response.created",
-            &json!({
-                "type": "response.created",
-                "response": {
-                    "id": resp_id,
-                    "object": "response",
-                    "model": response_model,
-                    "created_at": created,
-                    "status": "in_progress",
-                    "output": [],
-                },
-            }),
-        ),
-    )
-    .await;
     // Reasoning item is pre-opened at output_index 0 IMMEDIATELY so codex's
     // UI commits to rendering the reasoning panel before any text arrives.
     // Without this, when a turn starts with text (vs thought/tool), codex
     // anchors on the message item and intermittently hides reasoning that
     // streams in later — visible in round 2 of debug-20260524-114900.
     // Message item opens lazily at the next index on first text delta.
-    let reasoning_id = new_responses_reasoning_id();
-    let reasoning_index: u32 = 0;
-    let _ = emit_responses_reasoning_open(socket, &resp_id, &reasoning_id, reasoning_index).await;
-    let mut reasoning_text = String::new();
+    let BridgedResponsesOpen {
+        resp_id,
+        reasoning_id,
+        reasoning_index,
+        mut reasoning_text,
+        created,
+    } = match pre_opened {
+        Some(open) => open,
+        None => match emit_responses_opening_events(socket, response_model).await {
+            Ok(o) => o,
+            Err(e) => {
+                {
+                    let mut guard = bridge_session.lock().await;
+                    guard.detach_event_sink();
+                }
+                drop(acp);
+                drop(stream);
+                state.mcp_bridge.drop_session(bridge_id).await;
+                return Err(e).context("write Responses SSE opening");
+            }
+        },
+    };
     let mut reasoning_closed = false;
     let mut current_message: Option<(String, String, u32)> = None;
     let mut next_output_index: u32 = 1;
@@ -420,6 +659,20 @@ pub(super) async fn stream_bridged_responses_turn(
     let mut function_call_item: Option<Value> = None;
     let mut errored = false;
     let mut parked = false;
+    // Cursor goes silent in two distinct windows: (1) between `session/prompt`
+    // and its first `agent_*` chunk (10+ s on cold prewarm), and (2)
+    // between text bursts while it runs internal tools — 24+ s gaps with
+    // only `tool_call_update` (no title → no marker) and
+    // `available_commands_update` (→ `: keepalive` comment, invisible).
+    // Both windows make codex's UI think the turn is done. Track when the
+    // last visible event was emitted; whenever the gap exceeds 1.5 s and
+    // the reasoning item is still open, tick a visible `.` so the spinner /
+    // reasoning panel stay alive across the silence. Reset on every visible
+    // delta — text, thought, or tool marker.
+    let mut last_visible_at = std::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(1500));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the zero-delay first tick
 
     'outer: loop {
         tokio::select! {
@@ -556,6 +809,7 @@ pub(super) async fn stream_bridged_responses_turn(
                                 ),
                             )
                             .await;
+                            last_visible_at = std::time::Instant::now();
                         } else if let Some(reasoning) = extract_agent_thought(&value)
                             .map(str::to_string)
                             .or_else(|| extract_tool_call_marker(&value))
@@ -581,11 +835,13 @@ pub(super) async fn stream_bridged_responses_turn(
                                     ),
                                 )
                                 .await;
+                                last_visible_at = std::time::Instant::now();
                             }
                         } else {
                             // Keep the stream alive on updates we don't
                             // surface (plans, available_commands, etc.) so
-                            // OpenAI SDK clients don't time out.
+                            // OpenAI SDK clients don't time out. The
+                            // heartbeat branch below adds the visible tick.
                             let _ = write_sse_chunk(socket, SSE_KEEPALIVE).await;
                         }
                     }
@@ -596,6 +852,45 @@ pub(super) async fn stream_bridged_responses_turn(
                         break 'outer;
                     }
                     None => break 'outer,
+                }
+            }
+            _ = heartbeat.tick(), if !reasoning_closed && current_message.is_none() => {
+                // Only fire heartbeat while the reasoning panel is still
+                // the canonical "in-progress" surface. Once a message item
+                // opens, codex's TUI re-renders the full message on
+                // `output_item.done`; if we'd appended dots in the
+                // meantime, codex shows the live cell (without dots) AND
+                // a second cell with the finalized text (with dots) —
+                // a visible duplicate bullet (see screenshot from
+                // debug-20260525-143805). And dots into the reasoning
+                // panel after that point are dropped by codex for models
+                // outside its built-in catalog (composer-2.5). So we
+                // gracefully give up on visible mid-message heartbeats
+                // here; the in-loop tick stays useful only for the
+                // pre-first-chunk wait window.
+                if last_visible_at.elapsed() >= Duration::from_millis(3000) {
+                    let delta = if reasoning_text.is_empty() {
+                        "Waking cursor session"
+                    } else {
+                        "."
+                    };
+                    reasoning_text.push_str(delta);
+                    let _ = write_sse_chunk(
+                        socket,
+                        &sse_named_event(
+                            "response.reasoning_summary_text.delta",
+                            &json!({
+                                "type": "response.reasoning_summary_text.delta",
+                                "response_id": resp_id,
+                                "item_id": reasoning_id,
+                                "output_index": reasoning_index,
+                                "summary_index": 0,
+                                "delta": delta,
+                            }),
+                        ),
+                    )
+                    .await;
+                    last_visible_at = std::time::Instant::now();
                 }
             }
         }

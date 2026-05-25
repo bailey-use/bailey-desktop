@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -232,6 +233,123 @@ pub(super) async fn run_anthropic_bridged(
     run_anthropic_bridged_fresh(socket, state, body, requested_model).await
 }
 
+/// Snapshot of an in-progress `/v1/messages` stream whose head +
+/// `message_start` + initial `thinking` content block have already been
+/// written. Same purpose as [`super::responses::BridgedResponsesOpen`]: lets
+/// the bridged fresh path commit claude's UI to an active turn before
+/// paying cursor-agent setup latency, so a stalled prewarm doesn't make
+/// the user think the turn already finished.
+pub(super) struct BridgedAnthropicOpen {
+    pub block_state: AnthropicBlockState,
+    pub output_tokens: u64,
+}
+
+/// Write head + `message_start` and open a `thinking` content block at
+/// index 0 so the bridged fresh path has somewhere to stream heartbeat
+/// deltas while cursor-agent is being spawned/initialized.
+pub(super) async fn emit_anthropic_opening_events(
+    socket: &mut TcpStream,
+    response_model: &str,
+    input_tokens: u64,
+) -> Result<BridgedAnthropicOpen> {
+    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .context("write Anthropic SSE head")?;
+    let message_id = new_anthropic_message_id();
+    write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": response_model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            }),
+        ),
+    )
+    .await
+    .context("write message_start")?;
+    let mut block_state = AnthropicBlockState::default();
+    block_state
+        .ensure_kind(socket, AnthropicBlockKind::Thinking)
+        .await
+        .context("open initial thinking block")?;
+    Ok(BridgedAnthropicOpen {
+        block_state,
+        output_tokens: 0,
+    })
+}
+
+/// Stream `delta` as a `thinking_delta` inside the pre-opened thinking
+/// block so claude shows visible activity while cursor-agent is being
+/// spawned.
+async fn write_anthropic_heartbeat_delta(
+    socket: &mut TcpStream,
+    open: &mut BridgedAnthropicOpen,
+    delta: &str,
+) -> Result<()> {
+    open.output_tokens = open.output_tokens.saturating_add(estimate_tokens(delta));
+    write_sse_chunk(
+        socket,
+        &anthropic_thinking_delta(open.block_state.index(), delta),
+    )
+    .await
+}
+
+/// Mid-stream failure path used once [`emit_anthropic_opening_events`] has
+/// committed us to a 200/SSE response. Appends the error to the thinking
+/// block and emits the standard `message_delta` + `message_stop` close so
+/// claude marks the turn as ended instead of waiting forever.
+async fn emit_anthropic_failure(
+    socket: &mut TcpStream,
+    mut open: BridgedAnthropicOpen,
+    error_message: &str,
+    input_tokens: u64,
+) {
+    let prefix = if open.output_tokens == 0 { "" } else { "\n\n" };
+    let chunk = format!("{prefix}Error: {error_message}");
+    let _ = write_anthropic_heartbeat_delta(socket, &mut open, &chunk).await;
+    let _ = open.block_state.close(socket).await;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": open.output_tokens,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            }),
+        ),
+    )
+    .await;
+    let _ = write_sse_chunk(
+        socket,
+        &sse_named_event("message_stop", &json!({"type": "message_stop"})),
+    )
+    .await;
+    let _ = write_chunk_terminator(socket).await;
+}
+
 pub(super) async fn run_anthropic_bridged_fresh(
     socket: &mut TcpStream,
     state: &RouterState,
@@ -246,6 +364,76 @@ pub(super) async fn run_anthropic_bridged_fresh(
     }
     let input_tokens = estimate_tokens(&prompt);
 
+    // Open the SSE stream + a thinking block BEFORE the slow cursor-agent
+    // setup so claude sees `message_start` immediately and can render its
+    // "Cogitating" panel. Without this, a stalled prewarm + cold-path
+    // `session/new` can keep claude with zero bytes on the wire for
+    // 25–60 s, during which its TUI shows nothing and the user assumes
+    // the turn has finished. See [`super::responses`] for the codex twin.
+    let initial_model = requested_model
+        .clone()
+        .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
+    let mut open = emit_anthropic_opening_events(socket, &initial_model, input_tokens).await?;
+
+    let setup = setup_bridged_session_for_anthropic(
+        state,
+        tools,
+        image_blocks,
+        requested_model.clone(),
+        &prompt,
+    );
+    tokio::pin!(setup);
+    let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await; // skip the zero-delay first tick
+
+    let setup_outcome = loop {
+        tokio::select! {
+            biased;
+            r = &mut setup => break r,
+            _ = ticker.tick() => {
+                let delta = if open.output_tokens == 0 {
+                    "Waking cursor session"
+                } else {
+                    "."
+                };
+                let _ = write_anthropic_heartbeat_delta(socket, &mut open, delta).await;
+            }
+        }
+    };
+
+    let (bridge_session, response_model) = match setup_outcome {
+        Ok(s) => s,
+        Err(e) => {
+            emit_anthropic_failure(socket, open, &format!("{e:#}"), input_tokens).await;
+            return Ok(None);
+        }
+    };
+    let bridge_id = { bridge_session.lock().await.id.clone() };
+
+    stream_bridged_turn(
+        socket,
+        state,
+        bridge_session,
+        &bridge_id,
+        &response_model,
+        input_tokens,
+        Some(open),
+    )
+    .await
+}
+
+/// Acquires (or spawns) a cursor-agent ACP session for the fresh-path
+/// `/v1/messages` turn. Extracted from [`run_anthropic_bridged_fresh`] so
+/// its slow awaits can be tokio::select'd against a UI heartbeat without
+/// borrowing `socket`. See the Responses twin for rationale.
+async fn setup_bridged_session_for_anthropic(
+    state: &RouterState,
+    tools: Vec<Value>,
+    image_blocks: Vec<Value>,
+    requested_model: Option<String>,
+    prompt: &str,
+) -> Result<(Arc<tokio::sync::Mutex<BridgeSession>>, String)> {
     let (bridge_session, mut acp) = if let Some(slot) = take_mcp_prewarmed(state).await {
         McpBridge::take_for_use(&slot.bridge_session, tools).await;
         (slot.bridge_session, slot.acp)
@@ -289,10 +477,10 @@ pub(super) async fn run_anthropic_bridged_fresh(
     let response_model = acp
         .model_id()
         .map(str::to_string)
-        .or(requested_model.clone())
+        .or(requested_model)
         .unwrap_or_else(|| CURSOR_ACP_SENTINEL.to_string());
 
-    let blocks = cursor_acp::assemble_prompt_blocks(&prompt, image_blocks);
+    let blocks = cursor_acp::assemble_prompt_blocks(prompt, image_blocks);
     let stream = match acp.prompt_with_blocks(blocks).await {
         Ok(s) => s,
         Err(e) => {
@@ -306,15 +494,7 @@ pub(super) async fn run_anthropic_bridged_fresh(
         guard.attach_session(acp, stream);
     }
 
-    stream_bridged_turn(
-        socket,
-        state,
-        bridge_session,
-        &bridge_id,
-        &response_model,
-        input_tokens,
-    )
-    .await
+    Ok((bridge_session, response_model))
 }
 
 pub(super) async fn run_anthropic_bridged_resume(
@@ -337,6 +517,7 @@ pub(super) async fn run_anthropic_bridged_resume(
         &bridge_id,
         &response_model,
         input_tokens,
+        None,
     )
     .await
 }
@@ -352,6 +533,7 @@ pub(super) async fn stream_bridged_turn(
     bridge_id: &str,
     response_model: &str,
     input_tokens: u64,
+    pre_opened: Option<BridgedAnthropicOpen>,
 ) -> Result<Option<String>> {
     let (acp, mut stream, mut event_rx) = match async {
         let mut guard = bridge_session.lock().await;
@@ -365,59 +547,54 @@ pub(super) async fn stream_bridged_turn(
         Err(e) => {
             // Race: bridge session is in the sessions map but its ACP
             // session / prompt stream was already taken (or never attached).
-            // Tear it down and surface as a 500 instead of panicking.
             state.mcp_bridge.drop_session(bridge_id).await;
+            if let Some(open) = pre_opened {
+                // We've already committed to a 200 with SSE — surface the
+                // race inside the thinking block and emit `message_stop`
+                // so claude doesn't wait forever.
+                emit_anthropic_failure(socket, open, &format!("{e:#}"), input_tokens).await;
+                return Ok(None);
+            }
             return Err(e).context("bridge session lost its active ACP slot");
         }
     };
 
-    let head = http_chunked_response_head_with_extra(200, "text/event-stream", cors_header_block());
-    if let Err(e) = socket.write_all(head.as_bytes()).await {
-        // Client closed on us before we wrote a byte; tear the bridge down
-        // wholesale — there's no resumption that could save this turn.
-        {
-            let mut guard = bridge_session.lock().await;
-            guard.detach_event_sink();
-        }
-        drop(acp);
-        drop(stream);
-        state.mcp_bridge.drop_session(bridge_id).await;
-        return Err(e).context("write SSE head");
-    }
-
-    let message_id = new_anthropic_message_id();
-    let _ = write_sse_chunk(
-        socket,
-        &sse_named_event(
-            "message_start",
-            &json!({
-                "type": "message_start",
-                "message": {
-                    "id": message_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": response_model,
-                    "stop_reason": null,
-                    "stop_sequence": null,
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": 0,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                    },
-                },
-            }),
-        ),
-    )
-    .await;
-
-    let mut block_state = AnthropicBlockState::default();
+    let BridgedAnthropicOpen {
+        block_state: initial_block_state,
+        output_tokens: initial_output_tokens,
+    } = match pre_opened {
+        Some(open) => open,
+        None => match emit_anthropic_opening_events(socket, response_model, input_tokens).await {
+            Ok(o) => o,
+            Err(e) => {
+                {
+                    let mut guard = bridge_session.lock().await;
+                    guard.detach_event_sink();
+                }
+                drop(acp);
+                drop(stream);
+                state.mcp_bridge.drop_session(bridge_id).await;
+                return Err(e).context("write Anthropic SSE opening");
+            }
+        },
+    };
+    let mut block_state = initial_block_state;
     let mut stop_reason = "end_turn";
-    let mut output_tokens: u64 = 0;
+    let mut output_tokens: u64 = initial_output_tokens;
     let mut aggregated = String::new();
     let mut parked = false;
     let mut turn_errored = false;
+    // Same rationale as the Responses twin: cursor goes silent both before
+    // the first chunk AND between text bursts while it runs internal
+    // tools, sometimes 20+ s with only `tool_call_update` (no title → no
+    // marker) and `available_commands_update` (→ keepalive comment). Both
+    // gaps make claude's UI think the turn ended. Track last visible
+    // delta time and tick a thinking heartbeat whenever the gap exceeds
+    // 1.5 s.
+    let mut last_visible_at = std::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_millis(1500));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the zero-delay first tick
 
     'outer: loop {
         tokio::select! {
@@ -466,6 +643,7 @@ pub(super) async fn stream_bridged_turn(
                                 &anthropic_text_delta(block_state.index(), text),
                             )
                             .await;
+                            last_visible_at = std::time::Instant::now();
                         } else if let Some(thought) = extract_agent_thought(&value) {
                             let _ = block_state
                                 .ensure_kind(socket, AnthropicBlockKind::Thinking)
@@ -475,6 +653,7 @@ pub(super) async fn stream_bridged_turn(
                                 &anthropic_thinking_delta(block_state.index(), thought),
                             )
                             .await;
+                            last_visible_at = std::time::Instant::now();
                         } else if let Some(marker) = extract_tool_call_marker(&value) {
                             let _ = block_state
                                 .ensure_kind(socket, AnthropicBlockKind::Thinking)
@@ -484,6 +663,7 @@ pub(super) async fn stream_bridged_turn(
                                 &anthropic_thinking_delta(block_state.index(), &marker),
                             )
                             .await;
+                            last_visible_at = std::time::Instant::now();
                         }
                     }
                     Some(PromptEvent::Done(result)) => {
@@ -496,6 +676,41 @@ pub(super) async fn stream_bridged_turn(
                         break 'outer;
                     }
                     None => break 'outer,
+                }
+            }
+            _ = heartbeat.tick() => {
+                // Only fire when there's been actual silence — the ticker
+                // is interval-based, not gap-based.
+                if last_visible_at.elapsed() < Duration::from_millis(3000) {
+                    // skip
+                } else if matches!(block_state.current, Some((_, AnthropicBlockKind::Text))) {
+                    // A text block is already open — append the heartbeat
+                    // dot into it directly so claude's UI shows it as the
+                    // message grows. Trades a `.` in the final message for
+                    // visible "still working" feedback. Same rationale as
+                    // the Responses twin: composer-2.5 isn't a recognized
+                    // model so reasoning/thinking panels are unreliable.
+                    aggregated.push('.');
+                    output_tokens = output_tokens.saturating_add(estimate_tokens("."));
+                    let _ = write_sse_chunk(
+                        socket,
+                        &anthropic_text_delta(block_state.index(), "."),
+                    )
+                    .await;
+                    last_visible_at = std::time::Instant::now();
+                } else {
+                    // No text block yet — keep the dot in a thinking block.
+                    let _ = block_state
+                        .ensure_kind(socket, AnthropicBlockKind::Thinking)
+                        .await;
+                    let delta = if output_tokens == 0 { "Waking cursor session" } else { "." };
+                    output_tokens = output_tokens.saturating_add(estimate_tokens(delta));
+                    let _ = write_sse_chunk(
+                        socket,
+                        &anthropic_thinking_delta(block_state.index(), delta),
+                    )
+                    .await;
+                    last_visible_at = std::time::Instant::now();
                 }
             }
         }

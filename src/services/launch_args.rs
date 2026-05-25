@@ -241,11 +241,44 @@ pub(crate) async fn build_runtime_args(
         maybe_write_codex_model_catalog(model, use_responses_router).await?;
     let args = inject_codex_model(model, &args, use_responses_router);
     let args = inject_codex_model_catalog(codex_model_catalog_path.as_deref(), &args);
+    let args = inject_codex_cursor_tui_reasoning(use_responses_router, &args);
 
     Ok(RuntimeArgs {
         args,
         codex_model_catalog_path,
     })
+}
+
+/// Force codex's TUI to render the reasoning panel for cursor-backed
+/// turns. The catalog override + `reasoning_summary_format=experimental`
+/// makes codex *request* reasoning summaries and parse the incoming
+/// `agent_reasoning` events (verified in `~/.codex/sessions/.../rollout-*.jsonl` —
+/// the events ARE recorded), but codex's TUI hides them by default for
+/// any model whose `hide_agent_reasoning` resolves to true. Explicit
+/// override forces the panel visible so cursor's `agent_thought_chunk`
+/// stream and the bridge's heartbeat dots show up as visible activity.
+/// `show_raw_agent_reasoning` makes raw thoughts render in addition to
+/// model-emitted summaries; cursor's composer-* doesn't emit OpenAI-style
+/// encrypted reasoning, only thought chunks routed through summary
+/// deltas, so the raw flag is what surfaces them.
+fn inject_codex_cursor_tui_reasoning(use_router: bool, args: &[String]) -> Vec<String> {
+    if !use_router {
+        return args.to_vec();
+    }
+    if args
+        .iter()
+        .any(|a| a.contains("tui.hide_agent_reasoning") || a.contains("hide_agent_reasoning"))
+    {
+        return args.to_vec();
+    }
+    let mut new_args = vec![
+        "--config".to_string(),
+        "tui.hide_agent_reasoning=false".to_string(),
+        "--config".to_string(),
+        "tui.show_raw_agent_reasoning=true".to_string(),
+    ];
+    new_args.extend_from_slice(args);
+    new_args
 }
 
 /// True when codex's upstream is one of aivo's local routers rather than a
@@ -690,7 +723,26 @@ fn build_codex_model_catalog_json(model: &str) -> Result<String> {
             "priority": 0,
             "upgrade": serde_json::Value::Null,
             "base_instructions": "base instructions",
-            "supports_reasoning_summaries": false,
+            // Tell codex this model exposes reasoning summaries so it (a)
+            // sends `reasoning: {summary: "auto"}` in the Responses request
+            // and (b) routes incoming `response.reasoning_summary_text.delta`
+            // events into a visible panel instead of dropping them. Cursor's
+            // composer-* models do actually emit thoughts (cursor's ACP
+            // `agent_thought_chunk` events), and aivo's bridge already
+            // forwards those as reasoning summaries — without this flag the
+            // bridge was emitting reasoning events into a UI codex had
+            // already gated off, making cursor's mid-turn silences look like
+            // a finished response. See debug-20260525-151512 trace.
+            "supports_reasoning_summaries": true,
+            "default_reasoning_summary": "auto",
+            // Codex's built-in catalog entries set this to "experimental" on
+            // every reasoning-capable model (verified by `strings` dump of
+            // codex 0.132's catalog blob — gpt-5-codex, gpt-5*, etc.). With
+            // `supports_reasoning_summaries: true` but `format` absent or
+            // "none", codex still requests `reasoning: {summary: "auto"}` but
+            // its TUI's reasoning-panel rendering path is gated off, so the
+            // events go in and nothing visible comes out.
+            "reasoning_summary_format": "experimental",
             "support_verbosity": false,
             "default_verbosity": serde_json::Value::Null,
             "apply_patch_tool_type": serde_json::Value::Null,

@@ -1616,6 +1616,7 @@ impl OpenAIStreamConverter {
                 .prompt_tokens_details
                 .as_ref()
                 .and_then(|d| d.cached_tokens)
+                .or(usage.prompt_cache_hit_tokens)
                 .or(self.openai_cached_tokens);
             self.recompute_anthropic_input();
         }
@@ -2397,6 +2398,27 @@ data: [DONE]\n";
             .expect("data line after message_delta");
         let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
         assert_eq!(payload["usage"]["input_tokens"], 12);
+        assert_eq!(payload["usage"]["cache_read_input_tokens"], 90);
+    }
+
+    #[test]
+    fn openai_sse_to_anthropic_extracts_cached_tokens_from_deepseek_cache_hit_field() {
+        let sse = "data: {\"id\":\"c\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+data: {\"id\":\"c\",\"model\":\"deepseek-chat\",\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":90}}\n\
+data: [DONE]\n";
+        let result = convert_openai_sse_to_anthropic(sse, 200).unwrap();
+        let delta_section = result
+            .split("event: message_delta\n")
+            .nth(1)
+            .expect("message_delta event present");
+        let data_line = delta_section
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("data line after message_delta");
+        let payload: Value = serde_json::from_str(data_line.trim_start_matches("data: ")).unwrap();
+        // Anthropic semantics: input_tokens is fresh-only (100 − 90).
+        assert_eq!(payload["usage"]["input_tokens"], 10);
+        assert_eq!(payload["usage"]["output_tokens"], 10);
         assert_eq!(payload["usage"]["cache_read_input_tokens"], 90);
     }
 

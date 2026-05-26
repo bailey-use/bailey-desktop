@@ -129,10 +129,8 @@ fn build_anthropic_usage(resp: &Value, mode: &UsageValueMode) -> Value {
     let anthropic_cache_read = usage_obj
         .and_then(|u| u.get("cache_read_input_tokens"))
         .and_then(|v| v.as_u64());
-    let openai_cached = usage_obj
-        .and_then(|u| u.get("prompt_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64());
+    let openai_cached =
+        usage_obj.and_then(crate::services::openai_models::extract_cached_prompt_tokens);
     let cache_creation = usage_obj
         .and_then(|u| u.get("cache_creation_input_tokens"))
         .and_then(|v| v.as_u64());
@@ -438,6 +436,38 @@ mod tests {
         assert_eq!(result["usage"]["input_tokens"], 200);
         assert_eq!(result["usage"]["output_tokens"], 50);
         assert_eq!(result["usage"]["cache_read_input_tokens"], 800);
+        assert!(result["usage"].get("cache_creation_input_tokens").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_usage_recognizes_deepseek_cache_hit_tokens() {
+        let resp = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_cache_hit_tokens": 90
+            }
+        });
+
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg",
+                model: "deepseek-chat",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+
+        // Anthropic semantics: input_tokens is fresh-only (100 − 90).
+        assert_eq!(result["usage"]["input_tokens"], 10);
+        assert_eq!(result["usage"]["output_tokens"], 10);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 90);
         assert!(result["usage"].get("cache_creation_input_tokens").is_none());
     }
 

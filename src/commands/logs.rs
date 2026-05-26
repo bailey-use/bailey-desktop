@@ -2464,6 +2464,7 @@ mod tests {
     /// guard treated that implicit default the same as a user-typed `--cwd`.
     /// The fix keys the bail on `args.cwd.is_some() && !args.all` so only an
     /// explicit cwd filter hides amp.
+    #[allow(clippy::nonminimal_bool)] // mirrors the production bail; don't de-Morgan
     fn should_emit_amp(args: &LogsArgs) -> bool {
         !(args.cwd.is_some() && !args.all)
     }

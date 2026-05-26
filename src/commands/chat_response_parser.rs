@@ -202,12 +202,7 @@ pub(crate) fn extract_openai_usage_update(body: &serde_json::Value) -> Option<To
         cache_read_input_tokens: usage
             .get("cache_read_input_tokens")
             .and_then(parse_token_u64)
-            .or_else(|| {
-                usage
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens"))
-                    .and_then(parse_token_u64)
-            }),
+            .or_else(|| crate::services::openai_models::extract_cached_prompt_tokens(usage)),
         cache_creation_input_tokens: usage
             .get("cache_creation_input_tokens")
             .and_then(parse_token_u64),
@@ -953,6 +948,46 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 cache_read_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_reads_deepseek_prompt_cache_hit_tokens() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "prompt_cache_hit_tokens": 90,
+                "completion_tokens": 10
+            }
+        });
+        assert_eq!(
+            extract_openai_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 10,
+                cache_read_input_tokens: 90,
+                cache_creation_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_anthropic_explicit_wins_over_deepseek() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "cache_read_input_tokens": 50,
+                "prompt_cache_hit_tokens": 90
+            }
+        });
+        assert_eq!(
+            extract_openai_usage(&body),
+            Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 0,
+                cache_read_input_tokens: 50,
                 cache_creation_input_tokens: 0,
             })
         );

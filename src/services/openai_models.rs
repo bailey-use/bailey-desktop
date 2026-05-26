@@ -365,6 +365,10 @@ pub(crate) struct OpenAIChatChunkUsage {
     pub cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+    /// DeepSeek non-standard cached-input field; semantically equivalent to
+    /// `prompt_tokens_details.cached_tokens`.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u64>,
 }
 
 /// OpenAI / OpenAI-compatible upstreams (DeepSeek, zai, etc.) report cached
@@ -375,6 +379,21 @@ pub(crate) struct OpenAIChatChunkUsage {
 pub(crate) struct OpenAIPromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+}
+
+/// Extract the count of cached prompt tokens from an upstream `usage` object,
+/// covering both the OpenAI convention (`prompt_tokens_details.cached_tokens`)
+/// and the DeepSeek convention (`prompt_cache_hit_tokens`).
+pub(crate) fn extract_cached_prompt_tokens(usage: &serde_json::Value) -> Option<u64> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            usage
+                .get("prompt_cache_hit_tokens")
+                .and_then(|v| v.as_u64())
+        })
 }
 
 /// Resolves Anthropic-shape `(input_tokens, cache_read)` from an upstream's

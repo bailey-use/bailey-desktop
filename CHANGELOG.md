@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.23.4
+
+- `aivo stats`: hide unsupported tools from the by-tool table; drop the `--top-sessions` flag.
+- `aivo audio`: reject `hf:` refs with a friendly error.
+- `aivo hf`: reject encoder-only GGUFs before spawning `llama-server`.
+- Provider bridge: recognize DeepSeek's `prompt_cache_hit_tokens` in usage accounting.
+
 ## v0.23.3
 
 - `aivo hf`: default to Metal GPU offload on macOS; keep tool routing alive when the jinja template fails.

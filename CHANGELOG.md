@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.23.6
+
+- fix(codex-app): stream the responses path to Codex instead of buffering
+- fix(codex-app): stream live, fail fast on bad model, fix empty transcripts
+- fix(router): hoist stray role:system messages into top-level system
+
+
 ## v0.23.5
 
 - `aivo codex-app`: add partial support for launching Codex App, macOS only.

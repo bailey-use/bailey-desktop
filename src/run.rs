@@ -844,26 +844,37 @@ async fn print_active_selection(session_store: &SessionStore) {
     let Some(config) = session_store.load().await.ok() else {
         return;
     };
-    let Some(sel) = config.last_selection.clone() else {
+
+    // Prefer the full last_selection (key + model). Fall back to the bare
+    // active_key_id so this footer agrees with what `aivo keys` marks active —
+    // that list also falls back to active_key_id when last_selection is empty
+    // (e.g. right after `aivo keys add`, which clears last_selection).
+    let selection = config
+        .last_selection
+        .as_ref()
+        .and_then(|sel| {
+            // Treat a missing or moved key as "no active selection" — mirrors
+            // `get_last_selection`'s stale check without rewriting the config.
+            let key = config.api_keys.iter().find(|k| k.id == sel.key_id)?;
+            (key.base_url == sel.base_url).then_some((key, sel.model.as_deref()))
+        })
+        .or_else(|| {
+            let id = config.active_key_id.as_deref()?;
+            config
+                .api_keys
+                .iter()
+                .find(|k| k.id == id)
+                .map(|k| (k, None))
+        });
+    let Some((key, model)) = selection else {
         return;
     };
-    let key_entry = config.api_keys.iter().find(|k| k.id == sel.key_id);
-    // Treat a missing or moved key as "no active selection" — mirrors
-    // `get_last_selection`'s stale check without rewriting the config here.
-    if key_entry.is_none_or(|k| k.base_url != sel.base_url) {
-        return;
-    }
-    let key_label = key_entry
-        .map(|k| k.display_name().to_string())
-        .unwrap_or_else(|| sel.key_id.clone());
-    let model_display = commands::models::model_display_label(sel.model.as_deref());
+
+    let model_display = commands::models::model_display_label(model);
     // HF models bypass the API key entirely (local llama-server with a
     // synthetic loopback key). Showing `key  hf:...` implies a coupling that
     // doesn't exist at runtime, so swap the line out for an HF-specific one.
-    let model_is_hf = sel
-        .model
-        .as_deref()
-        .is_some_and(services::huggingface::is_huggingface_ref);
+    let model_is_hf = model.is_some_and(services::huggingface::is_huggingface_ref);
 
     println!();
     println!("{}", style::bold("Active key:"));
@@ -879,7 +890,7 @@ async fn print_active_selection(session_store: &SessionStore) {
         println!(
             "  {} {}  {}  {}",
             style::bullet_symbol(),
-            key_label,
+            key.display_name(),
             style::dim(model_display),
             style::dim("(change with: aivo use)"),
         );

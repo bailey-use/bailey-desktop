@@ -533,16 +533,38 @@ where
     }
 }
 
-/// Streams a reqwest Response as chunked HTTP to a TCP stream.
-pub async fn write_streaming_response(
-    socket: &mut tokio::net::TcpStream,
+/// Streams a reqwest Response as chunked HTTP to a stream.
+pub async fn write_streaming_response<W>(
+    socket: &mut W,
     status: u16,
     content_type: &str,
+    upstream: reqwest::Response,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    write_streaming_response_with_prefix(socket, status, content_type, &[], upstream).await
+}
+
+/// Like `write_streaming_response`, but flushes `prefix` as the first chunk
+/// before draining `upstream`. Used when bytes were already read off the
+/// upstream (e.g. sniffing the SSE shape) and must be replayed to the client.
+pub async fn write_streaming_response_with_prefix<W>(
+    socket: &mut W,
+    status: u16,
+    content_type: &str,
+    prefix: &[u8],
     mut upstream: reqwest::Response,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
     let headers = http_chunked_response_head(status, content_type);
     socket.write_all(headers.as_bytes()).await?;
+    if !prefix.is_empty() {
+        socket.write_all(&format_http_chunk(prefix)).await?;
+    }
     while let Some(chunk) = upstream.chunk().await? {
         let formatted = format_http_chunk(&chunk);
         if !formatted.is_empty() {
@@ -1010,6 +1032,58 @@ mod tests {
             head,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn write_streaming_response_with_prefix_writes_chunked_transfer_and_terminator() {
+        use http::Response as HttpResponse;
+        use tokio::io::AsyncReadExt;
+
+        let body = "event: response.output_text.delta\ndata: {\"delta\":\"world\"}\n\n\
+                    event: response.completed\ndata: {}\n\n";
+        let upstream: reqwest::Response = HttpResponse::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(body.to_string())
+            .unwrap()
+            .into();
+        let prefix = b"event: response.created\ndata: {}\n\n";
+
+        let (mut client, mut server) = tokio::io::duplex(8 * 1024);
+        let writer = tokio::spawn(async move {
+            write_streaming_response_with_prefix(
+                &mut server,
+                200,
+                "text/event-stream",
+                prefix,
+                upstream,
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        writer.await.unwrap();
+
+        let wire = String::from_utf8(buf).expect("utf8 wire");
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "wire: {wire}");
+        assert!(
+            wire.contains("Transfer-Encoding: chunked\r\n"),
+            "wire: {wire}"
+        );
+        assert!(wire.contains("Content-Type: text/event-stream\r\n"));
+        // Prefix arrives as its own chunk before the upstream body.
+        let header_end = wire.find("\r\n\r\n").unwrap() + 4;
+        let body_part = &wire[header_end..];
+        let first_chunk_len =
+            u32::from_str_radix(body_part.split("\r\n").next().unwrap(), 16).unwrap();
+        assert_eq!(first_chunk_len as usize, prefix.len());
+        // Both events plus the zero-chunk terminator are present.
+        assert!(body_part.contains("event: response.created"));
+        assert!(body_part.contains("event: response.output_text.delta"));
+        assert!(body_part.contains("event: response.completed"));
+        assert!(body_part.ends_with("0\r\n\r\n"));
     }
 
     #[test]

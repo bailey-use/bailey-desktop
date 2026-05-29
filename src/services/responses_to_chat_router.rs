@@ -50,7 +50,8 @@ pub use responses_chat_conversion::{
 
 // Internal re-exports used within this router
 use responses_chat_conversion::{
-    apply_max_tokens_cap_to_fields, cap_reasoning_effort, sanitize_input_content,
+    ResponsesStreamConverter, apply_max_tokens_cap_to_fields, cap_reasoning_effort,
+    sanitize_input_content,
 };
 
 #[derive(Clone)]
@@ -304,10 +305,29 @@ async fn handle_api_request(
                 client,
                 responses_api_supported,
                 request_succeeded,
+                socket,
             )
             .await
         {
-            return Ok(Some(result?));
+            return result;
+        }
+        // Provider has no native /v1/responses — convert via Chat Completions.
+        // Try streaming first so output reaches Codex live; fall back to the
+        // buffered cascade on any pre-stream failure (wrong protocol, non-200,
+        // non-SSE) since nothing has been written to the socket yet.
+        if stream_responses_via_chat(
+            &body,
+            config,
+            client,
+            active_protocol,
+            request_succeeded,
+            learned_requires_reasoning,
+            socket,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(None); // already streamed to socket
         }
         Ok(Some(
             handle_responses_api_via_chat(
@@ -399,9 +419,15 @@ fn classify_responses_passthrough_error(state: u8, status: u16) -> ResponsesPass
 }
 
 /// Tries to forward a Responses API request directly to the upstream `/v1/responses`
-/// endpoint. Returns `Some(Ok(response))` on success or non-protocol HTTP errors,
-/// `None` if the upstream doesn't support the Responses API (404/405/415), allowing
-/// fallback to Chat Completions conversion.
+/// endpoint.
+///
+/// Return shape:
+/// - `Some(Ok(Some(response)))` — buffered HTTP response the caller writes.
+/// - `Some(Ok(None))` — already streamed chunked SSE to `socket`.
+/// - `Some(Err(_))` — surfaced to the caller.
+/// - `None` — upstream doesn't support the Responses API (404/405/415 or shape
+///   mismatch), fall back to Chat Completions conversion.
+#[allow(clippy::too_many_arguments)]
 async fn try_responses_api_passthrough(
     variant: PathVariant,
     body: &Value,
@@ -409,7 +435,8 @@ async fn try_responses_api_passthrough(
     client: &reqwest::Client,
     responses_api_supported: &Arc<AtomicU8>,
     request_succeeded: &Arc<AtomicBool>,
-) -> Option<Result<String>> {
+    socket: &mut tokio::net::TcpStream,
+) -> Option<Result<Option<String>>> {
     if responses_api_supported.load(Ordering::Relaxed) == 2 {
         return None;
     }
@@ -441,7 +468,7 @@ async fn try_responses_api_passthrough(
     )
     .await
     .ok()?;
-    let response =
+    let mut response =
         device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
             .send_logged()
             .await
@@ -454,9 +481,10 @@ async fn try_responses_api_passthrough(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(CONTENT_TYPE_JSON)
         .to_string();
-    let response_body = response.text().await.ok()?;
+    let is_sse = content_type.contains("text/event-stream");
 
     if status != 200 {
+        let response_body = response.text().await.ok()?;
         match classify_responses_passthrough_error(
             responses_api_supported.load(Ordering::Relaxed),
             status,
@@ -467,38 +495,92 @@ async fn try_responses_api_passthrough(
             }
             ResponsesPassthroughDecision::Reprobe => return None,
             ResponsesPassthroughDecision::PassError => {
-                return Some(Ok(http_utils::http_response(
+                return Some(Ok(Some(http_utils::http_response(
                     status,
                     &content_type,
                     &response_body,
-                )));
+                ))));
             }
         }
     }
 
-    // Only validate on the first probe (unknown state).  Once confirmed,
-    // skip the scan over the full response body on every subsequent request.
-    if responses_api_supported.load(Ordering::Relaxed) != 1 {
-        let looks_like_responses_api = if content_type.contains("text/event-stream") {
-            response_body.contains("response.completed")
-        } else {
-            response_body.contains("\"object\":\"response\"")
-                || response_body.contains("\"object\": \"response\"")
-        };
-
-        if !looks_like_responses_api {
-            responses_api_supported.store(2, Ordering::Relaxed);
-            return None;
+    if is_sse {
+        // Stream the SSE body chunk-by-chunk to the client. Previously this
+        // function drained the entire stream with `.text().await` and replayed
+        // it under Content-Length, which froze codex's UI until upstream
+        // produced `response.completed` — turning a live stream into a single
+        // blob at the end of the turn.
+        let known_supported = responses_api_supported.load(Ordering::Relaxed) == 1;
+        let mut prefix: Vec<u8> = Vec::new();
+        if !known_supported {
+            // First-probe validation: read until we see a Responses-API event
+            // signature, or until 4 KiB without one (latch unsupported). We
+            // must not write headers to the socket before we know the upstream
+            // is the right shape, since a wrong-shape response must fall back
+            // to the chat-completions conversion path.
+            const SIGNATURE: &str = "event: response.";
+            const SCAN_LIMIT: usize = 4096;
+            let mut validated = false;
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => return None,
+                };
+                prefix.extend_from_slice(&chunk);
+                // Search raw bytes: the signature is ASCII, and a multi-byte
+                // UTF-8 char split across a chunk boundary would make a
+                // str::from_utf8 check spuriously skip a round.
+                if prefix
+                    .windows(SIGNATURE.len())
+                    .any(|w| w == SIGNATURE.as_bytes())
+                {
+                    validated = true;
+                    break;
+                }
+                if prefix.len() >= SCAN_LIMIT {
+                    break;
+                }
+            }
+            if !validated {
+                responses_api_supported.store(2, Ordering::Relaxed);
+                return None;
+            }
+            responses_api_supported.store(1, Ordering::Relaxed);
         }
-
-        responses_api_supported.store(1, Ordering::Relaxed);
+        request_succeeded.store(true, Ordering::Relaxed);
+        match http_utils::write_streaming_response_with_prefix(
+            socket,
+            status,
+            &content_type,
+            &prefix,
+            response,
+        )
+        .await
+        {
+            Ok(()) => Some(Ok(None)),
+            Err(e) => Some(Err(e)),
+        }
+    } else {
+        // Non-streaming JSON response — keep the buffered path so the
+        // shape-validation step can inspect the full body.
+        let response_body = response.text().await.ok()?;
+        if responses_api_supported.load(Ordering::Relaxed) != 1 {
+            let looks_like_responses_api = response_body.contains("\"object\":\"response\"")
+                || response_body.contains("\"object\": \"response\"");
+            if !looks_like_responses_api {
+                responses_api_supported.store(2, Ordering::Relaxed);
+                return None;
+            }
+            responses_api_supported.store(1, Ordering::Relaxed);
+        }
+        request_succeeded.store(true, Ordering::Relaxed);
+        Some(Ok(Some(http_utils::http_response(
+            status,
+            &content_type,
+            &response_body,
+        ))))
     }
-    request_succeeded.store(true, Ordering::Relaxed);
-    Some(Ok(http_utils::http_response(
-        status,
-        &content_type,
-        &response_body,
-    )))
 }
 
 /// Handles Responses API requests by converting to Chat Completions format,
@@ -556,6 +638,106 @@ async fn handle_responses_api_via_chat(
     );
 
     Ok(http_utils::http_response(200, "text/event-stream", &sse))
+}
+
+/// Streaming counterpart of `handle_responses_api_via_chat`: forwards a
+/// `stream: true` Chat Completions request and converts each delta into
+/// Responses API SSE events written straight to the client socket.
+///
+/// Only runs when the route is already settled on the OpenAI protocol (the
+/// common case for OpenAI-compatible providers like DeepSeek). Bails before
+/// writing any bytes on a non-200 / non-SSE upstream so the caller can fall
+/// back to the buffered conversion cascade, which keeps the protocol-probe and
+/// strict-mode retry behavior.
+async fn stream_responses_via_chat(
+    body: &Value,
+    config: &Arc<ResponsesToChatRouterConfig>,
+    client: &reqwest::Client,
+    active_protocol: &Arc<AtomicU8>,
+    request_succeeded: &Arc<AtomicBool>,
+    learned_requires_reasoning: &Arc<AtomicBool>,
+    socket: &mut tokio::net::TcpStream,
+) -> Result<()> {
+    let (protocol, variant) = decode_route(active_protocol.load(Ordering::Relaxed));
+    if protocol != ProviderProtocol::Openai {
+        anyhow::bail!("streaming conversion only for OpenAI protocol");
+    }
+
+    let original_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o")
+        .to_string();
+    let effective_requires_reasoning =
+        config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
+
+    // Mirror handle_responses_api_via_chat's body construction, then force a
+    // streaming request and ask for a trailing usage chunk.
+    let mut chat_config = (**config).clone();
+    chat_config.actual_model = Some(original_model.clone());
+    chat_config.requires_reasoning_content = effective_requires_reasoning;
+    let mut chat_body = convert_responses_to_chat_request(body, &chat_config);
+    chat_body["stream"] = json!(true);
+    chat_body["stream_options"] = json!({"include_usage": true});
+
+    let target_url = build_target_url(
+        &config.target_base_url,
+        variant.apply("/v1/chat/completions"),
+    );
+    let initiator = if config.copilot_token_manager.is_some() {
+        Some(http_utils::copilot_initiator_from_openai(&chat_body))
+    } else {
+        None
+    };
+    let req = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+        initiator,
+    )
+    .await?;
+    let mut response =
+        device_fingerprint::maybe_with_starter_headers(req.json(&chat_body), config.is_starter)
+            .send_logged()
+            .await?;
+
+    if response.status().as_u16() != 200 {
+        anyhow::bail!("upstream returned {}", response.status().as_u16());
+    }
+    let is_sse = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        anyhow::bail!("upstream did not return an SSE stream");
+    }
+
+    request_succeeded.store(true, Ordering::Relaxed);
+
+    use tokio::io::AsyncWriteExt;
+    let headers = http_utils::http_chunked_response_head(200, "text/event-stream");
+    socket.write_all(headers.as_bytes()).await?;
+    let mut converter =
+        ResponsesStreamConverter::new(&original_model, effective_requires_reasoning);
+    while let Some(chunk) = response.chunk().await? {
+        let converted = converter.push_bytes(&chunk);
+        if !converted.is_empty() {
+            socket
+                .write_all(&http_utils::format_http_chunk(converted.as_bytes()))
+                .await?;
+        }
+    }
+    let tail = converter.finish();
+    if !tail.is_empty() {
+        socket
+            .write_all(&http_utils::format_http_chunk(tail.as_bytes()))
+            .await?;
+    }
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
 }
 
 // =============================================================================

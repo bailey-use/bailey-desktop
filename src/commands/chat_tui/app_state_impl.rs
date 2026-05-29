@@ -9,6 +9,12 @@ impl ChatTuiApp {
         self.sending || self.loading_resume.is_some()
     }
 
+    /// Elements that repaint without input — the `sending` spinner/clock and
+    /// the copy-toast fade. Gates the redraw cadence and `frame_tick`.
+    pub(super) fn is_animating(&self) -> bool {
+        self.sending || self.copy_toast.is_some()
+    }
+
     pub(super) fn should_show_input_cursor(&self) -> bool {
         !self.overlay.blocks_input() && !self.is_busy()
     }

@@ -1,11 +1,14 @@
 use super::*;
 
 impl ChatTuiApp {
-    pub(super) async fn handle_runtime_events(&mut self) -> Result<()> {
+    /// Drains queued runtime events; `true` if any were handled (caller repaints).
+    pub(super) async fn handle_runtime_events(&mut self) -> Result<bool> {
+        let mut handled = false;
         while let Ok(event) = self.rx.try_recv() {
             self.handle_runtime_event(event).await?;
+            handled = true;
         }
-        Ok(())
+        Ok(handled)
     }
 
     async fn handle_runtime_event(&mut self, event: RuntimeEvent) -> Result<()> {
@@ -247,20 +250,31 @@ impl ChatTuiApp {
 
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
+        // Repaint only on change; an idle chat draws nothing.
+        let mut needs_redraw = true;
         let run_result = loop {
-            self.frame_tick = self.frame_tick.wrapping_add(1);
-
-            if let Err(err) = self.handle_runtime_events().await {
-                break Err(err);
+            match self.handle_runtime_events().await {
+                Ok(true) => needs_redraw = true,
+                Ok(false) => {}
+                Err(err) => break Err(err),
             }
 
-            if let Err(err) = terminal.draw(|frame| self.render(frame)) {
-                break Err(err.into());
+            // Animations repaint without input.
+            if self.is_animating() {
+                needs_redraw = true;
+            }
+
+            if needs_redraw {
+                if let Err(err) = terminal.draw(|frame| self.render(frame)) {
+                    break Err(err.into());
+                }
+                needs_redraw = false;
             }
 
             match event::poll(Duration::from_millis(0)) {
                 Ok(true) => match event::read() {
                     Ok(event) => {
+                        needs_redraw = true;
                         if let Some(should_exit) = self.handle_terminal_event(event).await?
                             && should_exit
                         {
@@ -273,7 +287,19 @@ impl ChatTuiApp {
                 Err(err) => break Err(err.into()),
             }
 
-            tokio::time::sleep(Duration::from_millis(16)).await;
+            // Spinner advances only while animating.
+            if self.is_animating() {
+                self.frame_tick = self.frame_tick.wrapping_add(1);
+            }
+
+            // Non-blocking nap, never a blocking poll — that would freeze the
+            // streaming task on the current-thread runtime.
+            let nap = if self.is_animating() {
+                ANIMATING_FRAME_INTERVAL
+            } else {
+                IDLE_POLL_INTERVAL
+            };
+            tokio::time::sleep(nap).await;
         };
 
         self.flush_for_exit().await;

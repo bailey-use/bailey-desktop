@@ -17,6 +17,9 @@ pub(super) const DEFAULT_CHAT_SCROLL_SPEED: usize = 3;
 pub(super) const MAX_CHAT_SCROLL_SPEED: usize = 50;
 pub(super) const COPY_TOAST_DURATION: Duration = Duration::from_secs(3);
 pub(super) const COPY_TOAST_FADE_AFTER: Duration = Duration::from_secs(2);
+// Tight repaint cadence while animating; slower when idle to cut wakeups.
+pub(super) const ANIMATING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub(super) const COMMAND_MENU_MAX_ROWS: usize = 7;
 pub(super) const PICKER_ROW_PREFIX_WIDTH: usize = 2;

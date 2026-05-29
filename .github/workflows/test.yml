@@ -16,12 +16,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux audio dependencies
-        if: matrix.runs-on == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev pkg-config
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Format check
@@ -30,19 +24,6 @@ jobs:
       - run: cargo test --features __internal_test_fast_crypto
 
       - run: cargo clippy -- -D warnings
-
-      # The published `aivo-linux-*` artifacts are built with
-      # `--no-default-features` to drop the libasound.so.2 runtime dep, so
-      # exercise that build path on the Linux runner. Without this, a
-      # regression that only breaks the no-rodio code path would slip
-      # through CI and only surface when end users hit the binary.
-      - name: Test --no-default-features (linux artifact build path)
-        if: matrix.runs-on == 'ubuntu-latest'
-        run: cargo test --no-default-features --features __internal_test_fast_crypto
-
-      - name: Clippy --no-default-features
-        if: matrix.runs-on == 'ubuntu-latest'
-        run: cargo clippy --no-default-features -- -D warnings
 
       - uses: actions/setup-node@v5
         with:

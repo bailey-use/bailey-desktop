@@ -2141,7 +2141,7 @@ fn format_eta(secs: u64) -> String {
     }
 }
 
-/// Scales up to GB (unlike `media_io::human_bytes`, which stops at MB).
+/// Scales up to GB.
 fn human_size(b: u64) -> String {
     const K: f64 = 1024.0;
     let bf = b as f64;

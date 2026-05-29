@@ -8,21 +8,19 @@ use std::process;
 use clap::{Command, CommandFactory, Parser};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{self, Cli, Commands};
+use crate::cli::{Cli, Commands};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AliasCommand, AudioCommand, ChatCommand, ImageCommand, InfoCommand, KeysCommand,
-    LogsCommand, ModelsCommand, RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand,
-    StartFlowArgs, StatsCommand, UpdateCommand, VideoCommand,
+    self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand,
+    RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand,
+    UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
-    KeyLookupMode, KeyResolution, key_or_exit, resolve_audio_key_override,
-    resolve_image_key_override, resolve_key_override, resolve_key_override_info,
-    resolve_video_key_override,
+    KeyLookupMode, KeyResolution, key_or_exit, resolve_key_override, resolve_key_override_info,
 };
 use crate::services::ai_launcher::AIToolType;
 use crate::services::environment_injector::ClaudeSlotFlags;
@@ -131,18 +129,6 @@ pub async fn run() -> ! {
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
             Commands::Chat(_) => ChatCommand::print_help(),
-            Commands::Image(_) => {
-                ImageCommand::print_help();
-                ImageCommand::print_active_selection(&session_store).await;
-            }
-            Commands::Audio(_) => {
-                AudioCommand::print_help();
-                AudioCommand::print_active_selection(&session_store).await;
-            }
-            Commands::Video(_) => {
-                VideoCommand::print_help();
-                VideoCommand::print_active_selection(&session_store).await;
-            }
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
@@ -253,68 +239,6 @@ pub async fn run() -> ! {
                     chat_args.json,
                 )
                 .await
-        }
-
-        Commands::Image(image_args) => {
-            // No prompt → short-circuit before any key resolution so the
-            // user gets help + active-selection footer without a forced
-            // key picker. Mirrors the bare `aivo` and `aivo image -h` paths.
-            if image_args
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
-                ImageCommand::print_help();
-                ImageCommand::print_active_selection(&session_store).await;
-                process::exit(ExitCode::Success.code());
-            }
-
-            let key_override = key_or_exit(
-                resolve_image_key_override(
-                    &session_store,
-                    image_args.key.as_deref(),
-                    KeyLookupMode::RequireActiveOrPrompt,
-                    KeyCompatContext::Image,
-                )
-                .await,
-            );
-            let initial_key = match key_override {
-                Some(k) => k,
-                None => {
-                    eprintln!(
-                        "{} No API key available for image generation.",
-                        style::red("Error:")
-                    );
-                    process::exit(ExitCode::AuthError.code());
-                }
-            };
-            // resolve_key_override only annotates the picker; active-key /
-            // last-used / explicit `--key` paths bypass the annotation, so
-            // we have to re-check compat here and offer a swap if the
-            // resolved key can't actually talk to /v1/images/generations.
-            let key = match ensure_compatible_key(
-                &session_store,
-                initial_key,
-                KeyCompatContext::Image,
-                "image generation",
-            )
-            .await
-            {
-                Some(k) => k,
-                None => process::exit(ExitCode::UserError.code()),
-            };
-            let command = ImageCommand::new(session_store, models_cache.clone());
-            command.execute(image_args, key).await
-        }
-
-        Commands::Audio(audio_args) => {
-            audio_dispatch(&session_store, &models_cache, audio_args).await
-        }
-
-        Commands::Video(video_args) => {
-            video_dispatch(&session_store, &models_cache, video_args).await
         }
 
         Commands::Run(run_args) => {
@@ -1071,261 +995,6 @@ fn print_version() {
         style::cyan("aivo"),
         style::dim(format!("v{}", version::VERSION))
     );
-}
-
-/// Re-checks media-modality key compatibility against a concrete key
-/// *after* `resolve_key_override` returns. The picker path already annotates
-/// incompatible entries, but the active-key and explicit-`--key` paths skip
-/// that, so a user with an OAuth / Copilot / Ollama / Anthropic key can
-/// reach the command. Returns the original key if already compatible, or
-/// prompts for a compatible one. Returns `None` when the user cancels or
-/// no compatible keys exist.
-///
-/// `label` is the user-visible activity name ("image generation",
-/// "audio generation", "video generation") interpolated into the
-/// rejection messages.
-async fn ensure_compatible_key(
-    session_store: &SessionStore,
-    key: services::session_store::ApiKey,
-    compat: KeyCompatContext,
-    label: &str,
-) -> Option<services::session_store::ApiKey> {
-    use std::io::IsTerminal;
-
-    let reason = match compat.incompat_reason(&key) {
-        Some(r) => r,
-        None => return Some(key),
-    };
-
-    let all_keys = match session_store.get_keys().await {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            return None;
-        }
-    };
-    let annotations = compat.annotations_for(&all_keys);
-    let has_eligible = annotations.iter().any(Option::is_none);
-
-    if !has_eligible {
-        eprintln!(
-            "{} Key '{}' can't be used for {} ({}).",
-            style::red("Error:"),
-            key.display_name(),
-            label,
-            reason
-        );
-        eprintln!(
-            "  {} Add an OpenAI-compatible key with `aivo keys add`.",
-            style::dim("hint:")
-        );
-        return None;
-    }
-
-    if !std::io::stderr().is_terminal() {
-        eprintln!(
-            "{} Key '{}' can't be used for {} ({}). Pass `--key <id|name>` to pick another.",
-            style::red("Error:"),
-            key.display_name(),
-            label,
-            reason
-        );
-        return None;
-    }
-
-    eprintln!(
-        "{} Key '{}' can't be used for {} ({}) — pick a compatible key.",
-        style::yellow("Note:"),
-        key.display_name(),
-        label,
-        reason
-    );
-    match commands::keys::prompt_pick_key_without_activation(
-        &all_keys,
-        &annotations,
-        "Select a key",
-        0,
-    ) {
-        Ok(Some(picked)) => Some(picked),
-        Ok(None) => None,
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            None
-        }
-    }
-}
-
-/// Dispatch for `Commands::Audio`. Resolves the prompt from positional
-/// arg / `--file` / piped stdin (in that precedence) before any key or
-/// model work — so a no-prompt invocation in an interactive shell prints
-/// help instead of triggering a picker.
-async fn audio_dispatch(
-    session_store: &SessionStore,
-    models_cache: &services::ModelsCache,
-    audio_args: cli::AudioArgs,
-) -> ExitCode {
-    // List mode is purely local: no provider call, no key resolution.
-    // Route it before we try to resolve a prompt or a key.
-    if audio_args.list {
-        let command = AudioCommand::new(session_store.clone(), models_cache.clone());
-        return command.run_list().await;
-    }
-
-    let prompt = match resolve_audio_prompt(&audio_args) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            AudioCommand::print_help();
-            AudioCommand::print_active_selection(session_store).await;
-            process::exit(ExitCode::Success.code());
-        }
-        Err(e) => {
-            eprintln!("{} {}", style::red("Error:"), e);
-            process::exit(ExitCode::UserError.code());
-        }
-    };
-
-    // Local TTS via `hf:` refs isn't wired up. Reject these up front
-    // with a clear message — otherwise the request flows to the active
-    // key's `/v1/audio/speech` and fails confusingly (with a 404 from
-    // OpenAI, or with `This endpoint only accepts the path
-    // /chat/completions` from a stale llama-server base_url).
-    if let Some(m) = audio_args.model.as_deref()
-        && services::huggingface::is_hf_or_local_gguf(m)
-    {
-        eprintln!(
-            "{} aivo audio doesn't support local HuggingFace TTS models.",
-            style::red("Error:")
-        );
-        eprintln!(
-            "  {} use a provider TTS model instead:",
-            style::dim("hint:")
-        );
-        let ex = |s: &str| eprintln!("    {}", style::dim(s));
-        ex("aivo audio \"…\" -m tts-1            # OpenAI");
-        ex("aivo audio \"…\" -m gpt-4o-mini-tts  # OpenAI (newer)");
-        ex("aivo audio \"…\" -m gemini-tts       # Google");
-        process::exit(ExitCode::UserError.code());
-    }
-
-    let key_override = key_or_exit(
-        resolve_audio_key_override(
-            session_store,
-            audio_args.key.as_deref(),
-            KeyLookupMode::RequireActiveOrPrompt,
-            KeyCompatContext::Audio,
-        )
-        .await,
-    );
-    let initial_key = match key_override {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "{} No API key available for audio generation.",
-                style::red("Error:")
-            );
-            process::exit(ExitCode::AuthError.code());
-        }
-    };
-    let key = match ensure_compatible_key(
-        session_store,
-        initial_key,
-        KeyCompatContext::Audio,
-        "audio generation",
-    )
-    .await
-    {
-        Some(k) => k,
-        None => process::exit(ExitCode::UserError.code()),
-    };
-    let command = AudioCommand::new(session_store.clone(), models_cache.clone());
-    command.execute(audio_args, key, prompt).await
-}
-
-/// Resolves the audio prompt from (positional, `--file`, piped stdin) in
-/// that precedence. `--file -` or `--file` with no value reads stdin
-/// explicitly. Returns `Ok(None)` to mean "show help" — i.e. the caller
-/// had no positional, no `--file`, and stdin was a TTY or empty.
-fn resolve_audio_prompt(args: &cli::AudioArgs) -> anyhow::Result<Option<String>> {
-    if let Some(p) = args
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(Some(p.to_string()));
-    }
-    if let Some(path) = args.file.as_deref() {
-        return if commands::audio::is_stdin_file_arg(path) {
-            commands::audio::read_prompt_stdin_explicit().map(Some)
-        } else {
-            commands::audio::read_prompt_file(std::path::Path::new(path)).map(Some)
-        };
-    }
-    match services::stdin_io::read_stdin_if_piped()? {
-        Some(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Dispatch for `Commands::Video`. Mirrors `audio_dispatch` but does *not*
-/// short-circuit on empty prompt when `--job-id` is set — that's the
-/// recovery path and a prompt isn't required for it.
-async fn video_dispatch(
-    session_store: &SessionStore,
-    models_cache: &services::ModelsCache,
-    video_args: cli::VideoArgs,
-) -> ExitCode {
-    let has_prompt = video_args
-        .prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some();
-    if !has_prompt && video_args.job_id.is_none() {
-        VideoCommand::print_help();
-        VideoCommand::print_active_selection(session_store).await;
-        process::exit(ExitCode::Success.code());
-    }
-
-    let key_override = key_or_exit(
-        resolve_video_key_override(
-            session_store,
-            video_args.key.as_deref(),
-            KeyLookupMode::RequireActiveOrPrompt,
-            KeyCompatContext::Video,
-        )
-        .await,
-    );
-    let initial_key = match key_override {
-        Some(k) => k,
-        None => {
-            eprintln!(
-                "{} No API key available for video generation.",
-                style::red("Error:")
-            );
-            process::exit(ExitCode::AuthError.code());
-        }
-    };
-    let key = match ensure_compatible_key(
-        session_store,
-        initial_key,
-        KeyCompatContext::Video,
-        "video generation",
-    )
-    .await
-    {
-        Some(k) => k,
-        None => process::exit(ExitCode::UserError.code()),
-    };
-    let command = VideoCommand::new(session_store.clone(), models_cache.clone());
-    command.execute(video_args, key).await
 }
 
 /// Resolves a model alias if the model is a non-empty Some value.

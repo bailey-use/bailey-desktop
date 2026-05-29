@@ -61,13 +61,6 @@ unicode-width = "0.2"
 tempfile = "3.0"
 url = "2"
 
-# Audio playback (in-process; pause/seek/position).
-# Optional so headless Linux builds can ship without the alsa-sys/libasound
-# runtime dependency. Default features pull Symphonia, which decodes WAV /
-# MP3 / FLAC / Vorbis. AAC / Opus / PCM fall through to the system-player
-# path in playback.rs.
-rodio = { version = "0.20", optional = true }
-
 [target.'cfg(target_env = "musl")'.dependencies]
 # Static-musl needs an explicit DNS resolver; see src/services/dns_resolver.rs.
 hickory-resolver = "0.26.1"
@@ -80,13 +73,6 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 
 
 [features]
-default = ["audio_playback"]
-# In-process audio playback for `aivo audio`. Pulls rodio → cpal → alsa-sys,
-# which hard-links libasound.so.2 on Linux. Headless / minimal Linux servers
-# without ALSA can't run a binary built with this feature, so the published
-# `aivo-linux-*` artifacts are built with `--no-default-features`. Native
-# macOS / Windows builds keep it on.
-audio_playback = ["dep:rodio"]
 # Test-only feature: reduces PBKDF2 iterations so the test suite runs fast.
 # Double-underscore prefix signals "internal/private" — never enable from
 # release builds or downstream crates. A runtime guard in

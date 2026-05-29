@@ -1243,7 +1243,7 @@ mod tests {
     #[test]
     fn test_build_codex_model_catalog_json_includes_model_slug() {
         let model = "minimax/minimax-m2.5".to_string();
-        let json = build_codex_model_catalog_json(&[model.clone()]).unwrap();
+        let json = build_codex_model_catalog_json(std::slice::from_ref(&model)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["models"][0]["slug"], model);
         assert_eq!(parsed["models"][0]["display_name"], model);

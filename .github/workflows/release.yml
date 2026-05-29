@@ -56,17 +56,11 @@ jobs:
 
       - name: Build ${{ matrix.artifact }}
         shell: bash
-        env:
-          # Linux artifacts ship without rodio so the binary doesn't
-          # hard-link libasound.so.2 — minimal / headless servers (no ALSA)
-          # can run aivo. macOS / Windows keep default features (audio
-          # playback for `aivo audio`).
-          CARGO_BUILD_FLAGS: ${{ contains(matrix.target, 'linux') && '--no-default-features' || '' }}
         run: |
           if [[ "${{ matrix.use-cross }}" == "true" ]]; then
-            cross build --release --target ${{ matrix.target }} $CARGO_BUILD_FLAGS
+            cross build --release --target ${{ matrix.target }}
           else
-            cargo build --release --target ${{ matrix.target }} $CARGO_BUILD_FLAGS
+            cargo build --release --target ${{ matrix.target }}
           fi
 
       - name: Rename artifact and generate checksum

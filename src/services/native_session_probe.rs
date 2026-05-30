@@ -24,7 +24,6 @@
 //!   gemini   ~/.gemini/tmp/<sha256-cwd>/chats/session-*.json{,l}
 //!   pi       ~/.pi/agent/sessions/<encoded-cwd>/<ts>_<uuid>.jsonl
 //!   opencode ~/.local/share/opencode/opencode.db (sqlite `session` table)
-//!   amp      ~/.config/aivo/amp-threads/T-<id>.json (aivo's bridge cache)
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -139,9 +138,6 @@ async fn recent_session_entries(
                 cutoff,
             )
             .await
-        }
-        AIToolType::Amp => {
-            amp_entries(&crate::services::amp_threads::default_threads_dir(), cutoff).await
         }
     }
 }
@@ -367,34 +363,6 @@ fn opencode_query(db_path: &Path, cutoff_ms: i64) -> Vec<(SystemTime, String)> {
             let mtime = SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64);
             out.push((mtime, id));
         }
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Amp — id is the filename stem (`T-<ulid>.json`); flat dir, no scoping
-// ---------------------------------------------------------------------------
-
-async fn amp_entries(threads_dir: &Path, cutoff: SystemTime) -> Vec<(SystemTime, String)> {
-    let mut out = Vec::new();
-    let Ok(mut rd) = fs::read_dir(threads_dir).await else {
-        return out;
-    };
-    while let Ok(Some(f)) = rd.next_entry().await {
-        let p = f.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !id.starts_with("T-") {
-            continue;
-        }
-        let Some(mtime) = file_mtime_within(&p, cutoff).await else {
-            continue;
-        };
-        out.push((mtime, id.to_string()));
     }
     out
 }

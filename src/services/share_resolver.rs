@@ -1,6 +1,6 @@
 //! Find which source owns a given session id and produce its `SharePayload`.
 //!
-//! aivo can see seven distinct conversation sources (amp threads, aivo chat,
+//! aivo can see six distinct conversation sources (aivo chat,
 //! claude / codex / gemini / pi / opencode). The user passes a single session
 //! id to `aivo logs share`; this resolver fans out across the sources to figure
 //! out which one it belongs to, then runs the source-specific extractor.
@@ -21,7 +21,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use chrono::{DateTime, Utc};
 
-use crate::services::amp_threads;
 use crate::services::context_ingest::{
     self, IngestOptions, encode_claude_dir, gemini_matching_session_files, pi_session_dir,
 };
@@ -29,8 +28,8 @@ use crate::services::log_store::LogEntry;
 use crate::services::project_id::Thread;
 use crate::services::session_store::SessionStore;
 use crate::services::share_payload::{
-    SharePayload, extract_amp_full, extract_chat_full, extract_claude_full, extract_codex_full,
-    extract_gemini_full, extract_opencode_full, extract_pi_full,
+    SharePayload, extract_chat_full, extract_claude_full, extract_codex_full, extract_gemini_full,
+    extract_opencode_full, extract_pi_full,
 };
 use crate::services::system_env;
 
@@ -40,7 +39,6 @@ use crate::services::system_env;
 pub struct ResolverContext {
     pub project_root: PathBuf,
     pub session_store: SessionStore,
-    pub amp_dir: PathBuf,
     pub chat_sessions_dir: PathBuf,
     pub claude_projects_root: PathBuf,
     pub codex_sessions_root: PathBuf,
@@ -59,7 +57,6 @@ impl ResolverContext {
         Self {
             project_root,
             session_store,
-            amp_dir: amp_threads::default_threads_dir(),
             chat_sessions_dir: aivo_config_dir.join("sessions"),
             claude_projects_root: home.join(".claude").join("projects"),
             codex_sessions_root: home.join(".codex").join("sessions"),
@@ -96,8 +93,8 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     }
 
     // Probe logs.db first. Its ids are aivo-internal short alphanumerics
-    // (12-char base32-ish) and don't overlap with UUID-style native ids or
-    // T-… amp ids, so a hit here is decisive. The three logs.db sources
+    // (12-char base32-ish) and don't overlap with UUID-style native ids,
+    // so a hit here is decisive. The three logs.db sources
     // each map differently:
     //
     //   chat  → has a session_id linkage; share that chat session.
@@ -153,8 +150,8 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                 // exactly one native session, and we already know which X.
                 let mut payload = resolve_run_event(&entry, ctx).await?;
                 // Prefer logs.db's model so `share` matches `logs show
-                // --json` (and surfaces e.g. `composer-2.5` for amp routed
-                // through cursor, where the thread file only knows agentMode).
+                // --json` (and surfaces the cursor-routed model, where the
+                // session file only knows a generic mode name).
                 if let Some(m) = entry.model.as_deref().filter(|s| !s.is_empty()) {
                     payload.model = Some(m.to_string());
                 }
@@ -174,8 +171,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     // can hit several files inside one source, so within-source collisions
     // count too — flatten everything before deciding.
     let project_root_str = ctx.project_root.to_string_lossy().to_string();
-    let (amp_hits, chat_hits, claude_hits, codex_hits, gemini_hits, pi_hits, opencode_hits) = tokio::join!(
-        find_amp(&ctx.amp_dir, session_id),
+    let (chat_hits, claude_hits, codex_hits, gemini_hits, pi_hits, opencode_hits) = tokio::join!(
         find_chat(&ctx.session_store, &ctx.chat_sessions_dir, session_id),
         find_claude(&ctx.claude_projects_root, &ctx.project_root, session_id),
         find_codex(&ctx.codex_sessions_root, session_id),
@@ -185,7 +181,6 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     );
 
     let mut hits: Vec<Match> = Vec::new();
-    hits.extend(amp_hits);
     hits.extend(chat_hits.unwrap_or_default());
     hits.extend(claude_hits);
     hits.extend(codex_hits);
@@ -214,7 +209,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     };
 
     // For file-backed CLI sources, `Match::full_id` carries the resolved
-    // file path. For amp / chat / opencode it carries the actual session id
+    // file path. For chat / opencode it carries the actual session id
     // (loaded via the source's own lookup).
     //
     // Per-source cwd: derive from the source itself, not from the caller's
@@ -222,7 +217,6 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     // show the *session's* project rather than the user's terminal cwd.
     let p_root = ctx.project_root.to_str();
     let payload = match hit.source {
-        "amp" => extract_amp_full(&ctx.amp_dir, &hit.full_id, p_root).await?,
         "chat" => {
             let state = ctx
                 .session_store
@@ -321,26 +315,6 @@ fn id_prefix_matches(candidate: &str, user_input: &str) -> bool {
     let cand: String = candidate.chars().filter(|c| *c != '-').collect();
     let inp: String = user_input.chars().filter(|c| *c != '-').collect();
     !inp.is_empty() && cand.starts_with(&inp)
-}
-
-async fn find_amp(amp_dir: &Path, session_id: &str) -> Vec<Match> {
-    // `T-` is a hard prefix; an id without it can never resolve to amp.
-    // (`id_prefix_matches` strips dashes including the one after `T`, so we
-    // require the `T` literal up front to keep amp from matching every
-    // dashes-stripped UUID prefix that happens to start with the same chars.)
-    if !session_id.starts_with('T') {
-        return Vec::new();
-    }
-    find_files_by_stem_prefix(amp_dir, session_id, "json")
-        .await
-        .into_iter()
-        .filter_map(|p| {
-            p.file_stem().and_then(|s| s.to_str()).map(|s| Match {
-                source: "amp",
-                full_id: s.to_string(),
-            })
-        })
-        .collect()
 }
 
 async fn find_chat(store: &SessionStore, chat_dir: &Path, session_id: &str) -> Result<Vec<Match>> {
@@ -603,12 +577,6 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         .unwrap_or_else(|| ctx.project_root.to_string_lossy().to_string());
     let run_ts = parse_log_timestamp(&entry.ts_utc);
 
-    // Amp threads aren't cwd-scoped — they live in their own dir keyed by
-    // T-<id>. Find the one with mtime closest to the run's ts_utc.
-    if tool == "amp" {
-        return resolve_amp_run(&ctx.amp_dir, run_ts, &run_cwd).await;
-    }
-
     // Native CLIs: project-scoped enumeration, then closest-mtime match within
     // the matching cli.
     //
@@ -696,33 +664,6 @@ async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Resul
         })
 }
 
-async fn resolve_amp_run(
-    amp_dir: &Path,
-    run_ts: Option<DateTime<Utc>>,
-    run_cwd: &str,
-) -> Result<SharePayload> {
-    let listed = amp_threads::list_threads(amp_dir, 200).await;
-    let mut candidates: Vec<(String, DateTime<Utc>)> = listed
-        .iter()
-        .filter_map(|v| {
-            let id = v.get("id")?.as_str()?.to_string();
-            let updated = v.get("updatedAt")?.as_str()?;
-            let ts = DateTime::parse_from_rfc3339(updated)
-                .ok()?
-                .with_timezone(&Utc);
-            Some((id, ts))
-        })
-        .collect();
-    if candidates.is_empty() {
-        return Err(anyhow!(
-            "no amp threads on disk yet — nothing to resolve the run event to"
-        ));
-    }
-    candidates.sort_by_key(|(_, ts)| run_ts.map(|rt| (*ts - rt).num_seconds().abs()).unwrap_or(0));
-    let (closest_id, _) = &candidates[0];
-    extract_amp_full(amp_dir, closest_id, Some(run_cwd)).await
-}
-
 /// Re-run the per-cli extractor on a `Thread` (which only carries summary
 /// data) to produce a full `SharePayload`. Mirrors the dispatch in
 /// `resolve_session` but driven from a Thread rather than a Match.
@@ -749,7 +690,6 @@ mod tests {
     use super::*;
     use crate::services::session_crypto::encrypt;
     use crate::services::session_store::{SessionTokens, StoredChatMessage};
-    use serde_json::json;
     use tempfile::TempDir;
 
     fn ctx_with_tempdirs(temp: &TempDir, project_root: PathBuf) -> ResolverContext {
@@ -757,7 +697,6 @@ mod tests {
         ResolverContext {
             project_root,
             session_store: store,
-            amp_dir: temp.path().join("amp-threads"),
             chat_sessions_dir: temp.path().join("sessions"),
             claude_projects_root: temp.path().join("claude_projects"),
             codex_sessions_root: temp.path().join("codex"),
@@ -765,24 +704,6 @@ mod tests {
             pi_sessions_root: temp.path().join("pi"),
             opencode_db_path: temp.path().join("opencode.db"),
         }
-    }
-
-    #[tokio::test]
-    async fn resolve_amp_thread_via_t_prefix_shortcut() {
-        let temp = TempDir::new().unwrap();
-        let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
-        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        let payload = json!({
-            "id": "T-aaa",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        amp_threads::save_thread(&ctx.amp_dir, &payload)
-            .await
-            .unwrap();
-
-        let resolved = resolve_session("T-aaa", &ctx).await.unwrap();
-        assert_eq!(resolved.payload.source_cli, "amp");
-        assert_eq!(resolved.payload.session_id, "T-aaa");
     }
 
     #[tokio::test]
@@ -919,137 +840,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_amp_returns_error_when_thread_missing() {
-        let temp = TempDir::new().unwrap();
-        let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
-        // amp_dir doesn't exist yet — extract_amp_full should bubble up.
-        let err = resolve_session("T-bogus", &ctx).await.unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[tokio::test]
     async fn resolve_rejects_empty_id() {
         let temp = TempDir::new().unwrap();
         let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
         let err = resolve_session("", &ctx).await.unwrap_err();
         assert!(err.to_string().contains("empty"));
-    }
-
-    #[tokio::test]
-    async fn resolve_amp_via_short_prefix() {
-        let temp = TempDir::new().unwrap();
-        let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
-        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        let payload = json!({
-            "id": "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        amp_threads::save_thread(&ctx.amp_dir, &payload)
-            .await
-            .unwrap();
-
-        // 8-char prefix (matches what `aivo context` shows).
-        let resolved = resolve_session("T-019e05a", &ctx).await.unwrap();
-        assert_eq!(resolved.payload.source_cli, "amp");
-        assert_eq!(
-            resolved.payload.session_id,
-            "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_event_overrides_amp_agent_mode_with_logs_db_model() {
-        // The bug: `aivo logs show --json` shows the cursor-routed model
-        // (e.g. `composer-2.5`) but `aivo logs share` shows amp's agentMode
-        // (e.g. `rush`) because the amp thread file carries no per-message
-        // model. The run-event branch should override with logs.db's model.
-        let temp = TempDir::new().unwrap();
-        let project_root = temp.path().to_path_buf();
-        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
-        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        let thread_id = "T-019e593a-b41f-700b-a3db-ebb54822cb7a";
-        let thread = json!({
-            "id": thread_id,
-            "agentMode": "rush",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        amp_threads::save_thread(&ctx.amp_dir, &thread)
-            .await
-            .unwrap();
-
-        ctx.session_store
-            .logs()
-            .append(crate::services::log_store::LogEvent {
-                source: "run".into(),
-                kind: "tool_launch".into(),
-                phase: Some("finished".into()),
-                tool: Some("amp".into()),
-                model: Some("composer-2.5".into()),
-                cwd: Some(project_root.to_string_lossy().to_string()),
-                session_id: Some(thread_id.into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let resolved = resolve_session(thread_id, &ctx).await.unwrap();
-        assert_eq!(resolved.payload.source_cli, "amp");
-        assert_eq!(resolved.payload.model.as_deref(), Some("composer-2.5"));
-    }
-
-    #[tokio::test]
-    async fn run_event_keeps_amp_agent_mode_when_logs_db_model_absent() {
-        // Older run rows have no model column. The agentMode fallback in
-        // extract_amp_value must still survive.
-        let temp = TempDir::new().unwrap();
-        let project_root = temp.path().to_path_buf();
-        let ctx = ctx_with_tempdirs(&temp, project_root.clone());
-        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        let thread_id = "T-019e593b-0000-7000-8000-000000000000";
-        let thread = json!({
-            "id": thread_id,
-            "agentMode": "rush",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        amp_threads::save_thread(&ctx.amp_dir, &thread)
-            .await
-            .unwrap();
-
-        ctx.session_store
-            .logs()
-            .append(crate::services::log_store::LogEvent {
-                source: "run".into(),
-                kind: "tool_launch".into(),
-                phase: Some("finished".into()),
-                tool: Some("amp".into()),
-                model: None,
-                cwd: Some(project_root.to_string_lossy().to_string()),
-                session_id: Some(thread_id.into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let resolved = resolve_session(thread_id, &ctx).await.unwrap();
-        assert_eq!(resolved.payload.model.as_deref(), Some("rush"));
-    }
-
-    #[tokio::test]
-    async fn resolve_within_source_ambiguity_errors() {
-        let temp = TempDir::new().unwrap();
-        let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
-        fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        amp_threads::save_thread(&ctx.amp_dir, &json!({"id": "T-aaaa1", "messages": []}))
-            .await
-            .unwrap();
-        amp_threads::save_thread(&ctx.amp_dir, &json!({"id": "T-aaaa2", "messages": []}))
-            .await
-            .unwrap();
-
-        let err = resolve_session("T-aaaa", &ctx).await.unwrap_err();
-        assert!(err.to_string().contains("ambiguous"));
-        assert!(err.to_string().contains("T-aaaa1"));
-        assert!(err.to_string().contains("T-aaaa2"));
     }
 
     #[tokio::test]

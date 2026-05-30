@@ -1,5 +1,5 @@
 /// Strip dashes from a session id and clip to `width` chars. Preserves
-/// amp's `T-` source tag literally so the row stays grep-able.
+/// a leading `T-` source tag literally so the row stays grep-able.
 pub fn compact_id(id: &str, width: usize) -> String {
     if let Some(rest) = id.strip_prefix("T-") {
         let take = width.saturating_sub(2);

@@ -2,7 +2,7 @@
 //!
 //! `SharePayload` is the lossless, JSON-serializable representation of one
 //! conversation that aivo serves over the share tunnel. Each native source
-//! (amp / claude / codex / gemini / pi / opencode / aivo chat) has its own
+//! (claude / codex / gemini / pi / opencode / aivo chat) has its own
 //! `extract_*_full` that maps the source's on-disk shape into this schema.
 //!
 //! Companion to `context_ingest.rs`: that module collapses a session into a
@@ -10,12 +10,10 @@
 //! preserves every message, including tool calls/results.
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
 
-use crate::services::amp_threads;
 use crate::services::context_ingest::paths_match;
 use crate::services::device_fingerprint::hex_sha256;
 use crate::services::session_store::{
@@ -155,7 +153,7 @@ impl SharePayload {
 }
 
 /// Fold messages whose content is *only* tool_result blocks into the
-/// previous message. Anthropic-style wires (amp, claude) emit each tool
+/// previous message. Anthropic-style wires (claude) emit each tool
 /// result as a fresh `role: "user"` message; codex emits a separate
 /// `role: "tool"` message. The share viewer always renders those results
 /// inline with the preceding tool_use, so a standalone count of
@@ -176,312 +174,6 @@ fn merge_tool_result_turns(messages: Vec<ShareMessage>) -> Vec<ShareMessage> {
         out.push(msg);
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// Amp extractor
-// ---------------------------------------------------------------------------
-
-/// Read an amp thread JSON file (`~/.config/aivo/amp-threads/T-*.json`) and
-/// map it onto the share schema. Amp's payload is the raw `params.thread`
-/// the bridge captured from `uploadThread`, so we read it tolerantly: missing
-/// fields fall back to defaults rather than failing the share.
-pub async fn extract_amp_full(
-    threads_dir: &Path,
-    thread_id: &str,
-    project_root: Option<&str>,
-) -> Result<SharePayload> {
-    let raw = amp_threads::load_thread(threads_dir, thread_id)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "amp thread '{thread_id}' not found in {}",
-                threads_dir.display()
-            )
-        })?;
-    extract_amp_value(&raw, project_root)
-}
-
-/// Extracts a SharePayload from an already-parsed amp thread JSON value.
-/// Pulled out so tests don't have to round-trip through the filesystem.
-pub fn extract_amp_value(raw: &Value, project_root: Option<&str>) -> Result<SharePayload> {
-    let id = raw
-        .get("id")
-        .and_then(|v| v.as_str())
-        .context("amp thread missing string `id`")?
-        .to_string();
-
-    let title = raw
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let agent_mode = raw
-        .get("agentMode")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    // Amp `created` is unix millis; many threads omit it.
-    let created_at = raw
-        .get("created")
-        .and_then(|v| v.as_i64())
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
-
-    let messages_array = raw
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-
-    let mut messages: Vec<ShareMessage> = Vec::with_capacity(messages_array.len());
-    let mut latest_ts: Option<DateTime<Utc>> = None;
-    let mut last_model: Option<String> = None;
-
-    for msg in messages_array {
-        let role = msg
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("user")
-            .to_string();
-
-        let timestamp = msg
-            .get("createdAt")
-            .or_else(|| msg.get("timestamp"))
-            .and_then(parse_amp_timestamp);
-        if let Some(ts) = timestamp {
-            latest_ts = Some(latest_ts.map_or(ts, |cur| cur.max(ts)));
-        }
-
-        let model = msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                msg.get("meta")
-                    .and_then(|m| m.get("model"))
-                    .and_then(|v| v.as_str())
-            })
-            .map(str::to_string);
-        if model.is_some() {
-            last_model = model.clone();
-        }
-
-        let reasoning = msg
-            .get("reasoning")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-
-        let content = extract_amp_content(msg);
-
-        messages.push(ShareMessage {
-            role,
-            timestamp,
-            model,
-            reasoning,
-            content,
-        });
-    }
-
-    let messages = merge_tool_result_turns(messages);
-
-    let meta = SharePayload::new_meta(false);
-
-    let project = ProjectInfo {
-        root: project_root.map(str::to_string),
-        name: project_root
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .and_then(|n| n.to_str())
-            .map(str::to_string),
-    };
-
-    Ok(SharePayload {
-        schema_version: SHARE_SCHEMA_VERSION.to_string(),
-        source_cli: "amp".to_string(),
-        session_id: id,
-        project,
-        // Amp threads carry no canonical "model" at the top level; we
-        // surface `agentMode` (smart/rush/deep/large) as a model proxy when
-        // no per-message model is present, since that's what the recipient
-        // actually cares about.
-        model: last_model.or(agent_mode).or(title),
-        created_at,
-        // Prefer the latest message timestamp; fall back to `created` so a
-        // thread without per-message timestamps still has *some* updated_at.
-        updated_at: latest_ts.or(created_at),
-        messages,
-        meta,
-    })
-}
-
-/// Pull content blocks out of one amp message. Amp's wire shape varies by
-/// turn type (assistant turns may carry structured content arrays, user turns
-/// are usually plain strings, tool results live in their own messages); this
-/// extractor is tolerant and skips blocks it doesn't recognize.
-fn extract_amp_content(msg: &Value) -> Vec<ContentBlock> {
-    let mut out: Vec<ContentBlock> = Vec::new();
-
-    if let Some(content) = msg.get("content") {
-        match content {
-            Value::String(s) if !s.is_empty() => out.push(ContentBlock::Text { text: s.clone() }),
-            Value::Array(arr) => {
-                for block in arr {
-                    if let Some(b) = parse_amp_block(block) {
-                        out.push(b);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Amp sometimes splits tool I/O into siblings of `content`. Fold them in
-    // so the recipient sees what the model actually did.
-    if let Some(tool_use) = msg.get("toolUse").and_then(|v| v.as_object()) {
-        out.push(ContentBlock::ToolCall {
-            id: tool_use
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            name: tool_use
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool")
-                .to_string(),
-            arguments: tool_use
-                .get("input")
-                .or_else(|| tool_use.get("arguments"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        });
-    }
-    if let Some(tool_result) = msg.get("toolResult").and_then(|v| v.as_object()) {
-        let output = tool_result
-            .get("content")
-            .or_else(|| tool_result.get("output"))
-            .map(stringify_block_text)
-            .unwrap_or_default();
-        let error = tool_result
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        out.push(ContentBlock::ToolResult {
-            id: tool_result
-                .get("toolUseId")
-                .or_else(|| tool_result.get("id"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            ok: error.is_none(),
-            output,
-            error,
-        });
-    }
-
-    out
-}
-
-/// Parse one amp content block. Amp's `type` discriminator matches
-/// Anthropic's (`text` / `tool_use` / `tool_result` / `thinking`) but the
-/// `tool_result` envelope diverges: amp uses `toolUseID` (camelCase) for
-/// the linkage and nests output under `run.result.{output,diff,error}`
-/// (the per-tool shape varies). We accept both Anthropic and amp shapes
-/// so older fixtures and live amp threads both render.
-fn parse_amp_block(block: &Value) -> Option<ContentBlock> {
-    let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match kind {
-        "text" => block
-            .get("text")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| ContentBlock::Text {
-                text: s.to_string(),
-            }),
-        "thinking" | "reasoning" => block
-            .get("text")
-            .or_else(|| block.get("thinking"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| ContentBlock::Text {
-                text: s.to_string(),
-            }),
-        "tool_use" => Some(ContentBlock::ToolCall {
-            id: block.get("id").and_then(|v| v.as_str()).map(str::to_string),
-            name: block
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("tool")
-                .to_string(),
-            arguments: block
-                .get("input")
-                .or_else(|| block.get("arguments"))
-                .cloned()
-                .unwrap_or(Value::Null),
-        }),
-        "tool_result" => Some(parse_amp_tool_result(block)),
-        _ => None,
-    }
-}
-
-/// Extract id + output + error from amp's `tool_result` block, accepting
-/// both Anthropic's wire shape (`content`/`tool_use_id`/`is_error`) and
-/// amp's native shape (`toolUseID` + `run.result.{output,diff,error,exitCode}`).
-fn parse_amp_tool_result(block: &Value) -> ContentBlock {
-    let id = block
-        .get("tool_use_id")
-        .or_else(|| block.get("toolUseID"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    let run_result = block.get("run").and_then(|r| r.get("result"));
-
-    // Per-tool output: Bash → `output`; edit/create → `diff`; many other
-    // tools stuff their payload elsewhere in `result`. Fall back to a
-    // JSON dump of `result` so unknown shapes still surface something
-    // useful instead of an empty box.
-    let amp_output = run_result.and_then(|r| {
-        if let Some(s) = r.get("output").and_then(|v| v.as_str())
-            && !s.is_empty()
-        {
-            return Some(s.to_string());
-        }
-        if let Some(s) = r.get("diff").and_then(|v| v.as_str())
-            && !s.is_empty()
-        {
-            return Some(s.to_string());
-        }
-        if let Some(obj) = r.as_object()
-            && !obj.is_empty()
-            && !(obj.len() == 1 && obj.contains_key("error"))
-        {
-            return Some(serde_json::to_string_pretty(r).unwrap_or_default());
-        }
-        None
-    });
-
-    let anthropic_output = block.get("content").map(stringify_block_text);
-    let output = amp_output.or(anthropic_output).unwrap_or_default();
-
-    let amp_error = run_result
-        .and_then(|r| r.get("error"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let exit_code_failed = run_result
-        .and_then(|r| r.get("exitCode"))
-        .and_then(|v| v.as_i64())
-        .is_some_and(|c| c != 0);
-    let anthropic_is_error = block
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let error = amp_error
-        .or_else(|| (exit_code_failed || anthropic_is_error).then(|| output.clone()))
-        .filter(|s| !s.is_empty());
-
-    ContentBlock::ToolResult {
-        id,
-        ok: error.is_none(),
-        output,
-        error,
-    }
 }
 
 /// Flatten a `content` field that may be either a plain string or an array
@@ -620,19 +312,6 @@ fn parse_chat_timestamp(s: &str) -> Option<DateTime<Utc>> {
         .map(|p| p.with_timezone(&Utc))
 }
 
-/// Amp emits timestamps either as RFC3339 strings or unix-millis numbers.
-fn parse_amp_timestamp(v: &Value) -> Option<DateTime<Utc>> {
-    if let Some(s) = v.as_str()
-        && let Ok(parsed) = DateTime::parse_from_rfc3339(s)
-    {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    if let Some(ms) = v.as_i64() {
-        return Utc.timestamp_millis_opt(ms).single();
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Claude Code extractor
 // ---------------------------------------------------------------------------
@@ -729,7 +408,7 @@ pub async fn extract_claude_full(
     })
 }
 
-/// Anthropic-style content arrays show up in claude (and amp). One block per
+/// Anthropic-style content arrays show up in claude. One block per
 /// JSON entry: `text`, `tool_use`, `tool_result`, `thinking`. Strings are
 /// also accepted (older sessions inline a string `content`).
 fn parse_anthropic_content_array(content: Option<&Value>) -> Vec<ContentBlock> {
@@ -1381,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_tool_result_turns_folds_amp_alternation() {
+    fn merge_tool_result_turns_folds_alternation() {
         // user / asst(tool_use) / user(tool_result) / asst(tool_use) / user(tool_result)
         // collapses to user / asst(tool_use + tool_result) / asst(tool_use + tool_result)
         let input = vec![
@@ -1417,8 +1096,7 @@ mod tests {
 
     #[test]
     fn merge_tool_result_turns_preserves_orphan_first_message() {
-        // A tool_result with no preceding message survives as-is (rare, but
-        // a few amp threads start with one and existing tests rely on it).
+        // A tool_result with no preceding message survives as-is (rare).
         let input = vec![msg("user", vec![tool_result("a", "ok")])];
         let out = merge_tool_result_turns(input);
         assert_eq!(out.len(), 1);
@@ -1449,293 +1127,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_amp_value_preserves_messages_and_models() {
-        let raw = json!({
-            "v": 1,
-            "id": "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0",
-            "title": "fix pagination bug",
-            "created": 1778211465000i64,
-            "agentMode": "smart",
-            "messages": [
-                {
-                    "role": "user",
-                    "createdAt": "2026-04-01T10:00:00Z",
-                    "content": "Why does the cursor pagination return empty pages?"
-                },
-                {
-                    "role": "assistant",
-                    "createdAt": "2026-04-01T10:01:00Z",
-                    "model": "claude-sonnet-4-5",
-                    "content": [
-                        {"type": "text", "text": "Let me check the helper."},
-                        {"type": "tool_use", "id": "call_1", "name": "Read",
-                         "input": {"path": "handlers/users.go"}}
-                    ]
-                },
-                {
-                    "role": "tool",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": "call_1",
-                         "content": [{"type": "text", "text": "fn paginate() {...}"}]}
-                    ]
-                }
-            ]
-        });
-
-        let payload = extract_amp_value(&raw, Some("/Users/alice/project/work/aivo")).unwrap();
-        assert_eq!(payload.source_cli, "amp");
-        assert_eq!(payload.session_id, "T-019e05ae-80a5-7718-80ee-ec89cb6fc1c0");
-        assert_eq!(payload.project.name.as_deref(), Some("aivo"));
-        // Tool-result-only third message folds into the assistant turn so
-        // the count matches what the viewer renders.
-        assert_eq!(payload.messages.len(), 2);
-
-        // First user turn — plain string content.
-        let user = &payload.messages[0];
-        assert_eq!(user.role, "user");
-        assert_eq!(user.content.len(), 1);
-        match &user.content[0] {
-            ContentBlock::Text { text } => assert!(text.contains("cursor pagination")),
-            other => panic!("expected text block, got {other:?}"),
-        }
-
-        // Assistant turn carries text + tool_use + the merged tool_result.
-        let asst = &payload.messages[1];
-        assert_eq!(asst.role, "assistant");
-        assert_eq!(asst.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(asst.content.len(), 3);
-        assert!(matches!(asst.content[0], ContentBlock::Text { .. }));
-        match &asst.content[1] {
-            ContentBlock::ToolCall { id, name, .. } => {
-                assert_eq!(id.as_deref(), Some("call_1"));
-                assert_eq!(name, "Read");
-            }
-            other => panic!("expected tool_call, got {other:?}"),
-        }
-        match &asst.content[2] {
-            ContentBlock::ToolResult {
-                id,
-                ok,
-                output,
-                error,
-            } => {
-                assert_eq!(id.as_deref(), Some("call_1"));
-                assert!(*ok);
-                assert!(output.contains("fn paginate"));
-                assert!(error.is_none());
-            }
-            other => panic!("expected tool_result, got {other:?}"),
-        }
-
-        // Top-level model surfaces the assistant's last seen model.
-        assert_eq!(payload.model.as_deref(), Some("claude-sonnet-4-5"));
-
-        // updated_at is the latest message timestamp.
-        let updated = payload.updated_at.expect("updated_at present");
-        assert_eq!(
-            updated.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "2026-04-01T10:01:00Z"
-        );
-    }
-
-    #[test]
-    fn extract_amp_value_falls_back_to_agent_mode_when_no_message_model() {
-        let raw = json!({
-            "id": "T-bare",
-            "agentMode": "rush",
-            "messages": [
-                { "role": "user", "content": "hi" }
-            ]
-        });
-        let payload = extract_amp_value(&raw, None).unwrap();
-        assert_eq!(payload.model.as_deref(), Some("rush"));
-        assert!(payload.project.root.is_none());
-    }
-
-    #[test]
-    fn extract_amp_tool_result_unwraps_amp_native_bash_shape() {
-        // Real amp threads ship tool_result with `toolUseID` (camelCase)
-        // and the output nested under `run.result.output` — not the
-        // Anthropic `content`/`tool_use_id`/`is_error` shape the old
-        // parser assumed. Both must survive.
-        let raw = json!({
-            "id": "T-amp-bash",
-            "messages": [
-                { "role": "user", "content": "run pwd" },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "tool_use", "id": "call_x", "name": "Bash",
-                         "input": {"cmd": "pwd"}}
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "toolUseID": "call_x",
-                        "run": {
-                            "status": "done",
-                            "result": {"exitCode": 0, "output": "/tmp/proj"}
-                        }
-                    }]
-                }
-            ]
-        });
-        let payload = extract_amp_value(&raw, None).unwrap();
-        // tool_result merges into the preceding assistant turn — it lives
-        // alongside the tool_use at index 1.
-        let asst = &payload.messages[1];
-        match &asst.content[1] {
-            ContentBlock::ToolResult {
-                id,
-                ok,
-                output,
-                error,
-            } => {
-                assert_eq!(id.as_deref(), Some("call_x"));
-                assert!(*ok);
-                assert_eq!(output, "/tmp/proj");
-                assert!(error.is_none());
-            }
-            other => panic!("expected tool_result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_amp_tool_result_unwraps_amp_native_edit_shape() {
-        // Edit-tool results live at `run.result.diff` instead of `output`.
-        let raw = json!({
-            "id": "T-amp-edit",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "toolUseID": "call_e",
-                        "run": {
-                            "status": "done",
-                            "result": {"diff": "--- a\n+++ b", "lineRange": [1, 2]}
-                        }
-                    }]
-                }
-            ]
-        });
-        let payload = extract_amp_value(&raw, None).unwrap();
-        match &payload.messages[0].content[0] {
-            ContentBlock::ToolResult { output, ok, .. } => {
-                assert!(output.contains("+++ b"));
-                assert!(*ok);
-            }
-            other => panic!("expected tool_result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_amp_tool_result_marks_failed_exit_code_as_error() {
-        let raw = json!({
-            "id": "T-amp-fail",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "toolUseID": "call_f",
-                        "run": {
-                            "status": "done",
-                            "result": {"exitCode": 1, "output": "permission denied"}
-                        }
-                    }]
-                }
-            ]
-        });
-        let payload = extract_amp_value(&raw, None).unwrap();
-        match &payload.messages[0].content[0] {
-            ContentBlock::ToolResult {
-                ok, output, error, ..
-            } => {
-                assert!(!*ok);
-                assert_eq!(output, "permission denied");
-                assert_eq!(error.as_deref(), Some("permission denied"));
-            }
-            other => panic!("expected tool_result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_amp_tool_result_falls_back_to_json_dump_for_unknown_shape() {
-        // Some tools (todoWrite, read-file with summary, ...) put their
-        // payload in `result` under keys we don't enumerate. We dump the
-        // whole `result` object as a fallback so the viewer never shows
-        // an empty box.
-        let raw = json!({
-            "id": "T-amp-unknown",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "toolUseID": "call_u",
-                        "run": {
-                            "status": "done",
-                            "result": {"todos": ["a", "b"], "removed": 1}
-                        }
-                    }]
-                }
-            ]
-        });
-        let payload = extract_amp_value(&raw, None).unwrap();
-        match &payload.messages[0].content[0] {
-            ContentBlock::ToolResult { output, ok, .. } => {
-                assert!(output.contains("todos"));
-                assert!(output.contains("removed"));
-                assert!(*ok);
-            }
-            other => panic!("expected tool_result, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_amp_value_rejects_payload_without_id() {
-        let raw = json!({ "messages": [] });
-        let err = extract_amp_value(&raw, None).unwrap_err();
-        assert!(err.to_string().contains("missing"));
-    }
-
-    #[tokio::test]
-    async fn extract_amp_full_loads_from_disk() {
-        let dir = TempDir::new().unwrap();
-        let payload = json!({
-            "id": "T-aaa",
-            "title": "test",
-            "messages": [
-                { "role": "user", "content": "hello world" }
-            ]
-        });
-        amp_threads::save_thread(dir.path(), &payload)
-            .await
-            .unwrap();
-
-        let extracted = extract_amp_full(dir.path(), "T-aaa", None).await.unwrap();
-        assert_eq!(extracted.session_id, "T-aaa");
-        assert_eq!(extracted.messages.len(), 1);
-        assert_eq!(extracted.schema_version, SHARE_SCHEMA_VERSION);
-    }
-
-    #[tokio::test]
-    async fn extract_amp_full_errors_on_missing_thread() {
-        let dir = TempDir::new().unwrap();
-        let err = extract_amp_full(dir.path(), "T-nope", None)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
     fn approximate_chars_sums_text_and_code_and_tool_output() {
         let payload = SharePayload {
             schema_version: SHARE_SCHEMA_VERSION.into(),
-            source_cli: "amp".into(),
+            source_cli: "claude".into(),
             session_id: "T-x".into(),
             project: ProjectInfo::default(),
             model: None,

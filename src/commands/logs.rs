@@ -9,7 +9,6 @@ use crate::cli::LogsArgs;
 use crate::commands::chat::format_time_ago_short;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
-use crate::services::amp_threads;
 use crate::services::context_ingest::{self, IngestOptions};
 use crate::services::id_compact::compact_id;
 use crate::services::log_store::{LogEntry, LogQuery, RunMeta};
@@ -19,65 +18,34 @@ use crate::style;
 use unicode_width::UnicodeWidthChar;
 
 /// One row in the unified `aivo logs` listing. Mixes `logs.db` events
-/// (chat/run/serve), native CLI sessions (claude/codex/gemini/pi/opencode),
-/// and amp threads. Each variant carries its own provenance and time, so
-/// the merge sort + filter pipeline can treat them uniformly.
+/// (chat/run/serve) and native CLI sessions (claude/codex/gemini/pi/opencode).
+/// Each variant carries its own provenance and time, so the merge sort +
+/// filter pipeline can treat them uniformly.
 #[derive(Debug, Clone)]
 pub(crate) enum UnifiedRow {
     // LogEntry is large (~1KB worth of optional fields); box to keep the
     // enum's stack footprint reasonable for `Vec<UnifiedRow>` allocation.
     Log(Box<LogEntry>),
     Native(Thread),
-    Amp(AmpRow),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AmpRow {
-    pub(crate) id: String,
-    pub(crate) title: Option<String>,
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) message_count: u64,
-}
-
-impl AmpRow {
-    fn from_value(v: &Value) -> Option<Self> {
-        let id = v.get("id")?.as_str()?.to_string();
-        let title = v.get("title").and_then(|x| x.as_str()).map(str::to_string);
-        let updated_at = v
-            .get("updatedAt")
-            .and_then(|x| x.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
-        let message_count = v.get("messageCount").and_then(|x| x.as_u64()).unwrap_or(0);
-        Some(Self {
-            id,
-            title,
-            updated_at,
-            message_count,
-        })
-    }
 }
 
 impl UnifiedRow {
     /// Stable identifier suitable for the share resolver. For `Log/run` this
     /// is the event group id (matches what `aivo logs` prints), otherwise the
-    /// native session_id / amp thread id / logs row id.
+    /// native session_id / logs row id.
     pub(crate) fn id(&self) -> String {
         match self {
             UnifiedRow::Log(e) => display_id(e).to_string(),
             UnifiedRow::Native(t) => t.session_id.clone(),
-            UnifiedRow::Amp(a) => a.id.clone(),
         }
     }
 
-    /// `"chat" | "run" | "serve" | "claude" | … | "amp"`. Matches what `aivo
+    /// `"chat" | "run" | "serve" | "claude" | …`. Matches what `aivo
     /// logs` displays in the bracket column.
     pub(crate) fn source_label(&self) -> &str {
         match self {
             UnifiedRow::Log(e) => e.source.as_str(),
             UnifiedRow::Native(t) => t.cli.as_str(),
-            UnifiedRow::Amp(_) => "amp",
         }
     }
 
@@ -119,13 +87,6 @@ impl UnifiedRow {
                 format_time_ago_short_dt(t.updated_at),
                 compact_id(&t.session_id, id_width),
                 t.topic.clone(),
-            ),
-            UnifiedRow::Amp(a) => (
-                format_time_ago_short_dt(a.updated_at),
-                compact_id(&a.id, id_width),
-                a.title
-                    .clone()
-                    .unwrap_or_else(|| format!("(amp thread, {} messages)", a.message_count)),
             ),
         };
         let bracket = format!("[{}]", self.source_label());
@@ -386,8 +347,8 @@ impl LogsCommand {
             return Ok(ExitCode::Success);
         }
 
-        // 2. Fall back to native CLI / amp via the share resolver, which
-        //    already does prefix-matching across all 7 sources and surfaces
+        // 2. Fall back to native CLI via the share resolver, which
+        //    already does prefix-matching across all sources and surfaces
         //    cross-source ambiguity. We don't need the full payload — the
         //    metadata + first/last messages from `Thread`-style summaries
         //    are enough — but reusing one resolver is simpler than carving
@@ -405,7 +366,7 @@ impl LogsCommand {
                 Ok(ExitCode::Success)
             }
             Err(e) => Err(anyhow::anyhow!(
-                "No log entry, native session, or amp thread matching '{}'.\n  ({})",
+                "No log entry or native session matching '{}'.\n  ({})",
                 id,
                 e
             )),
@@ -526,7 +487,7 @@ fn print_help_overview() {
     );
     println!(
         "{}",
-        style::dim("codex, gemini, pi, opencode), and amp threads. `aivo logs share` picks")
+        style::dim("codex, gemini, pi, opencode). `aivo logs share` picks")
     );
     println!(
         "{}",
@@ -555,7 +516,7 @@ fn print_help_overview() {
     logs_help_row("-n, --limit <N>", "Maximum rows after merge (default: 20)");
     logs_help_row(
         "--json",
-        "Output JSON (tagged union: log_entry|native_session|amp_thread)",
+        "Output JSON (tagged union: log_entry|native_session)",
     );
     logs_help_row(
         "--watch",
@@ -565,7 +526,7 @@ fn print_help_overview() {
     logs_help_row("-s, --search <query>", "Search title/topic/body text");
     logs_help_row(
         "--by <name>",
-        "Sessions: chat | claude | codex | gemini | pi | opencode | amp | native",
+        "Sessions: chat | claude | codex | gemini | pi | opencode | native",
     );
     logs_help_row(
         "",
@@ -611,10 +572,6 @@ fn print_help_overview() {
     );
     println!(
         "  {}",
-        style::dim("aivo logs --by amp            # only amp threads")
-    );
-    println!(
-        "  {}",
         style::dim("aivo logs show 1335c631       # any unique id prefix works")
     );
     println!(
@@ -633,9 +590,7 @@ fn print_help_show() {
     println!();
     println!(
         "{}",
-        style::dim(
-            "Show full detail for a single row: logs.db id, native session id, or T-… thread."
-        )
+        style::dim("Show full detail for a single row: logs.db id or native session id.")
     );
     println!(
         "{}",
@@ -649,7 +604,6 @@ fn print_help_show() {
         style::dim("aivo logs show               # pick from this project")
     );
     println!("  {}", style::dim("aivo logs show 1335c631"));
-    println!("  {}", style::dim("aivo logs show T-abc123"));
 }
 
 fn print_help_share() {
@@ -752,7 +706,6 @@ fn render_unified_rows(
             UnifiedRow::Native(t) => {
                 print_native_summary(t, id_width, detail_width, run_meta.get(&t.session_id))
             }
-            UnifiedRow::Amp(a) => print_amp_summary(a, id_width, detail_width),
         }
     }
 }
@@ -855,24 +808,7 @@ fn visible_width(s: &str) -> usize {
     out
 }
 
-fn print_amp_summary(a: &AmpRow, id_width: usize, detail_width: usize) {
-    let time_ago = format_time_ago_short_dt(a.updated_at);
-    let id = compact_id(&a.id, id_width);
-    let title = a
-        .title
-        .clone()
-        .unwrap_or_else(|| format!("(amp thread, {} messages)", a.message_count));
-    let title = trim_to_one_line(&title, detail_width);
-    println!(
-        "{} {} {} {}",
-        style::dim(format!("{:>5}", time_ago)),
-        style::cyan(format!("{:<width$}", id, width = id_width)),
-        style::magenta(format!("{:<width$}", "[amp]", width = BRACKET_COL_WIDTH)),
-        title
-    );
-}
-
-/// "5m" / "2d" — for `Thread`/`AmpRow` which have already-parsed timestamps.
+/// "5m" / "2d" — for `Thread`, which has already-parsed timestamps.
 fn format_time_ago_short_dt(ts: DateTime<Utc>) -> String {
     format_time_ago_short(&ts.to_rfc3339())
 }
@@ -993,7 +929,7 @@ fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orph
     } else {
         detail
     };
-    // Same column shape as native/amp rows: age (5) · id (`id_width`) · bracket (10) · detail.
+    // Same column shape as native rows: age (5) · id (`id_width`) · bracket (10) · detail.
     // `{:<W.W}` truncates a too-long id to W chars then pads it to W — gives
     // a clean column even when logs.db's full 12-char id is longer than W.
     println!(
@@ -1370,31 +1306,6 @@ async fn fetch_native_rows(
     Ok(all)
 }
 
-// Amp threads have no cwd concept. The implicit "current project" scope
-// (auto-set when neither --all nor --cwd is passed) would silently drop every
-// amp row; only an explicit `--cwd X` should hide them, since the user then
-// asked for a directory amp can't match. `--all` overrides --cwd.
-async fn fetch_amp_rows(
-    args: &LogsArgs,
-    plan: &SourcePlan,
-    cwd_filter: Option<&str>,
-) -> Result<Vec<AmpRow>> {
-    if !plan.include_amp() {
-        return Ok(Vec::new());
-    }
-    let _ = cwd_filter; // amp rows have no cwd to compare against
-    if args.cwd.is_some() && !args.all {
-        return Ok(Vec::new());
-    }
-    let amp_dir = amp_threads::default_threads_dir();
-    let raw = amp_threads::list_threads(&amp_dir, args.limit.saturating_mul(2).max(50)).await;
-    Ok(raw
-        .iter()
-        .filter_map(AmpRow::from_value)
-        .filter(|a| amp_passes_filters(a, args))
-        .collect())
-}
-
 /// Compute the set of chat `session_id`s referenced by logs.db that no
 /// longer have a session file on disk. Used to tag stale rows in the
 /// listing and to refuse `aivo logs share` with a useful pointer. Returns
@@ -1441,13 +1352,12 @@ pub(crate) async fn fetch_unified_rows(
     // do a straight prefix check without each one calling `canonicalize`.
     let cwd_filter = cwd_filter.map(|s| canonicalize_for_match(&s));
 
-    let (log_rows, native_rows, amp_rows) = tokio::try_join!(
+    let (log_rows, native_rows) = tokio::try_join!(
         fetch_logs_rows(store, args, &plan, cwd_filter.clone()),
         fetch_native_rows(args, &plan, cwd_filter.clone()),
-        fetch_amp_rows(args, &plan, cwd_filter.as_deref()),
     )?;
 
-    let rows = merge_unified(log_rows, native_rows, amp_rows, args.limit);
+    let rows = merge_unified(log_rows, native_rows, args.limit);
     let run_meta = run_meta_for_native_rows(store, &rows).await;
     Ok((rows, run_meta))
 }
@@ -1476,22 +1386,15 @@ async fn run_meta_for_native_rows(store: &SessionStore, rows: &[UnifiedRow]) -> 
 
 /// Three-way merge of newest-first streams. Pops the source with the newest
 /// head until `limit` rows are emitted — never materializes the full union.
-fn merge_unified(
-    logs: Vec<LogEntry>,
-    native: Vec<Thread>,
-    amp: Vec<AmpRow>,
-    limit: usize,
-) -> Vec<UnifiedRow> {
+fn merge_unified(logs: Vec<LogEntry>, native: Vec<Thread>, limit: usize) -> Vec<UnifiedRow> {
     let mut logs = logs.into_iter().peekable();
     let mut native = native.into_iter().peekable();
-    let mut amp = amp.into_iter().peekable();
     let mut out: Vec<UnifiedRow> = Vec::with_capacity(limit);
 
     while out.len() < limit {
         let heads = [
             logs.peek().map(|e| parse_log_ts(&e.ts_utc)),
             native.peek().map(|t| t.updated_at),
-            amp.peek().map(|a| a.updated_at),
         ];
         let winner = heads
             .into_iter()
@@ -1504,7 +1407,6 @@ fn merge_unified(
             None => break,
             Some(0) => out.push(UnifiedRow::Log(Box::new(logs.next().unwrap()))),
             Some(1) => out.push(UnifiedRow::Native(native.next().unwrap())),
-            Some(2) => out.push(UnifiedRow::Amp(amp.next().unwrap())),
             Some(_) => unreachable!(),
         }
     }
@@ -1533,13 +1435,12 @@ struct SourcePlan {
     /// `--by run` / `--by serve`).
     logs_by: Option<String>,
     native: bool,
-    amp: bool,
 }
 
 impl SourcePlan {
     fn from_args(args: &LogsArgs) -> Self {
         // Filters that only make sense for logs.db rows force a strict mode:
-        // drop native/amp, and open logs.db up to every source so audits
+        // drop native, and open logs.db up to every source so audits
         // see run/serve errors alongside chat ones.
         let strict_logs = args.errors || args.key.is_some() || args.model.is_some();
 
@@ -1549,26 +1450,17 @@ impl SourcePlan {
         let logs;
         let logs_by;
         let native;
-        let amp;
         match by {
             // Explicit logs.db source.
             Some(name @ ("chat" | "run" | "serve")) => {
                 logs = true;
                 logs_by = Some(name.to_string());
                 native = false;
-                amp = false;
-            }
-            Some("amp") => {
-                logs = false;
-                logs_by = None;
-                native = false;
-                amp = true;
             }
             Some("native") => {
                 logs = false;
                 logs_by = None;
                 native = true;
-                amp = false;
             }
             // CLI names: native sessions of that cli only. `[run]` rows are
             // aivo's launch record for the same session — including them
@@ -1580,10 +1472,9 @@ impl SourcePlan {
                 logs = strict_logs;
                 logs_by = if strict_logs { args.by.clone() } else { None };
                 native = !strict_logs;
-                amp = false;
             }
             // No --by: the unified session list. logs.db restricted to chat
-            // (collapsed by session_id downstream), native + amp join in,
+            // (collapsed by session_id downstream), native joins in,
             // run/serve stay out of the default view. Strict-logs reopens
             // logs.db to every source for auditing.
             None | Some(_) => {
@@ -1594,7 +1485,6 @@ impl SourcePlan {
                     Some("chat".to_string())
                 };
                 native = !strict_logs;
-                amp = !strict_logs;
             }
         }
 
@@ -1602,7 +1492,6 @@ impl SourcePlan {
             logs,
             logs_by,
             native,
-            amp,
         }
     }
 
@@ -1614,9 +1503,6 @@ impl SourcePlan {
     }
     fn include_native(&self) -> bool {
         self.native
-    }
-    fn include_amp(&self) -> bool {
-        self.amp
     }
 }
 
@@ -1757,29 +1643,6 @@ fn expand_cwd_filter(input: &str) -> String {
     input.to_string()
 }
 
-fn amp_passes_filters(a: &AmpRow, args: &LogsArgs) -> bool {
-    if let Some(needle) = args.search.as_deref() {
-        let n = needle.to_ascii_lowercase();
-        let title = a.title.as_deref().unwrap_or("").to_ascii_lowercase();
-        if !title.contains(&n) && !a.id.to_ascii_lowercase().contains(&n) {
-            return false;
-        }
-    }
-    if let Some(since) = args.since.as_deref()
-        && let Some(cutoff) = parse_loose_time(since)
-        && a.updated_at < cutoff
-    {
-        return false;
-    }
-    if let Some(until) = args.until.as_deref()
-        && let Some(cutoff) = parse_loose_time(until)
-        && a.updated_at > cutoff
-    {
-        return false;
-    }
-    true
-}
-
 /// Best-effort time parse: tries relative durations (`2h`, `30m`, `1d`, `1w`,
 /// `45s`) first, then RFC3339, then a date-only `YYYY-MM-DD` parse. Relative
 /// values are interpreted as "ago" so `--since 2h` means "in the last 2 hours".
@@ -1868,13 +1731,6 @@ fn unified_row_to_json(row: &UnifiedRow, run_meta: &RunMetaIndex) -> Value {
             }
             v
         }
-        UnifiedRow::Amp(a) => json!({
-            "kind": "amp_thread",
-            "id": a.id,
-            "title": a.title,
-            "updated_at": a.updated_at.to_rfc3339(),
-            "message_count": a.message_count,
-        }),
     }
 }
 
@@ -1892,12 +1748,11 @@ fn unified_id_key(row: &UnifiedRow) -> String {
             }
         }
         UnifiedRow::Native(t) => format!("native:{}:{}", t.cli, t.session_id),
-        UnifiedRow::Amp(a) => format!("amp:{}", a.id),
     }
 }
 
 /// Pretty-print a `SharePayload` returned by `share_resolver` for
-/// `aivo logs show <native-or-amp-id>`. Mirrors `print_entry`'s style.
+/// `aivo logs show <native-id>`. Mirrors `print_entry`'s style.
 fn print_share_payload(p: &crate::services::share_payload::SharePayload) {
     use crate::services::share_payload::ContentBlock;
 
@@ -2178,73 +2033,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_entry_json_attaches_resolved_session_for_amp_run() {
-        // `aivo logs show T-… --json` used to drop just the launch row,
-        // which has null tokens and no transcript. With session_id
-        // enrichment the resolved SharePayload rides along under `session`.
-        use crate::services::amp_threads;
-        use crate::services::share_resolver::ResolverContext;
-        let temp = tempfile::TempDir::new().unwrap();
-        let project_root = temp.path().to_path_buf();
-        let store = SessionStore::with_path(temp.path().join("config.json"));
-        let ctx = ResolverContext {
-            project_root: project_root.clone(),
-            session_store: store,
-            amp_dir: temp.path().join("amp-threads"),
-            chat_sessions_dir: temp.path().join("sessions"),
-            claude_projects_root: temp.path().join("claude_projects"),
-            codex_sessions_root: temp.path().join("codex"),
-            gemini_tmp_root: temp.path().join("gemini"),
-            pi_sessions_root: temp.path().join("pi"),
-            opencode_db_path: temp.path().join("opencode.db"),
-        };
-        tokio::fs::create_dir_all(&ctx.amp_dir).await.unwrap();
-        let thread_id = "T-019e593a-b41f-700b-a3db-ebb54822cb7a";
-        amp_threads::save_thread(
-            &ctx.amp_dir,
-            &serde_json::json!({
-                "id": thread_id,
-                "agentMode": "rush",
-                "messages": [{ "role": "user", "content": "hi" }]
-            }),
-        )
-        .await
-        .unwrap();
-
-        let mut entry = test_entry("rmt4kbcxchmr", "2026-05-24T09:09:03Z", "run");
-        entry.tool = Some("amp".into());
-        entry.model = Some("composer-2.5".into());
-        entry.session_id = Some(thread_id.into());
-        entry.cwd = Some(project_root.to_string_lossy().to_string());
-
-        let value = build_entry_json(&entry, &ctx).await.unwrap();
-        let session = value
-            .get("session")
-            .expect("run rows with a session_id should attach the resolved session");
-        assert_eq!(
-            session.get("source_cli").and_then(|v| v.as_str()),
-            Some("amp")
-        );
-        assert_eq!(
-            session
-                .get("messages")
-                .and_then(|v| v.as_array())
-                .map(Vec::len),
-            Some(1)
-        );
-        // Row-level fields stay where they were so existing JSON consumers
-        // keep working.
-        assert_eq!(
-            value.get("id").and_then(|v| v.as_str()),
-            Some("rmt4kbcxchmr")
-        );
-        assert_eq!(
-            value.get("model").and_then(|v| v.as_str()),
-            Some("composer-2.5")
-        );
-    }
-
-    #[tokio::test]
     async fn build_entry_json_skips_session_for_chat_rows() {
         // Only `run` rows get the transcript drill-through; chat rows
         // already carry their content in the row itself.
@@ -2254,7 +2042,6 @@ mod tests {
         let ctx = ResolverContext {
             project_root: temp.path().to_path_buf(),
             session_store: store,
-            amp_dir: temp.path().join("amp-threads"),
             chat_sessions_dir: temp.path().join("sessions"),
             claude_projects_root: temp.path().join("claude_projects"),
             codex_sessions_root: temp.path().join("codex"),
@@ -2400,20 +2187,10 @@ mod tests {
         }
     }
 
-    fn test_amp(id: &str, ts: DateTime<Utc>) -> AmpRow {
-        AmpRow {
-            id: id.into(),
-            title: None,
-            updated_at: ts,
-            message_count: 0,
-        }
-    }
-
     fn unified_key(row: &UnifiedRow) -> String {
         match row {
             UnifiedRow::Log(e) => format!("log:{}", e.id),
             UnifiedRow::Native(t) => format!("native:{}", t.session_id),
-            UnifiedRow::Amp(a) => format!("amp:{}", a.id),
         }
     }
 
@@ -2427,14 +2204,10 @@ mod tests {
             test_thread("N1", "2026-05-01T09:30:00Z".parse().unwrap()),
             test_thread("N2", "2026-05-01T07:00:00Z".parse().unwrap()),
         ];
-        let amp = vec![test_amp("A1", "2026-05-01T09:00:00Z".parse().unwrap())];
 
-        let merged = merge_unified(logs, native, amp, 10);
+        let merged = merge_unified(logs, native, 10);
         let order: Vec<String> = merged.iter().map(unified_key).collect();
-        assert_eq!(
-            order,
-            vec!["log:L1", "native:N1", "amp:A1", "log:L2", "native:N2",]
-        );
+        assert_eq!(order, vec!["log:L1", "native:N1", "log:L2", "native:N2",]);
     }
 
     #[test]
@@ -2446,7 +2219,7 @@ mod tests {
         ];
         let native = vec![test_thread("N1", "2026-05-01T07:00:00Z".parse().unwrap())];
 
-        let merged = merge_unified(logs, native, Vec::new(), 2);
+        let merged = merge_unified(logs, native, 2);
         assert_eq!(merged.len(), 2);
         let order: Vec<String> = merged.iter().map(unified_key).collect();
         assert_eq!(order, vec!["log:L1", "log:L2"]);
@@ -2454,53 +2227,8 @@ mod tests {
 
     #[test]
     fn merge_unified_handles_empty_sources() {
-        let merged: Vec<UnifiedRow> = merge_unified(Vec::new(), Vec::new(), Vec::new(), 5);
+        let merged: Vec<UnifiedRow> = merge_unified(Vec::new(), Vec::new(), 5);
         assert!(merged.is_empty());
-    }
-
-    /// Regression: `aivo logs --by amp` and the default `aivo logs` listing
-    /// both used to silently drop every amp thread because `fetch_unified_rows`
-    /// auto-fills `cwd_filter` from `current_dir`, and the old `fetch_amp_rows`
-    /// guard treated that implicit default the same as a user-typed `--cwd`.
-    /// The fix keys the bail on `args.cwd.is_some() && !args.all` so only an
-    /// explicit cwd filter hides amp.
-    #[allow(clippy::nonminimal_bool)] // mirrors the production bail; don't de-Morgan
-    fn should_emit_amp(args: &LogsArgs) -> bool {
-        !(args.cwd.is_some() && !args.all)
-    }
-
-    #[test]
-    fn amp_emitted_when_no_explicit_cwd_filter() {
-        // Default `aivo logs` — implicit cwd_filter is applied upstream but
-        // amp must still come through.
-        let args = base_args();
-        assert!(should_emit_amp(&args));
-    }
-
-    #[test]
-    fn amp_emitted_when_by_amp_without_explicit_cwd() {
-        // `aivo logs --by amp` — was broken: returned "No entries found".
-        let mut args = base_args();
-        args.by = Some("amp".into());
-        assert!(should_emit_amp(&args));
-    }
-
-    #[test]
-    fn amp_emitted_when_all_overrides_cwd() {
-        // `aivo logs --all --cwd /foo` — --all wins over --cwd.
-        let mut args = base_args();
-        args.all = true;
-        args.cwd = Some("/foo".into());
-        assert!(should_emit_amp(&args));
-    }
-
-    #[test]
-    fn amp_suppressed_when_user_explicitly_scoped_via_cwd() {
-        // `aivo logs --cwd /foo` — user asked for a specific directory and amp
-        // threads can't possibly match.
-        let mut args = base_args();
-        args.cwd = Some("/foo".into());
-        assert!(!should_emit_amp(&args));
     }
 
     #[test]

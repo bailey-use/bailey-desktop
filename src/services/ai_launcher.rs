@@ -11,13 +11,11 @@ use tokio::process::Command;
 use tokio::signal;
 
 use crate::errors::{CLIError, ErrorCategory};
-use crate::services::environment_injector::{
-    AmpModeModels, ClaudeModelOverrides, EnvironmentInjector,
-};
+use crate::services::environment_injector::{ClaudeModelOverrides, EnvironmentInjector};
 use crate::services::launch_args::{
     build_preview_notes, build_runtime_args, inject_codex_max_context,
     inject_codex_max_context_before_args, inject_codex_provider_config, inject_codex_root_model,
-    merge_preview_env, preview_args, rewrite_amp_preview_env, rewrite_codex_preview_env,
+    merge_preview_env, preview_args, rewrite_codex_preview_env,
 };
 use crate::services::launch_runtime::{
     cleanup_runtime_artifacts, finalize_codex_oauth, finalize_gemini_oauth,
@@ -46,7 +44,6 @@ pub enum AIToolType {
     Gemini,
     Opencode,
     Pi,
-    Amp,
 }
 
 impl AIToolType {
@@ -59,7 +56,6 @@ impl AIToolType {
             "gemini" => Some(Self::Gemini),
             "opencode" => Some(Self::Opencode),
             "pi" => Some(Self::Pi),
-            "amp" => Some(Self::Amp),
             _ => None,
         }
     }
@@ -72,7 +68,6 @@ impl AIToolType {
             Self::Gemini => "gemini",
             Self::Opencode => "opencode",
             Self::Pi => "pi",
-            Self::Amp => "amp",
         }
     }
 
@@ -95,7 +90,6 @@ impl AIToolType {
             Self::Gemini,
             Self::Opencode,
             Self::Pi,
-            Self::Amp,
         ]
     }
 
@@ -122,7 +116,6 @@ impl AIToolType {
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
-            Self::Amp => "curl -fsSL https://ampcode.com/install.sh | bash",
         }
         #[cfg(not(unix))]
         match self {
@@ -131,7 +124,6 @@ impl AIToolType {
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "npm install -g opencode-ai",
             Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
-            Self::Amp => "npm install -g @sourcegraph/amp",
         }
     }
 
@@ -153,7 +145,6 @@ impl AIToolType {
             match self {
                 Self::Claude => dirs.push(home.join(".claude").join("local")),
                 Self::Opencode => dirs.push(home.join(".opencode").join("bin")),
-                Self::Amp => dirs.push(home.join(".amp").join("bin")),
                 _ => {}
             }
             #[cfg(windows)]
@@ -185,12 +176,8 @@ pub struct LaunchOptions {
     /// other tools they trigger one stderr warning per slot and are then
     /// dropped. `max_context` is honored by Claude and Codex (each
     /// interprets it differently — see `for_claude_with_overrides` and
-    /// `inject_codex_max_context`); rejected up-front for Amp.
+    /// `inject_codex_max_context`).
     pub claude_overrides: ClaudeModelOverrides,
-    /// Amp-only per-agent-mode model overrides (`--rush-model`,
-    /// `--smart-model`, `--deep-model`, `--large-model`). Ignored for
-    /// other tools. Default is empty (all `None`).
-    pub amp_modes: AmpModeModels,
     pub env: Option<HashMap<String, String>>,
     /// Temporary key override for this launch (does not persist to config)
     pub key_override: Option<ApiKey>,
@@ -334,14 +321,6 @@ impl AILauncher {
                     options.claude_overrides.max_context.as_deref(),
                 );
             }
-        }
-
-        if options.tool == AIToolType::Amp {
-            // The settings-file path is plumbed to amp via the prepended
-            // `--settings-file <path>` arg. The marker env var has done its
-            // job; strip it so we don't leak an aivo-internal name into the
-            // amp child's environment.
-            runtime.env.remove("AIVO_AMP_SETTINGS_FILE");
         }
 
         // The cursor router marker was left in place through
@@ -610,12 +589,7 @@ impl AILauncher {
         } else {
             runtime_args.codex_model_catalog_path.as_deref()
         };
-        cleanup_runtime_artifacts(
-            catalog_to_clean,
-            runtime.pi_agent_dir.as_deref(),
-            runtime.amp_settings_path.as_deref(),
-        )
-        .await;
+        cleanup_runtime_artifacts(catalog_to_clean, runtime.pi_agent_dir.as_deref()).await;
 
         let exit_code = result.as_ref().ok().copied();
         let detected_session_id = probe.detect_new().await;
@@ -695,9 +669,6 @@ impl AILauncher {
                     options.claude_overrides.max_context.as_deref(),
                 );
             }
-        }
-        if options.tool == AIToolType::Amp {
-            rewrite_amp_preview_env(&mut env_vars);
         }
 
         Ok(PreparedLaunch {
@@ -799,7 +770,6 @@ impl AILauncher {
             opencode_models.as_deref(),
             &pi_models,
             &options.claude_overrides,
-            &options.amp_modes,
         );
         Ok(ResolvedLaunchContext {
             key,
@@ -1006,7 +976,6 @@ impl AILauncher {
     }
 
     /// Gets tool-specific configuration including command and environment variables
-    #[allow(clippy::too_many_arguments)]
     fn get_tool_config(
         &self,
         tool: AIToolType,
@@ -1015,12 +984,11 @@ impl AILauncher {
         opencode_models: Option<&[String]>,
         pi_models: &[String],
         claude_overrides: &ClaudeModelOverrides,
-        amp_modes: &AmpModeModels,
     ) -> ToolConfig {
         // claude_overrides.{slot fields} are non-empty only on the Claude
         // path; for other tools the run command warns up-front and never
-        // populates them. `max_context` may be set for Claude, Codex, or
-        // Amp — each branch below picks it up explicitly.
+        // populates them. `max_context` may be set for Claude or Codex —
+        // each branch below picks it up explicitly.
         let env_vars = match tool {
             AIToolType::Claude => {
                 self.env_injector
@@ -1030,7 +998,6 @@ impl AILauncher {
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
             AIToolType::Pi => self.env_injector.for_pi(key, model, pi_models),
-            AIToolType::Amp => self.env_injector.for_amp(key, model, amp_modes),
         };
 
         ToolConfig {
@@ -1795,8 +1762,6 @@ mod tests {
         assert_eq!(AIToolType::parse("gemini"), Some(AIToolType::Gemini));
         assert_eq!(AIToolType::parse("opencode"), Some(AIToolType::Opencode));
         assert_eq!(AIToolType::parse("pi"), Some(AIToolType::Pi));
-        assert_eq!(AIToolType::parse("amp"), Some(AIToolType::Amp));
-        assert_eq!(AIToolType::parse("Amp"), Some(AIToolType::Amp));
         assert_eq!(AIToolType::parse("unknown"), None);
     }
 

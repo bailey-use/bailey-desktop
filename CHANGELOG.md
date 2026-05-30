@@ -4,7 +4,6 @@
 
 ### Features
 
-- `aivo amp`: full neo-compatible bridge.
 - `aivo keys`: in-place line editing and paste-safe input for the add/edit flows.
 - `aivo pi`: list the full provider catalog in pi's `/model` picker.
 

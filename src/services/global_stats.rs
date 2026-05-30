@@ -77,7 +77,7 @@ pub async fn collect_all(
     refresh: bool,
     cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> HashMap<String, GlobalToolStats> {
-    let tools = ["claude", "codex", "gemini", "opencode", "pi", "amp"];
+    let tools = ["claude", "codex", "gemini", "opencode", "pi"];
     let total_tools = tools.len();
     let mut result = HashMap::new();
     for (i, tool) in tools.iter().enumerate() {
@@ -121,7 +121,6 @@ async fn collect_with_step(
         return match tool {
             "opencode" => collect_opencode(cutoff).await,
             "pi" => collect_pi(cutoff).await,
-            "amp" => collect_amp(cutoff).await,
             _ => Ok(None),
         };
     }
@@ -969,119 +968,6 @@ async fn parse_pi_file(
     Some((entry, session_ids))
 }
 
-/// Amp: ~/.config/aivo/amp-threads/T-*.json
-///
-/// Each thread is a single JSON file uploaded by amp on every turn (see
-/// `services::amp_threads`). Token usage is recorded per assistant message
-/// under `messages[].usage` with an RFC3339 `timestamp` we can filter on.
-async fn collect_amp(
-    cutoff: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<Option<GlobalToolStats>> {
-    let dir = crate::services::amp_threads::default_threads_dir();
-    if !dir.exists() {
-        return Ok(None);
-    }
-
-    let files = walk_files_with_size(&dir, |name| {
-        name.starts_with("T-") && name.ends_with(".json")
-    })
-    .await;
-    if files.is_empty() {
-        return Ok(None);
-    }
-
-    let mut stats = GlobalToolStats::default();
-    for (path, _, _) in &files {
-        let Some(entry) = parse_amp_file(path, cutoff).await else {
-            continue;
-        };
-        if entry.has_session {
-            stats.sessions += 1;
-        }
-        stats.input_tokens += entry.input_tokens;
-        stats.output_tokens += entry.output_tokens;
-        stats.cache_read_tokens += entry.cache_read_tokens;
-        stats.cache_write_tokens += entry.cache_write_tokens;
-        for (model, mt) in entry.models {
-            let m = stats.models.entry(model).or_default();
-            m.input_tokens += mt.input_tokens;
-            m.output_tokens += mt.output_tokens;
-            m.cache_read_tokens += mt.cache_read_tokens;
-            m.cache_write_tokens += mt.cache_write_tokens;
-        }
-    }
-
-    if stats.sessions == 0 && stats.total_tokens() == 0 {
-        return Ok(None);
-    }
-    Ok(Some(stats))
-}
-
-/// Parse a single amp thread file. amp's `usage.inputTokens` is the fresh
-/// (non-cached) input count — `totalInputTokens` includes cache reads — so
-/// matching Pi/Claude convention we pull `inputTokens` for fresh and treat
-/// `cacheReadInputTokens` / `cacheCreationInputTokens` as separate buckets.
-async fn parse_amp_file(
-    path: &Path,
-    cutoff: Option<chrono::DateTime<chrono::Utc>>,
-) -> Option<FileEntry> {
-    let data = fs::read_to_string(path).await.ok()?;
-    let v: Value = serde_json::from_str(&data).ok()?;
-    let messages = v.get("messages")?.as_array()?;
-
-    let mut entry = FileEntry::default();
-    for msg in messages {
-        let Some(usage) = msg.get("usage").filter(|u| u.is_object()) else {
-            continue;
-        };
-        if let Some(c) = cutoff {
-            let Some(ts) = parse_rfc3339_utc(usage, "timestamp") else {
-                continue;
-            };
-            if ts < c {
-                continue;
-            }
-        }
-
-        let input = usage
-            .get("inputTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output = usage
-            .get("outputTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_read = usage
-            .get("cacheReadInputTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_write = usage
-            .get("cacheCreationInputTokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-
-        entry.input_tokens += input;
-        entry.output_tokens += output;
-        entry.cache_read_tokens += cache_read;
-        entry.cache_write_tokens += cache_write;
-
-        if let Some(model) = usage.get("model").and_then(|m| m.as_str()) {
-            let key = normalize_model_for_display(model);
-            let m = entry.models.entry(key).or_default();
-            m.input_tokens += input;
-            m.output_tokens += output;
-            m.cache_read_tokens += cache_read;
-            m.cache_write_tokens += cache_write;
-        }
-    }
-
-    entry.has_session = entry.input_tokens > 0
-        || entry.output_tokens > 0
-        || entry.cache_read_tokens > 0
-        || entry.cache_write_tokens > 0;
-    Some(entry)
-}
-
 // ---------------------------------------------------------------------------
 // Shared utilities
 // ---------------------------------------------------------------------------
@@ -1106,7 +992,6 @@ pub fn tool_display_name(tool: &str) -> &str {
         "gemini" => "Gemini",
         "opencode" => "OpenCode",
         "pi" => "Pi",
-        "amp" => "Amp",
         "chat" => "Chat",
         _ => tool,
     }
@@ -1317,88 +1202,6 @@ mod tests {
         assert_eq!(ids, vec!["sess-abc".to_string()]);
     }
 
-    async fn write_amp_thread(
-        dir: &tempfile::TempDir,
-        name: &str,
-        messages: serde_json::Value,
-    ) -> PathBuf {
-        let body = serde_json::json!({
-            "id": name.trim_end_matches(".json"),
-            "messages": messages,
-        });
-        let path = dir.path().join(name);
-        fs::write(&path, body.to_string()).await.unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn parse_amp_file_sums_assistant_usage() {
-        let dir = tempfile::tempdir().unwrap();
-        let messages = serde_json::json!([
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {"role": "assistant", "usage": {
-                "inputTokens": 100, "outputTokens": 20,
-                "cacheReadInputTokens": 5, "cacheCreationInputTokens": 7,
-                "model": "MiniMax-M2.7",
-                "timestamp": "2026-05-08T07:12:46.167Z"
-            }},
-            {"role": "assistant", "usage": {
-                "inputTokens": 50, "outputTokens": 8,
-                "cacheReadInputTokens": null, "cacheCreationInputTokens": null,
-                "model": "MiniMax-M2.7",
-                "timestamp": "2026-05-08T07:13:00.000Z"
-            }}
-        ]);
-        let path = write_amp_thread(&dir, "T-test-1.json", messages).await;
-        let entry = parse_amp_file(&path, None).await.unwrap();
-        assert!(entry.has_session);
-        assert_eq!(entry.input_tokens, 150);
-        assert_eq!(entry.output_tokens, 28);
-        assert_eq!(entry.cache_read_tokens, 5);
-        assert_eq!(entry.cache_write_tokens, 7);
-        let m = entry.models.get("minimax-m2.7").unwrap();
-        assert_eq!(m.input_tokens, 150);
-        assert_eq!(m.output_tokens, 28);
-    }
-
-    #[tokio::test]
-    async fn parse_amp_file_filters_by_cutoff() {
-        let dir = tempfile::tempdir().unwrap();
-        let messages = serde_json::json!([
-            {"role": "assistant", "usage": {
-                "inputTokens": 999, "outputTokens": 999,
-                "model": "gpt-5.4",
-                "timestamp": "2025-05-31T23:59:59Z"
-            }},
-            {"role": "assistant", "usage": {
-                "inputTokens": 7, "outputTokens": 11,
-                "model": "gpt-5.4",
-                "timestamp": "2026-05-08T00:00:00Z"
-            }}
-        ]);
-        let path = write_amp_thread(&dir, "T-test-2.json", messages).await;
-        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-05-08T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let entry = parse_amp_file(&path, Some(cutoff)).await.unwrap();
-        assert_eq!(entry.input_tokens, 7);
-        assert_eq!(entry.output_tokens, 11);
-    }
-
-    #[tokio::test]
-    async fn parse_amp_file_skips_messages_without_usage() {
-        let dir = tempfile::tempdir().unwrap();
-        let messages = serde_json::json!([
-            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "no usage here"}]}
-        ]);
-        let path = write_amp_thread(&dir, "T-test-3.json", messages).await;
-        let entry = parse_amp_file(&path, None).await.unwrap();
-        assert!(!entry.has_session);
-        assert_eq!(entry.input_tokens, 0);
-        assert_eq!(entry.output_tokens, 0);
-    }
-
     #[tokio::test]
     async fn parse_codex_file_subtracts_cached_from_input() {
         // Codex's `input_tokens` in `total_token_usage` is the total input
@@ -1579,7 +1382,6 @@ mod tests {
         assert_eq!(tool_display_name("codex"), "Codex");
         assert_eq!(tool_display_name("gemini"), "Gemini");
         assert_eq!(tool_display_name("pi"), "Pi");
-        assert_eq!(tool_display_name("amp"), "Amp");
         assert_eq!(tool_display_name("chat"), "Chat");
         assert_eq!(tool_display_name("unknown"), "unknown");
     }

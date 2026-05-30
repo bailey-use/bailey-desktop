@@ -525,7 +525,7 @@ mod tests {
     fn fake_payload() -> SharePayload {
         SharePayload {
             schema_version: SHARE_SCHEMA_VERSION.into(),
-            source_cli: "amp".into(),
+            source_cli: "claude".into(),
             session_id: "T-test".into(),
             project: ProjectInfo {
                 root: Some("~/work/aivo".into()),
@@ -585,7 +585,7 @@ mod tests {
         let (status, body) = http_get(port, "/state").await;
         assert_eq!(status, 200);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["meta"]["source_cli"], "amp");
+        assert_eq!(parsed["meta"]["source_cli"], "claude");
         assert_eq!(parsed["meta"]["message_count"], 1);
         assert_eq!(parsed["meta"]["live"], false);
         assert!(parsed["cursor"].as_str().unwrap().contains(':'));

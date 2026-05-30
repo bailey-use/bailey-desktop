@@ -64,7 +64,6 @@ Supported tools:
 - `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - `opencode` [OpenCode](https://github.com/anomalyco/opencode)
 - `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
-- `amp` [Amp](https://ampcode.com)
 
 ```bash
 aivo claude                                  # launch with active key
@@ -209,16 +208,15 @@ Names that collide with built-in subcommands or tool names are rejected.
 
 ## logs
 
-Unified activity feed across aivo's own events (`chat`, `run`, `serve`), native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`), and `amp` threads. Defaults to the current project's cwd; use `-a` for every project.
+Unified activity feed across aivo's own events (`chat`, `run`, `serve`) and native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`). Defaults to the current project's cwd; use `-a` for every project.
 
 ```bash
 aivo logs                                    # current cwd, newest first
 aivo logs -a                                 # all projects
-aivo logs show <id>                          # logs.db id, native session id, or T-… amp id
+aivo logs show <id>                          # logs.db id or native session id
 
 aivo logs --by claude -n 5                   # claude run-events + native sessions
 aivo logs --by native                        # only native CLI sessions
-aivo logs --by amp                           # only amp threads
 aivo logs -s "rate limit" --since 7d --errors
 aivo logs --watch --jsonl                    # live tail as JSONL
 ```

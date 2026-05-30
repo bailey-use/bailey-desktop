@@ -1140,14 +1140,13 @@ pub(crate) async fn fetch_models_cached(
 /// Determines whether the "(leave it to the tool)" default option should be
 /// shown in the model picker for the given tool type and model list.
 ///
-/// - Pi, Opencode, Amp: never (these tools require explicit model selection
-///   or, in Amp's case, do not accept a model env var at all)
+/// - Pi, Opencode: never (these tools require explicit model selection)
 /// - Claude: only if the list contains Claude-family models
 /// - Codex: only if the list contains gpt- prefixed models
 /// - Gemini: only if the list contains Gemini-family models
 pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -> bool {
     match tool {
-        AIToolType::Pi | AIToolType::Opencode | AIToolType::Amp => false,
+        AIToolType::Pi | AIToolType::Opencode => false,
         AIToolType::Claude => models
             .iter()
             .any(|m| m.to_ascii_lowercase().contains("claude")),
@@ -1527,12 +1526,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_supports_default_amp_always_false() {
-        let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
-        assert!(!tool_supports_default_model(AIToolType::Amp, &models));
-    }
-
-    #[test]
     fn test_tool_supports_default_claude_with_claude_models() {
         let models = vec!["claude-sonnet-4-6".into(), "gpt-4o".into()];
         assert!(tool_supports_default_model(AIToolType::Claude, &models));
@@ -1793,6 +1786,5 @@ mod tests {
         assert!(!tool_supports_default_model(AIToolType::Gemini, &[]));
         assert!(!tool_supports_default_model(AIToolType::Pi, &[]));
         assert!(!tool_supports_default_model(AIToolType::Opencode, &[]));
-        assert!(!tool_supports_default_model(AIToolType::Amp, &[]));
     }
 }

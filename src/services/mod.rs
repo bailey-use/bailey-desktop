@@ -10,9 +10,6 @@
 
 pub mod acp_client;
 pub mod ai_launcher;
-pub mod amp_bridge;
-pub mod amp_threads;
-pub mod amp_trust;
 pub mod ansi;
 pub mod anthropic_chat_request;
 pub mod anthropic_chat_response;

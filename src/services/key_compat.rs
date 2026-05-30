@@ -101,7 +101,7 @@ mod tests {
         let codex = make_key("codex", CODEX_OAUTH_SENTINEL);
         let gemini = make_key("gemini", GEMINI_OAUTH_SENTINEL);
 
-        for tool in [AIToolType::Opencode, AIToolType::Pi, AIToolType::Amp] {
+        for tool in [AIToolType::Opencode, AIToolType::Pi] {
             let ctx = KeyCompatContext::Tool(tool);
             assert!(ctx.incompat_reason(&claude).is_some());
             assert!(ctx.incompat_reason(&codex).is_some());

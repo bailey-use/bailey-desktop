@@ -1361,7 +1361,7 @@ fn chat_usage_to_responses_usage(chat: &Value) -> Option<Value> {
 
     // Map OpenAI chat-completion's `prompt_tokens_details.cached_tokens` (and
     // Anthropic's `cache_read_input_tokens`) to the Responses API shape.
-    // Some clients (Amp, recent OpenAI SDKs) crash on `usage.input_tokens_details.
+    // Some clients (recent OpenAI SDKs) crash on `usage.input_tokens_details.
     // cached_tokens` being absent, so emit a zeroed object even when the
     // upstream didn't return cache info.
     let cached_tokens = usage

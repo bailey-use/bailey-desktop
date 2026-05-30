@@ -136,9 +136,6 @@ pub async fn run() -> ! {
             Commands::Logs(logs_args) => LogsCommand::print_help(logs_args.action.as_deref()),
             Commands::Stats(_) => StatsCommand::print_help(),
             Commands::Update(_) => UpdateCommand::print_help(),
-            Commands::Amp(amp_args) => {
-                crate::commands::AmpCommand::print_help(amp_args.action.as_deref())
-            }
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
         }
@@ -258,14 +255,6 @@ pub async fn run() -> ! {
                     sonnet: run_args.sonnet_model,
                     opus: run_args.opus_model,
                 },
-                services::environment_injector::AmpModeModels {
-                    rush: run_args.rush_model,
-                    smart: run_args.smart_model,
-                    deep: run_args.deep_model,
-                    large: run_args.large_model,
-                    disable_tools: run_args.disable_tool,
-                    initial_mode: run_args.mode,
-                },
                 run_args.key,
                 run_args.debug,
                 run_args.dry_run,
@@ -322,18 +311,11 @@ pub async fn run() -> ! {
                     .is_some_and(|t| matches!(t, AIToolType::Claude) || t.is_codex_family());
                 if !supported {
                     let tool_name = run_args.tool.as_deref().unwrap_or("(none)");
-                    if parsed_tool == Some(AIToolType::Amp) {
-                        eprintln!(
-                            "{} --max-context / --1m / --2m don't apply to `aivo run amp`. Use `--mode large` for amp's built-in 1M-context tier, or `--smart-model` / `--large-model` to swap the upstream model.",
-                            style::red("Error:"),
-                        );
-                    } else {
-                        eprintln!(
-                            "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run codex-app` (got {}).",
-                            style::red("Error:"),
-                            tool_name
-                        );
-                    }
+                    eprintln!(
+                        "{} --max-context only applies to `aivo run claude`, `aivo run codex`, and `aivo run codex-app` (got {}).",
+                        style::red("Error:"),
+                        tool_name
+                    );
                     process::exit(ExitCode::UserError.code());
                 }
                 Some(canonical)
@@ -526,15 +508,6 @@ pub async fn run() -> ! {
                     None
                 };
 
-                let amp_modes = services::environment_injector::AmpModeModels {
-                    rush: resolve(extracted.amp_modes.rush),
-                    smart: resolve(extracted.amp_modes.smart),
-                    deep: resolve(extracted.amp_modes.deep),
-                    large: resolve(extracted.amp_modes.large),
-                    disable_tools: extracted.amp_modes.disable_tools,
-                    initial_mode: extracted.amp_modes.initial_mode,
-                };
-
                 command
                     .execute(
                         run_args.tool.as_deref(),
@@ -544,7 +517,6 @@ pub async fn run() -> ! {
                         model,
                         model_flag_explicit,
                         slots,
-                        amp_modes,
                         env,
                         key_override,
                         context_selector,
@@ -708,12 +680,6 @@ pub async fn run() -> ! {
             command.execute(stats_args).await
         }
 
-        Commands::Amp(amp_args) => {
-            use crate::commands::AmpCommand;
-            let command = AmpCommand::new();
-            command.execute(amp_args).await
-        }
-
         Commands::Hf(hf_args) => {
             let command = crate::commands::hf::HfCommand::new();
             command.execute(hf_args).await
@@ -803,7 +769,7 @@ fn print_help() {
         (
             "<tool>",
             "run <tool>",
-            "claude / codex / codex-app / gemini / opencode / pi / amp",
+            "claude / codex / codex-app / gemini / opencode / pi",
         ),
     ];
     let expansion_width = shortcuts.iter().map(|(_, e, _)| e.len()).max().unwrap_or(0);
@@ -919,8 +885,7 @@ fn print_help_json() {
             { "alias": "codex-app", "expands_to": ["run", "codex-app"] },
             { "alias": "gemini", "expands_to": ["run", "gemini"] },
             { "alias": "opencode", "expands_to": ["run", "opencode"] },
-            { "alias": "pi", "expands_to": ["run", "pi"] },
-            { "alias": "amp", "expands_to": ["run", "amp"] }
+            { "alias": "pi", "expands_to": ["run", "pi"] }
         ],
         "environment": [
             { "name": "AIVO_REDUCE_MOTION", "desc": "Disable chat TUI motion effects (=1)" },

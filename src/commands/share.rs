@@ -144,9 +144,7 @@ impl ShareCommand {
         println!();
         println!(
             "{}",
-            style::dim(
-                "Share an AI session (claude, codex, gemini, pi, opencode, chat, amp) via a"
-            )
+            style::dim("Share an AI session (claude, codex, gemini, pi, opencode, chat) via a")
         );
         println!(
             "{}",
@@ -199,7 +197,7 @@ impl ShareCommand {
         );
         println!(
             "  {}",
-            style::dim("aivo logs share T-019cafea --live # amp thread, follow changes")
+            style::dim("aivo logs share 1335c631 --live   # follow changes live")
         );
     }
 }

@@ -717,7 +717,7 @@ literal sk-1 should pass
     fn redact_payload_walks_messages_and_tool_args_and_writes_summary() {
         let payload = SharePayload {
             schema_version: SHARE_SCHEMA_VERSION.into(),
-            source_cli: "amp".into(),
+            source_cli: "claude".into(),
             session_id: "T-x".into(),
             project: ProjectInfo {
                 root: Some("/Users/alice/project/aivo".into()),

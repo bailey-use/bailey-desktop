@@ -11,9 +11,7 @@ use crate::errors::ExitCode;
 use crate::services::ai_launcher::{AILauncher, AIToolType, LaunchOptions};
 use crate::services::context_ingest::{IngestOptions, ingest_project};
 use crate::services::context_render::{RenderedContext, render_single_session};
-use crate::services::environment_injector::{
-    AMP_AGENT_MODES, AmpModeModels, ClaudeModelOverrides, ClaudeSlotFlags,
-};
+use crate::services::environment_injector::{ClaudeModelOverrides, ClaudeSlotFlags};
 use crate::services::http_utils;
 use crate::services::huggingface;
 use crate::services::models_cache::ModelsCache;
@@ -118,58 +116,6 @@ impl RunCommand {
         }
     }
 
-    /// Walks the four amp per-mode model flags (`--rush-model`,
-    /// `--smart-model`, `--deep-model`, `--large-model`). Same picker
-    /// semantics as `resolve_claude_overrides`: bare flag (empty string)
-    /// triggers a step-numbered picker; explicit values pass through;
-    /// ESC aborts the whole launch.
-    async fn resolve_amp_overrides(
-        &self,
-        client: &Client,
-        key: &ApiKey,
-        modes: AmpModeModels,
-        refresh: bool,
-    ) -> Result<Option<AmpModeModels>> {
-        let slots = [
-            ("rush mode", modes.rush),
-            ("smart mode", modes.smart),
-            ("deep mode", modes.deep),
-            ("large mode", modes.large),
-        ];
-        let total_pickers = slots
-            .iter()
-            .filter(|(_, v)| matches!(v, Some(s) if s.is_empty()))
-            .count();
-
-        let mut resolved: [Option<String>; 4] = [None, None, None, None];
-        let mut step = 0usize;
-        for (idx, (label, value)) in slots.into_iter().enumerate() {
-            let prompt = if matches!(value, Some(ref s) if s.is_empty()) {
-                step += 1;
-                format!("Step {step} of {total_pickers} — {label}")
-            } else {
-                String::new()
-            };
-            let outcome = self
-                .resolve_model(client, key, value, true, refresh, AIToolType::Amp, &prompt)
-                .await?;
-            match outcome {
-                ModelOutcome::Cancelled => return Ok(None),
-                ModelOutcome::Model(m) => resolved[idx] = Some(m),
-                ModelOutcome::UseDefault => {}
-            }
-        }
-        let [rush, smart, deep, large] = resolved;
-        Ok(Some(AmpModeModels {
-            rush,
-            smart,
-            deep,
-            large,
-            disable_tools: modes.disable_tools,
-            initial_mode: modes.initial_mode,
-        }))
-    }
-
     /// Walks the per-slot Claude model flags. For each slot: leave unset,
     /// take the explicit value as-is, or open a sequential picker (with a
     /// `Step N of M — <slot>` header) for bare flags. ESC at any picker step
@@ -241,7 +187,6 @@ impl RunCommand {
         model: Option<String>,
         explicit_model_flag: bool,
         slots: ClaudeSlotFlags,
-        amp_modes: AmpModeModels,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -256,7 +201,6 @@ impl RunCommand {
                 model,
                 explicit_model_flag,
                 slots,
-                amp_modes,
                 env,
                 key_override,
                 context_selector,
@@ -282,7 +226,6 @@ impl RunCommand {
         model: Option<String>,
         explicit_model_flag: bool,
         slots: ClaudeSlotFlags,
-        mut amp_modes: AmpModeModels,
         env: Option<HashMap<String, String>>,
         key_override: Option<ApiKey>,
         context_selector: Option<String>,
@@ -308,7 +251,7 @@ impl RunCommand {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "{} Unknown tool '{}'. Valid tools: claude, codex, codex-app, gemini, opencode, pi, amp.",
+                    "{} Unknown tool '{}'. Valid tools: claude, codex, codex-app, gemini, opencode, pi.",
                     style::red("Error:"),
                     tool
                 );
@@ -385,23 +328,6 @@ impl RunCommand {
             }
         }
 
-        // `--mode <X>`: validate, run picker for bare flag, warn if non-amp
-        // tool. Resolved before the generic model picker so the suppression
-        // logic below sees the final state of `amp_modes`.
-        match resolve_amp_initial_mode(ai_tool, amp_modes.initial_mode.take())? {
-            ModeOutcome::Resolved(m) => amp_modes.initial_mode = m,
-            ModeOutcome::Cancelled => return Ok(ExitCode::Success),
-            ModeOutcome::Invalid => return Ok(ExitCode::UserError),
-        }
-
-        // Amp per-mode model flags (`--rush-model`, `--smart-model`, ...)
-        // provide the model selection through `amp.internal.model`. If the
-        // user did not explicitly pass `-m`, ignore the synthetic picker
-        // trigger inserted by the generic run flow; otherwise `aivo run amp
-        // --rush-model ...` still opens an unrelated main-model picker.
-        let model =
-            suppress_implicit_amp_model_picker(ai_tool, explicit_model_flag, &amp_modes, model);
-
         let client = http_utils::router_http_client();
         let resolved_model = if let Some(ref key) = key_override {
             let outcome = self
@@ -457,24 +383,6 @@ impl RunCommand {
                 ClaudeModelOverrides::default()
             }
         };
-
-        // Amp per-mode model flags follow the same picker semantics as the
-        // Claude per-slot flags: bare `--smart-model` opens a picker for that
-        // slot. Only run the picker walk when amp is the target AND at least
-        // one slot was passed bare (empty string sentinel) — explicit values
-        // pass through unchanged.
-        if matches!(ai_tool, AIToolType::Amp) && amp_modes.has_any_picker_request() {
-            let key = key_override
-                .as_ref()
-                .expect("key_override is required (validated above)");
-            amp_modes = match self
-                .resolve_amp_overrides(&client, key, amp_modes, refresh)
-                .await?
-            {
-                Some(o) => o,
-                None => return Ok(ExitCode::Success),
-            };
-        }
 
         // Auto-defaults (1m/2m based on the model's advertised context window)
         // only make sense for Claude — they target Anthropic's beta-tier
@@ -564,7 +472,6 @@ impl RunCommand {
             args,
             model: launch_model,
             claude_overrides,
-            amp_modes,
             env,
             key_override,
         };
@@ -588,10 +495,9 @@ impl RunCommand {
     /// tools the run pipeline actually honors:
     ///   - Claude slot flags (`--reasoning-model`, `--{haiku,sonnet,opus}-model`,
     ///     `--subagent-model`) → claude
-    ///   - Amp mode-model flags (`--{rush,smart,deep,large}-model`) → amp
     ///   - `--max-context`/`--1m`/`--2m` → claude, codex, codex-app
     ///   - `--relogin` → claude, codex/codex-app, gemini (the OAuth-backed keys)
-    ///   - `-c, --context` → every tool except amp (no flat prompt-flag path)
+    ///   - `-c, --context` → every tool (no flat prompt-flag path)
     pub fn print_help(tool: Option<&str>) {
         let generic = tool.is_none();
         let is = |name: &str| generic || tool == Some(name);
@@ -614,7 +520,6 @@ impl RunCommand {
             Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),
             Some("opencode") => println!("{}", style::dim("Launch OpenCode with a local API key.")),
             Some("pi") => println!("{}", style::dim("Launch Pi with a local API key.")),
-            Some("amp") => println!("{}", style::dim("Launch Amp through aivo's bridge.")),
             _ => {
                 println!(
                     "{}",
@@ -643,16 +548,15 @@ impl RunCommand {
             println!();
             println!("{}", style::bold(name));
         };
-        // Generic help keeps the "Claude only:" / "Amp only:" prefixes so
-        // the union view stays unambiguous; per-tool help drops them since
-        // every flag listed already applies to that tool.
+        // Generic help keeps the "Claude only:" prefixes so the union view
+        // stays unambiguous; per-tool help drops them since every flag listed
+        // already applies to that tool.
         let label = |s: &str| -> String {
             if generic {
                 s.to_string()
             } else {
                 s.trim_start_matches("Claude only: ")
                     .trim_start_matches("Codex only: ")
-                    .trim_start_matches("Amp only: ")
                     .to_string()
             }
         };
@@ -682,53 +586,20 @@ impl RunCommand {
             );
         }
 
-        if is("amp") {
-            section("Amp Modes:");
+        section("Context:");
+        if is("claude") || is("codex") || is("codex-app") {
             print_opt(
-                "--mode <name>",
-                &label(
-                    "Amp only: pin initial agent mode for the thread (smart, rush, deep, large; bare = picker)",
-                ),
+                "--max-context <size>",
+                "Opt every model slot into a larger context window (e.g. 1m, 2m)",
             );
-            print_opt(
-                "--rush-model <m>",
-                &label("Amp only: model for `rush` mode (fast/cheap, small tasks; bare = picker)"),
-            );
-            print_opt(
-                "--smart-model <m>",
-                &label("Amp only: model for `smart` mode (default; most capable; bare = picker)"),
-            );
-            print_opt(
-                "--deep-model <m>",
-                &label("Amp only: model for `deep` mode (deep reasoning; bare = picker)"),
-            );
-            print_opt(
-                "--large-model <m>",
-                &label("Amp only: model for `large` mode (biggest context window; bare = picker)"),
-            );
-            print_opt(
-                "--disable-tool <name>",
-                &label("Amp only: strip a tool by name (repeatable)"),
-            );
+            print_opt("--1m", "Shorthand for --max-context=1m");
+            print_opt("--2m", "Shorthand for --max-context=2m");
         }
-
-        let context_flags = is("claude") || is("codex") || is("codex-app") || tool != Some("amp");
-        if context_flags {
-            section("Context:");
-            if is("claude") || is("codex") || is("codex-app") {
-                print_opt(
-                    "--max-context <size>",
-                    "Opt every model slot into a larger context window (e.g. 1m, 2m)",
-                );
-                print_opt("--1m", "Shorthand for --max-context=1m");
-                print_opt("--2m", "Shorthand for --max-context=2m");
-            }
-            if tool != Some("amp") && tool != Some("codex-app") {
-                print_opt(
-                    "-c, --context[=<id>]",
-                    "Inject one past session (bare = picker; id from `aivo logs --by native`)",
-                );
-            }
+        if tool != Some("codex-app") {
+            print_opt(
+                "-c, --context[=<id>]",
+                "Inject one past session (bare = picker; id from `aivo logs --by native`)",
+            );
         }
 
         section("Key & Auth:");
@@ -775,17 +646,6 @@ impl RunCommand {
             print_tool("gemini", "Gemini");
             print_tool("opencode", "OpenCode");
             print_tool("pi", "Pi");
-            print_tool("amp", "Amp");
-        }
-
-        if tool == Some("amp") {
-            println!();
-            println!("{}", style::bold("See also:"));
-            println!(
-                "  {}{}",
-                style::cyan(format!("{:<26}", "aivo amp trust")),
-                style::dim("Approve workspace MCP servers (run `aivo amp trust --help`)"),
-            );
         }
 
         println!();
@@ -820,12 +680,6 @@ impl RunCommand {
                 println!("  {}", style::dim("aivo pi -k mykey"));
                 println!("  {}", style::dim("aivo pi --transform -k openrouter"));
             }
-            Some("amp") => {
-                println!("  {}", style::dim("aivo amp"));
-                println!("  {}", style::dim("aivo amp --mode rush"));
-                println!("  {}", style::dim("aivo amp --smart-model gpt-5"));
-                println!("  {}", style::dim("aivo amp threads list"));
-            }
             _ => {
                 println!("  {}", style::dim("aivo run claude"));
                 println!(
@@ -838,106 +692,6 @@ impl RunCommand {
                 println!("  {}", style::dim("aivo gemini \"explain this code\""));
             }
         }
-    }
-}
-
-/// Outcome of `--mode` flag resolution.
-enum ModeOutcome {
-    /// `None` = no override (no flag passed, or non-amp tool warned and dropped).
-    /// `Some(name)` = canonical mode name to inject into amp's args.
-    Resolved(Option<String>),
-    /// User dismissed the picker — exit success without launching.
-    Cancelled,
-    /// User passed `--mode <unknown>`; an error has already been printed
-    /// and the launch should exit with `UserError`.
-    Invalid,
-}
-
-/// Validate `--mode` and resolve the bare-flag picker.
-///
-/// Empty string sentinel → open a four-item picker. A non-empty value is
-/// validated against the canonical list; unknown values exit with a user
-/// error so the launch doesn't burn through interactive picks first. On
-/// non-amp tools the flag is dropped with a warning (parity with the
-/// Claude per-slot warning pattern).
-fn resolve_amp_initial_mode(tool: AIToolType, value: Option<String>) -> Result<ModeOutcome> {
-    let Some(raw) = value else {
-        return Ok(ModeOutcome::Resolved(None));
-    };
-
-    if !matches!(tool, AIToolType::Amp) {
-        eprintln!(
-            "  {} --mode is ignored for {}",
-            style::yellow("!"),
-            tool.as_str(),
-        );
-        return Ok(ModeOutcome::Resolved(None));
-    }
-
-    let trimmed = raw.trim();
-    if !trimmed.is_empty() {
-        let canonical = AMP_AGENT_MODES.iter().find(|(name, _)| *name == trimmed);
-        return match canonical {
-            Some((name, _)) => Ok(ModeOutcome::Resolved(Some((*name).to_string()))),
-            None => {
-                let valid = AMP_AGENT_MODES
-                    .iter()
-                    .map(|(n, _)| *n)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                eprintln!(
-                    "{} --mode expects one of: {} (got {:?}).",
-                    style::red("Error:"),
-                    valid,
-                    trimmed,
-                );
-                Ok(ModeOutcome::Invalid)
-            }
-        };
-    }
-
-    use std::io::IsTerminal;
-    if !std::io::stderr().is_terminal() {
-        // Non-interactive (piped/redirected): no human to pick. Drop with a
-        // hint, mirroring how the model picker degrades.
-        eprintln!(
-            "  {} --mode picker needs a TTY; not pinning a mode.",
-            style::yellow("!"),
-        );
-        return Ok(ModeOutcome::Resolved(None));
-    }
-
-    use crate::tui::FuzzySelect;
-    let items: Vec<String> = AMP_AGENT_MODES
-        .iter()
-        .map(|(name, desc)| format!("{name:<6} — {desc}"))
-        .collect();
-    match FuzzySelect::new()
-        .with_prompt("Select agent mode")
-        .items(&items)
-        .default(0)
-        .interact_opt()
-    {
-        Ok(Some(idx)) => Ok(ModeOutcome::Resolved(Some(
-            AMP_AGENT_MODES[idx].0.to_string(),
-        ))),
-        Ok(None) | Err(_) => Ok(ModeOutcome::Cancelled),
-    }
-}
-
-fn suppress_implicit_amp_model_picker(
-    tool: AIToolType,
-    explicit_model_flag: bool,
-    amp_modes: &AmpModeModels,
-    model: Option<String>,
-) -> Option<String> {
-    if matches!(tool, AIToolType::Amp)
-        && !explicit_model_flag
-        && (amp_modes.to_internal_model_value().is_some() || amp_modes.has_any_picker_request())
-    {
-        None
-    } else {
-        model
     }
 }
 
@@ -1026,9 +780,6 @@ async fn maybe_inject_context(tool: AIToolType, args: Vec<String>, selector: &st
         AIToolType::Codex | AIToolType::CodexApp => inject_codex(&rendered, args),
         AIToolType::Gemini => inject_via_flag(&rendered, args, "-i"),
         AIToolType::Opencode => inject_via_flag(&rendered, args, "--prompt"),
-        // Amp has no flat prompt flag (uses `amp threads continue <id>` semantics);
-        // skip injection for v1 — `--context=<id>` is a no-op for amp.
-        AIToolType::Amp => args.to_vec(),
     }
 }
 
@@ -1270,7 +1021,6 @@ mod tests {
         assert!(AIToolType::parse("gemini").is_some());
         assert!(AIToolType::parse("opencode").is_some());
         assert!(AIToolType::parse("pi").is_some());
-        assert!(AIToolType::parse("amp").is_some());
     }
 
     #[test]
@@ -1283,15 +1033,7 @@ mod tests {
     #[test]
     fn test_ai_tool_type_display_names() {
         // Ensure all tools have valid string representations
-        let tools = [
-            "claude",
-            "codex",
-            "codex-app",
-            "gemini",
-            "opencode",
-            "pi",
-            "amp",
-        ];
+        let tools = ["claude", "codex", "codex-app", "gemini", "opencode", "pi"];
         for tool in &tools {
             let parsed = AIToolType::parse(tool).unwrap();
             // Roundtrip: parsing should give a valid tool type
@@ -1304,38 +1046,11 @@ mod tests {
                         | AIToolType::Gemini
                         | AIToolType::Opencode
                         | AIToolType::Pi
-                        | AIToolType::Amp
                 ),
                 "Tool {} should parse to a valid AIToolType",
                 tool
             );
         }
-    }
-
-    #[test]
-    fn amp_per_mode_flags_suppress_implicit_model_picker() {
-        let modes = AmpModeModels {
-            rush: Some("deepseek-v4-flash".into()),
-            ..Default::default()
-        };
-        let out =
-            suppress_implicit_amp_model_picker(AIToolType::Amp, false, &modes, Some(String::new()));
-        assert_eq!(out, None);
-    }
-
-    #[test]
-    fn amp_per_mode_flags_preserve_explicit_model_flag() {
-        let modes = AmpModeModels {
-            rush: Some("deepseek-v4-flash".into()),
-            ..Default::default()
-        };
-        let out = suppress_implicit_amp_model_picker(
-            AIToolType::Amp,
-            true,
-            &modes,
-            Some("kimi-k2.6".into()),
-        );
-        assert_eq!(out.as_deref(), Some("kimi-k2.6"));
     }
 
     use crate::services::models_cache::{ModelMetadata, full_catalog_key};

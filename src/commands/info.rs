@@ -19,7 +19,7 @@ use crate::services::system_env;
 use crate::style;
 use crate::version;
 
-const TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "pi", "amp"];
+const TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "pi"];
 
 pub struct InfoCommand {
     session_store: SessionStore,

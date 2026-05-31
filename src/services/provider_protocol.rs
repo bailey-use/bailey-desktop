@@ -327,12 +327,14 @@ pub struct AttemptClassification {
 }
 
 pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification {
-    let is_terminal = is_terminal_upstream_error(status);
+    let is_format_unsupported = is_format_unsupported_error(body);
+    let is_terminal = is_terminal_upstream_error(status) && !is_format_unsupported;
     let is_rate_limited = status == 429;
     // Wrong model is a semantic rejection at any status (404 included) — probing
     // other protocols/paths can't help, so don't let the cascade thrash on it.
-    let is_semantic_rejection = (matches!(status, 400 | 422) && is_request_error_envelope(body))
-        || is_model_not_found_error(body);
+    let is_semantic_rejection = !is_format_unsupported
+        && ((matches!(status, 400 | 422) && is_request_error_envelope(body))
+            || is_model_not_found_error(body));
     let quirk_hint = if is_semantic_rejection {
         quirk_hint_for_error_body(body)
     } else {
@@ -344,6 +346,17 @@ pub fn classify_failed_attempt(status: u16, body: &str) -> AttemptClassification
         is_semantic_rejection,
         quirk_hint,
     }
+}
+
+/// True when the upstream parsed the request enough to say the selected model
+/// does not support this wire format. That is a protocol mismatch, not an auth
+/// or model-selection failure, so fallback should keep probing other formats.
+pub fn is_format_unsupported_error(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("format")
+        && (lower.contains("not supported")
+            || lower.contains("not support")
+            || lower.contains("unsupported"))
 }
 
 /// True when an error body names a *model* problem (`{"error":"Model not found"}`)
@@ -677,6 +690,21 @@ mod tests {
         ] {
             assert!(!is_model_not_found_error(body), "should not match: {body}");
         }
+    }
+
+    #[test]
+    fn classify_keeps_probing_on_unsupported_format_errors() {
+        let body = r#"{"type":"error","error":{"type":"ModelError","message":"Model qwen3.7-max is not supported for format oa-compat"}}"#;
+
+        let c = classify_failed_attempt(401, body);
+        assert!(!c.is_terminal);
+        assert!(!c.is_semantic_rejection);
+        assert!(c.quirk_hint.is_none());
+
+        let c = classify_failed_attempt(400, body);
+        assert!(!c.is_terminal);
+        assert!(!c.is_semantic_rejection);
+        assert!(c.quirk_hint.is_none());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! ChatCommand handler. Interactive sessions launch the full-screen TUI
 //! (chat_tui). One-shot queries (-x flag) stream directly to stdout using
-//! OpenAI-compatible /v1/chat/completions, falling back to Anthropic
-//! /v1/messages on 404/405.
+//! OpenAI-compatible /v1/chat/completions, falling back through the shared
+//! protocol router when the upstream rejects that wire format.
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
@@ -28,6 +28,11 @@ use crate::services::http_utils::sse_data_payload;
 use crate::services::huggingface;
 use crate::services::model_names;
 use crate::services::models_cache::ModelsCache;
+use crate::services::provider_profile::{provider_profile_for_key, resolve_starter_base_url};
+use crate::services::provider_protocol::{PathVariant, ProviderProtocol};
+use crate::services::responses_to_chat_router::{
+    ResponsesToChatRouterConfig, forward_chat_completions_with_fallback,
+};
 use crate::services::session_store::{
     ApiKey, AttachmentStorage, MessageAttachment, SessionStore, SessionTokens, StoredChatMessage,
 };
@@ -108,7 +113,7 @@ fn chat_sandbox_dir() -> Result<std::path::PathBuf> {
 }
 
 fn detect_initial_chat_format(base_url: &str) -> ChatFormat {
-    use crate::services::provider_protocol::{ProviderProtocol, detect_provider_protocol};
+    use crate::services::provider_protocol::detect_provider_protocol;
     match detect_provider_protocol(base_url) {
         ProviderProtocol::Google => ChatFormat::Google,
         ProviderProtocol::Anthropic => ChatFormat::Anthropic,
@@ -779,6 +784,26 @@ where
             .await
             {
                 ok @ Ok(_) => ok,
+                Err(e) if is_format_mismatch(&e) => {
+                    match send_chat_via_shared_fallback(
+                        client,
+                        key,
+                        model,
+                        history,
+                        ProviderProtocol::Anthropic,
+                        spinning,
+                        non_streaming,
+                        on_chunk,
+                    )
+                    .await
+                    {
+                        Ok((content, protocol)) => {
+                            *format = chat_format_for_router_protocol(protocol);
+                            Ok(content)
+                        }
+                        Err(_) => Err(e),
+                    }
+                }
                 Err(e) if is_responses_api_required(&e) => {
                     // Model requires the Responses API instead of Chat Completions
                     match send_responses_request(
@@ -797,26 +822,6 @@ where
                             Ok(content)
                         }
                         Err(responses_err) => Err(responses_err),
-                    }
-                }
-                Err(e) if is_format_mismatch(&e) => {
-                    // Provider doesn't speak OpenAI format; try Anthropic
-                    match send_anthropic_request(
-                        client,
-                        key,
-                        model,
-                        history,
-                        spinning,
-                        non_streaming,
-                        on_chunk,
-                    )
-                    .await
-                    {
-                        Ok(content) => {
-                            *format = ChatFormat::Anthropic;
-                            Ok(content)
-                        }
-                        Err(_) => Err(e), // both failed; report original error
                     }
                 }
                 Err(e) => Err(e),
@@ -860,20 +865,20 @@ where
             {
                 ok @ Ok(_) => ok,
                 Err(e) if is_format_mismatch(&e) => {
-                    // Fall back to OpenAI for gateways serving Google models via /v1/chat/completions
-                    match send_chat_request(
+                    match send_chat_via_shared_fallback(
                         client,
                         key,
                         model,
                         history,
+                        ProviderProtocol::Openai,
                         spinning,
                         non_streaming,
                         on_chunk,
                     )
                     .await
                     {
-                        Ok(content) => {
-                            *format = ChatFormat::OpenAI;
+                        Ok((content, protocol)) => {
+                            *format = chat_format_for_router_protocol(protocol);
                             Ok(content)
                         }
                         Err(_) => Err(e),
@@ -883,6 +888,76 @@ where
             }
         }
     }
+}
+
+fn chat_format_for_router_protocol(protocol: ProviderProtocol) -> ChatFormat {
+    match protocol {
+        ProviderProtocol::Anthropic => ChatFormat::Anthropic,
+        ProviderProtocol::Google => ChatFormat::Google,
+        // The shared Chat Completions fallback currently treats ResponsesApi as
+        // an OpenAI-chat wire route, not as `/v1/responses`.
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => ChatFormat::OpenAI,
+    }
+}
+
+fn chat_path_variant_for_protocol(key: &ApiKey, protocol: ProviderProtocol) -> Option<PathVariant> {
+    let value = match protocol {
+        ProviderProtocol::Google => key.gemini_path_variant.as_deref(),
+        ProviderProtocol::Openai | ProviderProtocol::ResponsesApi | ProviderProtocol::Anthropic => {
+            key.claude_path_variant.as_deref()
+        }
+    };
+    value.and_then(PathVariant::parse)
+}
+
+fn shared_chat_fallback_config(
+    key: &ApiKey,
+    initial_protocol: ProviderProtocol,
+) -> ResponsesToChatRouterConfig {
+    let profile = provider_profile_for_key(key);
+    let mut requires_reasoning_content = profile.quirks.requires_reasoning_content;
+    requires_reasoning_content |= key.requires_reasoning_content == Some(true);
+
+    ResponsesToChatRouterConfig {
+        target_base_url: resolve_starter_base_url(&key.base_url),
+        api_key: key.key.as_str().to_string(),
+        target_protocol: initial_protocol,
+        target_path_variant: chat_path_variant_for_protocol(key, initial_protocol),
+        copilot_token_manager: None,
+        model_prefix: profile.quirks.model_prefix.map(str::to_string),
+        requires_reasoning_content,
+        actual_model: None,
+        max_tokens_cap: profile.quirks.max_tokens_cap,
+        responses_api_supported: key.responses_api_supported,
+        is_starter: profile.serve_flags.is_starter,
+        aivo_prefix_models: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_chat_via_shared_fallback<F>(
+    client: &Client,
+    key: &ApiKey,
+    model: &str,
+    messages: &[ChatMessage],
+    initial_protocol: ProviderProtocol,
+    spinning: &Arc<AtomicBool>,
+    non_streaming: bool,
+    on_chunk: &mut F,
+) -> Result<(ChatTurnResult, ProviderProtocol)>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let body = build_openai_chat_request(model, messages, !non_streaming, None)?;
+    let requested_stream = body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let config = shared_chat_fallback_config(key, initial_protocol);
+    let (body, protocol) =
+        forward_chat_completions_with_fallback(&body, config, client, requested_stream).await?;
+    let result = emit_openai_chat_value(body, spinning, on_chunk)?;
+    Ok((result, protocol))
 }
 
 fn read_one_shot_message_from_stdin() -> Result<String> {
@@ -1217,13 +1292,13 @@ fn with_auth(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::Request
     }
 }
 
-/// Like `with_auth` but also adds the `x-api-key` header for Anthropic gateways.
+/// Adds native Anthropic auth headers. Some Anthropic-compatible gateways reject
+/// a simultaneous OpenAI-style Authorization bearer, so send only `x-api-key`.
 fn with_auth_anthropic(builder: reqwest::RequestBuilder, key: &ApiKey) -> reqwest::RequestBuilder {
-    let b = with_auth(builder, key);
     if key.key.is_empty() {
-        b
+        crate::services::device_fingerprint::with_starter_headers(builder)
     } else {
-        b.header("x-api-key", key.key.as_str())
+        builder.header("x-api-key", key.key.as_str())
     }
 }
 
@@ -1444,6 +1519,17 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
+    emit_openai_chat_value(body, spinning, on_chunk)
+}
+
+fn emit_openai_chat_value<F>(
+    body: serde_json::Value,
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
     let response = extract_openai_message(&body);
     let usage = extract_openai_usage(&body);
     let response_model = extract_response_model(&body);
@@ -1923,6 +2009,7 @@ fn is_format_mismatch(e: &anyhow::Error) -> bool {
             && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
         || (msg.contains("method not allowed")
             && (msg.contains("endpoint") || msg.contains("route") || msg.contains("path")))
+        || crate::services::provider_protocol::is_format_unsupported_error(&msg)
 }
 
 /// Returns true when the error suggests trying the Responses API.
@@ -2543,6 +2630,27 @@ mod tests {
     }
 
     #[test]
+    fn test_with_auth_anthropic_uses_x_api_key_only() {
+        let key = ApiKey::new_with_protocol(
+            "test".to_string(),
+            "test".to_string(),
+            "https://opencode.ai/zen/go/v1".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+        let request = with_auth_anthropic(
+            reqwest::Client::new().post("http://127.0.0.1/v1/messages"),
+            &key,
+        )
+        .build()
+        .unwrap();
+        let headers = request.headers();
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-test");
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
     fn test_chat_message_serialization() {
         let msg = ChatMessage {
             role: "user".to_string(),
@@ -2571,6 +2679,19 @@ mod tests {
     #[test]
     fn test_is_format_mismatch_endpoint_text() {
         let e = anyhow::anyhow!("route not found for requested endpoint");
+        assert!(is_format_mismatch(&e));
+    }
+
+    #[test]
+    fn test_is_format_mismatch_unsupported_format_wording() {
+        // A 401 status whose body is really a format-routing error, not auth.
+        let e = anyhow::anyhow!(
+            r#"API returned 401 Unauthorized — {{"type":"error","error":{{"type":"ModelError","message":"Model qwen3.7-max is not supported for format oa-compat"}}}}"#
+        );
+        assert!(is_format_mismatch(&e));
+        let e = anyhow::anyhow!("API returned 403 Forbidden — unsupported format");
+        assert!(is_format_mismatch(&e));
+        let e = anyhow::anyhow!("API returned 400 Bad Request — unsupported format oa-compat");
         assert!(is_format_mismatch(&e));
     }
 

@@ -871,8 +871,12 @@ impl AILauncher {
         if is_copilot_base(&key.base_url) {
             return Ok(key);
         }
-        if key.opencode_mode.is_none() {
-            key.opencode_mode = Some(preferred_opencode_mode(&key.base_url));
+        let preferred = preferred_opencode_mode(&key.base_url);
+        let has_stale_direct_pin = is_opencode_zen_base(&key.base_url)
+            && key.opencode_mode == Some(OpenAICompatibilityMode::Direct)
+            && preferred == OpenAICompatibilityMode::Router;
+        if key.opencode_mode.is_none() || has_stale_direct_pin {
+            key.opencode_mode = Some(preferred);
             if persist {
                 let _ = self
                     .session_store
@@ -1734,6 +1738,9 @@ fn preferred_opencode_mode(base_url: &str) -> OpenAICompatibilityMode {
     if is_direct_openai_base(base_url) {
         return OpenAICompatibilityMode::Direct;
     }
+    if is_opencode_zen_base(base_url) {
+        return OpenAICompatibilityMode::Router;
+    }
     let profile = provider_profile_for_base_url(base_url);
     if profile.default_protocol == ProviderProtocol::Openai {
         // Direct connection works for plain OpenAI-compatible endpoints,
@@ -1746,6 +1753,15 @@ fn preferred_opencode_mode(base_url: &str) -> OpenAICompatibilityMode {
     } else {
         OpenAICompatibilityMode::Router
     }
+}
+
+fn is_opencode_zen_base(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_ascii_lowercase().contains("opencode.ai/zen");
+    };
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+        && url.path().starts_with("/zen")
 }
 
 #[cfg(test)]
@@ -1901,6 +1917,14 @@ mod tests {
             preferred_opencode_mode("https://openrouter.ai/api/v1"),
             OpenAICompatibilityMode::Direct
         );
+        assert_eq!(
+            preferred_opencode_mode("https://opencode.ai/zen/v1"),
+            OpenAICompatibilityMode::Router
+        );
+        assert_eq!(
+            preferred_opencode_mode("https://opencode.ai/zen/go/v1"),
+            OpenAICompatibilityMode::Router
+        );
     }
 
     #[test]
@@ -1977,6 +2001,32 @@ mod tests {
         assert!(
             reloaded.gemini_protocol.is_none(),
             "disk pin must stay None — persist_runtime_discoveries is the sole writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_mode_rewrites_stale_opencode_zen_direct_pin() {
+        let (store, launcher, _tmp) = test_launcher_with_store().await;
+        let key = test_insert_key(&store, "https://opencode.ai/zen/go/v1").await;
+        store
+            .set_key_opencode_mode(&key.id, Some(OpenAICompatibilityMode::Direct))
+            .await
+            .unwrap();
+        let key = store.get_key_by_id(&key.id).await.unwrap().unwrap();
+
+        let resolved = launcher
+            .resolve_opencode_mode(key.clone(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved.opencode_mode,
+            Some(OpenAICompatibilityMode::Router)
+        );
+        let reloaded = store.get_key_by_id(&key.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.opencode_mode,
+            Some(OpenAICompatibilityMode::Router)
         );
     }
 }

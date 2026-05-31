@@ -189,6 +189,47 @@ impl ResponsesToChatRouter {
     }
 }
 
+pub(crate) async fn forward_chat_completions_with_fallback(
+    body: &Value,
+    config: ResponsesToChatRouterConfig,
+    client: &reqwest::Client,
+    force_non_streaming: bool,
+) -> Result<(Value, ProviderProtocol)> {
+    let initial_route = crate::services::provider_protocol::encode_route(
+        config.target_protocol,
+        config.target_path_variant.unwrap_or(PathVariant::Default),
+    );
+    let active_protocol = Arc::new(AtomicU8::new(initial_route));
+    let request_succeeded = Arc::new(AtomicBool::new(false));
+    let saw_authoritative_response = Arc::new(AtomicBool::new(false));
+    let learned_requires_reasoning = Arc::new(AtomicBool::new(false));
+    let config = Arc::new(config);
+
+    match forward_openai_chat_request(
+        body,
+        &config,
+        client,
+        force_non_streaming,
+        &active_protocol,
+        &request_succeeded,
+        &saw_authoritative_response,
+        &learned_requires_reasoning,
+    )
+    .await?
+    {
+        ForwardedChatResponse::Success(value) => {
+            let (protocol, _) = decode_route(active_protocol.load(Ordering::Relaxed));
+            Ok((value, protocol))
+        }
+        ForwardedChatResponse::HttpError { status, body } => {
+            let status = reqwest::StatusCode::from_u16(status)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| status.to_string());
+            anyhow::bail!("API returned {} — {}", status, body)
+        }
+    }
+}
+
 async fn handle_router_request_streaming(
     request: String,
     state: Arc<ResponsesToChatRouterState>,
@@ -1184,12 +1225,7 @@ async fn forward_anthropic_protocol(
 
     let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/messages"));
     let response = device_fingerprint::maybe_with_starter_headers(
-        client
-            .post(&target_url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("x-api-key", config.api_key.as_str())
-            .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", CONTENT_TYPE_JSON)
+        with_anthropic_messages_headers(client.post(&target_url), &config.api_key)
             .json(&anthropic_body),
         config.is_starter,
     )
@@ -1214,6 +1250,16 @@ async fn forward_anthropic_protocol(
     // strip the wrap so the real upstream message reaches the user.
     let normalized = strip_anthropic_error_wrap(&response_text);
     Ok(classify_attempt::<Value>(status_code, normalized, None))
+}
+
+fn with_anthropic_messages_headers(
+    builder: reqwest::RequestBuilder,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    builder
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", CONTENT_TYPE_JSON)
 }
 
 fn strip_anthropic_error_wrap(body: &str) -> String {
@@ -1462,6 +1508,22 @@ mod tests {
         let body = r#"{"error":{"message":"bad key","type":"invalid_request"}}"#;
         // No outer `"type":"error"` wrap → returned unchanged.
         assert_eq!(strip_anthropic_error_wrap(body), body);
+    }
+
+    #[test]
+    fn anthropic_messages_headers_use_x_api_key_without_authorization() {
+        let request = with_anthropic_messages_headers(
+            reqwest::Client::new().post("http://127.0.0.1/v1/messages"),
+            "sk-test",
+        )
+        .build()
+        .unwrap();
+        let headers = request.headers();
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-test");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(headers.get("content-type").unwrap(), CONTENT_TYPE_JSON);
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
     }
 
     #[test]

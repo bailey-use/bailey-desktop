@@ -317,7 +317,7 @@ impl ChatTuiApp {
         self.sending = false;
         self.request_started_at = None;
         self.session_id = new_chat_session_id();
-        self.format = detect_initial_chat_format(&self.key.base_url);
+        self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
         self.context_tokens = 0;
         self.follow_output = true;

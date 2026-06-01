@@ -60,7 +60,30 @@ impl ChatTuiApp {
         Ok(())
     }
 
+    /// Persist the learned route if new/changed, and update the in-memory key so
+    /// later turns this session don't rewrite it.
+    async fn persist_chat_route(&mut self) {
+        let Some((model_key, route)) =
+            chat_route_to_persist(&self.key, &self.raw_model, &self.format)
+        else {
+            return;
+        };
+        if self
+            .session_store
+            .merge_routes(&self.key.id, "chat", &[(model_key.clone(), route.clone())])
+            .await
+            .is_ok()
+        {
+            self.key
+                .protocol_routes
+                .entry("chat".to_string())
+                .or_default()
+                .insert(model_key, route);
+        }
+    }
+
     async fn finish_successful_response(&mut self, turn: ChatTurnResult) -> Result<()> {
+        self.persist_chat_route().await;
         let content = if self.pending_response.is_empty() {
             turn.content.clone()
         } else {

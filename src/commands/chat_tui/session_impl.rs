@@ -51,6 +51,8 @@ impl ChatTuiApp {
 
         self.raw_model = raw_model.clone();
         self.model = ChatCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        // Routes are per-model — re-seed the format for the new model.
+        self.format = seeded_chat_format(&self.key, &raw_model);
         self.billed_model = None;
         self.draft_history_index = None;
         self.draft_history_stash = None;
@@ -372,7 +374,7 @@ impl ChatTuiApp {
         self.draft_history_stash = None;
         self.pending_response.clear();
         self.pending_submit = None;
-        self.format = detect_initial_chat_format(&self.key.base_url);
+        self.format = seeded_chat_format(&self.key, &session.raw_model);
         self.last_usage = None;
         self.context_tokens = estimate_context_tokens(&self.history);
         self.follow_output = true;

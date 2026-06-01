@@ -85,7 +85,7 @@ impl ChatTuiApp {
             .map(|message| (MUTED, message))
             .or(Some((MUTED, "Ready".to_string())));
 
-        let initial_format = detect_initial_chat_format(&params.key.base_url);
+        let initial_format = seeded_chat_format(&params.key, &params.raw_model);
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,

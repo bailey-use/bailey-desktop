@@ -74,7 +74,7 @@ impl ChatTuiApp {
         self.pending_response.clear();
         self.pending_reasoning.clear();
         self.pending_submit = None;
-        self.format = detect_initial_chat_format(&self.key.base_url);
+        self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
         self.context_tokens = 0;
         self.follow_output = true;

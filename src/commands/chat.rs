@@ -33,6 +33,7 @@ use crate::services::provider_protocol::{PathVariant, ProviderProtocol};
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, forward_chat_completions_with_fallback,
 };
+use crate::services::route_cache::{PersistedRoute, canonical_model};
 use crate::services::session_store::{
     ApiKey, AttachmentStorage, MessageAttachment, SessionStore, SessionTokens, StoredChatMessage,
 };
@@ -119,6 +120,72 @@ fn detect_initial_chat_format(base_url: &str) -> ChatFormat {
         ProviderProtocol::Anthropic => ChatFormat::Anthropic,
         _ => ChatFormat::OpenAI,
     }
+}
+
+/// Lossless `ChatFormat` → protocol for the route store. Unlike
+/// `chat_format_for_router_protocol`, `ResponsesApi` stays distinct.
+fn chat_format_protocol(format: &ChatFormat) -> ProviderProtocol {
+    match format {
+        ChatFormat::Anthropic => ProviderProtocol::Anthropic,
+        ChatFormat::Google => ProviderProtocol::Google,
+        ChatFormat::Responses => ProviderProtocol::ResponsesApi,
+        ChatFormat::OpenAI => ProviderProtocol::Openai,
+    }
+}
+
+fn chat_format_from_protocol(protocol: ProviderProtocol) -> ChatFormat {
+    match protocol {
+        ProviderProtocol::Anthropic => ChatFormat::Anthropic,
+        ProviderProtocol::Google => ChatFormat::Google,
+        ProviderProtocol::ResponsesApi => ChatFormat::Responses,
+        ProviderProtocol::Openai => ChatFormat::OpenAI,
+    }
+}
+
+/// Seed the turn's wire format from a persisted `(chat, key, model)` route,
+/// else URL detection — mirrors how launch routers seed their `RouteCache`.
+fn seeded_chat_format(key: &ApiKey, raw_model: &str) -> ChatFormat {
+    match persisted_chat_protocol(key, raw_model) {
+        Some(protocol) => chat_format_from_protocol(protocol),
+        None => detect_initial_chat_format(&key.base_url),
+    }
+}
+
+fn persisted_chat_protocol(key: &ApiKey, raw_model: &str) -> Option<ProviderProtocol> {
+    if raw_model.trim().is_empty() {
+        return None;
+    }
+    let routes = key.routes_for_tool("chat");
+    let model = canonical_model(raw_model);
+    routes
+        .get(&model)
+        .or_else(|| routes.get(""))
+        .and_then(|route| ProviderProtocol::parse(&route.protocol))
+}
+
+/// The `(model, route)` to persist after a turn, or `None` if it matches what's
+/// stored — the launch path's "confirmed + changed" rule, so only discoveries write.
+fn chat_route_to_persist(
+    key: &ApiKey,
+    raw_model: &str,
+    format: &ChatFormat,
+) -> Option<(String, PersistedRoute)> {
+    // Cursor ACP keys skip the wire-format cascade; `format` is just a placeholder.
+    if raw_model.trim().is_empty() || key.is_cursor_acp() {
+        return None;
+    }
+    let model = canonical_model(raw_model);
+    let route = PersistedRoute::from_route(chat_format_protocol(format), PathVariant::Default);
+    // Compare packed bytes so a default variant ("" vs "default") isn't a false diff.
+    if key
+        .routes_for_tool("chat")
+        .get(&model)
+        .and_then(PersistedRoute::to_byte)
+        == route.to_byte()
+    {
+        return None;
+    }
+    Some((model, route))
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -403,7 +470,7 @@ impl ChatCommand {
                 reasoning_content: None,
                 attachments: one_shot_attachments,
             }];
-            let mut format = detect_initial_chat_format(&key.base_url);
+            let mut format = seeded_chat_format(&key, &raw_model);
             self.session_store
                 .record_selection(&key.id, "chat", Some(&raw_model))
                 .await?;
@@ -492,6 +559,14 @@ impl ChatCommand {
 
             match result {
                 Ok(turn) => {
+                    if let Some((model_key, route)) =
+                        chat_route_to_persist(&key, &raw_model, &format)
+                    {
+                        let _ = self
+                            .session_store
+                            .merge_routes(&key.id, "chat", &[(model_key, route)])
+                            .await;
+                    }
                     let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
                     let usage = turn.usage_or_estimate(&prompt_text);
                     let billed_model = turn.model.as_deref();
@@ -2743,5 +2818,107 @@ mod tests {
         ] {
             assert_eq!(detect_initial_chat_format(base_url), expected, "{base_url}");
         }
+    }
+
+    fn key_with_chat_route(model: &str, protocol: &str) -> ApiKey {
+        let mut key = ApiKey::new_with_protocol(
+            "id".to_string(),
+            "name".to_string(),
+            // Generic host → URL detection picks OpenAI, so a persisted route must win.
+            "https://api.example.com/v1".to_string(),
+            None,
+            "sk-test".to_string(),
+        );
+        let mut tool = std::collections::BTreeMap::new();
+        tool.insert(
+            model.to_string(),
+            PersistedRoute {
+                protocol: protocol.to_string(),
+                path_variant: String::new(),
+            },
+        );
+        key.protocol_routes.insert("chat".to_string(), tool);
+        key
+    }
+
+    #[test]
+    fn chat_format_protocol_round_trips() {
+        for f in [
+            ChatFormat::OpenAI,
+            ChatFormat::Anthropic,
+            ChatFormat::Responses,
+            ChatFormat::Google,
+        ] {
+            assert_eq!(
+                chat_format_from_protocol(chat_format_protocol(&f)),
+                f,
+                "{f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_format_prefers_persisted_route_over_url() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert_eq!(seeded_chat_format(&key, "gpt-oss"), ChatFormat::Anthropic);
+    }
+
+    #[test]
+    fn seeded_format_round_trips_responses() {
+        let key = key_with_chat_route("o3", "responses");
+        assert_eq!(seeded_chat_format(&key, "o3"), ChatFormat::Responses);
+    }
+
+    #[test]
+    fn seeded_format_falls_back_to_url_when_unrouted() {
+        let key = key_with_chat_route("other-model", "anthropic");
+        assert_eq!(seeded_chat_format(&key, "gpt-oss"), ChatFormat::OpenAI);
+    }
+
+    #[test]
+    fn seeded_format_canonicalizes_context_suffix() {
+        let key = key_with_chat_route("claude-sonnet", "anthropic");
+        assert_eq!(
+            seeded_chat_format(&key, "claude-sonnet[1m]"),
+            ChatFormat::Anthropic
+        );
+    }
+
+    #[test]
+    fn persist_skips_unchanged_route() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert!(chat_route_to_persist(&key, "gpt-oss", &ChatFormat::Anthropic).is_none());
+    }
+
+    #[test]
+    fn persist_emits_changed_route() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert_eq!(
+            chat_route_to_persist(&key, "gpt-oss", &ChatFormat::OpenAI),
+            Some((
+                "gpt-oss".to_string(),
+                PersistedRoute::from_route(ProviderProtocol::Openai, PathVariant::Default)
+            ))
+        );
+    }
+
+    #[test]
+    fn persist_emits_first_route_for_new_model() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert!(chat_route_to_persist(&key, "claude-3", &ChatFormat::Anthropic).is_some());
+    }
+
+    #[test]
+    fn persist_skips_empty_model() {
+        let key = key_with_chat_route("gpt-oss", "anthropic");
+        assert!(chat_route_to_persist(&key, "", &ChatFormat::OpenAI).is_none());
+    }
+
+    #[test]
+    fn persist_skips_cursor_acp_key() {
+        let mut key = key_with_chat_route("gpt-oss", "anthropic");
+        key.base_url = crate::services::cursor_acp::CURSOR_ACP_SENTINEL.to_string();
+        assert!(key.is_cursor_acp());
+        assert!(chat_route_to_persist(&key, "gpt-oss", &ChatFormat::OpenAI).is_none());
     }
 }

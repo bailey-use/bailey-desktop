@@ -1745,3 +1745,89 @@ async fn take_mcp_prewarmed_wakes_on_failed_prewarm_and_falls_back_to_cold() {
         start.elapsed()
     );
 }
+
+#[test]
+fn json_constraint_openai_json_object_appended() {
+    let body = json!({"response_format": {"type": "json_object"}});
+    let out = append_json_output_constraint("User: extract fields".to_string(), &body, false);
+    assert_eq!(
+        out,
+        "User: extract fields\n\nOUTPUT CONSTRAINT: Respond with a single valid JSON object and nothing else — no prose, no markdown, no code fences."
+    );
+}
+
+#[test]
+fn json_constraint_openai_json_schema_includes_schema() {
+    let body = json!({"response_format": {
+        "type": "json_schema",
+        "json_schema": {"name": "r", "schema": {"type": "object", "properties": {"x": {"type": "number"}}}}
+    }});
+    let out = append_json_output_constraint("User: hi".to_string(), &body, false);
+    assert!(out.contains("must conform to this schema:"));
+    assert!(out.contains("\"properties\":{\"x\":{\"type\":\"number\"}}"));
+}
+
+#[test]
+fn json_constraint_responses_text_format_schema_at_top() {
+    let body = json!({"text": {"format": {"type": "json_schema", "schema": {"type": "array"}}}});
+    let out = append_json_output_constraint("User: hi".to_string(), &body, false);
+    assert!(out.contains("conform to this schema: {\"type\":\"array\"}"));
+}
+
+#[test]
+fn json_constraint_gemini_response_mime_type() {
+    let body = json!({"generationConfig": {
+        "responseMimeType": "application/json",
+        "responseSchema": {"type": "object"}
+    }});
+    let out = append_json_output_constraint("User: hi".to_string(), &body, false);
+    assert!(out.contains("conform to this schema: {\"type\":\"object\"}"));
+}
+
+#[test]
+fn json_constraint_absent_without_format() {
+    let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+    assert_eq!(json_output_constraint(&body), None);
+    assert_eq!(
+        append_json_output_constraint("User: hi".to_string(), &body, false),
+        "User: hi"
+    );
+}
+
+#[test]
+fn json_constraint_absent_for_plain_text_format() {
+    let body = json!({"response_format": {"type": "text"}});
+    assert_eq!(json_output_constraint(&body), None);
+}
+
+#[test]
+fn json_constraint_noop_on_empty_prompt() {
+    let body = json!({"response_format": {"type": "json_object"}});
+    assert_eq!(
+        append_json_output_constraint(String::new(), &body, false),
+        ""
+    );
+}
+
+#[test]
+fn json_constraint_image_only_emits_lone_constraint() {
+    let body = json!({"response_format": {"type": "json_object"}});
+    let out = append_json_output_constraint(String::new(), &body, true);
+    assert_eq!(
+        out,
+        "OUTPUT CONSTRAINT: Respond with a single valid JSON object and nothing else — no prose, no markdown, no code fences."
+    );
+}
+
+#[test]
+fn json_constraint_reaches_image_only_responses_turn() {
+    // Responses drops input_image from reduced text → empty prompt; constraint must survive.
+    let body = json!({
+        "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]}],
+        "text": {"format": {"type": "json_object"}}
+    });
+    let reduced = reduce_responses_request_to_prompt(&body);
+    assert!(reduced.trim().is_empty());
+    assert!(append_json_output_constraint(reduced, &body, true).contains("OUTPUT CONSTRAINT"));
+}

@@ -72,11 +72,16 @@ pub(super) async fn run_responses(
         return run_responses_bridged(socket, state, body, requested_model).await;
     }
 
+    let image_blocks = extract_responses_image_blocks(&body)?;
     let parsed = ParsedTurn {
         stream_flag,
         requested_model,
-        image_blocks: extract_responses_image_blocks(&body)?,
-        prompt: reduce_responses_request_to_prompt(&body),
+        prompt: append_json_output_constraint(
+            reduce_responses_request_to_prompt(&body),
+            &body,
+            !image_blocks.is_empty(),
+        ),
+        image_blocks,
     };
     if parsed.prompt.trim().is_empty() && parsed.image_blocks.is_empty() {
         return Err(anyhow!("reduced prompt is empty; no user-visible message"));
@@ -413,7 +418,11 @@ pub(super) async fn run_responses_bridged_fresh(
 ) -> Result<Option<String>> {
     let tools = extract_responses_tools_normalized(&body);
     let image_blocks = extract_responses_image_blocks(&body)?;
-    let prompt = reduce_responses_request_to_prompt_without_tools(&body);
+    let prompt = append_json_output_constraint(
+        reduce_responses_request_to_prompt_without_tools(&body),
+        &body,
+        !image_blocks.is_empty(),
+    );
     if prompt.trim().is_empty() && image_blocks.is_empty() {
         return Err(anyhow!("reduced prompt is empty; no user-visible message"));
     }

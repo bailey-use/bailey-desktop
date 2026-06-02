@@ -1420,6 +1420,81 @@ pub(crate) fn estimate_tokens(text: &str) -> u64 {
     }
 }
 
+/// Best-effort JSON-output enforcement: cursor-agent/ACP has no
+/// structured-output control, so a client's `response_format` / `text.format`
+/// / `responseSchema` is otherwise dropped silently. Returns the instruction to
+/// append to the prompt, or `None`. Mirrors composer-api's `appendJsonConstraint`.
+pub(crate) fn json_output_constraint(body: &Value) -> Option<String> {
+    if let Some(line) = body
+        .get("response_format")
+        .and_then(json_constraint_from_format)
+    {
+        return Some(line);
+    }
+    if let Some(line) = body
+        .get("text")
+        .and_then(|text| text.get("format"))
+        .and_then(json_constraint_from_format)
+    {
+        return Some(line);
+    }
+    let cfg = body.get("generationConfig")?;
+    let wants_json = cfg
+        .get("responseMimeType")
+        .and_then(Value::as_str)
+        .is_some_and(|mime| mime.eq_ignore_ascii_case("application/json"));
+    wants_json.then(|| json_constraint_line(cfg.get("responseSchema")))
+}
+
+/// Map an OpenAI/Responses `{type, schema?}` format object to a constraint
+/// line. `None` for `type: "text"` or an unknown/missing type.
+fn json_constraint_from_format(format: &Value) -> Option<String> {
+    match format.get("type").and_then(Value::as_str)? {
+        "json_object" => Some(json_constraint_line(None)),
+        // Chat nests schema under `json_schema.schema`; Responses uses `format.schema`.
+        "json_schema" => {
+            let schema = format
+                .get("schema")
+                .or_else(|| format.get("json_schema").and_then(|j| j.get("schema")));
+            Some(json_constraint_line(schema))
+        }
+        _ => None,
+    }
+}
+
+fn json_constraint_line(schema: Option<&Value>) -> String {
+    match schema {
+        Some(schema) if !schema.is_null() => format!(
+            "OUTPUT CONSTRAINT: Respond with a single valid JSON value and nothing else — no prose, no markdown, no code fences. The JSON must conform to this schema: {}",
+            serde_json::to_string(schema).unwrap_or_default()
+        ),
+        _ => "OUTPUT CONSTRAINT: Respond with a single valid JSON object and nothing else — no prose, no markdown, no code fences."
+            .to_string(),
+    }
+}
+
+/// Append [`json_output_constraint`] to a reduced prompt when JSON was
+/// requested. `has_images` keeps an image-only turn (empty text) carrying the
+/// constraint; a turn with neither text nor images stays empty so the adapters'
+/// empty-prompt guard still rejects it.
+pub(crate) fn append_json_output_constraint(
+    prompt: String,
+    body: &Value,
+    has_images: bool,
+) -> String {
+    if prompt.trim().is_empty() && !has_images {
+        return prompt;
+    }
+    let Some(constraint) = json_output_constraint(body) else {
+        return prompt;
+    };
+    if prompt.trim().is_empty() {
+        constraint
+    } else {
+        format!("{prompt}\n\n{constraint}")
+    }
+}
+
 pub(crate) fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

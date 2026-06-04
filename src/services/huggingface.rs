@@ -685,6 +685,13 @@ pub fn local_openai_base_url(port: u16) -> String {
 /// the cache without spawning anything. For local-path refs, imports
 /// from disk instead of downloading.
 pub async fn ensure_cached(model: &HfModelRef) -> Result<CachedFile> {
+    ensure_cached_refresh(model, false).await
+}
+
+/// Like [`ensure_cached`], but `refresh` skips the cached resolve so a prior
+/// (stale or gated) pick can't pin re-runs to the same file. The on-disk file
+/// is still honored — a fully cached `.gguf` is never re-downloaded.
+pub async fn ensure_cached_refresh(model: &HfModelRef, refresh: bool) -> Result<CachedFile> {
     if let Some(src) = &model.local_source {
         return import_into_cache(src, &model.repo);
     }
@@ -696,7 +703,7 @@ pub async fn ensure_cached(model: &HfModelRef) -> Result<CachedFile> {
         crate::style::dim("⟳"),
         crate::style::cyan(&model.repo)
     );
-    let resolved = resolve_gguf_file(model).await?;
+    let resolved = resolve_gguf_file(model, refresh).await?;
     eprintln!(
         "  {} Found {} ({})",
         crate::style::dim("·"),
@@ -732,6 +739,10 @@ pub async fn ensure_cached(model: &HfModelRef) -> Result<CachedFile> {
             human_size(resolved.size_bytes)
         );
     }
+
+    // Cache the resolve only now — a failed download (e.g. 401 on a gated
+    // repo) must never pin re-runs to the same unreachable file.
+    save_cached_metadata(model, &resolved);
 
     Ok(CachedFile {
         repo: resolved.repo,
@@ -1294,13 +1305,13 @@ struct TreeEntry {
     kind: String,
 }
 
-async fn resolve_gguf_file(model: &HfModelRef) -> Result<ResolvedGgufFile> {
-    if let Some(cached) = load_cached_metadata(model) {
+async fn resolve_gguf_file(model: &HfModelRef, refresh: bool) -> Result<ResolvedGgufFile> {
+    if !refresh && let Some(cached) = load_cached_metadata(model) {
         return Ok(cached);
     }
-    let resolved = resolve_gguf_file_uncached(model).await?;
-    save_cached_metadata(model, &resolved);
-    Ok(resolved)
+    // Saved by the caller after a successful download, not here — so a
+    // download failure leaves no cached resolve to stick to on retry.
+    resolve_gguf_file_uncached(model).await
 }
 
 async fn resolve_gguf_file_uncached(model: &HfModelRef) -> Result<ResolvedGgufFile> {
@@ -1721,11 +1732,21 @@ async fn stream_to_file(
         .await
         .with_context(|| format!("GET {} failed", file.download_url))?;
     if !resp.status().is_success() {
-        anyhow::bail!(
-            "Download of {} returned HTTP {}",
-            file.filename,
-            resp.status()
-        );
+        let status = resp.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            anyhow::bail!(
+                "Download of {} returned HTTP {status} — this looks like a gated or private \
+                 repo (e.g. `google/gemma-*`). aivo can't authenticate to HuggingFace yet.\n  \
+                 · Pull an ungated community GGUF mirror instead — a `bartowski/…-GGUF`, \
+                 `unsloth/…-GGUF`, or `lmstudio-community/…-GGUF` repo.\n  \
+                 · Re-run with `--refresh` to drop the cached pick and re-resolve.",
+                file.filename,
+            );
+        }
+        anyhow::bail!("Download of {} returned HTTP {status}", file.filename);
     }
 
     // Server honored `Range` → append. Anything else (incl. 200 OK when we

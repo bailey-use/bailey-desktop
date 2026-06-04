@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::cli::{HfArgs, HfCleanArgs, HfListArgs, HfPullArgs, HfRmArgs, HfSubcommand};
 use crate::errors::ExitCode;
 use crate::services::huggingface::{
-    self, CachedModel, CachedRepo, ensure_cached, format_modified_ago, format_size,
+    self, CachedModel, CachedRepo, ensure_cached_refresh, format_modified_ago, format_size,
     is_hf_or_local_gguf, list_cached_models, list_cached_repos, parse_hf_ref, remove_all_cached,
     remove_cached_repo,
 };
@@ -74,6 +74,7 @@ impl HfCommand {
             "aivo hf list --verbose",
             "aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF",
             "aivo hf pull hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M",
+            "aivo hf pull hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF --refresh",
             "aivo hf pull ~/Downloads/Llama-3.2-3B-Instruct-Q5_K_M.gguf",
             "aivo hf pull ./my-model.gguf --as me/my-model",
             "aivo hf rm bartowski/Llama-3.2-3B-Instruct-GGUF --quant Q5_K_M",
@@ -237,7 +238,7 @@ async fn pull_action(args: HfPullArgs) -> Result<ExitCode> {
     }
 
     let was_local = hf_ref.is_local();
-    let cached = ensure_cached(&hf_ref).await?;
+    let cached = ensure_cached_refresh(&hf_ref, args.refresh).await?;
     let launch_ref = cached.launch_ref();
     if cached.was_cached {
         eprintln!(

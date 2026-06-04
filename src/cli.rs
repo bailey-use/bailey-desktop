@@ -160,6 +160,12 @@ pub struct HfPullArgs {
     /// Ignored for `hf:` / URL refs.
     #[arg(long = "as", value_name = "OWNER/REPO")]
     pub as_repo: Option<String>,
+
+    /// Ignore any cached resolve for this ref and re-resolve from
+    /// HuggingFace. Use after a failed pull so a prior (stale or gated)
+    /// pick doesn't pin the retry to the same file.
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 #[derive(Args, Debug, Clone)]

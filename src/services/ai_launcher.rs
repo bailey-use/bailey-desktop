@@ -129,7 +129,7 @@ impl AIToolType {
             Self::Codex | Self::CodexApp => "npm install -g @openai/codex",
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "curl -fsSL https://opencode.ai/install | bash",
-            Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
+            Self::Pi => "npm install -g @earendil-works/pi-coding-agent",
         }
         #[cfg(not(unix))]
         match self {
@@ -137,7 +137,7 @@ impl AIToolType {
             Self::Codex | Self::CodexApp => "npm install -g @openai/codex",
             Self::Gemini => "npm install -g @google/gemini-cli",
             Self::Opencode => "npm install -g opencode-ai",
-            Self::Pi => "npm install -g @mariozechner/pi-coding-agent",
+            Self::Pi => "npm install -g @earendil-works/pi-coding-agent",
         }
     }
 

@@ -335,6 +335,21 @@ async fn handle_router_request(
     }
 }
 
+/// Before bailing a streaming attempt on a non-200, peek the error body and
+/// learn the `requires_reasoning_content` quirk so the buffered fallback's
+/// first attempt is already strict instead of eating a second 400. Consumes
+/// the response (we're bailing regardless).
+async fn note_streaming_failure(
+    response: reqwest::Response,
+    learned_requires_reasoning: &AtomicBool,
+) {
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    if classify_failed_attempt(status, &body).quirk_hint == Some("requires_reasoning_content") {
+        learned_requires_reasoning.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Routes the request based on body format:
 /// - Responses API format (has "input" array): convert ↔ Chat Completions
 /// - Chat Completions format: filter non-function tools and forward
@@ -712,8 +727,10 @@ async fn stream_responses_via_chat(
             .send_logged()
             .await?;
 
-    if response.status().as_u16() != 200 {
-        anyhow::bail!("upstream returned {}", response.status().as_u16());
+    let status = response.status().as_u16();
+    if status != 200 {
+        note_streaming_failure(response, learned_requires_reasoning).await;
+        anyhow::bail!("upstream returned {status}");
     }
     let is_sse = response
         .headers()
@@ -822,6 +839,7 @@ async fn stream_chat_completions(
 
     let status = response.status().as_u16();
     if status != 200 {
+        note_streaming_failure(response, learned_requires_reasoning).await;
         anyhow::bail!("upstream returned {status}");
     }
 
@@ -1381,6 +1399,45 @@ mod tests {
         assert!(!response_is_2xx("HTTP/1.1 502 Bad Gateway\r\n"));
         assert!(!response_is_2xx("HTTP/1.1 429 Too Many Requests\r\n"));
         assert!(!response_is_2xx("garbage"));
+    }
+
+    fn mock_response(status: u16, body: &str) -> reqwest::Response {
+        http::Response::builder()
+            .status(status)
+            .header("content-type", CONTENT_TYPE_JSON)
+            .body(body.to_string())
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn note_streaming_failure_learns_reasoning_quirk_from_400() {
+        // The exact DeepSeek thinking-mode rejection from the bug report: the
+        // streaming bail must flip the learned flag so the buffered fallback's
+        // first attempt is already strict instead of eating a second 400.
+        let body = r#"{"error":{"message":"The reasoning_content in the thinking mode must be passed back to the API.","type":"invalid_request_error","code":"invalid_request_error"}}"#;
+        let learned = AtomicBool::new(false);
+        note_streaming_failure(mock_response(400, body), &learned).await;
+        assert!(learned.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn note_streaming_failure_ignores_unrelated_400() {
+        let body =
+            r#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#;
+        let learned = AtomicBool::new(false);
+        note_streaming_failure(mock_response(400, body), &learned).await;
+        assert!(!learned.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn note_streaming_failure_does_not_mislearn_when_field_is_rejected() {
+        // Provider says it does NOT accept the field — flipping the flag would
+        // inject reasoning_content into an upstream that rejects it.
+        let body = r#"{"error":{"message":"Unknown field reasoning_content","type":"invalid_request_error"}}"#;
+        let learned = AtomicBool::new(false);
+        note_streaming_failure(mock_response(400, body), &learned).await;
+        assert!(!learned.load(Ordering::Relaxed));
     }
 
     #[test]

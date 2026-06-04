@@ -3,6 +3,9 @@
 //! Checked before clap, and only when the sibling exists, so built-ins, tools,
 //! and the chat shortcut always win.
 
+pub(crate) mod manifest;
+pub(crate) mod registry;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

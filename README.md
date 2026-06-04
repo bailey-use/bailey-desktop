@@ -250,6 +250,20 @@ aivo update --force                          # force even if pkg-managed
 aivo update --rollback                       # restore previous backup
 ```
 
+## plugins
+
+Add a top-level command — a standalone `aivo-<name>` executable, in any language, that aivo runs
+as `aivo <name>`. Plugins run with your privileges; install only ones you trust. Full contract:
+[docs/PLUGIN-PROTOCOL.md](docs/PLUGIN-PROTOCOL.md).
+
+```bash
+aivo plugins install ./aivo-amp              # local file or http(s) URL
+aivo amp --help                              # runs the sibling aivo-amp
+aivo plugins list                            # installed, with version/roles/caps
+aivo plugins update amp                      # re-fetch from the recorded source
+aivo plugins remove amp
+```
+
 ## License
 
 MIT

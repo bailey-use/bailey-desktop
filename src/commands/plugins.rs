@@ -2,9 +2,8 @@
 //! Plugins are `aivo-<name>` executables in `~/.config/aivo/plugins/`; dispatch
 //! lives in `crate::plugin`.
 
-use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -12,11 +11,15 @@ use crate::cli::{
     PluginInstallArgs, PluginRemoveArgs, PluginUpdateArgs, PluginsArgs, PluginsSubcommand,
 };
 use crate::errors::ExitCode;
+use crate::plugin::manifest::{PluginManifest, probe_manifest};
+use crate::plugin::registry::{self, PluginRecord};
 use crate::plugin::{
     PLUGIN_PREFIX, discover, infer_plugin_name, installed_plugins, is_reserved_plugin_name,
     plugins_dir,
 };
+use crate::services::device_fingerprint::hex_sha256;
 use crate::style;
+use chrono::Utc;
 
 const INSTALL_HINT: &str = "Install one with `aivo plugins install <path|url>`.";
 
@@ -104,6 +107,7 @@ fn list_action() -> Result<ExitCode> {
     }
 
     let managed_dir = plugins_dir();
+    let records = registry::load().plugins;
     let width = plugins
         .iter()
         .map(|(n, _)| n.len())
@@ -114,13 +118,34 @@ fn list_action() -> Result<ExitCode> {
         let is_managed = managed_dir
             .as_deref()
             .is_some_and(|d| path.parent() == Some(d));
-        let tag = if is_managed { "" } else { " (external)" };
+        let manifest = records.get(name).and_then(|r| r.manifest.as_ref());
+        let tag = if !is_managed {
+            " (external)"
+        } else if manifest.is_none() {
+            " (no manifest)"
+        } else {
+            ""
+        };
         println!(
             "  {}  {}{}",
             style::cyan(format!("{name:<width$}")),
             style::dim(path.display().to_string()),
             style::dim(tag),
         );
+        if let Some(m) = manifest {
+            let mut bits = vec![format!("v{}", m.version)];
+            if !m.roles.is_empty() {
+                bits.push(m.roles.join("+"));
+            }
+            if !m.capabilities.is_empty() {
+                bits.push(format!("caps: {}", m.capabilities.join(", ")));
+            }
+            println!(
+                "  {}  {}",
+                " ".repeat(width),
+                style::dim(bits.join("  ·  "))
+            );
+        }
     }
     Ok(ExitCode::Success)
 }
@@ -151,8 +176,8 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
 
     // Stable, re-fetchable source (absolute path for local files) for `update`.
     let source = canonical_source(&args.source);
-    reinstall(&name, &source, &dir).await?;
-    record_source(&name, &source);
+    let outcome = reinstall(&name, &source, &dir).await?;
+    record_install(&name, &source, &outcome);
 
     eprintln!(
         "  {} Installed plugin `{}` — run it with {}",
@@ -165,16 +190,17 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         style::dim("·"),
         style::dim(target.display().to_string())
     );
+    print_disclosure(&outcome);
     Ok(ExitCode::Success)
 }
 
 async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
     let dir = plugins_dir().context("could not resolve ~/.config/aivo/plugins")?;
-    let sources = load_sources();
+    let records = registry::load().plugins;
 
     let targets: Vec<String> = match args.name {
         Some(n) => vec![n.strip_prefix(PLUGIN_PREFIX).unwrap_or(&n).to_string()],
-        None => sources.keys().cloned().collect(),
+        None => records.keys().cloned().collect(),
     };
     if targets.is_empty() {
         eprintln!(
@@ -187,7 +213,7 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
 
     let mut any_failed = false;
     for name in &targets {
-        let Some(source) = sources.get(name) else {
+        let Some(source) = records.get(name).map(|r| r.source.clone()) else {
             any_failed = true;
             if discover(name).is_some() {
                 eprintln!(
@@ -199,12 +225,15 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
             }
             continue;
         };
-        match reinstall(name, source, &dir).await {
-            Ok(()) => eprintln!(
-                "  {} Updated `{name}` from {}",
-                style::success_symbol(),
-                style::dim(source)
-            ),
+        match reinstall(name, &source, &dir).await {
+            Ok(outcome) => {
+                record_install(name, &source, &outcome);
+                eprintln!(
+                    "  {} Updated `{name}` from {}",
+                    style::success_symbol(),
+                    style::dim(&source)
+                );
+            }
             Err(e) => {
                 any_failed = true;
                 eprintln!("  {} `{name}`: {e:#}", style::red("✗"));
@@ -243,7 +272,7 @@ fn remove_action(args: PluginRemoveArgs) -> Result<ExitCode> {
     }
 
     std::fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
-    forget_source(&name);
+    registry::forget(&name);
     eprintln!("  {} Removed plugin `{name}`", style::success_symbol());
     Ok(ExitCode::Success)
 }
@@ -284,12 +313,33 @@ fn plugin_filename(name: &str) -> String {
     }
 }
 
-/// Fetch `source` and write `aivo-<name>` into `dir`, overwriting any existing
-/// binary. Shared by install and update.
-async fn reinstall(name: &str, source: &str, dir: &Path) -> Result<()> {
+/// Outcome of a fetch+install: the integrity pin and the probed manifest (if the
+/// plugin self-describes). Shared by install and update.
+struct InstallOutcome {
+    checksum: String,
+    manifest: Option<PluginManifest>,
+}
+
+/// Fetch `source`, write `aivo-<name>` into `dir` (overwriting), then probe the
+/// installed binary for a manifest. The probe is best-effort — a plugin that
+/// doesn't self-describe still installs, just without recorded metadata.
+///
+/// The probe runs for **local-path installs only**: aivo won't execute a
+/// freshly-downloaded (`http(s)://`) binary to read its manifest before an
+/// install-consent gate exists (a later phase). URL installs are recorded
+/// without a manifest until re-installed from a local path.
+async fn reinstall(name: &str, source: &str, dir: &Path) -> Result<InstallOutcome> {
     let bytes = fetch_source(source).await?;
+    let checksum = format!("sha256:{}", hex_sha256(&bytes));
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    write_executable(&dir.join(plugin_filename(name)), &bytes)
+    let target = dir.join(plugin_filename(name));
+    write_executable(&target, &bytes)?;
+    let manifest = if is_url(source) {
+        None
+    } else {
+        probe_manifest(&target, name).await
+    };
+    Ok(InstallOutcome { checksum, manifest })
 }
 
 /// A stable, re-fetchable form of the install source: URLs verbatim, local
@@ -308,48 +358,52 @@ fn is_url(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
 }
 
-// ── Source index (.sources.json) ──────────────────────────────────────────
-// Where each plugin came from, so `update` can re-fetch. Dotfile → not discovered.
+// ── Registry write + install disclosure ────────────────────────────────────
 
-fn sources_path() -> Option<PathBuf> {
-    plugins_dir().map(|d| d.join(".sources.json"))
+/// Persist provenance (source + checksum + manifest + timestamp) so `update`
+/// can re-fetch and `list` can show what a plugin declared. See
+/// `crate::plugin::registry`.
+fn record_install(name: &str, source: &str, outcome: &InstallOutcome) {
+    registry::record(
+        name,
+        PluginRecord {
+            source: source.to_string(),
+            checksum: Some(outcome.checksum.clone()),
+            manifest: outcome.manifest.clone(),
+            installed_at: Some(Utc::now().to_rfc3339()),
+        },
+    );
 }
 
-fn load_sources() -> BTreeMap<String, String> {
-    sources_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
-}
-
-/// Load the index, apply `mutate`, save if it changed. Best-effort — a write
-/// failure only costs a future `update` (which warns).
-fn update_sources(mutate: impl FnOnce(&mut BTreeMap<String, String>) -> bool) {
-    let mut map = load_sources();
-    if mutate(&mut map) {
-        let _ = save_sources(&map);
+/// Surface what a freshly-installed plugin declared about itself. Capabilities
+/// are disclosure-only in protocol v1 — nothing is granted or enforced yet
+/// (a consent gate + a scoped endpoint are a later phase), so this stays low-key
+/// rather than implying a grant. See `docs/PLUGIN-PROTOCOL.md`.
+fn print_disclosure(outcome: &InstallOutcome) {
+    let Some(m) = &outcome.manifest else {
+        eprintln!(
+            "  {} {}",
+            style::dim("·"),
+            style::dim("no manifest — runs as a plain subcommand")
+        );
+        return;
+    };
+    let mut bits = vec![format!("v{}", m.version)];
+    if !m.roles.is_empty() {
+        bits.push(format!("roles: {}", m.roles.join(", ")));
     }
-}
-
-fn record_source(name: &str, source: &str) {
-    update_sources(|m| {
-        m.insert(name.to_string(), source.to_string());
-        true
-    });
-}
-
-fn forget_source(name: &str) {
-    update_sources(|m| m.remove(name).is_some());
-}
-
-fn save_sources(map: &BTreeMap<String, String>) -> Result<()> {
-    let path = sources_path().context("could not resolve the plugin source index path")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    if !m.capabilities.is_empty() {
+        bits.push(format!("declares caps: {}", m.capabilities.join(", ")));
     }
-    let text = serde_json::to_string_pretty(map).context("serializing plugin sources")?;
-    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    eprintln!("  {} {}", style::dim("·"), style::dim(bits.join("  ·  ")));
+    if !m.capabilities.is_empty() {
+        eprintln!(
+            "    {}",
+            style::dim(
+                "(capabilities are disclosure-only here — not granted or enforced; see docs/PLUGIN-PROTOCOL.md)"
+            )
+        );
+    }
 }
 
 async fn fetch_source(source: &str) -> Result<Vec<u8>> {

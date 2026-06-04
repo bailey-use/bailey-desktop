@@ -401,3 +401,122 @@ fn plugins_update_reinstalls_from_recorded_source() {
         "update should pick up the rebuilt source"
     );
 }
+
+/// Self-describes via `--aivo-manifest` (first arg), else dispatches normally.
+#[cfg(unix)]
+const MANIFEST_PLUGIN: &str = r#"#!/bin/sh
+if [ "$1" = "--aivo-manifest" ]; then
+  printf '%s\n' '{"name":"widget","version":"0.3.0","protocol":"1","roles":["subcommand"],"capabilities":["endpoint"],"description":"demo"}'
+  exit 0
+fi
+echo "widget ran: $*"
+exit 0
+"#;
+
+#[cfg(unix)]
+#[test]
+fn plugins_install_captures_manifest_and_surfaces_it() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(&src, "aivo-widget", MANIFEST_PLUGIN);
+
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+
+    // The registry captured the probed manifest + an integrity pin.
+    let registry_path = home.path().join(".config/aivo/plugins/.registry.json");
+    let registry: Value =
+        serde_json::from_str(&std::fs::read_to_string(&registry_path).expect("registry file"))
+            .expect("registry json");
+    let rec = &registry["plugins"]["widget"];
+    assert_eq!(rec["manifest"]["version"], "0.3.0");
+    assert_eq!(rec["manifest"]["capabilities"][0], "endpoint");
+    assert!(
+        rec["checksum"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"),
+        "expected a sha256 pin, got:\n{rec}"
+    );
+
+    // `plugins list` shows the version + declared capability.
+    let list = run_ok(&home, &["plugins", "list"]);
+    assert!(list.contains("0.3.0"), "list:\n{list}");
+    assert!(list.contains("endpoint"), "list:\n{list}");
+
+    // `--help-json` enriches the plugin entry from the registry.
+    let help: Value = serde_json::from_str(&run_ok(&home, &["--help-json"])).expect("help json");
+    let entry = help["plugins"]
+        .as_array()
+        .expect("plugins array")
+        .iter()
+        .find(|p| p["name"] == "widget")
+        .expect("widget in help-json plugins");
+    assert_eq!(entry["version"], "0.3.0");
+    assert_eq!(entry["roles"][0], "subcommand");
+    assert_eq!(entry["capabilities"][0], "endpoint");
+}
+
+#[cfg(unix)]
+fn registry_json(home: &TempDir) -> Value {
+    let path = home.path().join(".config/aivo/plugins/.registry.json");
+    serde_json::from_str(&std::fs::read_to_string(&path).expect("registry file"))
+        .expect("registry json")
+}
+
+/// Hangs on the manifest probe; the host's timeout must reap it and install anyway.
+#[cfg(unix)]
+const SLOW_MANIFEST_PLUGIN: &str = r#"#!/bin/sh
+if [ "$1" = "--aivo-manifest" ]; then
+  sleep 30
+fi
+echo "slow ran"
+"#;
+
+#[cfg(unix)]
+#[test]
+fn plugins_install_survives_a_hanging_manifest_probe() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(&src, "aivo-slow", SLOW_MANIFEST_PLUGIN);
+
+    // Must return (the probe is deadline-bounded), installing without a manifest.
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+    assert!(
+        registry_json(&home)["plugins"]["slow"]["manifest"].is_null(),
+        "a hung probe must yield no manifest"
+    );
+    // It still dispatches normally.
+    assert!(run_ok(&home, &["slow"]).contains("slow ran"));
+}
+
+/// Prints junk and exits non-zero on the probe → no manifest, but still installs.
+#[cfg(unix)]
+const FAILING_MANIFEST_PLUGIN: &str = r#"#!/bin/sh
+if [ "$1" = "--aivo-manifest" ]; then
+  echo "not a manifest"
+  exit 1
+fi
+echo "ran fine"
+"#;
+
+#[cfg(unix)]
+#[test]
+fn plugins_install_records_no_manifest_on_probe_failure() {
+    let home = TempDir::new().unwrap();
+    let src = TempDir::new().unwrap();
+    let plugin_src = fake_plugin(&src, "aivo-grumpy", FAILING_MANIFEST_PLUGIN);
+
+    run_ok(&home, &["plugins", "install", plugin_src.to_str().unwrap()]);
+    let rec = &registry_json(&home)["plugins"]["grumpy"];
+    assert!(
+        rec["manifest"].is_null(),
+        "a non-zero probe exit must yield no manifest"
+    );
+    assert!(
+        rec["checksum"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:"),
+        "but the integrity pin is still recorded"
+    );
+}

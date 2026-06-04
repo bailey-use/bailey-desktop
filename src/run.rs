@@ -901,6 +901,26 @@ async fn print_active_selection(session_store: &SessionStore) {
 fn print_help_json() {
     let cmd = Cli::command();
     let tree = serialize_command(&cmd);
+    // Enrich each plugin entry with its cached manifest (version / roles / caps).
+    let registry = plugin::registry::load().plugins;
+    let plugins = plugin::installed_plugin_names()
+        .into_iter()
+        .map(|name| {
+            let mut obj = Map::new();
+            obj.insert("name".into(), json!(name));
+            obj.insert("binary".into(), json!(format!("aivo-{name}")));
+            if let Some(m) = registry.get(&name).and_then(|r| r.manifest.as_ref()) {
+                obj.insert("version".into(), json!(m.version));
+                if !m.roles.is_empty() {
+                    obj.insert("roles".into(), json!(m.roles));
+                }
+                if !m.capabilities.is_empty() {
+                    obj.insert("capabilities".into(), json!(m.capabilities));
+                }
+            }
+            Value::Object(obj)
+        })
+        .collect::<Vec<_>>();
     let payload = json!({
         "name": "aivo",
         "version": version::VERSION,
@@ -928,10 +948,7 @@ fn print_help_json() {
             { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
             { "name": "AIVO_DEBUG", "desc": "Surface upstream HTTP request/response detail in some flows (=1)" }
         ],
-        "plugins": plugin::installed_plugin_names()
-            .into_iter()
-            .map(|name| json!({ "name": name, "binary": format!("aivo-{name}") }))
-            .collect::<Vec<_>>(),
+        "plugins": plugins,
         "tree": tree,
     });
     match serde_json::to_string_pretty(&payload) {

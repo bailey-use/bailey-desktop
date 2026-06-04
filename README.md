@@ -258,9 +258,12 @@ as `aivo <name>`. Plugins run with your privileges; install only ones you trust.
 
 ```bash
 aivo plugins install ./aivo-amp              # local file or http(s) URL
+aivo plugins install github:owner/aivo-amp   # GitHub release (picks your OS/arch asset)
+aivo plugins install npm:aivo-foo            # npm package (node shim)
+aivo plugins install cargo:aivo-bar          # cargo install from crates.io
 aivo amp --help                              # runs the sibling aivo-amp
 aivo plugins list                            # installed, with version/roles/caps
-aivo plugins update amp                      # re-fetch from the recorded source
+aivo plugins update amp                      # re-fetch / re-resolve the recorded source
 aivo plugins remove amp
 ```
 

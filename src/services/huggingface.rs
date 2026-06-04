@@ -15,6 +15,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
+use crate::services::archive::{ArchiveKind, extract_archive, flatten_single_subdir};
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils;
 use crate::services::system_env;
@@ -409,12 +410,6 @@ fn run_brew_install() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArchiveKind {
-    TarGz,
-    Zip,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ReleaseTarget {
     /// Substring that must terminate a release asset's filename
@@ -600,56 +595,6 @@ fn render_download_progress(downloaded: u64, total: u64) {
         );
     }
     let _ = std::io::stderr().flush();
-}
-
-/// Shells out to `tar` (universal on Unix, ships in Windows 10+ as `tar.exe`
-/// backed by libarchive — handles both `.tar.gz` and `.zip`).
-fn extract_archive(archive: &Path, dest_dir: &Path, kind: ArchiveKind) -> Result<()> {
-    let mut cmd = Command::new("tar");
-    match kind {
-        ArchiveKind::TarGz => cmd.arg("-xzf"),
-        ArchiveKind::Zip => cmd.arg("-xf"),
-    };
-    cmd.arg(archive).arg("-C").arg(dest_dir);
-    let output = cmd.output().context(
-        "Failed to invoke `tar` to extract the archive. On Windows ensure tar.exe is on PATH.",
-    )?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "tar failed to extract {}: {}",
-            archive.display(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    Ok(())
-}
-
-/// llama.cpp tarballs extract to a single `llama-bXXXX/` directory containing
-/// the binary + `.so`/`.dylib`/`.dll` files. Move that directory's contents up
-/// one level so `dest_dir/llama-server` is where `detect_binary` expects it.
-fn flatten_single_subdir(dest_dir: &Path) -> Result<()> {
-    let entries: Vec<_> = std::fs::read_dir(dest_dir)
-        .with_context(|| format!("Failed to read {}", dest_dir.display()))?
-        .collect::<std::io::Result<Vec<_>>>()
-        .with_context(|| format!("Failed to enumerate {}", dest_dir.display()))?;
-
-    let only = match entries.as_slice() {
-        [e] if e.file_type().map(|t| t.is_dir()).unwrap_or(false) => e.path(),
-        _ => return Ok(()),
-    };
-
-    for sub in
-        std::fs::read_dir(&only).with_context(|| format!("Failed to read {}", only.display()))?
-    {
-        let sub = sub.with_context(|| format!("Failed to read entry in {}", only.display()))?;
-        let from = sub.path();
-        let to = dest_dir.join(sub.file_name());
-        std::fs::rename(&from, &to)
-            .with_context(|| format!("Failed to move {} -> {}", from.display(), to.display()))?;
-    }
-    std::fs::remove_dir(&only)
-        .with_context(|| format!("Failed to remove now-empty {}", only.display()))?;
-    Ok(())
 }
 
 fn alloc_free_port() -> Result<u16> {

@@ -5,6 +5,7 @@
 
 pub(crate) mod manifest;
 pub(crate) mod registry;
+pub(crate) mod source;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -128,17 +129,10 @@ pub fn is_reserved_plugin_name(name: &str) -> bool {
     name == "help" || RESERVED_ALIAS_NAMES.contains(&name) || KNOWN_TOOLS.contains(&name)
 }
 
-/// Infer a plugin name from an install source (path or URL): the final path
-/// segment, minus any `?query`/`#frag`, file extension, and leading `aivo-`.
+/// Infer a plugin name from an install source. Scheme-aware (github:/npm:/cargo:/
+/// URL/local) — delegates to the source classifier.
 pub fn infer_plugin_name(source: &str) -> Option<String> {
-    let last = source.rsplit(['/', '\\']).next().unwrap_or(source);
-    let last = last.split(['?', '#']).next().unwrap_or(last);
-    let stem = std::path::Path::new(last)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(last);
-    let name = stem.strip_prefix(PLUGIN_PREFIX).unwrap_or(stem).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    source::suggested_name(source)
 }
 
 /// Spawn the plugin with stdio inherited and wait for it. Spawn-and-wait (not

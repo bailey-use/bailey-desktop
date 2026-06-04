@@ -3,7 +3,7 @@
 //! lives in `crate::plugin`.
 
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -13,15 +13,16 @@ use crate::cli::{
 use crate::errors::ExitCode;
 use crate::plugin::manifest::{PluginManifest, probe_manifest};
 use crate::plugin::registry::{self, PluginRecord};
+use crate::plugin::source::{self, SourceKind};
 use crate::plugin::{
     PLUGIN_PREFIX, discover, infer_plugin_name, installed_plugins, is_reserved_plugin_name,
     plugins_dir,
 };
-use crate::services::device_fingerprint::hex_sha256;
 use crate::style;
 use chrono::Utc;
 
-const INSTALL_HINT: &str = "Install one with `aivo plugins install <path|url>`.";
+const INSTALL_HINT: &str =
+    "Install one with `aivo plugins install <source>` (path, url, github:/npm:/cargo:).";
 
 #[derive(Default)]
 pub struct PluginsCommand;
@@ -68,8 +69,8 @@ impl PluginsCommand {
             "Show installed plugins and where each resolves (default)",
         );
         row(
-            "install <path|url> [--name N]",
-            "Install from a local file or http(s) URL (--force to overwrite)",
+            "install <source> [--name N]",
+            "Install from a path, URL, github:owner/repo, npm:pkg, or cargo:crate",
         );
         row(
             "update [name]",
@@ -81,7 +82,9 @@ impl PluginsCommand {
         for ex in [
             "aivo plugins",
             "aivo plugins install ./target/release/aivo-amp",
-            "aivo plugins install https://example.com/dl/aivo-amp --name amp",
+            "aivo plugins install github:owner/aivo-amp",
+            "aivo plugins install npm:aivo-foo",
+            "aivo plugins install cargo:aivo-bar",
             "aivo plugins update amp",
             "aivo plugins remove amp",
             "aivo amp --help        # run an installed plugin",
@@ -156,8 +159,13 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
 
     let name = match args.name {
         Some(n) => n,
-        None => infer_plugin_name(&args.source)
-            .context("could not infer a plugin name from the source — pass --name <name>")?,
+        None => {
+            // Surface a specific scheme error (e.g. `expected github:owner/repo`)
+            // ahead of the generic name-inference failure.
+            source::classify(&args.source)?;
+            infer_plugin_name(&args.source)
+                .context("could not infer a plugin name from the source — pass --name <name>")?
+        }
     };
     validate_name(&name)?;
     if is_reserved_plugin_name(&name) {
@@ -166,7 +174,7 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         );
     }
 
-    let target = dir.join(plugin_filename(&name));
+    let target = dir.join(source::plugin_filename(&name));
     if target.exists() && !args.force {
         anyhow::bail!(
             "plugin `{name}` is already installed at {}. Pass --force to overwrite.",
@@ -188,7 +196,7 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
     eprintln!(
         "  {} {}",
         style::dim("·"),
-        style::dim(target.display().to_string())
+        style::dim(outcome.primary.display().to_string())
     );
     print_disclosure(&outcome);
     Ok(ExitCode::Success)
@@ -255,7 +263,13 @@ fn remove_action(args: PluginRemoveArgs) -> Result<ExitCode> {
         .strip_prefix(PLUGIN_PREFIX)
         .unwrap_or(&args.name)
         .to_string();
-    let target = dir.join(plugin_filename(&name));
+    // Binary plugins are `aivo-<name>`; an npm plugin's shim may be `.cmd` on Windows.
+    let bin = dir.join(source::plugin_filename(&name));
+    let target = if bin.exists() {
+        bin
+    } else {
+        dir.join(format!("{PLUGIN_PREFIX}{name}.cmd"))
+    };
 
     if !target.exists() {
         if let Some(found) = discover(&name) {
@@ -272,6 +286,11 @@ fn remove_action(args: PluginRemoveArgs) -> Result<ExitCode> {
     }
 
     std::fs::remove_file(&target).with_context(|| format!("removing {}", target.display()))?;
+    // npm plugins also leave an `aivo-<name>.d/` payload directory.
+    let bundle = dir.join(format!("{PLUGIN_PREFIX}{name}.d"));
+    if bundle.is_dir() {
+        let _ = std::fs::remove_dir_all(&bundle);
+    }
     registry::forget(&name);
     eprintln!("  {} Removed plugin `{name}`", style::success_symbol());
     Ok(ExitCode::Success)
@@ -304,58 +323,43 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// On-disk filename for a plugin: `aivo-<name>` (`.exe` on Windows).
-fn plugin_filename(name: &str) -> String {
-    if cfg!(windows) {
-        format!("{PLUGIN_PREFIX}{name}.exe")
-    } else {
-        format!("{PLUGIN_PREFIX}{name}")
-    }
-}
-
-/// Outcome of a fetch+install: the integrity pin and the probed manifest (if the
-/// plugin self-describes). Shared by install and update.
+/// Outcome of materializing a source: where it installed, the integrity pin, and
+/// the probed manifest (local installs only). Shared by install and update.
 struct InstallOutcome {
-    checksum: String,
+    primary: PathBuf,
+    checksum: Option<String>,
     manifest: Option<PluginManifest>,
 }
 
-/// Fetch `source`, write `aivo-<name>` into `dir` (overwriting), then probe the
-/// installed binary for a manifest. The probe is best-effort — a plugin that
-/// doesn't self-describe still installs, just without recorded metadata.
-///
-/// The probe runs for **local-path installs only**: aivo won't execute a
-/// freshly-downloaded (`http(s)://`) binary to read its manifest before an
-/// install-consent gate exists (a later phase). URL installs are recorded
-/// without a manifest until re-installed from a local path.
+/// Resolve the source (local path / URL / `github:` / `npm:` / `cargo:`), install
+/// `aivo-<name>` into `dir`, and probe for a manifest. The probe runs for
+/// **local-path installs only** — aivo won't execute a freshly-fetched remote
+/// binary to read its manifest before an install-consent gate exists (a later
+/// phase); such plugins are recorded manifest-less until reinstalled locally.
 async fn reinstall(name: &str, source: &str, dir: &Path) -> Result<InstallOutcome> {
-    let bytes = fetch_source(source).await?;
-    let checksum = format!("sha256:{}", hex_sha256(&bytes));
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let target = dir.join(plugin_filename(name));
-    write_executable(&target, &bytes)?;
-    let manifest = if is_url(source) {
+    let materialized = source::materialize(source, name, dir).await?;
+    let manifest = if materialized.trusted_local {
+        probe_manifest(&materialized.primary, name).await
+    } else {
         None
-    } else {
-        probe_manifest(&target, name).await
     };
-    Ok(InstallOutcome { checksum, manifest })
+    Ok(InstallOutcome {
+        primary: materialized.primary,
+        checksum: materialized.checksum,
+        manifest,
+    })
 }
 
-/// A stable, re-fetchable form of the install source: URLs verbatim, local
-/// paths made absolute so `update` works regardless of the current directory.
+/// A stable, re-fetchable form of the install source: scheme strings (`github:`,
+/// `npm:`, `cargo:`, URLs) verbatim so `update` re-resolves; local paths made
+/// absolute so `update` works regardless of the current directory.
 fn canonical_source(source: &str) -> String {
-    if is_url(source) {
-        source.to_string()
-    } else {
-        std::fs::canonicalize(source)
+    match source::classify(source) {
+        Ok(SourceKind::LocalPath) | Err(_) => std::fs::canonicalize(source)
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| source.to_string())
+            .unwrap_or_else(|_| source.to_string()),
+        _ => source.to_string(),
     }
-}
-
-fn is_url(source: &str) -> bool {
-    source.starts_with("http://") || source.starts_with("https://")
 }
 
 // ── Registry write + install disclosure ────────────────────────────────────
@@ -368,7 +372,7 @@ fn record_install(name: &str, source: &str, outcome: &InstallOutcome) {
         name,
         PluginRecord {
             source: source.to_string(),
-            checksum: Some(outcome.checksum.clone()),
+            checksum: outcome.checksum.clone(),
             manifest: outcome.manifest.clone(),
             installed_at: Some(Utc::now().to_rfc3339()),
         },
@@ -404,65 +408,4 @@ fn print_disclosure(outcome: &InstallOutcome) {
             )
         );
     }
-}
-
-async fn fetch_source(source: &str) -> Result<Vec<u8>> {
-    if is_url(source) {
-        download(source).await
-    } else {
-        let path = Path::new(source);
-        let meta =
-            std::fs::metadata(path).with_context(|| format!("reading local source `{source}`"))?;
-        if !meta.is_file() {
-            anyhow::bail!("`{source}` is not a file");
-        }
-        std::fs::read(path).with_context(|| format!("reading `{source}`"))
-    }
-}
-
-async fn download(url: &str) -> Result<Vec<u8>> {
-    eprintln!("  {} Downloading {url}", style::dim("·"));
-    // Reuse aivo's shared client so proxy / IPv4-only / Termux-DNS handling apply.
-    let client = crate::services::http_utils::aivo_http_client_builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .context("failed to build HTTP client")?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("requesting {url}"))?
-        .error_for_status()
-        .with_context(|| format!("downloading {url}"))?;
-    let bytes = resp.bytes().await.context("reading download body")?;
-    Ok(bytes.to_vec())
-}
-
-/// Write via a temp dotfile + rename, so a partial write never leaves a
-/// half-written (or discoverable `aivo-*`) binary. Sets the exec bit on Unix.
-fn write_executable(target: &Path, bytes: &[u8]) -> Result<()> {
-    let file_name = target
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = target.with_file_name(format!(".{file_name}.tmp"));
-
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    set_executable(&tmp)?;
-    std::fs::rename(&tmp, target).with_context(|| format!("installing {}", target.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<()> {
-    Ok(())
 }

@@ -101,11 +101,29 @@ transform launches/routing over JSON-RPC), a **scoped control endpoint** (`AIVO_
 an ephemeral token → routed access without the raw key) that makes capabilities *enforceable*,
 and **signing / a discovery index**.
 
+## Install sources
+
+`aivo plugins install <source>` accepts several forms:
+
+| Source | Example | Notes |
+|---|---|---|
+| local path | `./aivo-foo` | the binary as-is (the only form probed for a manifest) |
+| direct URL | `https://host/dl/aivo-foo` | downloads the binary, or a `.tar.gz`/`.zip` and unpacks it |
+| GitHub | `github:owner/repo[@tag]`, `gh:owner/repo`, bare `https://github.com/owner/repo` | resolves the release and picks the asset matching your OS+arch |
+| npm | `npm:pkg`, `npm:@scope/pkg@1.2.0` | fetches the tarball and writes a `node` shim — needs Node.js to run |
+| cargo | `cargo:crate[@version]` | `cargo install`s it (builds from source; needs a Rust toolchain) |
+
+A release asset / archive must contain an executable named `aivo-<name>` (or a single
+executable). `aivo plugins update` re-runs the recorded source — `github:owner/repo` (no tag)
+re-resolves to the latest release; a pinned `@tag`/`@version` stays put. `AIVO_GITHUB_API` /
+`AIVO_NPM_REGISTRY` override the endpoints (GitHub Enterprise, private mirrors). Remote installs
+(URL/github/npm/cargo) are recorded without a manifest — the probe runs for local installs only.
+
 ## Commands
 
 ```bash
 aivo plugins list
-aivo plugins install <path|url> [--name N] [--force]
-aivo plugins update [name]      # re-fetch from the recorded source
+aivo plugins install <source> [--name N] [--force]   # path, url, github:/gh:, npm:, cargo:
+aivo plugins update [name]      # re-fetch / re-resolve from the recorded source
 aivo plugins remove <name>
 ```

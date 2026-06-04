@@ -224,8 +224,9 @@ pub enum PluginsSubcommand {
 
 #[derive(Args, Debug, Clone)]
 pub struct PluginInstallArgs {
-    /// Path to a local executable, or an `http(s)://` URL to download.
-    #[arg(value_name = "PATH_OR_URL", value_parser = non_empty())]
+    /// What to install: a local path, an `http(s)://` URL, `github:owner/repo[@tag]`
+    /// (or `gh:` / a bare github.com URL), `npm:[@scope/]pkg[@version]`, or `cargo:crate`.
+    #[arg(value_name = "SOURCE", value_parser = non_empty())]
     pub source: String,
 
     /// Plugin name (default: inferred from the source file name). The binary

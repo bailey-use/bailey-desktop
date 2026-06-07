@@ -44,6 +44,7 @@ fn state_with_models(models: Vec<&str>) -> Arc<RouterState> {
             models_cache: None,
             prewarm_count: 0,
             mcp_prewarm_id_style: None,
+            expected_token: None,
         },
         cached_models: Mutex::new(Some(models.into_iter().map(String::from).collect())),
         mcp_bridge: McpBridge::for_tests(),
@@ -182,6 +183,7 @@ async fn cached_models_serves_from_disk_cache_without_spawning_cursor_agent() {
             models_cache: Some(cache),
             prewarm_count: 0,
             mcp_prewarm_id_style: None,
+            expected_token: None,
         },
         // In-memory cache deliberately empty so the lookup falls through
         // to the disk-backed branch.
@@ -1830,4 +1832,16 @@ fn json_constraint_reaches_image_only_responses_turn() {
     let reduced = reduce_responses_request_to_prompt(&body);
     assert!(reduced.trim().is_empty());
     assert!(append_json_output_constraint(reduced, &body, true).contains("OUTPUT CONSTRAINT"));
+}
+
+#[test]
+fn request_authorized_accepts_bearer_or_x_api_key() {
+    use crate::services::http_utils::request_bearer_authorized as auth;
+    let req = |h: &str| format!("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n{h}\r\n\r\n{{}}");
+    // Either form of the expected token is accepted.
+    assert!(auth(&req("Authorization: Bearer tok123"), "tok123"));
+    assert!(auth(&req("x-api-key: tok123"), "tok123"));
+    // Wrong / missing token is rejected.
+    assert!(!auth(&req("Authorization: Bearer nope"), "tok123"));
+    assert!(!auth(&req("Host: x"), "tok123"));
 }

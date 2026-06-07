@@ -349,6 +349,20 @@ pub async fn cursor_status_authenticated_for_key(key: &ApiKey) -> Result<bool> {
     cursor_status_authenticated(cursor_agent_command_for_key(key)?).await
 }
 
+/// True when `key` is an OAuth-login shadow (no API key) whose `cursor-agent`
+/// session is signed out — the signal to bail before spawning a router that
+/// would hand over a dead endpoint. API-key shadows always report
+/// unauthenticated (`status` only inspects auth.json), so they're excluded and
+/// left for the first upstream request to validate.
+pub async fn cursor_oauth_shadow_signed_out(key: &ApiKey) -> bool {
+    let is_oauth_shadow =
+        parse_cursor_shadow_secret(key.key.as_str()).is_some_and(|parsed| parsed.api_key.is_none());
+    is_oauth_shadow
+        && !cursor_status_authenticated_for_key(key)
+            .await
+            .unwrap_or(false)
+}
+
 /// Status check against an explicit shadow — used by `aivo keys add
 /// cursor` after the login flow finishes and before an `ApiKey` exists.
 pub async fn cursor_status_authenticated_for_shadow(shadow: &CursorShadow) -> Result<bool> {

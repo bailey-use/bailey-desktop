@@ -541,6 +541,7 @@ fn opencode_query_global(db_path: &Path, cap: i64, after_ms: i64, permissive: bo
     let mut out = Vec::new();
     for (session_id, time_updated_ms, worktree) in rows {
         if let Some(thread) = opencode_extract_session(
+            db_path,
             &conn,
             &session_id,
             time_updated_ms,
@@ -1462,6 +1463,7 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64, permissive: bool
     let mut out = Vec::new();
     for (session_id, time_updated_ms) in sessions {
         if let Some(thread) = opencode_extract_session(
+            db_path,
             &conn,
             &session_id,
             time_updated_ms,
@@ -1475,6 +1477,7 @@ fn opencode_query(db_path: &Path, project_root: &str, cap: i64, permissive: bool
 }
 
 fn opencode_extract_session(
+    db_path: &Path,
     conn: &rusqlite::Connection,
     session_id: &str,
     time_updated_ms: i64,
@@ -1529,7 +1532,7 @@ fn opencode_extract_session(
     Some(Thread {
         cli: "opencode".into(),
         session_id: session_id.to_string(),
-        source_path: format!("db://opencode/{session_id}"),
+        source_path: db_path.to_string_lossy().to_string(),
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at,
@@ -1590,7 +1593,7 @@ fn opencode_list_stubs(db_path: &Path, project_root: &str) -> Vec<Thread> {
         .map(|(session_id, time_ms)| Thread {
             cli: "opencode".into(),
             session_id: session_id.clone(),
-            source_path: format!("db://opencode/{session_id}"),
+            source_path: db_path.to_string_lossy().to_string(),
             topic: String::new(),
             last_response: String::new(),
             updated_at: chrono::DateTime::<Utc>::from_timestamp_millis(time_ms)

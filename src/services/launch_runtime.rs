@@ -1429,17 +1429,9 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
         created_at: String::new(),
     };
 
-    // Bail before spawning the router when the saved OAuth shadow has
-    // been signed out. `cursor-agent status` only inspects auth.json, so
-    // API-key shadows always report "unauthenticated" — skip the check
-    // for those and let the first /v1/models request surface a real
-    // upstream error instead.
-    if let Some(parsed) = cursor_acp::parse_cursor_shadow_secret(key.key.as_str())
-        && parsed.api_key.is_none()
-        && !cursor_acp::cursor_status_authenticated_for_key(&key)
-            .await
-            .unwrap_or(false)
-    {
+    // Bail before spawning the router when the saved OAuth shadow has been
+    // signed out, rather than let the first request surface a dead upstream.
+    if cursor_acp::cursor_oauth_shadow_signed_out(&key).await {
         anyhow::bail!(
             "Cursor is not logged in for this key. Run `aivo keys reauth <id>` (or pick `aivo keys reauth` interactively) to sign in again."
         );
@@ -1475,6 +1467,9 @@ async fn start_cursor_router(env: &mut HashMap<String, String>, tool: AIToolType
         models_cache: Some(crate::services::models_cache::ModelsCache::new()),
         prewarm_count,
         mcp_prewarm_id_style,
+        // Native-tool launches reach the router over trusted local env (the
+        // `aivo-cursor` placeholder); only the plugin endpoint gates the bearer.
+        expected_token: None,
     });
     let (port, handle) = router.start_background().await?;
     tokio::spawn(async move {

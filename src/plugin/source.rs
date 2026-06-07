@@ -177,6 +177,17 @@ fn arch_aliases(arch: &str) -> &'static [&'static str] {
     }
 }
 
+/// Arch tokens for every arch *other* than `arch`, so `pick_asset` can reject an
+/// asset that explicitly targets a different CPU while still accepting one that
+/// names no arch at all (an OS-only or universal build).
+fn foreign_arch_aliases(arch: &str) -> Vec<&'static str> {
+    ["x86_64", "aarch64"]
+        .iter()
+        .filter(|known| **known != arch)
+        .flat_map(|known| arch_aliases(known).iter().copied())
+        .collect()
+}
+
 fn target_triples(os: &str, arch: &str) -> &'static [&'static str] {
     match (os, arch) {
         ("macos", "x86_64") => &["x86_64-apple-darwin"],
@@ -189,10 +200,19 @@ fn target_triples(os: &str, arch: &str) -> &'static [&'static str] {
     }
 }
 
+/// Name tokens that mark a build as arch-independent (a macOS universal binary,
+/// a `noarch` package), so `pick_asset` accepts it on any CPU.
+const ARCH_AGNOSTIC_MARKERS: &[&str] = &["universal", "noarch"];
+
 fn asset_score(name_lc: &str, os: &str, arch: &str, prefer_musl: bool) -> i32 {
     let mut score = 0;
     if target_triples(os, arch).iter().any(|t| name_lc.contains(t)) {
         score += 100;
+    }
+    // An asset naming the host arch outranks an arch-agnostic (universal/noarch)
+    // one, so the exact build wins when both are published.
+    if arch_aliases(arch).iter().any(|t| name_lc.contains(t)) {
+        score += 30;
     }
     if os == "linux" {
         let (strong, weak) = if prefer_musl {
@@ -231,14 +251,21 @@ pub(crate) fn pick_asset<'a>(
 ) -> std::result::Result<&'a str, NoAssetMatch> {
     let os_al = os_aliases(os);
     let arch_al = arch_aliases(arch);
-    // Score every asset once (lowercasing each name once); `eligible` gates on
-    // whether the name carries a host OS *and* arch token.
+    let foreign_arch = foreign_arch_aliases(arch);
+    // Score every asset once (lowercasing each name once). Eligible = names the
+    // host OS and either names the host arch, is explicitly arch-agnostic
+    // (universal/noarch), or names no *other* arch — the last clause accepts an
+    // OS-only asset (e.g. `tool-darwin.tar.gz`) while still rejecting a build
+    // that targets a different CPU.
     let mut scored: Vec<(bool, i32, &'a str)> = names
         .iter()
         .map(|n| {
             let lc = n.to_ascii_lowercase();
-            let eligible =
-                os_al.iter().any(|a| lc.contains(a)) && arch_al.iter().any(|a| lc.contains(a));
+            let has_os = os_al.iter().any(|a| lc.contains(a));
+            let has_host_arch = arch_al.iter().any(|a| lc.contains(a));
+            let arch_agnostic = ARCH_AGNOSTIC_MARKERS.iter().any(|m| lc.contains(m));
+            let names_foreign_arch = foreign_arch.iter().any(|a| lc.contains(a));
+            let eligible = has_os && (has_host_arch || arch_agnostic || !names_foreign_arch);
             (eligible, asset_score(&lc, os, arch, prefer_musl), *n)
         })
         .collect();
@@ -376,6 +403,30 @@ async fn materialize_url(url: &str, name: &str, dir: &Path) -> Result<Materializ
     })
 }
 
+/// Best-effort: does the host run musl libc (Alpine, etc.)? A musl-built aivo
+/// always does; a glibc build probes at runtime so it still prefers a musl asset
+/// on a musl host. Decides the gnu↔musl tiebreak in `asset_score`.
+fn host_prefers_musl() -> bool {
+    // A musl-built binary only runs on a musl-capable host.
+    cfg!(target_env = "musl") || musl_host_runtime()
+}
+
+#[cfg(target_os = "linux")]
+fn musl_host_runtime() -> bool {
+    // Alpine's marker, or the musl dynamic loader at `/lib/ld-musl-<arch>.so.*`.
+    Path::new("/etc/alpine-release").exists()
+        || std::fs::read_dir("/lib").is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("ld-musl-"))
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn musl_host_runtime() -> bool {
+    false
+}
+
 async fn materialize_github(
     owner: &str,
     repo: &str,
@@ -425,7 +476,7 @@ async fn materialize_github(
         .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
         .collect();
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
-    let picked = pick_asset(&names, os, arch, cfg!(target_env = "musl")).map_err(|e| {
+    let picked = pick_asset(&names, os, arch, host_prefers_musl()).map_err(|e| {
         anyhow::anyhow!(
             "no release asset for {os}/{arch} in {owner}/{repo}.\n  Available: {}.\n  \
              Publish an asset whose name contains the OS and arch (e.g. `aivo-{name}-{arch}-…`).",
@@ -853,6 +904,38 @@ mod tests {
         assert_eq!(
             pick_asset(raw, "linux", "x86_64", false).unwrap(),
             "app-linux-x64"
+        );
+
+        // arch-agnostic fallback: a universal build matches when there's no
+        // exact-arch asset, but an exact-arch asset still wins when both exist.
+        let mac_uni = &[
+            "app-macos-universal.tar.gz",
+            "app-x86_64-apple-darwin.tar.gz",
+        ];
+        assert_eq!(
+            pick_asset(mac_uni, "macos", "aarch64", false).unwrap(),
+            "app-macos-universal.tar.gz"
+        );
+        assert_eq!(
+            pick_asset(mac_uni, "macos", "x86_64", false).unwrap(),
+            "app-x86_64-apple-darwin.tar.gz"
+        );
+
+        // an OS-only asset (no arch token) is accepted as a fallback…
+        let osonly = &["tool-linux.tar.gz", "tool-darwin.tar.gz"];
+        assert_eq!(
+            pick_asset(osonly, "linux", "x86_64", false).unwrap(),
+            "tool-linux.tar.gz"
+        );
+        // …but an asset that names a *different* arch is still rejected.
+        assert!(
+            pick_asset(
+                &["tool-linux-arm64.tar.gz", "notes.txt"],
+                "linux",
+                "x86_64",
+                false
+            )
+            .is_err()
         );
     }
 

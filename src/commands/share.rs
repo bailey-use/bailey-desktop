@@ -4,6 +4,7 @@
 //! the tunnel so the local server can be exercised end to end via
 //! `curl 127.0.0.1:<port>/state` without the public host.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,10 +16,29 @@ use crate::services::share_local_server::{build_state, start_local_server};
 use crate::services::share_payload::{RedactionHit, SharePayload};
 use crate::services::share_picker;
 use crate::services::share_redact::{RedactCtx, redact};
-use crate::services::share_resolver::{ResolverContext, resolve_session};
+use crate::services::share_resolver::{PluginTranscript, ResolverContext, resolve_session};
 use crate::services::share_tunnel;
 use crate::services::shutdown_signal::ShutdownSignal;
+use crate::services::system_env::expand_tilde;
 use crate::style;
+
+/// Plugin tools that declared a transcript source aivo can read (`aivo share`
+/// reuses the matching built-in reader). Resolved here, where the plugin
+/// registry is reachable, and handed to the resolver as plain data.
+fn plugin_transcript_sources() -> HashMap<String, PluginTranscript> {
+    crate::plugin::installed_transcript_sources()
+        .into_iter()
+        .map(|(name, format, dir)| {
+            (
+                name,
+                PluginTranscript {
+                    format,
+                    dir: expand_tilde(&dir),
+                },
+            )
+        })
+        .collect()
+}
 
 pub struct ShareCommand {
     session_store: SessionStore,
@@ -64,7 +84,10 @@ impl ShareCommand {
             },
         };
 
-        let resolver_ctx = Arc::new(ResolverContext::from_system(cwd, self.session_store));
+        let resolver_ctx = Arc::new(
+            ResolverContext::from_system(cwd, self.session_store)
+                .with_plugin_transcripts(plugin_transcript_sources()),
+        );
 
         let resolved = resolve_session(&session_id, &resolver_ctx).await?;
         let mut payload = resolved.payload;

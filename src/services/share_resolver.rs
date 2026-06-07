@@ -12,6 +12,7 @@
 //! `id_prefix_matches` over the session directory. Ambiguous prefixes are
 //! reported back to the user with the candidates that matched.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -34,6 +35,13 @@ use crate::services::share_payload::{
 };
 use crate::services::system_env;
 
+/// A plugin tool's transcript source: a format aivo can read + the sessions
+/// root. Lets `aivo share` resolve a plugin run by reusing a built-in reader.
+pub struct PluginTranscript {
+    pub format: String,
+    pub dir: PathBuf,
+}
+
 /// Inputs the resolver needs that aren't on the user's command line. All
 /// filesystem roots are explicit so tests can inject temp paths instead of
 /// having to mutate `$HOME`.
@@ -46,6 +54,9 @@ pub struct ResolverContext {
     pub gemini_tmp_root: PathBuf,
     pub pi_sessions_root: PathBuf,
     pub opencode_db_path: PathBuf,
+    /// Plugin tools that declared a transcript source (tool name → source).
+    /// Populated by the caller, which has plugin-registry access.
+    pub plugin_transcripts: HashMap<String, PluginTranscript>,
 }
 
 impl ResolverContext {
@@ -68,7 +79,15 @@ impl ResolverContext {
                 .join("share")
                 .join("opencode")
                 .join("opencode.db"),
+            plugin_transcripts: HashMap::new(),
         }
+    }
+
+    /// Attach the plugin transcript sources resolved by the caller (which has
+    /// registry access — keeps this module free of a `plugin` dependency).
+    pub fn with_plugin_transcripts(mut self, map: HashMap<String, PluginTranscript>) -> Self {
+        self.plugin_transcripts = map;
+        self
     }
 }
 
@@ -563,6 +582,15 @@ async fn find_opencode(db_path: &Path, session_id: &str) -> Vec<Match> {
         .collect()
 }
 
+/// Session formats `aivo share` can read, so a plugin declaring one of these is
+/// shareable. The `match` in `resolve_run_event` dispatches each to its reader.
+const SHAREABLE_PLUGIN_FORMATS: &[&str] = &["pi", "codex", "gemini", "opencode"];
+
+/// The sessions root for a run: the plugin's declared dir, or the native default.
+fn reader_root<'a>(plugin_src: Option<&'a PluginTranscript>, default: &'a Path) -> &'a Path {
+    plugin_src.map_or(default, |s| s.dir.as_path())
+}
+
 /// Resolve a logs.db `run` event to the native session aivo launched for it.
 /// Strategy: take the event's tool + cwd + ts_utc; among native sessions of
 /// that tool in that cwd, pick the one whose `updated_at` is closest to
@@ -572,14 +600,33 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
         .tool
         .as_deref()
         .ok_or_else(|| anyhow!("run event has no tool field"))?;
-    // Plugin tools (not a native AIToolType) run out-of-process via their own
-    // binary; aivo records the launch in `aivo logs` but never sees the
-    // transcript, so there's nothing to share. Fail with a clear reason rather
-    // than the misleading "session deleted / lives elsewhere" native message.
-    if !KNOWN_TOOLS.contains(&tool) {
-        return Err(anyhow!(
-            "'{tool}' is a plugin tool — aivo logs its launches but doesn't store a transcript, so this run can't be shared"
-        ));
+    // Plugin tools (not a native AIToolType) run out-of-process and store their
+    // own transcripts; aivo only sees the launch. A plugin can still be shared
+    // if its manifest declares a transcript source in a format aivo reads — then
+    // we reuse that built-in reader pointed at the plugin's sessions dir.
+    // Otherwise there's nothing to share: fail with a clear reason.
+    let is_native = KNOWN_TOOLS.contains(&tool);
+    let plugin_src = if is_native {
+        None
+    } else {
+        ctx.plugin_transcripts.get(tool)
+    };
+    if !is_native {
+        match plugin_src {
+            None => {
+                return Err(anyhow!(
+                    "'{tool}' is a plugin tool — aivo logs its launches but doesn't store a transcript, so this run can't be shared"
+                ));
+            }
+            Some(src) if !SHAREABLE_PLUGIN_FORMATS.contains(&src.format.as_str()) => {
+                return Err(anyhow!(
+                    "'{tool}' declares transcript format '{}', which aivo can't read — shareable plugin formats: {}",
+                    src.format,
+                    SHAREABLE_PLUGIN_FORMATS.join(", ")
+                ));
+            }
+            _ => {}
+        }
     }
     let run_cwd: String = entry
         .cwd
@@ -602,20 +649,31 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
     // (which won't return anything for unknown tools, yielding a clean "no
     // session found" error).
     let run_path = std::path::Path::new(&run_cwd);
-    let threads: Vec<Thread> = match tool {
+    // A plugin run reads its declared format from its own sessions dir; a native
+    // run uses the tool name + the ctx roots. The format determines the reader,
+    // which stamps `cli` on the Thread, so the downstream extractor is correct
+    // regardless of the plugin's name.
+    let fmt = plugin_src.map(|s| s.format.as_str()).unwrap_or(tool);
+    let threads: Vec<Thread> = match fmt {
         "claude" => context_ingest::list_claude_sessions_for_cwd(run_path).await,
         // codex-app launches the `codex` binary, so its rollouts land in the
         // same ~/.codex/sessions tree (via the shadow CODEX_HOME symlink) and
         // are indistinguishable from plain codex sessions.
         "codex" | "codex-app" => {
-            context_ingest::list_codex_sessions_for_cwd(&ctx.codex_sessions_root, run_path).await
+            let root = reader_root(plugin_src, &ctx.codex_sessions_root);
+            context_ingest::list_codex_sessions_for_cwd(root, run_path).await
         }
-        "pi" => context_ingest::list_pi_sessions_for_cwd(&ctx.pi_sessions_root, run_path).await,
+        "pi" => {
+            let root = reader_root(plugin_src, &ctx.pi_sessions_root);
+            context_ingest::list_pi_sessions_for_cwd(root, run_path).await
+        }
         "gemini" => {
-            context_ingest::list_gemini_sessions_for_cwd(&ctx.gemini_tmp_root, run_path).await
+            let root = reader_root(plugin_src, &ctx.gemini_tmp_root);
+            context_ingest::list_gemini_sessions_for_cwd(root, run_path).await
         }
         "opencode" => {
-            context_ingest::list_opencode_sessions_for_cwd(&ctx.opencode_db_path, run_path).await
+            let root = reader_root(plugin_src, &ctx.opencode_db_path);
+            context_ingest::list_opencode_sessions_for_cwd(root, run_path).await
         }
         _ => {
             let opts = IngestOptions {
@@ -646,7 +704,7 @@ async fn resolve_run_event(entry: &LogEntry, ctx: &ResolverContext) -> Result<Sh
             .unwrap_or(0)
     });
     let closest = candidates[0];
-    extract_thread_full(closest, ctx).await
+    extract_thread_full(closest).await
 }
 
 async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Result<String> {
@@ -677,14 +735,14 @@ async fn infer_chat_session_id(entry: &LogEntry, ctx: &ResolverContext) -> Resul
 /// Re-run the per-cli extractor on a `Thread` (which only carries summary
 /// data) to produce a full `SharePayload`. Mirrors the dispatch in
 /// `resolve_session` but driven from a Thread rather than a Match.
-async fn extract_thread_full(t: &Thread, ctx: &ResolverContext) -> Result<SharePayload> {
+async fn extract_thread_full(t: &Thread) -> Result<SharePayload> {
     let cwd = t.cwd.as_deref();
     match t.cli.as_str() {
         "claude" => extract_claude_full(Path::new(&t.source_path), cwd).await,
         "codex" => extract_codex_full(Path::new(&t.source_path), None).await,
         "gemini" => extract_gemini_full(Path::new(&t.source_path), cwd).await,
         "pi" => extract_pi_full(Path::new(&t.source_path), cwd).await,
-        "opencode" => extract_opencode_full(&ctx.opencode_db_path, &t.session_id, cwd).await,
+        "opencode" => extract_opencode_full(Path::new(&t.source_path), &t.session_id, cwd).await,
         other => Err(anyhow!("unexpected cli '{other}' for run-event resolve")),
     }
 }
@@ -713,7 +771,23 @@ mod tests {
             gemini_tmp_root: temp.path().join("gemini"),
             pi_sessions_root: temp.path().join("pi"),
             opencode_db_path: temp.path().join("opencode.db"),
+            plugin_transcripts: HashMap::new(),
         }
+    }
+
+    /// Append a `run` tool_launch event and return its id.
+    async fn append_run_event(ctx: &ResolverContext, tool: &str, cwd: &str) -> String {
+        ctx.session_store
+            .logs()
+            .append(crate::services::log_store::LogEvent {
+                source: "run".into(),
+                kind: "tool_launch".into(),
+                tool: Some(tool.into()),
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -913,21 +987,159 @@ mod tests {
         ];
         fs::write(&path, lines.join("\n")).await.unwrap();
 
-        let event_id = ctx
-            .session_store
-            .logs()
-            .append(crate::services::log_store::LogEvent {
-                source: "run".into(),
-                kind: "tool_launch".into(),
-                tool: Some("codex-app".into()),
-                cwd: Some(project_root.to_string_lossy().to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let event_id = append_run_event(&ctx, "codex-app", &project_root.to_string_lossy()).await;
 
         let resolved = resolve_session(&event_id, &ctx).await.unwrap();
         assert_eq!(resolved.payload.source_cli, "codex");
         assert_eq!(resolved.payload.session_id, full_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_run_event_via_declared_pi_transcript() {
+        // A plugin tool (`omp`) that declares a pi-format transcript source is
+        // shareable: the run event routes to the pi reader pointed at the
+        // plugin's own sessions dir, and extracts via the pi pipeline.
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("proj");
+        fs::create_dir_all(&project_root).await.unwrap();
+        let canonical = fs::canonicalize(&project_root).await.unwrap();
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        // omp's sessions live under a pi-format tree at a custom root.
+        let omp_root = temp.path().join("omp-sessions");
+        let encoded = format!("--{}--", canonical_str.trim_matches('/').replace('/', "-"));
+        let session_dir = omp_root.join(encoded);
+        fs::create_dir_all(&session_dir).await.unwrap();
+        let full_id = "019e9b4a-5627-7000-ae0c-4854c916a807";
+        // omp uses pi's record schema: message `content` is an array of parts.
+        let lines = [
+            format!(
+                r#"{{"type":"session","id":"{full_id}","cwd":"{canonical_str}","timestamp":"2026-06-06T04:56:40.000Z","version":"1"}}"#
+            ),
+            r#"{"type":"message","timestamp":"2026-06-06T04:56:41.000Z","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#.to_string(),
+            r#"{"type":"message","timestamp":"2026-06-06T04:56:42.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#.to_string(),
+        ];
+        fs::write(
+            session_dir.join(format!("2026-06-06T04-56-40-743Z_{full_id}.jsonl")),
+            lines.join("\n"),
+        )
+        .await
+        .unwrap();
+
+        let mut ctx = ctx_with_tempdirs(&temp, canonical.clone());
+        ctx.plugin_transcripts.insert(
+            "omp".to_string(),
+            PluginTranscript {
+                format: "pi".to_string(),
+                dir: omp_root,
+            },
+        );
+
+        let event_id = append_run_event(&ctx, "omp", &canonical_str).await;
+
+        let resolved = resolve_session(&event_id, &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "pi");
+        assert_eq!(resolved.payload.session_id, full_id);
+        assert_eq!(resolved.payload.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_run_event_via_declared_opencode_transcript() {
+        // OpenCode plugin transcripts are a single DB file. The run-event
+        // resolver must extract from the same plugin DB it used for enumeration,
+        // not from the native OpenCode DB in the resolver context.
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("proj");
+        fs::create_dir_all(&project_root).await.unwrap();
+        let canonical = fs::canonicalize(&project_root).await.unwrap();
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        let plugin_db = temp.path().join("omp-opencode.db");
+        let full_id = "oc-plugin-1";
+        let conn = rusqlite::Connection::open(&plugin_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, time_updated INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL, time_created INTEGER NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, data TEXT NOT NULL, time_created INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project (id, worktree) VALUES ('p1', ?1)",
+            [&canonical_str],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, project_id, time_updated) VALUES (?1, 'p1', 1778211465000)",
+            [full_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "m1",
+                full_id,
+                serde_json::json!({"role": "user"}).to_string(),
+                1000_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "m2",
+                full_id,
+                serde_json::json!({"role": "assistant"}).to_string(),
+                2000_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "p1",
+                "m1",
+                serde_json::json!({"type": "text", "text": "plugin question"}).to_string(),
+                1001_i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part (id, message_id, data, time_created) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "p2",
+                "m2",
+                serde_json::json!({"type": "text", "text": "plugin answer"}).to_string(),
+                2001_i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut ctx = ctx_with_tempdirs(&temp, canonical.clone());
+        ctx.plugin_transcripts.insert(
+            "omp".to_string(),
+            PluginTranscript {
+                format: "opencode".to_string(),
+                dir: plugin_db,
+            },
+        );
+
+        let event_id = append_run_event(&ctx, "omp", &canonical_str).await;
+
+        let resolved = resolve_session(&event_id, &ctx).await.unwrap();
+        assert_eq!(resolved.payload.source_cli, "opencode");
+        assert_eq!(resolved.payload.session_id, full_id);
+        assert_eq!(resolved.payload.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_plugin_run_event_without_transcript_source_is_unshareable() {
+        let temp = TempDir::new().unwrap();
+        let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
+        let event_id = append_run_event(&ctx, "mystery", &temp.path().to_string_lossy()).await;
+
+        let err = resolve_session(&event_id, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("doesn't store a transcript"));
     }
 }

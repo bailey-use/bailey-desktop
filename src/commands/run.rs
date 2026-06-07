@@ -20,19 +20,7 @@ use crate::services::session_store::{ApiKey, OpenAICompatibilityMode, SessionSto
 use crate::services::system_env;
 use crate::style;
 
-/// Outcome of picker-style model resolution. Distinguishes "user cancelled
-/// the picker" (exit success, don't launch) from "no fetchable model list,
-/// fall back to the tool's default" (launch anyway, no model flag).
-enum ModelOutcome {
-    /// User picked a model, or `--model <value>` was passed.
-    Model(String),
-    /// No `--model` flag, or the picker fetched an empty list. Launch the
-    /// tool with its own default model.
-    UseDefault,
-    /// Picker was shown and the user cancelled (Ctrl-C / Esc). Caller
-    /// should exit without launching.
-    Cancelled,
-}
+use crate::commands::models::ModelOutcome;
 
 /// RunCommand provides a unified interface to launch AI tools
 pub struct RunCommand {
@@ -66,52 +54,17 @@ impl RunCommand {
         tool: AIToolType,
         prompt: &str,
     ) -> Result<ModelOutcome> {
-        match flag_model {
-            None => return Ok(ModelOutcome::UseDefault),
-            Some(ref m) if !m.is_empty() => return Ok(ModelOutcome::Model(m.clone())),
-            Some(_) => {}
-        }
-
-        // The picker reads keys via console::Term; on a non-TTY (pipe,
-        // /dev/null) `read_key_raw` returns immediately with values that
-        // match no key handler, spinning the loop at 100% CPU. Bail before
-        // the network fetch so piped invocations don't pay for a catalog
-        // they can't show.
-        use std::io::IsTerminal;
-        if !std::io::stderr().is_terminal() {
-            if explicit_model_flag {
-                crate::commands::print_no_model_list_hint();
-            }
-            return Ok(ModelOutcome::UseDefault);
-        }
-
-        let models_list =
-            crate::commands::models::fetch_all_models_cached(client, key, &self.cache, refresh)
-                .await
-                .unwrap_or_default();
-
-        if models_list.is_empty() {
-            // No fetchable model list (common for providers without a public
-            // /v1/models endpoint — e.g. Codex ChatGPT OAuth). Skip the
-            // picker and let the tool use its own default rather than
-            // blocking the launch. Only explain this when the user
-            // explicitly asked for a picker.
-            if explicit_model_flag {
-                crate::commands::print_no_model_list_hint();
-            }
-            return Ok(ModelOutcome::UseDefault);
-        }
-
-        let annotations = crate::services::model_compat::text_chat_annotations(&models_list);
-        match crate::commands::models::prompt_model_picker(
-            models_list,
+        crate::commands::models::resolve_model_outcome(
+            client,
+            key,
+            flag_model,
+            explicit_model_flag,
+            refresh,
             Some(tool),
-            annotations,
+            &self.cache,
             prompt,
-        ) {
-            Some(m) => Ok(ModelOutcome::Model(m)),
-            None => Ok(ModelOutcome::Cancelled),
-        }
+        )
+        .await
     }
 
     /// Walks the per-slot Claude model flags. For each slot: leave unset,

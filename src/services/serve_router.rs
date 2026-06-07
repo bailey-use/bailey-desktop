@@ -15,6 +15,7 @@ use crate::constants::CONTENT_TYPE_JSON;
 use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::http_utils::{self, router_http_client_with_timeout};
 use crate::services::log_store::{LogEvent, LogStore};
+use crate::services::model_list_response;
 use crate::services::provider_protocol::{
     ProviderProtocol, fallback_protocols, is_protocol_mismatch, is_terminal_upstream_error,
 };
@@ -31,7 +32,7 @@ use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, send_anthropic_chat, send_gemini_chat,
     send_openai_chat, send_openai_embeddings,
 };
-use crate::services::session_store::ApiKey;
+use crate::services::session_store::{ApiKey, SessionStore};
 
 use std::sync::LazyLock;
 
@@ -40,6 +41,16 @@ static HEALTH_RESPONSE: LazyLock<Vec<u8>> = LazyLock::new(|| {
         .to_string()
         .into_bytes()
 });
+
+/// A random 32-char alphanumeric bearer token for a serve/endpoint instance.
+pub(crate) fn random_auth_token() -> String {
+    use rand::Rng;
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
 
 pub struct ServeRouterConfig {
     pub upstream_base_url: String,
@@ -58,12 +69,49 @@ pub struct ServeRouterConfig {
     pub aliases: HashMap<String, String>,
 }
 
+impl ServeRouterConfig {
+    /// Build the config from a resolved key, deriving the upstream URL +
+    /// protocol/provider flags from its provider profile. The caller supplies
+    /// the serving knobs (cors/timeout/auth/aliases). Shared by `aivo serve` and
+    /// the plugin loopback endpoint.
+    pub(crate) fn from_key(
+        key: &ApiKey,
+        cors: bool,
+        timeout: u64,
+        auth_token: Option<String>,
+        aliases: HashMap<String, String>,
+    ) -> Self {
+        use crate::services::provider_profile::{
+            provider_profile_for_key, resolve_starter_base_url,
+        };
+        let profile = provider_profile_for_key(key);
+        Self {
+            upstream_base_url: resolve_starter_base_url(&key.base_url),
+            upstream_api_key: key.key.as_str().to_string(),
+            upstream_protocol: profile.default_protocol,
+            is_copilot: profile.serve_flags.is_copilot,
+            is_openrouter: profile.serve_flags.is_openrouter,
+            is_starter: profile.serve_flags.is_starter,
+            cors,
+            timeout,
+            auth_token,
+            aliases,
+        }
+    }
+}
+
 pub struct ServeRouter {
     config: ServeRouterConfig,
     key: ApiKey,
     log_store: LogStore,
     logger: Option<RequestLogger>,
     failover_keys: Vec<ApiKey>,
+    /// When set, buffered 2xx responses have their token usage recorded against
+    /// `key` in stats. Off by default (plain `aivo serve` doesn't account); the
+    /// plugin endpoint opts in via `with_usage_accounting`.
+    usage_sink: Option<SessionStore>,
+    /// Tool label for accounted requests (the plugin name); `None` → "serve".
+    usage_tool: Option<String>,
 }
 
 struct ServeState {
@@ -76,6 +124,8 @@ struct ServeState {
     logger: Option<RequestLogger>,
     failover_keys: Arc<Vec<FailoverEntry>>,
     shutdown: Arc<tokio::sync::Notify>,
+    usage_sink: Option<SessionStore>,
+    usage_tool: Option<String>,
 }
 
 struct FailoverEntry {
@@ -93,6 +143,8 @@ impl ServeRouter {
             log_store,
             logger: None,
             failover_keys: Vec::new(),
+            usage_sink: None,
+            usage_tool: None,
         }
     }
 
@@ -103,6 +155,15 @@ impl ServeRouter {
 
     pub fn with_failover_keys(mut self, keys: Vec<ApiKey>) -> Self {
         self.failover_keys = keys;
+        self
+    }
+
+    /// Record token usage of buffered 2xx responses against the bound key,
+    /// labeling them with `tool` in logs. Used by the plugin endpoint so a
+    /// coding-agent plugin routing through the loopback gets token/cost stats.
+    pub fn with_usage_accounting(mut self, store: SessionStore, tool: String) -> Self {
+        self.usage_sink = Some(store);
+        self.usage_tool = Some(tool);
         self
     }
 
@@ -118,7 +179,36 @@ impl ServeRouter {
         Arc<tokio::sync::Notify>,
     )> {
         let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        Ok(self.spawn_on(listener))
+    }
 
+    /// Like `start_background`, but also returns the actually-bound port — for
+    /// `port: 0` (OS-assigned), which the plugin endpoint uses to avoid clashing
+    /// with a user's own `aivo serve`.
+    pub async fn start_background_with_addr(
+        self,
+        host: &str,
+        port: u16,
+    ) -> Result<(
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<tokio::sync::Notify>,
+        u16,
+    )> {
+        let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+        let bound = listener.local_addr()?.port();
+        let (handle, shutdown) = self.spawn_on(listener);
+        Ok((handle, shutdown, bound))
+    }
+
+    /// Build the shared state and spawn the accept loop over an already-bound
+    /// listener.
+    fn spawn_on(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> (
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<tokio::sync::Notify>,
+    ) {
         let copilot_tokens = if self.config.is_copilot {
             Some(Arc::new(CopilotTokenManager::new(
                 self.config.upstream_api_key.clone(),
@@ -180,9 +270,11 @@ impl ServeRouter {
             logger: self.logger,
             failover_keys: Arc::new(failover_entries),
             shutdown: shutdown.clone(),
+            usage_sink: self.usage_sink,
+            usage_tool: self.usage_tool,
         });
 
-        Ok((tokio::spawn(run_accept_loop(listener, state)), shutdown))
+        (tokio::spawn(run_accept_loop(listener, state)), shutdown)
     }
 }
 
@@ -359,6 +451,21 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 Err(_) => 500,
             };
 
+            // Peek token usage off a buffered 2xx body before it's moved to the
+            // socket (streaming bodies are pass-through — no usage to read).
+            let usage = if state.usage_sink.is_some() {
+                match &result {
+                    Ok(RouterResponse::Buffered { status, body, .. })
+                        if (200..300).contains(status) =>
+                    {
+                        parse_token_usage(body)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             match result {
                 Ok(response) => {
                     let _ = write_router_response(&mut socket, response, cors_extra).await;
@@ -368,6 +475,19 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         .write_all(http_utils::http_error_response(500, &e.to_string()).as_bytes())
                         .await;
                 }
+            }
+
+            if let (Some(store), Some(u)) = (&state.usage_sink, &usage) {
+                let _ = store
+                    .record_tokens(
+                        &state.key.id,
+                        log_model.as_deref(),
+                        u.prompt,
+                        u.completion,
+                        u.cache_read,
+                        u.cache_creation,
+                    )
+                    .await;
             }
 
             // Log request (non-blocking, non-fatal)
@@ -400,10 +520,19 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                     key_id: Some(state.key.id.clone()),
                     key_name: Some(state.key.display_name().to_string()),
                     base_url: Some(state.key.base_url.clone()),
-                    tool: Some("serve".to_string()),
+                    tool: Some(
+                        state
+                            .usage_tool
+                            .clone()
+                            .unwrap_or_else(|| "serve".to_string()),
+                    ),
                     model: log_model,
                     status_code: Some(response_status as i64),
                     duration_ms: Some(latency_ms as i64),
+                    input_tokens: usage.as_ref().map(|u| u.prompt as i64),
+                    output_tokens: usage.as_ref().map(|u| u.completion as i64),
+                    cache_read_input_tokens: usage.as_ref().map(|u| u.cache_read as i64),
+                    cache_creation_input_tokens: usage.as_ref().map(|u| u.cache_creation as i64),
                     title: Some(format!("{method} {path_no_query}")),
                     payload_json: Some(json!({
                         "method": method,
@@ -419,21 +548,67 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 
 async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     let models = fetch_models(&state.client, &state.key).await?;
-    let mut data: Vec<Value> = models
+    let mut entries: Vec<(String, String)> = models
         .into_iter()
-        .map(|id| json!({"id": id, "object": "model", "owned_by": "aivo"}))
+        .map(|id| (id, "aivo".to_string()))
         .collect();
     let mut alias_names: Vec<&String> = state.config.aliases.keys().collect();
     alias_names.sort();
     for name in alias_names {
-        data.push(json!({"id": name, "object": "model", "owned_by": "aivo-alias"}));
+        entries.push((name.clone(), "aivo-alias".to_string()));
     }
-    let resp = json!({"object": "list", "data": data});
+    let resp = model_list_response::build_models_response_body(entries);
     Ok(RouterResponse::buffered(
         200,
         CONTENT_TYPE_JSON,
         resp.to_string().into_bytes(),
     ))
+}
+
+/// Token counts pulled from a response `usage` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub(crate) prompt: u64,
+    pub(crate) completion: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_creation: u64,
+}
+
+/// Extract token usage from a buffered JSON response body. Handles both the
+/// OpenAI chat shape (`prompt_tokens`/`completion_tokens`/`prompt_tokens_details
+/// .cached_tokens`) and the Responses shape (`input_tokens`/`output_tokens`/
+/// `input_tokens_details.cached_tokens`), since the `/v1/responses` route emits
+/// the latter. Returns `None` when there's no usage or it's all zero.
+pub(crate) fn parse_token_usage(body: &[u8]) -> Option<TokenUsage> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    let u = v.get("usage")?;
+    let num = |obj: &Value, a: &str, b: &str| -> u64 {
+        obj.get(a)
+            .or_else(|| obj.get(b))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    };
+    let cached = |a: &str, b: &str| -> u64 {
+        u.get(a)
+            .and_then(|d| d.get("cached_tokens"))
+            .or_else(|| u.get(b).and_then(|d| d.get("cached_tokens")))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0)
+    };
+    let usage = TokenUsage {
+        prompt: num(u, "prompt_tokens", "input_tokens"),
+        completion: num(u, "completion_tokens", "output_tokens"),
+        cache_read: cached("prompt_tokens_details", "input_tokens_details"),
+        cache_creation: u
+            .get("cache_creation_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+    };
+    let all_zero = usage.prompt == 0
+        && usage.completion == 0
+        && usage.cache_read == 0
+        && usage.cache_creation == 0;
+    (!all_zero).then_some(usage)
 }
 
 fn parse_json_body(body_str: &str) -> std::result::Result<Value, RouterResponse> {
@@ -550,6 +725,8 @@ fn failover_state(
         logger: None,
         failover_keys: Arc::new(Vec::new()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
+        usage_sink: None,
+        usage_tool: None,
     }
 }
 
@@ -1015,6 +1192,8 @@ mod tests {
             logger: None,
             failover_keys: Arc::new(Vec::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            usage_sink: None,
+            usage_tool: None,
         }
     }
 
@@ -1149,6 +1328,8 @@ mod tests {
             logger: None,
             failover_keys: Arc::new(Vec::new()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            usage_sink: None,
+            usage_tool: None,
         };
 
         let context = upstream_context(&state);
@@ -1513,5 +1694,39 @@ mod tests {
         let mut body = json!({"model": "fast"});
         apply_alias(&mut body, &HashMap::new());
         assert_eq!(body["model"], "fast");
+    }
+
+    #[test]
+    fn parse_token_usage_openai_shape() {
+        let body = json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 8}
+            }
+        })
+        .to_string();
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!((u.prompt, u.completion, u.cache_read), (30, 12, 8));
+    }
+
+    #[test]
+    fn parse_token_usage_responses_shape() {
+        let body = json!({
+            "object": "response",
+            "usage": {"input_tokens": 100, "output_tokens": 40}
+        })
+        .to_string();
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!((u.prompt, u.completion), (100, 40));
+    }
+
+    #[test]
+    fn parse_token_usage_none_when_absent_or_zero() {
+        assert!(parse_token_usage(br#"{"choices":[]}"#).is_none());
+        assert!(parse_token_usage(b"not json").is_none());
+        let zero = json!({"usage": {"prompt_tokens": 0, "completion_tokens": 0}}).to_string();
+        assert!(parse_token_usage(zero.as_bytes()).is_none());
     }
 }

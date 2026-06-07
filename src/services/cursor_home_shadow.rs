@@ -44,10 +44,15 @@ impl CursorShadow {
     }
 
     /// Pre-creates an empty-password `login.keychain-db` under the shadow's
-    /// `Library/Keychains/` and runs `set-keychain-settings` (no flags) so
-    /// cursor-agent's `security add-generic-password` doesn't pop a GUI
-    /// prompt on sleep/idle. Reapplied on every call so pre-fix shadows
-    /// get repaired without forcing the user to re-add their key.
+    /// `Library/Keychains/`, **unlocks** it, and runs `set-keychain-settings`
+    /// (no flags) so cursor-agent's `security add-generic-password` probe never
+    /// pops a GUI password prompt. The unlock is the load-bearing part: a
+    /// keychain that has locked (reboot / login-session restart) does NOT
+    /// auto-unlock on access even with an empty password — `add`/`find-generic-
+    /// password` show the dialog instead. `unlock-keychain -p ""` is silent
+    /// (empty password) and the unlocked state persists for the whole securityd
+    /// session, so every later cursor-agent spawn is prompt-free. Reapplied on
+    /// every call so pre-fix shadows get repaired without re-adding the key.
     #[cfg(target_os = "macos")]
     fn ensure_macos_keychain(&self) -> Result<()> {
         let keychain_dir = self.root.join("Library").join("Keychains");
@@ -72,14 +77,19 @@ impl CursorShadow {
                 );
             }
         }
-        // No flags → no lock-on-sleep, no idle timeout. Best-effort:
-        // a failure here just means the user might see the password
-        // prompt later, which is the pre-fix behavior — no reason to
-        // hard-fail the spawn.
-        let _ = std::process::Command::new("/usr/bin/security")
-            .env("HOME", &self.root)
-            .args(["set-keychain-settings", keychain_str])
-            .output();
+        // Unlock first: an already-locked keychain (post-reboot) makes
+        // cursor-agent's probe pop the GUI prompt; the empty-password unlock is
+        // silent and sticks for the session. Then clear lock-on-sleep / idle
+        // timeout so it can't re-lock under us. Both best-effort — a failure
+        // just restores the pre-fix prompt, no reason to hard-fail the spawn.
+        let security = |args: &[&str]| {
+            let _ = std::process::Command::new("/usr/bin/security")
+                .env("HOME", &self.root)
+                .args(args)
+                .output();
+        };
+        security(&["unlock-keychain", "-p", "", keychain_str]);
+        security(&["set-keychain-settings", keychain_str]);
         Ok(())
     }
 
@@ -258,6 +268,62 @@ mod tests {
         assert!(
             combined.contains("no-timeout"),
             "ensure() must clear timeout/lock-on-sleep: {combined:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ensure_unlocks_a_locked_keychain() {
+        // Regression: a locked keychain does NOT auto-unlock on write even with
+        // an empty password — cursor-agent's probe would pop the GUI prompt.
+        // ensure() must leave it unlocked so a write succeeds silently.
+        let dir = tempfile::tempdir().unwrap();
+        let shadow = CursorShadow {
+            account_id: "test-unlock-fixture".to_string(),
+            root: dir.path().to_path_buf(),
+        };
+        shadow.ensure().expect("first ensure should succeed");
+        let keychain = shadow
+            .root
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db");
+        let kc = keychain.to_str().unwrap();
+
+        // Lock it, simulating a post-reboot state. Skip if the sandbox blocks
+        // /usr/bin/security so CI doesn't false-fail.
+        let lock = std::process::Command::new("/usr/bin/security")
+            .env("HOME", &shadow.root)
+            .args(["lock-keychain", kc])
+            .output();
+        let Ok(out) = lock else { return };
+        if !out.status.success() {
+            return;
+        }
+
+        shadow.ensure().expect("repair ensure should succeed");
+
+        // A write now targets the shadow keychain; it succeeds only if ensure()
+        // left it unlocked (otherwise: errSecUserCanceled in headless CI).
+        let add = std::process::Command::new("/usr/bin/security")
+            .env("HOME", &shadow.root)
+            .args([
+                "add-generic-password",
+                "-a",
+                "probe",
+                "-s",
+                "probe",
+                "-w",
+                "x",
+                "-U",
+                kc,
+            ])
+            .output()
+            .expect("add-generic-password should run");
+        assert!(
+            add.status.success(),
+            "ensure() must leave the keychain unlocked: {}",
+            String::from_utf8_lossy(&add.stderr)
         );
     }
 

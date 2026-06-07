@@ -26,6 +26,7 @@ use crate::services::http_utils::{
     self, bind_local_listener, cors_header_block, extract_request_body, extract_request_path,
     format_http_chunk, http_response_head_with_extra,
 };
+use crate::services::model_list_response;
 
 mod anthropic;
 mod gemini;
@@ -66,6 +67,12 @@ pub struct CursorRouterConfig {
     /// disables the optimization. Distinct from `prewarm_count`, which
     /// pre-opens MCP-less pool sessions for non-tool turns.
     pub mcp_prewarm_id_style: Option<ToolUseIdStyle>,
+    /// When `Some`, every request (except the CORS preflight and root probe)
+    /// must carry `Authorization: Bearer <t>` or `x-api-key: <t>`. Native-tool
+    /// launches leave this `None` (they reach the router over trusted local env
+    /// with the `aivo-cursor` placeholder); the plugin endpoint sets it so the
+    /// loopback proxy is bearer-gated like the plain-key `ServeRouter`.
+    pub expected_token: Option<String>,
 }
 
 pub struct CursorModelRouter {
@@ -490,6 +497,30 @@ pub(crate) async fn handle_request(
     let log_id = log_inbound(&method, &path, &request).await;
     let started = Instant::now();
 
+    // Bearer gate for the plugin endpoint (native-tool launches set no token
+    // and skip this). The CORS preflight and the root probe stay open — clients
+    // send them before any auth and Claude Code treats a non-200 root as a
+    // config error.
+    if let Some(expected) = state.config.expected_token.as_deref() {
+        let is_open = method == "OPTIONS"
+            || ((method == "HEAD" || method == "GET")
+                && matches!(strip_v1_prefix(&path), "/" | ""));
+        if !is_open && !http_utils::request_bearer_authorized(&request, expected) {
+            let msg = "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)";
+            let _ = write_json_error(&mut socket, 401, msg).await;
+            log_outbound(
+                log_id,
+                &method,
+                &path,
+                401,
+                None,
+                started.elapsed().as_millis() as u64,
+            )
+            .await;
+            return;
+        }
+    }
+
     // Collapse `/v1/...` (Claude/Anthropic style) and the unversioned `/...`
     // (Codex/Pi style) to a single canonical form so each handler is named
     // once below. Mirrors `commands::normalize_base_url`'s suffix-stripping
@@ -559,55 +590,8 @@ pub(crate) async fn write_models(
     (200, summary)
 }
 
-/// Builds the `/v1/models` response body that satisfies both OpenAI's standard
-/// `{"object":"list","data":[...]}` consumers AND codex 0.132+'s
-/// `codex_models_manager`, whose `ModelsResponse` expects `{"models": [<ModelInfo>...]}`
-/// with each entry carrying the full strongly-typed codex `ModelInfo` shape
-/// (see `codex-rs/protocol/src/openai_models.rs`). Missing any required field
-/// makes codex spam `failed to decode models response: missing field "<x>"` on
-/// every interaction.
-///
-/// We emit both `data` (OpenAI) and `models` (codex) twin arrays. Codex's
-/// `ModelsResponse` doesn't `deny_unknown_fields`, so the extra `data` / `object`
-/// keys are ignored by codex; OpenAI-style consumers ignore the unknown
-/// `models` field in turn.
 pub(crate) fn build_models_response_body(models: &[String]) -> Value {
-    let openai_entries: Vec<Value> = models
-        .iter()
-        .map(|id| json!({"id": id, "object": "model", "owned_by": CURSOR_ACP_SENTINEL}))
-        .collect();
-    let codex_entries: Vec<Value> = models.iter().map(|id| codex_model_info(id)).collect();
-    json!({
-        "object": "list",
-        "data": openai_entries,
-        "models": codex_entries,
-    })
-}
-
-/// Minimal valid `ModelInfo` for codex. Every field serde considers required
-/// (no `#[serde(default)]`, no `Option` with default) is present; optional
-/// fields are omitted so codex's defaults apply.
-pub(crate) fn codex_model_info(id: &str) -> Value {
-    json!({
-        "slug": id,
-        "display_name": id,
-        "description": null,
-        "supported_reasoning_levels": [],
-        "shell_type": "default",
-        "visibility": "list",
-        "supported_in_api": true,
-        "priority": 0,
-        "availability_nux": null,
-        "upgrade": null,
-        "base_instructions": "",
-        "supports_reasoning_summaries": false,
-        "support_verbosity": false,
-        "default_verbosity": null,
-        "apply_patch_tool_type": null,
-        "truncation_policy": {"mode": "tokens", "limit": 100_000},
-        "supports_parallel_tool_calls": false,
-        "experimental_supported_tools": [],
-    })
+    model_list_response::build_models_response_body_for_owner(models, CURSOR_ACP_SENTINEL)
 }
 
 pub(crate) async fn cached_models(state: &RouterState) -> Result<Vec<String>> {

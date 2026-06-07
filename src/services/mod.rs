@@ -58,6 +58,7 @@ pub mod launch_args;
 pub mod launch_runtime;
 pub mod log_store;
 pub mod model_compat;
+pub mod model_list_response;
 pub mod model_names;
 pub mod models_cache;
 pub mod native_session_probe;

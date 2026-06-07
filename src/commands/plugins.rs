@@ -11,13 +11,14 @@ use crate::cli::{
     PluginInstallArgs, PluginRemoveArgs, PluginUpdateArgs, PluginsArgs, PluginsSubcommand,
 };
 use crate::errors::ExitCode;
-use crate::plugin::manifest::{PluginManifest, probe_manifest};
+use crate::plugin::manifest::{PluginManifest, grantable_capabilities, probe_manifest};
 use crate::plugin::registry::{self, PluginRecord};
 use crate::plugin::source::{self, SourceKind};
 use crate::plugin::{
     PLUGIN_PREFIX, discover, infer_plugin_name, installed_plugins, is_reserved_plugin_name,
-    plugins_dir,
+    plugins_dir, prompt_capability_grant,
 };
+use crate::services::system_env::collapse_tilde;
 use crate::style;
 use chrono::Utc;
 
@@ -96,20 +97,24 @@ impl PluginsCommand {
 
 fn list_action() -> Result<ExitCode> {
     let plugins = installed_plugins();
+    let managed_dir = plugins_dir();
+    let managed_dir_display = managed_dir
+        .as_ref()
+        .map(|d| collapse_tilde(&d.display().to_string()));
+
     if plugins.is_empty() {
         eprintln!("  {} No plugins installed.", style::dim("·"));
         eprintln!("  {} {}", style::dim("·"), style::dim(INSTALL_HINT));
-        if let Some(dir) = plugins_dir() {
+        if let Some(dir) = &managed_dir_display {
             eprintln!(
                 "  {} {}",
                 style::dim("·"),
-                style::dim(format!("Plugins live in {}", dir.display()))
+                style::dim(format!("Plugins live in {dir}"))
             );
         }
         return Ok(ExitCode::Success);
     }
 
-    let managed_dir = plugins_dir();
     let records = registry::load().plugins;
     let width = plugins
         .iter()
@@ -117,11 +122,52 @@ fn list_action() -> Result<ExitCode> {
         .max()
         .unwrap_or(0)
         .min(24);
+    // Continuation lines align under the name: "  ● " (4) + name + "  " (2).
+    let indent = " ".repeat(width + 6);
+    let sep = style::dim("  ·  ");
+
+    println!(
+        "{} {}",
+        style::bold("Installed plugins"),
+        style::dim(format!("({})", plugins.len()))
+    );
+    println!();
+
     for (name, path) in &plugins {
         let is_managed = managed_dir
             .as_deref()
             .is_some_and(|d| path.parent() == Some(d));
         let manifest = records.get(name).and_then(|r| r.manifest.as_ref());
+
+        // Resolve each required binary once (PATH scan), reused for both the
+        // status bullet and the detail line.
+        let reqs: Vec<(&str, bool)> = manifest
+            .map(|m| {
+                m.requires
+                    .iter()
+                    .map(|r| (r.bin.as_str(), bin_on_path(&r.bin)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Bullet encodes readiness: green = ready to run, yellow = installed but
+        // a required binary is missing, dim ○ = no manifest (can't tell).
+        let bullet = if manifest.is_none() {
+            style::empty_bullet_symbol()
+        } else if reqs.iter().any(|(_, ok)| !ok) {
+            style::yellow("●")
+        } else {
+            style::bullet_symbol()
+        };
+
+        // Line 1: bullet + name + identity (type · version) + provenance tag.
+        let mut ident: Vec<String> = Vec::new();
+        if let Some(m) = manifest {
+            if let Some(kind) = &m.kind {
+                ident.push(kind.clone());
+            }
+            ident.push(format!("v{}", m.version));
+        }
         let tag = if !is_managed {
             " (external)"
         } else if manifest.is_none() {
@@ -130,25 +176,70 @@ fn list_action() -> Result<ExitCode> {
             ""
         };
         println!(
-            "  {}  {}{}",
+            "  {} {}  {}{}",
+            bullet,
             style::cyan(format!("{name:<width$}")),
-            style::dim(path.display().to_string()),
+            style::dim(ident.join(" · ")),
             style::dim(tag),
         );
-        if let Some(m) = manifest {
-            let mut bits = vec![format!("v{}", m.version)];
-            if !m.roles.is_empty() {
-                bits.push(m.roles.join("+"));
-            }
-            if !m.capabilities.is_empty() {
-                bits.push(format!("caps: {}", m.capabilities.join(", ")));
-            }
-            println!(
-                "  {}  {}",
-                " ".repeat(width),
-                style::dim(bits.join("  ·  "))
-            );
+
+        // Description on its own line — tells you what the plugin actually is.
+        if let Some(desc) = manifest.and_then(|m| m.description.as_deref())
+            && !desc.is_empty()
+        {
+            println!("{indent}{}", style::dim(desc));
         }
+
+        // Detail line: granted/declared caps, requirement status, and — for
+        // external plugins only — where the binary resolves (managed ones all
+        // live in the footer dir, so the path would be noise).
+        let mut details: Vec<String> = Vec::new();
+        if let Some(m) = manifest {
+            let grantable = grantable_capabilities(&m.capabilities);
+            let granted = records.get(name).map(|r| {
+                grantable
+                    .iter()
+                    .filter(|c| r.granted_caps.contains(c))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+            match granted.as_deref() {
+                Some(g) if !g.is_empty() => {
+                    details.push(style::dim(format!("caps: {}", g.join(", "))))
+                }
+                _ if !m.capabilities.is_empty() => details.push(style::dim(format!(
+                    "requests: {}",
+                    m.capabilities.join(", ")
+                ))),
+                _ => {}
+            }
+            if !reqs.is_empty() {
+                let marked = reqs
+                    .iter()
+                    .map(|(bin, ok)| {
+                        let mark = if *ok {
+                            style::green("✓")
+                        } else {
+                            style::red("✗")
+                        };
+                        format!("{} {mark}", style::dim(*bin))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(&style::dim(", "));
+                details.push(format!("{} {marked}", style::dim("requires")));
+            }
+        }
+        if !is_managed {
+            details.push(style::dim(collapse_tilde(&path.display().to_string())));
+        }
+        if !details.is_empty() {
+            println!("{indent}{}", details.join(&sep));
+        }
+        println!();
+    }
+
+    if let Some(dir) = &managed_dir_display {
+        println!("  {}", style::dim(format!("Plugins live in {dir}")));
     }
     Ok(ExitCode::Success)
 }
@@ -184,8 +275,13 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
 
     // Stable, re-fetchable source (absolute path for local files) for `update`.
     let source = canonical_source(&args.source);
+    // Any caps already granted to this name (a force-reinstall preserves them).
+    let prior = registry::load()
+        .plugins
+        .get(&name)
+        .map(|r| r.granted_caps.clone())
+        .unwrap_or_default();
     let outcome = reinstall(&name, &source, &dir).await?;
-    record_install(&name, &source, &outcome);
 
     eprintln!(
         "  {} Installed plugin `{}` — run it with {}",
@@ -198,7 +294,12 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         style::dim("·"),
         style::dim(outcome.primary.display().to_string())
     );
-    print_disclosure(&outcome);
+    // Seek consent for any grantable caps the manifest requests, then
+    // persist the grant alongside the record.
+    let granted = resolve_grants(&name, outcome.manifest.as_ref(), &prior, args.trust);
+    record_install(&name, &source, &outcome, granted.clone());
+    print_disclosure(&outcome, &granted);
+    ensure_requirements(outcome.manifest.as_ref()).await;
     Ok(ExitCode::Success)
 }
 
@@ -235,7 +336,13 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
         };
         match reinstall(name, &source, &dir).await {
             Ok(outcome) => {
-                record_install(name, &source, &outcome);
+                let prior = records
+                    .get(name)
+                    .map(|r| r.granted_caps.clone())
+                    .unwrap_or_default();
+                // Update preserves prior grants; it never auto-escalates.
+                let granted = resolve_grants(name, outcome.manifest.as_ref(), &prior, false);
+                record_install(name, &source, &outcome, granted);
                 eprintln!(
                     "  {} Updated `{name}` from {}",
                     style::success_symbol(),
@@ -364,10 +471,10 @@ fn canonical_source(source: &str) -> String {
 
 // ── Registry write + install disclosure ────────────────────────────────────
 
-/// Persist provenance (source + checksum + manifest + timestamp) so `update`
-/// can re-fetch and `list` can show what a plugin declared. See
+/// Persist provenance (source + checksum + manifest + timestamp + granted caps)
+/// so `update` can re-fetch and dispatch knows what to hand over. See
 /// `crate::plugin::registry`.
-fn record_install(name: &str, source: &str, outcome: &InstallOutcome) {
+fn record_install(name: &str, source: &str, outcome: &InstallOutcome, granted_caps: Vec<String>) {
     registry::record(
         name,
         PluginRecord {
@@ -375,15 +482,113 @@ fn record_install(name: &str, source: &str, outcome: &InstallOutcome) {
             checksum: outcome.checksum.clone(),
             manifest: outcome.manifest.clone(),
             installed_at: Some(Utc::now().to_rfc3339()),
+            granted_caps,
         },
     );
 }
 
-/// Surface what a freshly-installed plugin declared about itself. Capabilities
-/// are disclosure-only in protocol v1 — nothing is granted or enforced yet
-/// (a consent gate + a scoped endpoint are a later phase), so this stays low-key
-/// rather than implying a grant. See `docs/PLUGIN-PROTOCOL.md`.
-fn print_disclosure(outcome: &InstallOutcome) {
+/// Decide which grantable caps to grant. With `auto_grant` (`--trust`),
+/// grants all requested without prompting; otherwise prompts (TTY only) for caps
+/// not already approved, never escalating silently. A manifest-less plugin
+/// (remote install) keeps its prior grant — the first dispatch probes + prompts
+/// instead (see `crate::plugin::endpoint`).
+fn resolve_grants(
+    name: &str,
+    manifest: Option<&PluginManifest>,
+    prior: &[String],
+    auto_grant: bool,
+) -> Vec<String> {
+    let Some(m) = manifest else {
+        return prior.to_vec();
+    };
+    let requested = grantable_capabilities(&m.capabilities);
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    if requested.iter().all(|c| prior.contains(c)) {
+        return requested; // already consented to everything requested
+    }
+    if auto_grant || (std::io::stdin().is_terminal() && prompt_capability_grant(name, &requested)) {
+        requested
+    } else {
+        // Keep only previously-granted caps still requested; no silent escalation.
+        requested
+            .into_iter()
+            .filter(|c| prior.contains(c))
+            .collect()
+    }
+}
+
+/// True when `bin` resolves on `$PATH`.
+fn bin_on_path(bin: &str) -> bool {
+    crate::services::path_search::find_in_dirs(
+        bin,
+        &crate::services::path_search::collect_path_dirs(),
+    )
+    .is_some()
+}
+
+/// After install, check the plugin's declared `requires`: for each missing
+/// executable, offer to run its (plugin-authored) install command — the same
+/// consent-gated flow native tools get — or print a hint. aivo never invents the
+/// command; it only runs what the plugin declared, after showing it.
+async fn ensure_requirements(manifest: Option<&PluginManifest>) {
+    let Some(m) = manifest else { return };
+    for req in &m.requires {
+        if bin_on_path(&req.bin) {
+            continue;
+        }
+        eprintln!(
+            "  {} this plugin needs `{}`, which isn't on your PATH.",
+            style::yellow("!"),
+            req.bin,
+        );
+        let Some(cmd) = &req.install else {
+            eprintln!(
+                "    {}",
+                style::dim(format!("install `{}` and re-run.", req.bin))
+            );
+            continue;
+        };
+        eprintln!("    {}", style::dim(format!("install command: {cmd}")));
+        // Non-interactive (CI) → just leave the hint; don't run installers blind.
+        if !std::io::stdin().is_terminal() {
+            continue;
+        }
+        if confirm(&format!("Run it to install `{}`?", req.bin)).unwrap_or(false) {
+            run_install_command(cmd, &req.bin).await;
+        }
+    }
+}
+
+/// Run a plugin-declared install command with inherited stdio (consent already
+/// given by the caller).
+async fn run_install_command(cmd: &str, bin: &str) {
+    eprintln!("  {} Installing `{bin}`...", style::arrow_symbol());
+    let mut command = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    match command.status().await {
+        Ok(s) if s.success() => eprintln!("  {} `{bin}` installed.", style::success_symbol()),
+        Ok(_) => eprintln!(
+            "  {} install command exited non-zero — install `{bin}` manually.",
+            style::yellow("!")
+        ),
+        Err(e) => eprintln!(
+            "  {} couldn't run the install command: {e}",
+            style::yellow("!")
+        ),
+    }
+}
+
+/// Surface what a freshly-installed plugin declared, and what was granted.
+fn print_disclosure(outcome: &InstallOutcome, granted: &[String]) {
     let Some(m) = &outcome.manifest else {
         eprintln!(
             "  {} {}",
@@ -393,19 +598,62 @@ fn print_disclosure(outcome: &InstallOutcome) {
         return;
     };
     let mut bits = vec![format!("v{}", m.version)];
+    if let Some(t) = &m.kind {
+        bits.push(format!("type: {t}"));
+    }
     if !m.roles.is_empty() {
         bits.push(format!("roles: {}", m.roles.join(", ")));
     }
     if !m.capabilities.is_empty() {
-        bits.push(format!("declares caps: {}", m.capabilities.join(", ")));
+        bits.push(format!("requests: {}", m.capabilities.join(", ")));
     }
     eprintln!("  {} {}", style::dim("·"), style::dim(bits.join("  ·  ")));
-    if !m.capabilities.is_empty() {
+    if !granted.is_empty() {
         eprintln!(
             "    {}",
-            style::dim(
-                "(capabilities are disclosure-only here — not granted or enforced; see docs/PLUGIN-PROTOCOL.md)"
-            )
+            style::dim(format!("granted: {}", granted.join(", ")))
+        );
+    } else if !grantable_capabilities(&m.capabilities).is_empty() {
+        eprintln!(
+            "    {}",
+            style::dim("no capabilities granted — reinstall interactively to grant")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_with_caps(caps: &[&str]) -> PluginManifest {
+        PluginManifest {
+            name: "amp".to_string(),
+            version: "1".to_string(),
+            protocol: "1".to_string(),
+            description: None,
+            kind: None,
+            roles: Vec::new(),
+            documents_aivo_flags: false,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            hooks: Vec::new(),
+            homepage: None,
+            transcripts: None,
+            requires: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_grants_ignores_reserved_capabilities() {
+        let manifest = manifest_with_caps(&["config-read", "endpoint", "config-write"]);
+        assert_eq!(
+            resolve_grants("amp", Some(&manifest), &[], true),
+            ["endpoint"]
+        );
+
+        let prior = vec!["config-read".to_string(), "endpoint".to_string()];
+        assert_eq!(
+            resolve_grants("amp", Some(&manifest), &prior, false),
+            ["endpoint"]
         );
     }
 }

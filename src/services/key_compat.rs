@@ -21,6 +21,10 @@ pub enum KeyCompatContext {
     Tool(AIToolType),
     /// `aivo chat` — all OAuth keys are incompatible.
     Chat,
+    /// A plugin handoff — aivo serves the key over a loopback proxy (the
+    /// `endpoint` cap). OAuth keys are native-agent-only. Cursor is available
+    /// only to `type: coding-agent` plugins, which use the Cursor ACP router.
+    Plugin { allow_cursor: bool },
 }
 
 impl KeyCompatContext {
@@ -31,6 +35,13 @@ impl KeyCompatContext {
             KeyCompatContext::None => None,
             KeyCompatContext::Tool(tool) => tool.oauth_incompat_reason(key),
             KeyCompatContext::Chat => key.oauth_run_requirement(),
+            KeyCompatContext::Plugin { allow_cursor } => {
+                if key.is_cursor_acp() && !allow_cursor {
+                    Some("needs coding-agent plugin")
+                } else {
+                    key.oauth_run_requirement()
+                }
+            }
         }
     }
 
@@ -113,6 +124,45 @@ mod tests {
     fn none_context_disables_nothing() {
         let claude = make_key("claude", CLAUDE_OAUTH_SENTINEL);
         assert!(KeyCompatContext::None.incompat_reason(&claude).is_none());
+    }
+
+    #[test]
+    fn plugin_context_disables_oauth_and_cursor_when_not_allowed() {
+        let ctx = KeyCompatContext::Plugin {
+            allow_cursor: false,
+        };
+        // OAuth is native-agent-only; Cursor needs the coding-agent router path.
+        assert!(
+            ctx.incompat_reason(&make_key("cl", CLAUDE_OAUTH_SENTINEL))
+                .is_some()
+        );
+        assert!(
+            ctx.incompat_reason(&make_key("cx", CODEX_OAUTH_SENTINEL))
+                .is_some()
+        );
+        assert!(
+            ctx.incompat_reason(&make_key("gm", GEMINI_OAUTH_SENTINEL))
+                .is_some()
+        );
+        assert_eq!(
+            ctx.incompat_reason(&make_key("cur", "cursor")),
+            Some("needs coding-agent plugin")
+        );
+        // Plain REST keys are fine.
+        assert!(
+            ctx.incompat_reason(&make_key("o", "https://openrouter.ai/api/v1"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn plugin_context_can_allow_cursor_for_coding_agents() {
+        let ctx = KeyCompatContext::Plugin { allow_cursor: true };
+        assert!(ctx.incompat_reason(&make_key("cur", "cursor")).is_none());
+        assert!(
+            ctx.incompat_reason(&make_key("cl", CLAUDE_OAUTH_SENTINEL))
+                .is_some()
+        );
     }
 
     #[test]

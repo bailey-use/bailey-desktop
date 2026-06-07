@@ -1562,6 +1562,221 @@ pub fn convert_responses_json_to_chat(resp: &Value) -> Value {
         .unwrap_or_else(|_| json!({"choices": [], "usage": {}}))
 }
 
+/// Streaming inverse of [`ResponsesStreamConverter`]: feeds upstream Responses
+/// API SSE and emits Chat Completions SSE, so a Chat Completions client (e.g.
+/// omp) can drive a model that only accepts `/v1/responses` (gpt-5.x with
+/// reasoning + tools) and still get incremental tokens. Buffers partial lines.
+pub struct ResponsesToChatStreamConverter {
+    pending: Vec<u8>,
+    id: String,
+    created: u64,
+    model: String,
+    include_usage: bool,
+    role_emitted: bool,
+    finished: bool,
+    /// function_call item_id → its chat `tool_calls` array index.
+    tool_index: std::collections::HashMap<String, u64>,
+    next_tool_index: u64,
+    finish_reason: &'static str,
+    usage: Option<Value>,
+}
+
+impl ResponsesToChatStreamConverter {
+    pub fn new(original_model: &str, include_usage: bool) -> Self {
+        Self {
+            pending: Vec::new(),
+            id: gen_id("chatcmpl"),
+            created: current_unix_ts(),
+            model: original_model.to_string(),
+            include_usage,
+            role_emitted: false,
+            finished: false,
+            tool_index: std::collections::HashMap::new(),
+            next_tool_index: 0,
+            finish_reason: "stop",
+            usage: None,
+        }
+    }
+
+    /// Feed a network chunk of the upstream Responses SSE; returns Chat
+    /// Completions SSE to forward. Partial trailing lines buffer across calls.
+    pub fn push_bytes(&mut self, chunk: &[u8]) -> String {
+        let mut out = String::new();
+        self.pending.extend_from_slice(chunk);
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
+            self.pending.drain(..=pos);
+            self.process_line(line.trim_end_matches('\r'), &mut out);
+        }
+        out
+    }
+
+    /// Flush any buffered line, then emit the terminal `finish_reason` chunk, an
+    /// optional usage-only chunk, and `data: [DONE]`.
+    pub fn finish(&mut self) -> String {
+        let mut out = String::new();
+        if !self.pending.is_empty() {
+            let line = String::from_utf8_lossy(&self.pending).into_owned();
+            self.pending.clear();
+            self.process_line(line.trim_end_matches('\r'), &mut out);
+        }
+        if self.finished {
+            return out;
+        }
+        self.finished = true;
+        out.push_str(&self.chunk(json!({}), Some(self.finish_reason)));
+        if self.include_usage
+            && let Some(usage) = &self.usage
+        {
+            out.push_str(&data_line(&json!({
+                "id": self.id, "object": "chat.completion.chunk",
+                "created": self.created, "model": self.model,
+                "choices": [], "usage": usage,
+            })));
+        }
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
+    fn process_line(&mut self, line: &str, out: &mut String) {
+        let Some(data) = line.strip_prefix("data: ") else {
+            return;
+        };
+        if data == "[DONE]" {
+            return;
+        }
+        let Ok(ev) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(d) = ev
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    self.emit_delta(json!({ "content": d }), out);
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(d) = ev
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    self.emit_delta(json!({ "reasoning_content": d }), out);
+                }
+            }
+            "response.output_item.added" => {
+                let item = ev.get("item");
+                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                    == Some("function_call")
+                {
+                    self.start_tool_call(item.unwrap(), out);
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = ev.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                if let (Some(&idx), Some(d)) = (
+                    self.tool_index.get(item_id),
+                    ev.get("delta").and_then(|v| v.as_str()),
+                ) {
+                    self.emit_delta(
+                        json!({ "tool_calls": [{ "index": idx, "function": { "arguments": d } }] }),
+                        out,
+                    );
+                }
+            }
+            "response.completed" => {
+                self.usage = ev
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .filter(|u| !u.is_null())
+                    .map(responses_usage_to_chat_usage);
+            }
+            _ => {}
+        }
+    }
+
+    fn start_tool_call(&mut self, item: &Value, out: &mut String) {
+        let item_id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let call_id = item
+            .get("call_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| item.get("id").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let args = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("");
+        let idx = self.next_tool_index;
+        self.next_tool_index += 1;
+        self.tool_index.insert(item_id, idx);
+        self.finish_reason = "tool_calls";
+        self.emit_delta(
+            json!({ "tool_calls": [{
+                "index": idx, "id": call_id, "type": "function",
+                "function": { "name": name, "arguments": args }
+            }] }),
+            out,
+        );
+    }
+
+    /// Emit one chat chunk carrying `delta`, prefixing the assistant role on the
+    /// first chunk (mirrors OpenAI's stream).
+    fn emit_delta(&mut self, mut delta: Value, out: &mut String) {
+        if !self.role_emitted {
+            self.role_emitted = true;
+            if let Some(obj) = delta.as_object_mut() {
+                obj.insert("role".to_string(), json!("assistant"));
+            }
+        }
+        out.push_str(&self.chunk(delta, None));
+    }
+
+    fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> String {
+        data_line(&json!({
+            "id": self.id, "object": "chat.completion.chunk",
+            "created": self.created, "model": self.model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+        }))
+    }
+}
+
+fn data_line(v: &Value) -> String {
+    format!("data: {}\n\n", serde_json::to_string(v).unwrap_or_default())
+}
+
+/// Map a Responses API `usage` object to the Chat Completions shape.
+fn responses_usage_to_chat_usage(usage: &Value) -> Value {
+    let num = |obj: &Value, key: &str| obj.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
+    let input = num(usage, "input_tokens");
+    let output = num(usage, "output_tokens");
+    let total = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| input.saturating_add(output));
+    let cached = usage
+        .get("input_tokens_details")
+        .map(|d| num(d, "cached_tokens"))
+        .unwrap_or(0);
+    let reasoning = usage
+        .get("output_tokens_details")
+        .map(|d| num(d, "reasoning_tokens"))
+        .unwrap_or(0);
+    json!({
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": total,
+        "prompt_tokens_details": { "cached_tokens": cached },
+        "completion_tokens_details": { "reasoning_tokens": reasoning },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3072,5 +3287,77 @@ mod tests {
         assert_eq!(usage["input_tokens"], 10);
         assert_eq!(usage["output_tokens"], 5);
         assert_eq!(usage["total_tokens"], 15);
+    }
+
+    // ── ResponsesToChatStreamConverter ─────────────────────────────────────────
+
+    /// Round-trip through both streaming converters: a chat SSE stream → Responses
+    /// SSE (existing converter) → chat SSE (new converter) must preserve content,
+    /// reasoning, tool calls, and usage. The existing converter is the oracle.
+    #[test]
+    fn responses_to_chat_stream_roundtrip() {
+        let chat_sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        // chat → responses (oracle), then responses → chat (unit under test).
+        let mut to_resp = ResponsesStreamConverter::new("gpt-5.4", false);
+        let mut responses_sse = to_resp.push_bytes(chat_sse.as_bytes());
+        responses_sse.push_str(&to_resp.finish());
+
+        let mut to_chat = ResponsesToChatStreamConverter::new("gpt-5.4", true);
+        let mut back = to_chat.push_bytes(responses_sse.as_bytes());
+        back.push_str(&to_chat.finish());
+
+        assert!(
+            back.trim_end().ends_with("data: [DONE]"),
+            "must terminate the stream"
+        );
+        let acc = accumulate_chat_sse(&back);
+        let msg = &acc["choices"][0]["message"];
+        assert_eq!(msg["reasoning_content"], "think");
+        assert_eq!(acc["choices"][0]["finish_reason"], "tool_calls");
+        let tc = &msg["tool_calls"][0];
+        assert_eq!(tc["function"]["name"], "shell");
+        assert_eq!(tc["function"]["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(tc["id"], "call_1");
+
+        // usage rides the dedicated trailing chunk (include_usage = true).
+        let usage_line = back
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|c| c.get("usage").is_some_and(|u| !u.is_null()))
+            .expect("a usage chunk");
+        assert_eq!(usage_line["usage"]["prompt_tokens"], 10);
+        assert_eq!(usage_line["usage"]["completion_tokens"], 5);
+        assert_eq!(usage_line["usage"]["total_tokens"], 15);
+    }
+
+    /// A plain text turn yields content + a `stop` finish and a clean terminator.
+    #[test]
+    fn responses_to_chat_stream_text_only() {
+        let responses_sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+        );
+        let mut c = ResponsesToChatStreamConverter::new("gpt-5.4", false);
+        let mut out = c.push_bytes(responses_sse.as_bytes());
+        out.push_str(&c.finish());
+        let acc = accumulate_chat_sse(&out);
+        assert_eq!(acc["choices"][0]["message"]["content"], "hi");
+        assert_eq!(acc["choices"][0]["finish_reason"], "stop");
+        // include_usage = false → no usage chunk emitted.
+        assert!(!out.contains("\"usage\""));
     }
 }

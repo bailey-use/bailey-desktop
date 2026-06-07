@@ -17,8 +17,9 @@ pub(crate) const PROTOCOL_VERSION: &str = "1";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A plugin's self-description, captured at install/update and cached verbatim in
-/// `.registry.json`. Unknown fields are ignored (forward-compatible). Capabilities
-/// and hooks are disclosure-only in protocol v1 — see the spec for what's reserved.
+/// `.registry.json`. Unknown fields are ignored (forward-compatible). In
+/// protocol v1, `endpoint` is the only capability with host behavior; the rest
+/// are disclosure/reserved vocabulary for future protocol revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PluginManifest {
     pub name: String,
@@ -27,9 +28,22 @@ pub(crate) struct PluginManifest {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// What the plugin *is* — open vocabulary (`coding-agent`, `media`, …).
+    /// Orthogonal to `roles` (how aivo runs it) and `capabilities` (what it's
+    /// granted). `coding-agent` is the only type with host behavior today
+    /// (stats/logs wrapping). Absent for plugins that don't self-classify.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
-    /// Requested capabilities — declared for disclosure; not yet enforced (P1).
+    /// True when the plugin's own `--help` already documents aivo's injected
+    /// flags (`-k`/`-m`/`--debug`), so aivo omits its help banner. Default
+    /// false: aivo prepends the banner — the only place those flags appear for a
+    /// thin wrapper whose `--help` is the wrapped tool's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub documents_aivo_flags: bool,
+    /// Requested capabilities. Only `endpoint` is grantable in protocol v1;
+    /// reserved/disclosure caps are stored verbatim but ignored at launch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     /// Reserved (P2 hooks); stored verbatim, not acted on in v1.
@@ -37,6 +51,60 @@ pub(crate) struct PluginManifest {
     pub hooks: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
+    /// Where the plugin's session transcripts live + their format, so
+    /// `aivo share` can read a plugin run with a built-in reader (the plugin
+    /// stores its own transcript; aivo never sees it otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcripts: Option<TranscriptSource>,
+    /// External executables the plugin needs on PATH (e.g. the agent it wraps).
+    /// aivo checks these at install and offers to run their `install` command —
+    /// the same consent-gated flow native tools get. The command is authored by
+    /// the plugin (only it knows how to install its dependency).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Requirement>,
+}
+
+/// A plugin's transcript location, for `aivo share`. `format` must be a session
+/// format aivo already reads (`pi`, `codex`, `gemini`, `opencode`); `dir` is the
+/// sessions root (a leading `~` is expanded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TranscriptSource {
+    pub format: String,
+    pub dir: String,
+}
+
+/// An executable the plugin needs on PATH, with an optional install command
+/// aivo shows + runs on consent (`None` → aivo only reports it's missing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Requirement {
+    pub bin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Capabilities that hand the plugin real power, so they require explicit
+/// consent before aivo grants them. In protocol v1 this is only `endpoint`: a
+/// routed loopback proxy bound to the selected key. Other capability names are
+/// parsed for disclosure/forward-compatibility but are not granted.
+pub(crate) fn is_grantable_cap(cap: &str) -> bool {
+    matches!(cap, "endpoint")
+}
+
+/// Normalize the subset of a manifest's capability list that can actually be
+/// granted by this host version. Keeps manifest order but removes duplicates and
+/// reserved/unknown vocabulary.
+pub(crate) fn grantable_capabilities(capabilities: &[String]) -> Vec<String> {
+    let mut grantable = Vec::new();
+    for cap in capabilities {
+        if is_grantable_cap(cap) && !grantable.contains(cap) {
+            grantable.push(cap.clone());
+        }
+    }
+    grantable
 }
 
 /// Parse a manifest from a plugin's `--aivo-manifest` stdout. Tolerant of leading
@@ -101,14 +169,14 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"{"name":"amp","version":"0.1.0","protocol":"1",
-        "roles":["subcommand"],"capabilities":["raw-key","spawn"]}"#;
+        "roles":["subcommand"],"capabilities":["endpoint","spawn"]}"#;
 
     #[test]
     fn valid_manifest_parses() {
         let m = parse_manifest(VALID, "amp").expect("should parse");
         assert_eq!(m.version, "0.1.0");
         assert_eq!(m.roles, ["subcommand"]);
-        assert_eq!(m.capabilities, ["raw-key", "spawn"]);
+        assert_eq!(m.capabilities, ["endpoint", "spawn"]);
     }
 
     #[test]
@@ -142,5 +210,102 @@ mod tests {
     fn unknown_fields_are_ignored() {
         let extra = r#"{"name":"a","version":"1","protocol":"1","futureField":42}"#;
         assert!(parse_manifest(extra, "a").is_some());
+    }
+
+    #[test]
+    fn type_field_parses_and_defaults_to_none() {
+        let typed = r#"{"name":"omp","version":"1","protocol":"1","type":"coding-agent"}"#;
+        assert_eq!(
+            parse_manifest(typed, "omp").unwrap().kind.as_deref(),
+            Some("coding-agent")
+        );
+        // A manifest without `type` round-trips to None, not an error.
+        assert!(parse_manifest(VALID, "amp").unwrap().kind.is_none());
+    }
+
+    #[test]
+    fn type_round_trips_and_is_omitted_when_absent() {
+        let m = parse_manifest(
+            r#"{"name":"x","version":"1","protocol":"1","type":"tts"}"#,
+            "x",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"type\":\"tts\""));
+        // Absent type serializes away entirely (skip_serializing_if).
+        let bare = parse_manifest(r#"{"name":"x","version":"1","protocol":"1"}"#, "x").unwrap();
+        assert!(!serde_json::to_string(&bare).unwrap().contains("type"));
+    }
+
+    #[test]
+    fn transcripts_field_parses() {
+        let m = parse_manifest(
+            r#"{"name":"omp","version":"1","protocol":"1",
+                "transcripts":{"format":"pi","dir":"~/.omp/agent/sessions"}}"#,
+            "omp",
+        )
+        .unwrap();
+        let t = m.transcripts.unwrap();
+        assert_eq!(t.format, "pi");
+        assert_eq!(t.dir, "~/.omp/agent/sessions");
+        // Absent → None (and omitted on re-serialize).
+        let bare = parse_manifest(r#"{"name":"x","version":"1","protocol":"1"}"#, "x").unwrap();
+        assert!(bare.transcripts.is_none());
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("transcripts")
+        );
+    }
+
+    #[test]
+    fn requires_field_parses() {
+        let m = parse_manifest(
+            r#"{"name":"omp","version":"1","protocol":"1",
+                "requires":[{"bin":"omp","install":"curl x | sh"},{"bin":"node"}]}"#,
+            "omp",
+        )
+        .unwrap();
+        assert_eq!(m.requires.len(), 2);
+        assert_eq!(m.requires[0].bin, "omp");
+        assert_eq!(m.requires[0].install.as_deref(), Some("curl x | sh"));
+        assert_eq!(m.requires[1].bin, "node");
+        assert!(m.requires[1].install.is_none());
+        // Absent → empty, omitted on re-serialize.
+        let bare = parse_manifest(r#"{"name":"x","version":"1","protocol":"1"}"#, "x").unwrap();
+        assert!(bare.requires.is_empty());
+        assert!(!serde_json::to_string(&bare).unwrap().contains("requires"));
+    }
+
+    #[test]
+    fn grantable_caps_classified() {
+        for c in ["endpoint"] {
+            assert!(is_grantable_cap(c), "{c} should gate consent");
+        }
+        // These are parsed for disclosure/forward-compatibility but never
+        // granted in protocol v1.
+        for c in [
+            "config-read",
+            "config-write",
+            "spawn",
+            "hook:launch.pre",
+            "unknown-key-handoff",
+            "",
+            "unknown",
+        ] {
+            assert!(!is_grantable_cap(c), "{c} must not gate consent");
+        }
+    }
+
+    #[test]
+    fn grantable_capabilities_filters_reserved_and_dedupes() {
+        let caps = vec![
+            "config-read".to_string(),
+            "endpoint".to_string(),
+            "endpoint".to_string(),
+            "unknown-key-handoff".to_string(),
+            "config-write".to_string(),
+        ];
+        assert_eq!(grantable_capabilities(&caps), ["endpoint"]);
     }
 }

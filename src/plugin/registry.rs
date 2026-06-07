@@ -38,6 +38,11 @@ pub(crate) struct PluginRecord {
     /// RFC3339 timestamp of the last install/update (matches `ApiKey.created_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
+    /// Grantable capabilities the user approved at install (or on first
+    /// dispatch). Distinct from `manifest.capabilities` (what was *requested*):
+    /// only these are acted on at launch. Empty until consent is given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_caps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +134,7 @@ fn sources_view(dir: &Path) -> Option<Registry> {
                     checksum: None,
                     manifest: None,
                     installed_at: None,
+                    granted_caps: Vec::new(),
                 },
             )
         })
@@ -190,6 +196,7 @@ mod tests {
             checksum: Some("sha256:abc".to_string()),
             manifest: None,
             installed_at: Some("2026-06-04T00:00:00+00:00".to_string()),
+            granted_caps: Vec::new(),
         }
     }
 
@@ -264,5 +271,26 @@ mod tests {
     fn missing_files_yield_empty() {
         let dir = TempDir::new().unwrap();
         assert!(read_view(dir.path()).plugins.is_empty());
+    }
+
+    #[test]
+    fn granted_caps_round_trip_and_default_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut r = rec("/x");
+        r.granted_caps = vec!["endpoint".to_string()];
+        let mut reg = Registry::default();
+        reg.plugins.insert("omp".to_string(), r);
+        save_to(dir.path(), &reg).unwrap();
+
+        let back = read_view(dir.path());
+        assert_eq!(back.plugins["omp"].granted_caps, ["endpoint"]);
+
+        // A record persisted without the field deserializes to an empty vec.
+        std::fs::write(
+            dir.path().join(REGISTRY_FILE),
+            r#"{"version":1,"plugins":{"old":{"source":"/o"}}}"#,
+        )
+        .unwrap();
+        assert!(read_view(dir.path()).plugins["old"].granted_caps.is_empty());
     }
 }

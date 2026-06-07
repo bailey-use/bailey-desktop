@@ -170,6 +170,16 @@ pub fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// True when a raw HTTP request carries `expected` as `Authorization: Bearer
+/// <expected>` or `x-api-key: <expected>`. Shared by the loopback routers
+/// (cursor / responses) that gate the plugin endpoint's ephemeral bearer.
+pub fn request_bearer_authorized(request: &str, expected: &str) -> bool {
+    let headers_end = request.find("\r\n\r\n").unwrap_or(request.len());
+    let head = &request[..headers_end];
+    header_value(head, "Authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(expected)
+        || header_value(head, "x-api-key") == Some(expected)
+}
+
 /// Parses Content-Length from HTTP headers (case-insensitive).
 pub fn parse_content_length(headers: &str) -> Option<usize> {
     header_value(headers, "content-length").and_then(|v| v.parse().ok())

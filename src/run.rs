@@ -110,9 +110,7 @@ pub async fn run() -> ! {
 
     // Route an unowned `aivo <name>` / `aivo run <name>` to its `aivo-<name>`
     // plugin before clap can reject it (see `crate::plugin`).
-    if let Some(code) =
-        plugin::try_dispatch(&raw_args, &bundle_index, session_store.config_dir()).await
-    {
+    if let Some(code) = plugin::try_dispatch(&raw_args, &bundle_index, &session_store).await {
         process::exit(code);
     }
 
@@ -800,17 +798,6 @@ fn print_help() {
         println!("  {alias_col}  {expansion:<expansion_width$}  {hint_col}");
     }
     println!();
-
-    let plugins = plugin::installed_plugin_names();
-    if !plugins.is_empty() {
-        println!("{}", style::bold("Plugins:"));
-        for name in &plugins {
-            let name_col = style::cyan(format!("{name:<8}"));
-            let hint_col = style::dim(format!("(aivo-{name})"));
-            println!("  {name_col}  {hint_col}");
-        }
-        println!();
-    }
 
     println!("{}", style::bold("Examples:"));
     for cmd in [

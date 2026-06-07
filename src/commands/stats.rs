@@ -86,11 +86,12 @@ impl StatsCommand {
         };
 
         let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+        let plugins = crate::plugin::coding_agent_plugin_names();
 
         let mut tool_tokens: HashMap<String, ToolTokenSummary> = HashMap::new();
-        let aivo_tool_counts = aggregate_tool_counts(&stats, &key_ids);
+        let aivo_tool_counts = aggregate_tool_counts(&stats, &key_ids, &plugins);
         for (tool, gs) in &global {
-            if !is_valid_tool(tool) {
+            if !is_valid_tool(tool, &plugins) {
                 continue;
             }
             tool_tokens.insert(
@@ -298,11 +299,20 @@ impl StatsCommand {
 
     async fn show_tool(&self, tool: &str, args: &StatsArgs) -> ExitCode {
         let tool = tool.to_lowercase();
-        if !is_valid_tool(&tool) {
+        let plugins = crate::plugin::coding_agent_plugin_names();
+        if !is_valid_tool(&tool, &plugins) {
+            let mut valid: Vec<String> = ["claude", "codex", "gemini", "opencode", "pi", "chat"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let mut names: Vec<String> = plugins.into_iter().collect();
+            names.sort();
+            valid.extend(names);
             eprintln!(
-                "{} Unknown tool '{}'. Valid tools: claude, codex, gemini, opencode, pi, chat.",
+                "{} Unknown tool '{}'. Valid tools: {}.",
                 style::red("Error:"),
-                tool
+                tool,
+                valid.join(", "),
             );
             eprintln!("Run `aivo stats --help` for details.");
             return ExitCode::UserError;
@@ -334,7 +344,7 @@ impl StatsCommand {
                 None
             }
         };
-        let aivo = self.get_aivo_tool_stats(&tool).await;
+        let aivo = self.get_aivo_tool_stats(&tool, &plugins).await;
         let has_global = global
             .as_ref()
             .is_some_and(|gs| gs.total_tokens() > 0 || gs.sessions > 0);
@@ -448,14 +458,14 @@ impl StatsCommand {
         ExitCode::Success
     }
 
-    async fn get_aivo_tool_stats(&self, tool: &str) -> AivoToolStats {
+    async fn get_aivo_tool_stats(&self, tool: &str, plugins: &HashSet<String>) -> AivoToolStats {
         let stats = match self.store.load_stats().await {
             Ok(s) => s,
             Err(_) => return AivoToolStats::default(),
         };
         let keys = self.store.get_keys().await.unwrap_or_default();
         let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
-        let tool_counts = aggregate_tool_counts(&stats, &key_ids);
+        let tool_counts = aggregate_tool_counts(&stats, &key_ids, plugins);
         let launches = tool_counts.get(tool).copied().unwrap_or(0);
         let totals = tool_token_totals(&stats, tool, &key_ids);
 
@@ -1167,6 +1177,7 @@ fn combine_model_tokens(
 fn aggregate_tool_counts(
     stats: &UsageStats,
     existing_keys: &HashSet<&str>,
+    plugins: &HashSet<String>,
 ) -> HashMap<String, u64> {
     let mut result: HashMap<String, u64> = HashMap::new();
     let mut all_have_per_key = true;
@@ -1176,7 +1187,7 @@ fn aggregate_tool_counts(
                 all_have_per_key = false;
             }
             for (tool, count) in &entry.per_tool {
-                if !is_valid_tool(tool) {
+                if !is_valid_tool(tool, plugins) {
                     continue;
                 }
                 *result.entry(tool.clone()).or_default() += count;
@@ -1187,7 +1198,7 @@ fn aggregate_tool_counts(
         return stats
             .tool_counts
             .iter()
-            .filter(|(tool, _)| is_valid_tool(tool))
+            .filter(|(tool, _)| is_valid_tool(tool, plugins))
             .map(|(tool, count)| (tool.clone(), *count))
             .collect();
     }
@@ -1245,8 +1256,8 @@ fn aggregate_model_usage(
     result
 }
 
-fn is_valid_tool(tool: &str) -> bool {
-    AIToolType::parse(tool).is_some() || tool == "chat"
+fn is_valid_tool(tool: &str, plugins: &HashSet<String>) -> bool {
+    AIToolType::parse(tool).is_some() || tool == "chat" || plugins.contains(tool)
 }
 
 fn resolve_since(arg: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
@@ -1410,15 +1421,21 @@ mod tests {
 
     #[test]
     fn valid_tool_names() {
-        assert!(is_valid_tool("claude"));
-        assert!(is_valid_tool("codex"));
-        assert!(is_valid_tool("gemini"));
-        assert!(is_valid_tool("opencode"));
-        assert!(is_valid_tool("pi"));
-        assert!(is_valid_tool("chat"));
-        assert!(!is_valid_tool("unknown"));
-        assert!(!is_valid_tool(""));
-        assert!(is_valid_tool("Claude")); // AIToolType::parse is case-insensitive
+        let none: HashSet<String> = HashSet::new();
+        assert!(is_valid_tool("claude", &none));
+        assert!(is_valid_tool("codex", &none));
+        assert!(is_valid_tool("gemini", &none));
+        assert!(is_valid_tool("opencode", &none));
+        assert!(is_valid_tool("pi", &none));
+        assert!(is_valid_tool("chat", &none));
+        assert!(!is_valid_tool("unknown", &none));
+        assert!(!is_valid_tool("", &none));
+        assert!(is_valid_tool("Claude", &none)); // AIToolType::parse is case-insensitive
+
+        // A coding-agent plugin name is valid only when it's installed.
+        let plugins: HashSet<String> = ["omp".to_string()].into_iter().collect();
+        assert!(is_valid_tool("omp", &plugins));
+        assert!(!is_valid_tool("omp", &none));
     }
 
     #[test]
@@ -1430,7 +1447,7 @@ mod tests {
         stats.key_usage.insert("key1".to_string(), counter);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         assert_eq!(result.get("claude"), Some(&5));
         assert_eq!(result.get("codex"), Some(&3));
     }
@@ -1445,10 +1462,25 @@ mod tests {
         stats.key_usage.insert("key1".to_string(), counter);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         assert_eq!(result.get("claude"), Some(&5));
         assert!(!result.contains_key("omp"));
         assert!(!result.contains_key("cursor"));
+    }
+
+    #[test]
+    fn aggregate_tool_counts_includes_installed_coding_agent_plugin() {
+        let mut stats = UsageStats::default();
+        let mut counter = UsageCounter::default();
+        counter.per_tool.insert("claude".to_string(), 5);
+        counter.per_tool.insert("omp".to_string(), 3);
+        stats.key_usage.insert("key1".to_string(), counter);
+
+        let keys: HashSet<&str> = ["key1"].into_iter().collect();
+        let plugins: HashSet<String> = ["omp".to_string()].into_iter().collect();
+        let result = aggregate_tool_counts(&stats, &keys, &plugins);
+        assert_eq!(result.get("claude"), Some(&5));
+        assert_eq!(result.get("omp"), Some(&3));
     }
 
     #[test]
@@ -1461,7 +1493,7 @@ mod tests {
             .insert("key1".to_string(), UsageCounter::default());
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         assert_eq!(result.get("claude"), Some(&10));
         assert!(!result.contains_key("omp"));
     }
@@ -1476,7 +1508,7 @@ mod tests {
             .insert("key1".to_string(), UsageCounter::default());
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         assert_eq!(result.get("claude"), Some(&10));
     }
 
@@ -1669,7 +1701,7 @@ mod tests {
         stats.tool_counts.insert("claude".to_string(), 100);
 
         let keys: HashSet<&str> = ["new_key", "legacy_key"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         // Should fall back to global since legacy_key lacks per-tool data
         assert_eq!(result.get("claude"), Some(&100));
     }
@@ -1685,7 +1717,7 @@ mod tests {
         stats.key_usage.insert("deleted_key".to_string(), c2);
 
         let keys: HashSet<&str> = ["key1"].into_iter().collect();
-        let result = aggregate_tool_counts(&stats, &keys);
+        let result = aggregate_tool_counts(&stats, &keys, &HashSet::new());
         assert_eq!(result.get("claude"), Some(&5));
     }
 

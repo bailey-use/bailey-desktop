@@ -19,6 +19,7 @@ use crate::services::copilot_auth::CopilotTokenManager;
 use crate::services::device_fingerprint;
 use crate::services::http_debug::LoggedSend;
 use crate::services::http_utils::{self};
+use crate::services::model_list_response;
 use crate::services::model_names::select_model_for_provider_attempt;
 use crate::services::openai_anthropic_bridge::{
     OpenAIToAnthropicChatConfig, convert_anthropic_to_openai_chat_response,
@@ -54,7 +55,8 @@ pub use responses_chat_conversion::{
 
 // Internal re-exports used within this router
 use responses_chat_conversion::{
-    ResponsesStreamConverter, apply_max_tokens_cap_to_fields, cap_reasoning_effort,
+    ResponsesStreamConverter, ResponsesToChatStreamConverter, apply_max_tokens_cap_to_fields,
+    cap_reasoning_effort, convert_chat_to_responses_request, convert_responses_json_to_chat,
     sanitize_input_content,
 };
 
@@ -100,6 +102,21 @@ pub struct ResponsesToChatRouter {
     /// Learned per-model seed for the `RouteCache`. On the router (not the
     /// config) so the conversion-test config literals don't need a new field.
     seed_routes: BTreeMap<String, PersistedRoute>,
+    /// When set, buffered 2xx token usage is recorded against this key in stats
+    /// (the plugin endpoint opts in; native launches don't). Streaming is
+    /// uncounted, matching `ServeRouter`.
+    usage: Option<UsageAccounting>,
+    /// When set, every request must carry this bearer (`Authorization: Bearer`
+    /// or `x-api-key`). The plugin endpoint sets it; native launches leave it
+    /// `None` (trusted local env).
+    expected_token: Option<String>,
+}
+
+/// Records buffered-response token usage against a key, for the plugin endpoint.
+#[derive(Clone)]
+pub struct UsageAccounting {
+    pub store: crate::services::session_store::SessionStore,
+    pub key_id: String,
 }
 
 enum ForwardedChatResponse {
@@ -118,6 +135,10 @@ struct ResponsesToChatRouterState {
     /// the `requires_reasoning_content` quirk. Persisted to `ApiKey` so future
     /// launches enable strict mode without hardcoding the host.
     learned_requires_reasoning: Arc<AtomicBool>,
+    /// Optional buffered-2xx token accounting (plugin endpoint).
+    usage: Option<UsageAccounting>,
+    /// Optional required bearer (plugin endpoint loopback gate).
+    expected_token: Option<String>,
 }
 
 impl ResponsesToChatRouter {
@@ -126,12 +147,30 @@ impl ResponsesToChatRouter {
             config,
             tool: "codex",
             seed_routes: BTreeMap::new(),
+            usage: None,
+            expected_token: None,
         }
     }
 
     /// Stamp the `(tool, key, model)` namespace ("codex" | "opencode" | "pi").
     pub fn with_tool(mut self, tool: &'static str) -> Self {
         self.tool = tool;
+        self
+    }
+
+    /// Record buffered 2xx token usage against `key_id` in stats (plugin endpoint).
+    pub fn with_usage_accounting(
+        mut self,
+        store: crate::services::session_store::SessionStore,
+        key_id: String,
+    ) -> Self {
+        self.usage = Some(UsageAccounting { store, key_id });
+        self
+    }
+
+    /// Require this bearer on every request (plugin endpoint loopback gate).
+    pub fn with_auth_token(mut self, token: String) -> Self {
+        self.expected_token = Some(token);
         self
     }
 
@@ -187,6 +226,8 @@ impl ResponsesToChatRouter {
             client: Arc::new(http_utils::router_http_client()),
             route_cache: route_cache.clone(),
             learned_requires_reasoning: learned_requires_reasoning.clone(),
+            usage: self.usage.clone(),
+            expected_token: self.expected_token.clone(),
         };
         let handle = tokio::spawn(async move {
             http_utils::run_streaming_router(
@@ -278,9 +319,37 @@ async fn handle_router_request(
     socket: &mut tokio::net::TcpStream,
 ) -> Option<String> {
     let path = http_utils::extract_request_path(&request);
+    let path_no_query = path.split('?').next().unwrap_or(&path);
+    let method = request.split_whitespace().next().unwrap_or("");
+
+    // Plugin-endpoint loopback gate: reject requests missing the bearer. Native
+    // launches set no token and skip this.
+    if let Some(expected) = &state.expected_token
+        && !http_utils::request_bearer_authorized(&request, expected)
+    {
+        return Some(http_utils::http_error_response(
+            401,
+            "Invalid or missing auth token (expected Authorization: Bearer or x-api-key)",
+        ));
+    }
+
+    if matches!(path_no_query, "/models" | "/v1/models") {
+        return Some(if method == "GET" {
+            handle_models_request(&state.config, state.client.as_ref())
+                .await
+                .unwrap_or_else(|e| {
+                    http_utils::http_error_response(
+                        502,
+                        &format!("Models endpoint unavailable: {e:#}"),
+                    )
+                })
+        } else {
+            http_utils::http_error_response(405, "Method not allowed")
+        });
+    }
 
     let is_api_path = matches!(
-        path.as_str(),
+        path_no_query,
         "/responses" | "/v1/responses" | "/chat/completions" | "/v1/chat/completions"
     );
 
@@ -294,7 +363,7 @@ async fn handle_router_request(
             .unwrap_or_default();
         let slot = state.route_cache.resolve(&model);
         let response = match handle_api_request(
-            &path,
+            path_no_query,
             &request,
             &state.config,
             state.client.as_ref(),
@@ -322,10 +391,37 @@ async fn handle_router_request(
                 seed_variant,
                 response_is_2xx(resp),
             );
+            // Buffered 2xx token accounting for the plugin endpoint (streamed
+            // responses return `None` and are uncounted, like `ServeRouter`).
+            if let Some(acct) = &state.usage
+                && response_is_2xx(resp)
+                && let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b)
+                && let Some(u) = crate::services::serve_router::parse_token_usage(body.as_bytes())
+            {
+                let model = (!model.is_empty()).then_some(model.as_str());
+                let _ = acct
+                    .store
+                    .record_tokens(
+                        &acct.key_id,
+                        model,
+                        u.prompt,
+                        u.completion,
+                        u.cache_read,
+                        u.cache_creation,
+                    )
+                    .await;
+            }
         }
         response
     } else {
-        match forward_request(&path, &request, &state.config, state.client.as_ref()).await {
+        match forward_request(
+            path_no_query,
+            &request,
+            &state.config,
+            state.client.as_ref(),
+        )
+        .await
+        {
             Ok(r) => Some(r),
             Err(e) => Some(http_utils::http_error_response(
                 502,
@@ -335,19 +431,80 @@ async fn handle_router_request(
     }
 }
 
+async fn handle_models_request(
+    config: &Arc<ResponsesToChatRouterConfig>,
+    client: &reqwest::Client,
+) -> Result<String> {
+    if let Some(tm) = config.copilot_token_manager.as_deref() {
+        let (copilot_token, api_endpoint) = tm.get_token().await?;
+        let url = format!("{}/models", api_endpoint.trim_end_matches('/'));
+        let response = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", copilot_token))
+            .header(
+                "Editor-Version",
+                crate::services::copilot_auth::COPILOT_EDITOR_VERSION,
+            )
+            .header(
+                "Copilot-Integration-Id",
+                crate::services::copilot_auth::COPILOT_INTEGRATION_ID,
+            )
+            .header("X-GitHub-Api-Version", "2025-10-01")
+            .send_logged()
+            .await?;
+        if !response.status().is_success() {
+            return http_utils::buffered_reqwest_to_http_response(response).await;
+        }
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let models = extract_openai_model_ids(&body)?;
+        let body = model_list_response::build_models_response_body_for_owner(&models, "copilot")
+            .to_string();
+        return Ok(http_utils::http_json_response(status, &body));
+    }
+
+    let key = crate::services::session_store::ApiKey::new_with_protocol(
+        "responses-router-models".to_string(),
+        "responses-router".to_string(),
+        config.target_base_url.clone(),
+        None,
+        config.api_key.clone(),
+    );
+    let models = crate::commands::models::fetch_models(client, &key).await?;
+    let body =
+        model_list_response::build_models_response_body_for_owner(&models, "aivo").to_string();
+    Ok(http_utils::http_json_response(200, &body))
+}
+
+fn extract_openai_model_ids(body: &str) -> Result<Vec<String>> {
+    let value: Value = serde_json::from_str(body)?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("models response missing data array"))?;
+    Ok(data
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect())
+}
+
 /// Before bailing a streaming attempt on a non-200, peek the error body and
 /// learn the `requires_reasoning_content` quirk so the buffered fallback's
 /// first attempt is already strict instead of eating a second 400. Consumes
 /// the response (we're bailing regardless).
+/// Consume a failed streaming chat response: learn the reasoning_content quirk
+/// from the body, and report whether the upstream said the model needs the
+/// Responses API (so the caller can bridge instead of just bailing).
 async fn note_streaming_failure(
     response: reqwest::Response,
     learned_requires_reasoning: &AtomicBool,
-) {
+) -> bool {
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     if classify_failed_attempt(status, &body).quirk_hint == Some("requires_reasoning_content") {
         learned_requires_reasoning.store(true, Ordering::Relaxed);
     }
+    body_requires_responses_api(&body)
 }
 
 /// Routes the request based on body format:
@@ -369,9 +526,14 @@ async fn handle_api_request(
 
     if is_responses_api_format(&body) {
         // Responses-first: probe /v1/responses while the route is ResponsesApi
-        // (prior or learned). On miss, demote to chat so the cascade pins
-        // openai/anthropic and the next launch won't re-probe responses.
-        if slot.current().0 == ProviderProtocol::ResponsesApi {
+        // (prior or learned), or while this model's route is still an
+        // unconfirmed OpenAI-family seed. The latter matters for plugin
+        // endpoints: Chat clients should still start on chat, but an inbound
+        // Responses request must not be down-converted before native passthrough
+        // has had a chance to preserve built-in tools and streaming semantics.
+        let should_probe_responses = slot.current().0 == ProviderProtocol::ResponsesApi
+            || (config.responses_api_supported != Some(false) && !slot.is_confirmed());
+        if should_probe_responses {
             if let Some(result) =
                 try_responses_api_passthrough(&body, config, client, slot, socket).await
             {
@@ -408,12 +570,32 @@ async fn handle_api_request(
         .await?;
         Ok(Some(response))
     } else {
-        // For streaming Chat Completions, stream directly from upstream to client
-        if body
+        let client_wants_stream = body
             .get("stream")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            && stream_chat_completions(
+            .unwrap_or(false);
+
+        // A Chat Completions client (e.g. omp) against a model that only accepts
+        // `/v1/responses` (gpt-5.x reasoning + tools). Once the route is pinned to
+        // ResponsesApi, skip the doomed chat attempt and bridge straight there.
+        if slot.current().0 == ProviderProtocol::ResponsesApi {
+            return run_chat_via_responses(
+                &body,
+                config,
+                client,
+                slot,
+                client_wants_stream,
+                socket,
+            )
+            .await;
+        }
+
+        // Streaming client: try chat directly. If the upstream rejects it because
+        // the model requires `/v1/responses`, bridge to the *streaming* responses
+        // path — otherwise the buffered cascade below would force a non-streaming
+        // first turn. Any other failure falls through to that cascade.
+        if client_wants_stream {
+            match stream_chat_completions(
                 &body,
                 config,
                 client,
@@ -422,10 +604,17 @@ async fn handle_api_request(
                 socket,
             )
             .await
-            .is_ok()
-        {
-            return Ok(None); // already streamed to socket
+            {
+                Ok(ChatStreamOutcome::Streamed) => return Ok(None),
+                Ok(ChatStreamOutcome::NeedsResponses) => {
+                    return run_chat_via_responses(&body, config, client, slot, true, socket).await;
+                }
+                Ok(ChatStreamOutcome::Failed) | Err(_) => {}
+            }
         }
+        // Non-streaming, or a non-escalation streaming failure: the buffered
+        // cascade, which itself escalates to `/v1/responses` on the same signal
+        // (`forward_openai_protocol` → `try_responses_fallback`).
         Ok(Some(
             handle_chat_completions_with_filter(
                 path,
@@ -438,6 +627,143 @@ async fn handle_api_request(
             .await?,
         ))
     }
+}
+
+/// How a chat-completions streaming attempt ended.
+enum ChatStreamOutcome {
+    /// The response was streamed straight to the client socket.
+    Streamed,
+    /// The upstream rejected chat because the model requires `/v1/responses`
+    /// (gpt-5.x reasoning + tools); the caller bridges to the responses path.
+    NeedsResponses,
+    /// Any other failure — fall through to the buffered cascade.
+    Failed,
+}
+
+/// True when an upstream error body says the model needs the Responses API
+/// instead of `/v1/chat/completions` (gpt-5.x reasoning + tools, Copilot's
+/// responses-only models). Shared by the streaming and buffered escalations.
+fn body_requires_responses_api(error_body: &str) -> bool {
+    error_body.contains("unsupported_api_for_model")
+        || (error_body.contains("not support") && error_body.contains("chat/completions"))
+}
+
+/// Serve a Chat Completions request by converting it to the Responses API,
+/// POSTing `/v1/responses` upstream, and converting the reply back to Chat
+/// Completions — streamed incrementally when the client asked for it. Used on the
+/// `body_requires_responses_api` signal, or directly once the route is pinned.
+async fn run_chat_via_responses(
+    chat_body: &Value,
+    config: &Arc<ResponsesToChatRouterConfig>,
+    client: &reqwest::Client,
+    slot: &RouteSlot,
+    client_wants_stream: bool,
+    socket: &mut tokio::net::TcpStream,
+) -> Result<Option<String>> {
+    use tokio::io::AsyncWriteExt;
+
+    let variant = slot.current().1;
+    let original_model = chat_body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gpt-4o")
+        .to_string();
+    let include_usage = chat_body
+        .get("stream_options")
+        .and_then(|o| o.get("include_usage"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Chat → Responses request, with the same upstream hygiene the passthrough
+    // path applies.
+    let mut body = convert_chat_to_responses_request(chat_body);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("stream_options");
+    }
+    cap_reasoning_effort(&mut body);
+    sanitize_input_content(&mut body);
+    apply_max_tokens_cap_to_fields(&mut body, config.max_tokens_cap, &["max_output_tokens"]);
+    apply_selected_model(&mut body, config.as_ref(), ProviderProtocol::Openai);
+    body["stream"] = json!(client_wants_stream);
+
+    let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/responses"));
+    // For Copilot, X-Initiator (user vs agent) is read off the original chat
+    // turn, matching the other Copilot OpenAI paths — a tool-result follow-up
+    // must not default to `user`.
+    let initiator = if config.copilot_token_manager.is_some() {
+        Some(http_utils::copilot_initiator_from_openai(chat_body))
+    } else {
+        None
+    };
+    let req = http_utils::authorized_openai_post(
+        client,
+        &target_url,
+        &config.api_key,
+        config.copilot_token_manager.as_deref(),
+        initiator,
+    )
+    .await?;
+    let mut response =
+        device_fingerprint::maybe_with_starter_headers(req.json(&body), config.is_starter)
+            .send_logged()
+            .await?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(CONTENT_TYPE_JSON)
+        .to_string();
+
+    if status != 200 {
+        let err_body = response.text().await.unwrap_or_default();
+        return Ok(Some(http_utils::http_response(
+            status,
+            &content_type,
+            &err_body,
+        )));
+    }
+    // Pin + persist only after a verified 2xx — a failed `/responses` must never
+    // poison the learned route for future requests or launches.
+    slot.route_atom().store(
+        encode_route(ProviderProtocol::ResponsesApi, variant),
+        Ordering::Relaxed,
+    );
+    slot.confirm();
+
+    // Streaming client + SSE upstream → transform each event to chat SSE on the fly.
+    if client_wants_stream && content_type.contains("text/event-stream") {
+        socket
+            .write_all(http_utils::http_chunked_response_head(200, "text/event-stream").as_bytes())
+            .await?;
+        let mut conv = ResponsesToChatStreamConverter::new(&original_model, include_usage);
+        while let Some(chunk) = response.chunk().await? {
+            let out = conv.push_bytes(&chunk);
+            if !out.is_empty() {
+                socket
+                    .write_all(&http_utils::format_http_chunk(out.as_bytes()))
+                    .await?;
+            }
+        }
+        let tail = conv.finish();
+        if !tail.is_empty() {
+            socket
+                .write_all(&http_utils::format_http_chunk(tail.as_bytes()))
+                .await?;
+        }
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(None);
+    }
+
+    // Buffered: Responses JSON → Chat Completions JSON.
+    let resp_body = response.text().await?;
+    let responses_json: Value = serde_json::from_str(&resp_body).unwrap_or_else(|_| json!({}));
+    let chat_json = convert_responses_json_to_chat(&responses_json);
+    Ok(Some(http_utils::http_json_response(
+        200,
+        &serde_json::to_string(&chat_json)?,
+    )))
 }
 
 // =============================================================================
@@ -461,7 +787,7 @@ async fn try_responses_api_passthrough(
     let variant = slot.current().1;
     // Confirmed-responses routes surface their errors; an unprobed (prior-only)
     // route falls back to chat on any miss so a blip isn't taken as the answer.
-    let committed = slot.is_confirmed();
+    let committed = slot.is_confirmed() && slot.current().0 == ProviderProtocol::ResponsesApi;
 
     let mut body = body.clone();
     // Don't filter_tools here — the upstream Responses API supports all tool types
@@ -804,11 +1130,11 @@ async fn stream_chat_completions(
     slot: &RouteSlot,
     learned_requires_reasoning: &Arc<AtomicBool>,
     socket: &mut tokio::net::TcpStream,
-) -> Result<()> {
+) -> Result<ChatStreamOutcome> {
     // Only stream for OpenAI protocol (the common case for DeepSeek, etc.)
     let (protocol, variant) = slot.current();
     if protocol != ProviderProtocol::Openai {
-        anyhow::bail!("streaming passthrough only for OpenAI protocol");
+        return Ok(ChatStreamOutcome::Failed);
     }
 
     let effective_requires_reasoning =
@@ -839,8 +1165,16 @@ async fn stream_chat_completions(
 
     let status = response.status().as_u16();
     if status != 200 {
-        note_streaming_failure(response, learned_requires_reasoning).await;
-        anyhow::bail!("upstream returned {status}");
+        // `note_streaming_failure` returns whether the upstream said the model
+        // needs `/v1/responses`, so the caller can bridge to the streaming
+        // responses path instead of buffering.
+        return Ok(
+            if note_streaming_failure(response, learned_requires_reasoning).await {
+                ChatStreamOutcome::NeedsResponses
+            } else {
+                ChatStreamOutcome::Failed
+            },
+        );
     }
 
     let content_type = response
@@ -851,7 +1185,8 @@ async fn stream_chat_completions(
         .to_string();
 
     slot.confirm();
-    http_utils::write_streaming_response(socket, 200, &content_type, response).await
+    http_utils::write_streaming_response(socket, 200, &content_type, response).await?;
+    Ok(ChatStreamOutcome::Streamed)
 }
 
 // =============================================================================
@@ -944,8 +1279,10 @@ async fn forward_openai_chat_request(
     learned_requires_reasoning: &Arc<AtomicBool>,
 ) -> Result<ForwardedChatResponse> {
     let active_protocol = slot.route_atom();
-    // Openai and ResponsesApi both route through `forward_openai_protocol`,
-    // so one is a byte-identical duplicate of the other. Drop the non-active.
+    // Within the OpenAI family the active route already picks chat vs /responses
+    // (`forward_openai_protocol` honors it + reactively escalates on a "use
+    // responses" signal), so trying the other as a separate cascade candidate
+    // is redundant — drop the non-active one.
     let active_proto = decode_route(active_protocol.load(Ordering::Relaxed)).0;
     let candidates: Vec<(ProviderProtocol, PathVariant)> = protocol_candidates(active_protocol)
         .into_iter()
@@ -977,6 +1314,7 @@ async fn forward_openai_chat_request(
             config.as_ref(),
             client,
             force_non_streaming,
+            slot,
         )
         .await?
         {
@@ -1051,10 +1389,11 @@ async fn forward_chat_for_protocol(
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
     force_non_streaming: bool,
+    slot: &RouteSlot,
 ) -> Result<AttemptOutcome<Value>> {
     match protocol {
         ProviderProtocol::Openai | ProviderProtocol::ResponsesApi => {
-            forward_openai_protocol(variant, body, config, client).await
+            forward_openai_protocol(protocol, variant, body, config, client, slot).await
         }
         ProviderProtocol::Anthropic => {
             forward_anthropic_protocol(variant, body, config, client, force_non_streaming).await
@@ -1064,11 +1403,18 @@ async fn forward_chat_for_protocol(
 }
 
 async fn forward_openai_protocol(
+    protocol: ProviderProtocol,
     variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
+    slot: &RouteSlot,
 ) -> Result<AttemptOutcome<Value>> {
+    // A slot pinned to ResponsesApi (learned this launch or seeded from config)
+    // skips the doomed chat attempt and goes straight to /v1/responses.
+    if protocol == ProviderProtocol::ResponsesApi {
+        return try_responses_fallback(variant, body, config, client).await;
+    }
     let target_url = build_target_url(
         &config.target_base_url,
         variant.apply("/v1/chat/completions"),
@@ -1100,33 +1446,50 @@ async fn forward_openai_protocol(
     };
     let result = classify_attempt(status, body_text, parsed);
 
-    // If Copilot rejected the model specifically because /chat/completions
-    // is unsupported for it, fall back to /responses.
-    if config.copilot_token_manager.is_some()
-        && let AttemptOutcome::Mismatch {
-            body: ref error_body,
-            ..
-        } = result
-        && (error_body.contains("unsupported_api_for_model")
-            || (error_body.contains("not support") && error_body.contains("chat/completions")))
-        && let Ok(fallback) = try_copilot_responses_fallback(variant, body, config, client).await
+    // If the upstream rejected /chat/completions specifically because the model
+    // needs the Responses API (gpt-5.x reasoning_effort + tools, Copilot's
+    // responses-only models, …), retry against /v1/responses and pin the route
+    // so the next request this launch — and, once persisted, the next launch —
+    // skips the chat probe. Reactive (only after the upstream says so), so it
+    // doesn't disturb the responses-first probe / mismatch-bail tuning.
+    if let AttemptOutcome::Mismatch {
+        body: ref error_body,
+        ..
+    } = result
+        && body_requires_responses_api(error_body)
     {
-        return Ok(fallback);
+        match try_responses_fallback(variant, body, config, client).await {
+            Ok(AttemptOutcome::Success(v)) => {
+                slot.route_atom().store(
+                    encode_route(ProviderProtocol::ResponsesApi, variant),
+                    Ordering::Relaxed,
+                );
+                slot.confirm();
+                return Ok(AttemptOutcome::Success(v));
+            }
+            // /responses also rejected — surface it; the chat error stays first.
+            Ok(other) => return Ok(other),
+            Err(_) => {}
+        }
     }
 
     Ok(result)
 }
 
 /// Converts a Chat Completions request to Responses API format and sends it to
-/// Copilot's /responses endpoint. Returns the response converted back to Chat
-/// Completions format.
-async fn try_copilot_responses_fallback(
+/// the upstream `/responses` endpoint (using the key or, for Copilot, the token
+/// manager). Returns the response converted back to Chat Completions format.
+async fn try_responses_fallback(
     variant: PathVariant,
     body: &Value,
     config: &ResponsesToChatRouterConfig,
     client: &reqwest::Client,
 ) -> Result<AttemptOutcome<Value>> {
-    let responses_body = responses_chat_conversion::convert_chat_to_responses_request(body);
+    let mut responses_body = responses_chat_conversion::convert_chat_to_responses_request(body);
+    // This path buffers the response and converts it back to Chat Completions, so
+    // it must request non-streaming — otherwise a `stream:true` client request
+    // yields SSE that we'd fail to parse as JSON (falling back to the chat error).
+    responses_body["stream"] = json!(false);
     let target_url = build_target_url(&config.target_base_url, variant.apply("/v1/responses"));
     let req = http_utils::authorized_openai_post(
         client,
@@ -1410,6 +1773,167 @@ mod tests {
             .into()
     }
 
+    fn spawn_models_upstream() -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let body = json!({
+                    "object": "list",
+                    "data": [{
+                        "id": "gpt-test",
+                        "object": "model",
+                        "owned_by": "test"
+                    }]
+                })
+                .to_string();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    async fn raw_get(port: u16, path: &str, token: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let _ = stream.shutdown().await;
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        String::from_utf8(buf).unwrap()
+    }
+
+    async fn raw_post(port: u16, path: &str, token: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let _ = stream.shutdown().await;
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// A mock upstream that rejects `/v1/chat/completions` with the gpt-5.x
+    /// "use /v1/responses" 400 and serves SSE on `/v1/responses`.
+    fn spawn_chat_rejects_responses_streams() -> u16 {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let first = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if first.contains("/v1/responses") {
+                    let sse = concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+                        "event: response.completed\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+                    );
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = stream.write_all(sse.as_bytes());
+                } else {
+                    let body = r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.4 in /v1/chat/completions. Please use /v1/responses instead."}}"#;
+                    let head = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// P2 regression: a *streaming* chat client whose model needs `/v1/responses`
+    /// must get streamed chat SSE on the FIRST request (bridged via
+    /// `run_chat_via_responses`), not a buffered turn.
+    #[tokio::test]
+    async fn streaming_chat_escalates_to_responses_on_first_request() {
+        crate::services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
+        let upstream = spawn_chat_rejects_responses_streams();
+        let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
+            target_base_url: format!("http://127.0.0.1:{upstream}/v1"),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+            aivo_prefix_models: Vec::new(),
+        })
+        .with_auth_token("tok".to_string());
+        let (router_port, _routes, _learned, handle) = router.start_background().await.unwrap();
+
+        let body =
+            r#"{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = raw_post(router_port, "/v1/chat/completions", "tok", body).await;
+        handle.abort();
+
+        assert!(
+            resp.contains("200 OK"),
+            "first request must not 400: {resp}"
+        );
+        // Streamed (chunked chat-completion chunks), not a buffered turn.
+        assert!(resp.contains("Transfer-Encoding: chunked"), "{resp}");
+        assert!(resp.contains("chat.completion.chunk"), "{resp}");
+        assert!(resp.contains("\"content\":\"Hi\""), "{resp}");
+        assert!(resp.contains("[DONE]"), "{resp}");
+    }
+
     #[tokio::test]
     async fn note_streaming_failure_learns_reasoning_quirk_from_400() {
         // The exact DeepSeek thinking-mode rejection from the bug report: the
@@ -1419,6 +1943,39 @@ mod tests {
         let learned = AtomicBool::new(false);
         note_streaming_failure(mock_response(400, body), &learned).await;
         assert!(learned.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn models_route_returns_openai_and_codex_shapes() {
+        crate::services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
+        let upstream_port = spawn_models_upstream();
+        let router = ResponsesToChatRouter::new(ResponsesToChatRouterConfig {
+            target_base_url: format!("http://127.0.0.1:{upstream_port}/v1"),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+            aivo_prefix_models: Vec::new(),
+        })
+        .with_auth_token("tok".to_string());
+        let (router_port, _routes, _learned, handle) = router.start_background().await.unwrap();
+
+        let response = raw_get(router_port, "/v1/models", "tok").await;
+        handle.abort();
+
+        assert!(response.contains("200 OK"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let parsed: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["object"], "list");
+        assert_eq!(parsed["data"][0]["id"], "gpt-test");
+        assert_eq!(parsed["models"][0]["slug"], "gpt-test");
+        assert_eq!(parsed["models"][0]["supported_in_api"], true);
     }
 
     #[tokio::test]
@@ -1739,5 +2296,25 @@ mod tests {
     fn test_build_target_url_base_no_v1() {
         let url = build_target_url("https://api.example.com", "/v1/responses");
         assert_eq!(url, "https://api.example.com/v1/responses");
+    }
+
+    #[test]
+    fn body_requires_responses_api_detects_the_signal() {
+        // The real Copilot/gpt-5.x rejection ("not supported … in /v1/chat/completions").
+        assert!(body_requires_responses_api(
+            "Function tools with reasoning_effort are not supported for gpt-5.4 in /v1/chat/completions. Please use /v1/responses instead."
+        ));
+        // OpenAI's machine-readable variant.
+        assert!(body_requires_responses_api(
+            r#"{"error":{"code":"unsupported_api_for_model"}}"#
+        ));
+        // Unrelated errors must not trigger escalation.
+        assert!(!body_requires_responses_api(
+            r#"{"error":{"message":"invalid model"}}"#
+        ));
+        // "not support" without the chat/completions hint is not enough.
+        assert!(!body_requires_responses_api(
+            "your plan does not support this model"
+        ));
     }
 }

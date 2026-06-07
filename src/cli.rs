@@ -237,6 +237,11 @@ pub struct PluginInstallArgs {
     /// Overwrite an existing plugin of the same name.
     #[arg(short = 'f', long)]
     pub force: bool,
+
+    /// Grant the manifest's grantable capabilities without prompting for
+    /// non-interactive installs.
+    #[arg(long)]
+    pub trust: bool,
 }
 
 #[derive(Args, Debug, Clone)]

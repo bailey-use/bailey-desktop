@@ -6,7 +6,6 @@ use std::net::IpAddr;
 
 use crate::errors::ExitCode;
 use crate::services::log_store::LogStore;
-use crate::services::provider_profile::provider_profile_for_key;
 use crate::services::request_log::RequestLogger;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig};
 use crate::services::session_store::ApiKey;
@@ -58,15 +57,7 @@ impl ServeCommand {
 
         // Resolve auth token: None → no auth, Some("") → generate, Some(t) → use as-is
         let auth_token = match auth_token {
-            Some(ref t) if t.is_empty() => {
-                use rand::Rng;
-                let token: String = rand::thread_rng()
-                    .sample_iter(&rand::distributions::Alphanumeric)
-                    .take(32)
-                    .map(char::from)
-                    .collect();
-                Some(token)
-            }
+            Some(ref t) if t.is_empty() => Some(crate::services::serve_router::random_auth_token()),
             other => other,
         };
 
@@ -110,11 +101,6 @@ impl ServeCommand {
             return Ok(ExitCode::UserError);
         }
 
-        let profile = provider_profile_for_key(&key);
-        let is_copilot = profile.serve_flags.is_copilot;
-        let is_openrouter = profile.serve_flags.is_openrouter;
-        let upstream_protocol = profile.default_protocol;
-
         if is_self_proxy_target(&key.base_url, port, &host) {
             anyhow::bail!(
                 "Refusing to start `aivo serve`: active upstream {} points back to http://{}:{} and would proxy into itself. Switch to a real provider key with `aivo use <name>` or pass `--key <name>`.",
@@ -124,11 +110,13 @@ impl ServeCommand {
             );
         }
 
+        let config = ServeRouterConfig::from_key(&key, cors, timeout, auth_token, aliases);
+
         // Capture display info before moving key into the router
         let display_name = key.display_name().to_string();
         // Sentinel set in run.rs when the positional REF is an HF ref.
         let hf_mode = key.id == "aivo-hf-local";
-        let display_host = if is_copilot {
+        let display_host = if config.is_copilot {
             "github.com/copilot".to_string()
         } else if hf_mode {
             "local llama-server".to_string()
@@ -139,21 +127,6 @@ impl ServeCommand {
                 .or_else(|| key.base_url.strip_prefix("http://"))
                 .unwrap_or(&key.base_url);
             super::truncate_url_for_display(stripped, 40)
-        };
-
-        let config = ServeRouterConfig {
-            upstream_base_url: crate::services::provider_profile::resolve_starter_base_url(
-                &key.base_url,
-            ),
-            upstream_api_key: key.key.as_str().to_string(),
-            upstream_protocol,
-            is_copilot,
-            is_openrouter,
-            is_starter: profile.serve_flags.is_starter,
-            cors,
-            timeout,
-            auth_token,
-            aliases,
         };
 
         let logger = match log {

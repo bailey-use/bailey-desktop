@@ -45,7 +45,7 @@ impl UnifiedRow {
     /// logs` displays in the bracket column.
     pub(crate) fn source_label(&self) -> &str {
         match self {
-            UnifiedRow::Log(e) => e.source.as_str(),
+            UnifiedRow::Log(e) => log_bracket_label(e),
             UnifiedRow::Native(t) => t.cli.as_str(),
         }
     }
@@ -154,6 +154,29 @@ pub(crate) fn min_unique_id_width(rows: &[UnifiedRow]) -> usize {
     ID_COL_WIDTH_MAX
 }
 
+/// A `[run]` row for a plugin coding-agent — a tool that isn't a native CLI
+/// (e.g. omp, amp). These have no native session source, so their run row is
+/// their only representation in `aivo logs`. We surface them like first-class
+/// agents: tool name in the bracket column, not a generic `[run]`.
+fn is_plugin_run(entry: &LogEntry) -> bool {
+    entry.source == "run"
+        && entry
+            .tool
+            .as_deref()
+            .is_some_and(|t| !KNOWN_TOOLS.contains(&t))
+}
+
+/// Bracket-column label for a logs.db row. Plugin coding-agent runs use their
+/// tool name (`[omp]`) so they read like native agents; everything else uses
+/// its source (`[chat]`, `[run]`, `[serve]`).
+fn log_bracket_label(entry: &LogEntry) -> &str {
+    if is_plugin_run(entry) {
+        entry.tool.as_deref().unwrap_or("run")
+    } else {
+        entry.source.as_str()
+    }
+}
+
 /// Plain-text detail string for a logs.db row — mirrors the `text` half of
 /// `print_summary` (token suffix included for chat rows). Kept here so
 /// picker labels stay in sync with `aivo logs` printing.
@@ -169,7 +192,6 @@ fn log_row_detail(entry: &LogEntry) -> String {
             }
         }
         "run" => {
-            let tool = entry.tool.as_deref().unwrap_or("run");
             let model = entry
                 .model
                 .clone()
@@ -185,7 +207,14 @@ fn log_row_detail(entry: &LogEntry) -> String {
                 .duration_ms
                 .map(|ms| format!(" ({})", format_duration_ms(ms)))
                 .unwrap_or_default();
-            format!("{tool} {model} {state}{duration}")
+            // Plugin runs put the tool name in the bracket column; native
+            // `--by run` rows keep it inline since their bracket is `[run]`.
+            if is_plugin_run(entry) {
+                format!("{model} {state}{duration}")
+            } else {
+                let tool = entry.tool.as_deref().unwrap_or("run");
+                format!("{tool} {model} {state}{duration}")
+            }
         }
         "serve" => {
             let title = entry.title.clone().unwrap_or_else(|| "request".to_string());
@@ -534,6 +563,10 @@ fn print_help_overview() {
         "Events:   run | serve  (launch records / HTTP requests)",
     );
     logs_help_row(
+        "",
+        "Plugins:  <plugin name>  (e.g. omp, amp — that agent's runs)",
+    );
+    logs_help_row(
         "--model <model>",
         "Filter by model substring (logs.db only)",
     );
@@ -873,7 +906,6 @@ fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orph
             format_token_summary(entry),
         ),
         "run" => {
-            let tool = entry.tool.as_deref().unwrap_or("run");
             let model = entry
                 .model
                 .clone()
@@ -889,7 +921,15 @@ fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orph
                 .duration_ms
                 .map(|ms| format!(" ({})", format_duration_ms(ms)))
                 .unwrap_or_default();
-            (format!("{tool} {model} {state}{duration}"), String::new())
+            // Plugin runs put the tool name in the bracket column; native
+            // `--by run` rows keep it inline since their bracket is `[run]`.
+            let text = if is_plugin_run(entry) {
+                format!("{model} {state}{duration}")
+            } else {
+                let tool = entry.tool.as_deref().unwrap_or("run");
+                format!("{tool} {model} {state}{duration}")
+            };
+            (text, String::new())
         }
         "serve" => {
             let title = entry.title.clone().unwrap_or_else(|| "request".to_string());
@@ -939,7 +979,7 @@ fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orph
         style::cyan(format!("{:<width$.width$}", display_id, width = id_width)),
         style::yellow(format!(
             "{:<width$}",
-            format!("[{}]", entry.source),
+            format!("[{}]", log_bracket_label(entry)),
             width = BRACKET_COL_WIDTH
         )),
         detail
@@ -1510,13 +1550,27 @@ impl SourcePlan {
                 native = !strict_logs;
                 plugin_runs = false;
             }
+            // Any other name is a plugin coding-agent (e.g. omp, amp). Plugins
+            // have no native session source, so their `[run]` rows (tool=<name>)
+            // are their only representation. Scope logs.db to that tool — the
+            // `by` filter matches `source = ? or tool like %name%`, so the run
+            // rows come through — and drop both native and the broad
+            // `plugin_runs` pull (which would re-admit every *other* plugin).
+            // The strict-logs filters (errors/key/model) still apply as
+            // separate LogQuery fields, so `--by omp --errors` stays scoped.
+            Some(plugin) => {
+                logs = true;
+                logs_by = Some(plugin.to_string());
+                native = false;
+                plugin_runs = false;
+            }
             // No --by: the unified session list. logs.db restricted to chat
             // (collapsed by session_id downstream), native joins in,
             // run/serve stay out of the default view. Strict-logs reopens
             // logs.db to every source for auditing. Plugin tools have no
             // native source, so their `[run]` rows are pulled in (see
-            // `plugin_runs`) — this also covers `--by <plugin>` (unknown name).
-            None | Some(_) => {
+            // `plugin_runs`).
+            None => {
                 logs = true;
                 logs_by = if strict_logs {
                     None
@@ -1556,10 +1610,16 @@ fn native_passes_filters(t: &Thread, args: &LogsArgs, cwd_filter: Option<&str>) 
         let by = by.to_ascii_lowercase();
         match by.as_str() {
             "native" => {} // accepts every native cli
-            "claude" | "codex" | "gemini" | "opencode" | "pi" if t.cli != by => {
-                return false;
+            "claude" | "codex" | "gemini" | "opencode" | "pi" => {
+                if t.cli != by {
+                    return false;
+                }
             }
-            _ => {}
+            // Unknown name = a plugin coding-agent, which has no native
+            // session. Reject every native thread so `--by <plugin>` can't
+            // surface native sessions (SourcePlan already gates native off
+            // for plugin names; this keeps the filter self-consistent).
+            _ => return false,
         }
     }
     if let Some(needle) = cwd_filter {
@@ -2089,6 +2149,7 @@ mod tests {
             gemini_tmp_root: temp.path().join("gemini"),
             pi_sessions_root: temp.path().join("pi"),
             opencode_db_path: temp.path().join("opencode.db"),
+            plugin_transcripts: std::collections::HashMap::new(),
         };
         let mut entry = test_entry("c1", "2026-05-24T09:00:00Z", "chat");
         entry.session_id = Some("chat-xyz".into());
@@ -2103,6 +2164,83 @@ mod tests {
             source: source.to_string(),
             ..Default::default()
         }
+    }
+
+    /// `LogsArgs` with `--by <name>` and everything else at its default — just
+    /// enough to exercise `SourcePlan::from_args`.
+    fn logs_args_by(by: Option<&str>) -> LogsArgs {
+        LogsArgs {
+            action: None,
+            target: None,
+            limit: 20,
+            json: false,
+            watch: false,
+            jsonl: false,
+            search: None,
+            by: by.map(str::to_string),
+            model: None,
+            key: None,
+            cwd: None,
+            all: false,
+            since: None,
+            until: None,
+            errors: false,
+            live: false,
+            no_redact: false,
+            open: false,
+            debug_local_only: false,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn source_plan_plugin_name_scopes_to_that_tool() {
+        // `--by omp` (a plugin coding-agent, not a native CLI) must scope
+        // logs.db to that tool and drop native + the broad plugin_runs pull —
+        // otherwise the filter is a no-op that shows every plugin and every
+        // native session.
+        let plan = SourcePlan::from_args(&logs_args_by(Some("omp")));
+        assert!(plan.include_logs());
+        assert_eq!(plan.logs_by().as_deref(), Some("omp"));
+        assert!(!plan.include_native());
+        assert!(!plan.plugin_runs);
+    }
+
+    #[test]
+    fn source_plan_plugin_name_is_case_insensitive() {
+        // `by` is lowercased before matching, so the SQL tool filter (also
+        // lowercased) sees a normalized value.
+        let plan = SourcePlan::from_args(&logs_args_by(Some("OMP")));
+        assert_eq!(plan.logs_by().as_deref(), Some("omp"));
+        assert!(!plan.include_native());
+    }
+
+    #[test]
+    fn source_plan_default_keeps_unified_view() {
+        // No --by: chat sessions + native + plugin runs, the unchanged default.
+        let plan = SourcePlan::from_args(&logs_args_by(None));
+        assert!(plan.include_logs());
+        assert_eq!(plan.logs_by().as_deref(), Some("chat"));
+        assert!(plan.include_native());
+        assert!(plan.plugin_runs);
+    }
+
+    #[test]
+    fn source_plan_native_cli_name_uses_native_source() {
+        // Regression guard: a real native CLI name still routes to the native
+        // source, not the new plugin arm.
+        let plan = SourcePlan::from_args(&logs_args_by(Some("claude")));
+        assert!(plan.include_native());
+        assert!(!plan.include_logs());
+        assert!(!plan.plugin_runs);
+    }
+
+    #[test]
+    fn native_filter_rejects_threads_for_plugin_name() {
+        // A native session must never satisfy `--by <plugin>`.
+        let args = logs_args_by(Some("omp"));
+        let thread = test_thread("n1", "2026-05-01T10:00:00Z".parse().unwrap());
+        assert!(!native_passes_filters(&thread, &args, None));
     }
 
     #[test]

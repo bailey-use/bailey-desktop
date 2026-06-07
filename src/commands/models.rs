@@ -775,20 +775,48 @@ pub(crate) async fn fetch_all_models_cached(
     cache: &ModelsCache,
     bypass_cache: bool,
 ) -> Result<Vec<String>> {
-    let is_ollama = crate::services::provider_profile::is_ollama_base(&key.base_url);
-    let cache_key = full_catalog_cache_key_for_key(key);
-    if !bypass_cache
-        && !is_ollama
-        && let Some(cached) = cache.get(&cache_key).await
-        && !cursor_cache_looks_corrupt(key, &cached)
-    {
+    if !bypass_cache && let Some(cached) = full_catalog_cached(key, cache).await {
         return Ok(cached);
     }
     let models = fetch_all_models(client, key).await?;
-    if !is_ollama {
-        cache.set(&cache_key, models.clone()).await;
+    if !crate::services::provider_profile::is_ollama_base(&key.base_url) {
+        cache
+            .set(&full_catalog_cache_key_for_key(key), models.clone())
+            .await;
     }
     Ok(models)
+}
+
+/// Peek the cached full catalog, honoring the same skips as
+/// `fetch_all_models_cached`: Ollama never caches (lists locally, instantly),
+/// and a cursor entry poisoned by the old parser bug counts as a miss.
+async fn full_catalog_cached(key: &ApiKey, cache: &ModelsCache) -> Option<Vec<String>> {
+    if crate::services::provider_profile::is_ollama_base(&key.base_url) {
+        return None;
+    }
+    let cached = cache.get(&full_catalog_cache_key_for_key(key)).await?;
+    (!cursor_cache_looks_corrupt(key, &cached)).then_some(cached)
+}
+
+/// Cache-first catalog fetch for the interactive model picker, shared by the
+/// `run`/`start`/`chat` pickers. Returns instantly on a cache hit; shows a
+/// "Fetching models…" spinner only while a genuine network fetch runs — a hit
+/// must stay instant, since `stop_spinner` sleeps 100ms and would flash a frame.
+/// Empty on fetch failure: callers treat that as "no list → use tool default".
+pub(crate) async fn fetch_all_models_for_picker(
+    client: &Client,
+    key: &ApiKey,
+    cache: &ModelsCache,
+    refresh: bool,
+) -> Vec<String> {
+    if !refresh && let Some(cached) = full_catalog_cached(key, cache).await {
+        return cached;
+    }
+    let (spinning, handle) = style::start_spinner(Some(" Fetching models..."));
+    let result = fetch_all_models_cached(client, key, cache, true).await;
+    style::stop_spinner(&spinning);
+    let _ = handle.await;
+    result.unwrap_or_default()
 }
 
 /// Force-refetch when a cursor cache entry was populated by the older
@@ -1165,6 +1193,69 @@ pub(crate) fn tool_supports_default_model(tool: AIToolType, models: &[String]) -
 /// is hidden since a concrete model is required.
 /// Returns `Some(MODEL_DEFAULT_PLACEHOLDER)` if the default is chosen,
 /// `Some(model_name)` for a real model, or `None` if cancelled.
+/// Outcome of picker-style model resolution. Distinguishes "user cancelled the
+/// picker" (exit success, don't launch) from "no fetchable model list, fall back
+/// to the tool's own default" (launch anyway, no injected model). Shared by
+/// `aivo run` and the plugin endpoint so both resolve models identically.
+pub(crate) enum ModelOutcome {
+    /// User picked a model, or `--model <value>` was passed.
+    Model(String),
+    /// No `--model` flag, or the picker fetched an empty list. Launch with the
+    /// tool's own default.
+    UseDefault,
+    /// Picker shown and cancelled (Ctrl-C / Esc) — caller should not launch.
+    Cancelled,
+}
+
+/// Resolve the model to launch with. `--model <value>` → use as-is; bare
+/// `--model` (`Some("")`) → fuzzy picker; **no `--model` (`None`) → `UseDefault`**
+/// (let the tool use its own default — never a forced picker, so a bare launch
+/// or a `-k`-only launch doesn't pop a dialog). On a non-TTY or an empty catalog
+/// it also falls back to the default. `tool` colors the picker's "(leave it to
+/// the tool)" row; pass `None` for a generic client (plugins).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_model_outcome(
+    client: &Client,
+    key: &ApiKey,
+    flag_model: Option<String>,
+    explicit_model_flag: bool,
+    refresh: bool,
+    tool: Option<AIToolType>,
+    cache: &ModelsCache,
+    prompt: &str,
+) -> Result<ModelOutcome> {
+    match flag_model {
+        None => return Ok(ModelOutcome::UseDefault),
+        Some(ref m) if !m.is_empty() => return Ok(ModelOutcome::Model(m.clone())),
+        Some(_) => {}
+    }
+
+    // The picker reads keys via console::Term; on a non-TTY it would spin. Bail
+    // before the network fetch so piped invocations don't pay for a catalog they
+    // can't show. Only explain when the user explicitly asked for a picker.
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        if explicit_model_flag {
+            crate::commands::print_no_model_list_hint();
+        }
+        return Ok(ModelOutcome::UseDefault);
+    }
+
+    let models_list = fetch_all_models_for_picker(client, key, cache, refresh).await;
+    if models_list.is_empty() {
+        if explicit_model_flag {
+            crate::commands::print_no_model_list_hint();
+        }
+        return Ok(ModelOutcome::UseDefault);
+    }
+
+    let annotations = crate::services::model_compat::text_chat_annotations(&models_list);
+    match prompt_model_picker(models_list, tool, annotations, prompt) {
+        Some(m) => Ok(ModelOutcome::Model(m)),
+        None => Ok(ModelOutcome::Cancelled),
+    }
+}
+
 /// Shows a fuzzy model picker with per-row annotations. `annotations[i] =
 /// Some(reason)` disables the matching model and renders `reason` dim at the
 /// end of the row (parallels the key picker). Pass `vec![]` for a vanilla

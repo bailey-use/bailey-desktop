@@ -243,10 +243,11 @@ request escalated to `/v1/responses` upstream (that upstream stream is relayed c
 buffered into one blob). A request without `stream` is buffered. The proxy binds exactly one key —
 **no cross-key failover** (that's an `aivo serve` feature).
 
-For the REST engines, token usage is recorded against the key only for **buffered
-(non-streaming) 2xx** responses; **streaming responses are uncounted** (no body to read usage from
-mid-stream). Cursor-router usage is not token-accounted by the endpoint. Under
-`aivo <plugin> --debug` the proxy logs each proxied request to `AIVO_DEBUG_LOG`.
+For the REST engines, token usage is recorded against the key for **2xx** responses —
+**streaming included**: a usage sniffer extracts the totals from the SSE stream (when accounting is
+on aivo injects `stream_options.include_usage` for OpenAI Chat Completions so the upstream emits
+them). Cursor-router usage is not token-accounted by the endpoint. Under `aivo <plugin> --debug` the
+proxy logs each proxied request to `AIVO_DEBUG_LOG`.
 
 ### Not handoff-able
 
@@ -335,8 +336,17 @@ a manifest — the install-time probe is local-only.
 
 A plugin runs with **your full privileges** — aivo can't sandbox it. Treat `aivo plugins install`
 like `npm i -g`: install only what you trust. aivo's guarantees are **consent + provenance**
-(capability consent before any secret handoff, the `sha256` pin), not containment. The grant scopes a
-plugin to only the endpoint env its caps cover, but once running it can do anything you can.
+(capability consent before any secret handoff; a recorded install source + a `sha256` of the
+installed bytes), not containment. The pin is an **audit record, not tamper protection** — it is not
+yet verified on run or re-fetch (see [Registry](#registry)), so it records *what* was installed but
+doesn't detect a swapped binary. The grant scopes a plugin to only the endpoint env its caps cover,
+but once running it can do anything you can.
+
+`aivo <name>` resolving to a PATH-discovered `aivo-<name>` (the third lookup tier) is intentional and
+git-like, but it means **any writable `$PATH` directory can introduce a runnable subcommand**.
+Installing only trusted plugins bounds what you grant a key to — it does not bound what can run as
+`aivo <name>`. PATH plugins carry no registry record, so they never receive the key/endpoint handoff,
+but they do execute.
 
 ## Reserved for later
 
@@ -345,7 +355,6 @@ Specified so the contract stays stable; not yet implemented:
 - **`hook` role** — observe/transform launches and routing over JSON-RPC (the `hook:<event>` caps and
   the manifest `hooks` array)
 - **`config-read` / `config-write`** — scoped config access
-- **streaming token accounting** at the endpoint (today only buffered responses are counted)
 - **transcript export** — a subcommand so a plugin with a *novel* session format (one aivo can't
   read) can emit its own transcript for `aivo share`
 - **signing + a discovery index**

@@ -41,9 +41,10 @@ pub(crate) enum SourceKind {
 pub(crate) struct Materialized {
     pub primary: PathBuf,
     pub checksum: Option<String>,
-    /// True only for a local path the user pointed at — the one case aivo will
-    /// execute the artifact (to probe `--aivo-manifest`). Remote artifacts
-    /// (url/github/npm/cargo) are never run before an install-consent gate.
+    /// True only for a local path the user pointed at — the one case aivo
+    /// executes the artifact at install (to probe `--aivo-manifest`). Remote
+    /// artifacts (url/github/npm/cargo) aren't run at install time; their
+    /// manifest is probed lazily on first dispatch instead.
     pub trusted_local: bool,
 }
 

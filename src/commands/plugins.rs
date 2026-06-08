@@ -440,9 +440,9 @@ struct InstallOutcome {
 
 /// Resolve the source (local path / URL / `github:` / `npm:` / `cargo:`), install
 /// `aivo-<name>` into `dir`, and probe for a manifest. The probe runs for
-/// **local-path installs only** — aivo won't execute a freshly-fetched remote
-/// binary to read its manifest before an install-consent gate exists (a later
-/// phase); such plugins are recorded manifest-less until reinstalled locally.
+/// **local-path installs only** — aivo doesn't execute a freshly-fetched remote
+/// binary at install time just to read its manifest; such plugins are recorded
+/// manifest-less and probed lazily on first dispatch (see `crate::plugin::endpoint`).
 async fn reinstall(name: &str, source: &str, dir: &Path) -> Result<InstallOutcome> {
     let materialized = source::materialize(source, name, dir).await?;
     let manifest = if materialized.trusted_local {

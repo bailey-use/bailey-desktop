@@ -994,6 +994,10 @@ mod tests {
         assert_eq!(resolved.payload.session_id, full_id);
     }
 
+    // Pi's encoded-cwd dir name (`--<path>--`) is Unix-path-shaped; on Windows a
+    // canonicalized `\\?\C:\…` path yields a directory name with `:`/backslashes
+    // that can't be created. Gated like the pi tests in `context_ingest`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn resolve_plugin_run_event_via_declared_pi_transcript() {
         // A plugin tool (`omp`) that declares a pi-format transcript source is

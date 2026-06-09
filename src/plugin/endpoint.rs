@@ -20,13 +20,11 @@ use crate::services::log_store::{LogEvent, LogStore, new_log_id};
 use crate::services::request_log::RequestLogger;
 use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
 use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::usage_stats_store::RunTokenTally;
 use crate::style;
 
-use super::manifest::{PluginManifest, grantable_capabilities, probe_manifest};
+use super::manifest::{grantable_capabilities, probe_manifest};
 use super::registry::{self, PluginRecord};
-
-/// The only plugin `type` with host behavior today: stats/logs wrapping.
-const CODING_AGENT_TYPE: &str = "coding-agent";
 
 /// Dispatch a plugin that may need a key/endpoint handoff or run accounting.
 /// Falls back to a plain spawn (today's behavior) when neither applies.
@@ -177,6 +175,11 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
         ));
     }
     let mut endpoint: Option<EndpointHandle> = None;
+    // Token-accounted REST engines (serve / responses) fold this run's usage into
+    // the tally; `finish_accounting` stamps the total onto the run's finished log
+    // row so `aivo stats --since` can window it. Cursor/OAuth runs leave it at zero
+    // (the endpoint doesn't token-account them), so their finished row stays bare.
+    let run_tally = Arc::new(RunTokenTally::default());
     if let (Some(key), Some(serve)) = (key.as_ref(), serve) {
         match serve {
             // OAuth lives only in its own native agent — nothing to hand over;
@@ -226,7 +229,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
                 }
                 let started = if use_responses_router(key) {
                     maybe_init_http_debug(debug_log.as_deref()).await;
-                    start_responses_endpoint(key, store, name).await
+                    start_responses_endpoint(key, store, name, run_tally.clone()).await
                 } else {
                     let started = start_loopback_endpoint(
                         key,
@@ -234,6 +237,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
                         store.clone(),
                         name,
                         debug_log.clone(),
+                        run_tally.clone(),
                     )
                     .await;
                     if started.is_ok()
@@ -255,18 +259,32 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     }
 
     let accounting = if plan.is_coding_agent {
-        Some(begin_accounting(store, name, key.as_ref(), model.as_deref(), &plugin_args).await)
+        Some(
+            begin_accounting(
+                store,
+                name,
+                key.as_ref(),
+                model.as_deref(),
+                &plugin_args,
+                run_tally.clone(),
+            )
+            .await,
+        )
     } else {
         None
     };
 
     let code = super::exec_plugin(bin, &plugin_args, &config_dir, &extra_env).await;
 
-    if let Some(acct) = accounting {
-        finish_accounting(store, acct, code).await;
-    }
+    // Duration measures the run itself; the endpoint drain below doesn't count.
+    let run_duration = accounting.as_ref().map(|a| a.started.elapsed());
+    // Drain the endpoint before reading the tally — an accounting task may still
+    // be folding the final response's usage into it.
     if let Some(ep) = endpoint {
         ep.shutdown().await;
+    }
+    if let (Some(acct), Some(duration)) = (accounting, run_duration) {
+        finish_accounting(store, acct, code, duration).await;
     }
     // Stop the llama-server an hf takeover auto-started: the plugin path exits via
     // `process::exit` and never reaches run.rs's global `stop_if_we_started`.
@@ -304,10 +322,6 @@ impl GrantPlan {
     }
 }
 
-pub(crate) fn is_coding_agent(m: &PluginManifest) -> bool {
-    m.kind.as_deref() == Some(CODING_AGENT_TYPE)
-}
-
 /// Resolve what's granted to `name`: read the cached manifest + grants, or
 /// (for a managed but manifest-less plugin) lazily probe and seek consent once.
 async fn grant_plan(name: &str, bin: &Path) -> GrantPlan {
@@ -319,7 +333,7 @@ async fn grant_plan(name: &str, bin: &Path) -> GrantPlan {
             let requested = grantable_capabilities(&manifest.capabilities);
             GrantPlan {
                 caps: retained_grants(&requested, &rec.granted_caps),
-                is_coding_agent: is_coding_agent(manifest),
+                is_coding_agent: manifest.is_coding_agent(),
                 documents_aivo_flags: manifest.documents_aivo_flags,
             }
         }
@@ -347,7 +361,7 @@ async fn lazy_probe_and_consent(name: &str, bin: &Path, existing: &PluginRecord)
             documents_aivo_flags: false,
         };
     };
-    let is_ca = is_coding_agent(&manifest);
+    let is_ca = manifest.is_coding_agent();
     let documents_aivo_flags = manifest.documents_aivo_flags;
     let requested = grantable_capabilities(&manifest.capabilities);
     let mut granted = retained_grants(&requested, &existing.granted_caps);
@@ -884,11 +898,13 @@ async fn start_loopback_endpoint(
     usage: SessionStore,
     tool: &str,
     debug_log: Option<PathBuf>,
+    run_tally: Arc<RunTokenTally>,
 ) -> anyhow::Result<EndpointHandle> {
     let token = random_auth_token();
     let config = ServeRouterConfig::from_key(key, false, 300, Some(token.clone()), HashMap::new());
     let mut router = ServeRouter::new(config, key.clone(), log_store)
-        .with_usage_accounting(usage, tool.to_string());
+        .with_usage_accounting(usage, tool.to_string())
+        .with_run_tally(run_tally);
     if let Some(path) = &debug_log
         && let Some(logger) = RequestLogger::new_with_path(path).await
     {
@@ -975,6 +991,7 @@ async fn start_responses_endpoint(
     key: &ApiKey,
     store: &SessionStore,
     tool: &str,
+    run_tally: Arc<RunTokenTally>,
 ) -> anyhow::Result<EndpointHandle> {
     use crate::services::copilot_auth::CopilotTokenManager;
     use crate::services::provider_profile::{provider_profile_for_key, resolve_starter_base_url};
@@ -1026,6 +1043,7 @@ async fn start_responses_endpoint(
     .with_tool(PLUGIN_ROUTE_TOOL)
     .with_seed_routes(key.routes_for_tool(PLUGIN_ROUTE_TOOL))
     .with_usage_accounting(store.clone(), key.id.clone(), tool.to_string())
+    .with_run_tally(run_tally)
     .with_auth_token(token.clone());
     let (port, route_cache, learned, handle) = router.start_background().await?;
     Ok(
@@ -1045,6 +1063,8 @@ async fn start_responses_endpoint(
 struct Accounting {
     base: LogEvent,
     started: Instant,
+    /// This run's endpoint token usage, read onto the finished row at the end.
+    run_tally: Arc<RunTokenTally>,
 }
 
 async fn begin_accounting(
@@ -1053,6 +1073,7 @@ async fn begin_accounting(
     key: Option<&ApiKey>,
     model: Option<&str>,
     args: &[String],
+    run_tally: Arc<RunTokenTally>,
 ) -> Accounting {
     let cwd = std::env::current_dir()
         .ok()
@@ -1089,16 +1110,26 @@ async fn begin_accounting(
     Accounting {
         base,
         started: Instant::now(),
+        run_tally,
     }
 }
 
-async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32) {
+async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32, duration: Duration) {
+    // Stamp the run's endpoint token usage onto the finished row (a no-op zero for
+    // Cursor/OAuth runs), so a probe-less coding-agent plugin is windowable under
+    // `aivo stats --since` — its lifetime per-key counters carry no timestamp.
+    let (prompt, completion, cache_read, cache_creation) = acct.run_tally.snapshot();
+    let some_positive = |v: u64| (v > 0).then_some(v as i64);
     let _ = store
         .logs()
         .append(LogEvent {
             phase: Some("finished".to_string()),
             exit_code: Some(code as i64),
-            duration_ms: Some(acct.started.elapsed().as_millis() as i64),
+            duration_ms: Some(duration.as_millis() as i64),
+            input_tokens: some_positive(prompt),
+            output_tokens: some_positive(completion),
+            cache_read_input_tokens: some_positive(cache_read),
+            cache_creation_input_tokens: some_positive(cache_creation),
             ..acct.base
         })
         .await;

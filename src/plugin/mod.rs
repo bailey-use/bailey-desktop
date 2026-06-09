@@ -131,7 +131,7 @@ pub fn coding_agent_plugin_names() -> std::collections::HashSet<String> {
     registry::load()
         .plugins
         .into_iter()
-        .filter(|(_, rec)| rec.manifest.as_ref().is_some_and(endpoint::is_coding_agent))
+        .filter(|(_, rec)| rec.manifest.as_ref().is_some_and(|m| m.is_coding_agent()))
         .map(|(name, _)| name)
         .collect()
 }

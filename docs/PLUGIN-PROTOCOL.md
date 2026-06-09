@@ -100,13 +100,15 @@ echo "hello: $*"
   accounting, no llama-server spawn, no launch) — the plugin counterpart of `aivo run --dry-run`.
 - the launch is wrapped in the same run accounting native tools get: a `started`/`finished` row pair
   in `aivo logs` / `aivo stats` (launch count, duration, exit code).
+- it's probed for [`--aivo-stats`](#stats) automatically (no `stats` cap needed) — reporting its own
+  usage is part of being a coding agent.
 
 Other types are recorded and shown but otherwise inert. (Token accounting at the endpoint is
 independent of `type` — see [Endpoint handoff](#endpoint-handoff).)
 
 ## Stats
 
-A plugin that declares the **`stats`** capability implements a second probe:
+A plugin can implement a second probe that reports its own usage:
 
 ```
 aivo-<name> --aivo-stats --json
@@ -117,11 +119,16 @@ folder — and prints **one** `aivo.stats/v1` JSON object: a **timestamped, per-
 per-model token usage. **The plugin only provides data; aivo owns all filtering.** aivo applies
 `--since` windowing, model-name normalization, and aggregation host-side — consistently with native
 tools — so the plugin never reimplements them. aivo pulls this on demand for `aivo stats --by <name>`
-and the `By tool` overview, **preferring it over aivo's own endpoint accounting** (the plugin's data
-is the complete, authoritative view of that agent). Best-effort and capability-gated: a missing flag,
-timeout (5s), non-zero exit, or wrong schema → aivo falls back to its endpoint token accounting, then
-to launch counts. `stats` is **disclosure-only** (the plugin only reads its own data) — no consent
-grant, like `--aivo-manifest`.
+and the `By tool` overview (including under `--since`, windowed by each session's `ts`),
+**preferring it over aivo's own endpoint accounting** (the plugin's data is the complete,
+authoritative view of that agent).
+
+**Who gets probed:** a **`coding-agent`** plugin is probed automatically — reporting its own usage is
+part of being a coding agent, so no capability is needed. Any **other** plugin type opts in by
+declaring the **`stats`** capability. Either way the probe is best-effort: a missing flag, timeout
+(5s), non-zero exit, or wrong schema → aivo falls back to its endpoint token accounting, then to
+launch counts. It is **disclosure-only** (the plugin only reads its own data) — no consent grant,
+like `--aivo-manifest`.
 
 ```jsonc
 {
@@ -168,8 +175,9 @@ off and lets aivo's banner stand in.
 
 Capability vocabulary: `endpoint`, `config-read`, `config-write`, `spawn`, `stats`, `hook:<event>`.
 **`endpoint` is the only grantable capability in v1**; the rest are disclosure/reserved — parsed and
-stored verbatim, never granted or injected. `stats` opts the plugin into the
-[`--aivo-stats`](#stats) usage probe (read-only, no grant).
+stored verbatim, never granted or injected. `stats` opts a **non-`coding-agent`** plugin into the
+[`--aivo-stats`](#stats) usage probe (read-only, no grant); `coding-agent` plugins are probed
+without it.
 
 `endpoint` hands the plugin real power, so it is consent-gated:
 

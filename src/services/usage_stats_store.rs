@@ -1,8 +1,47 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_store::{ConfigContext, ConfigLockGuard, UsageStats};
+
+/// Per-run token accumulator the plugin endpoint taps so a coding-agent run's
+/// `finished` log row carries *timestamped* token totals.
+///
+/// The lifetime [`UsageStats`] is keyed by `(key, tool, model)` with no
+/// timestamp, so it can't be windowed by `aivo stats --since` — but logs.db
+/// rows can. Both endpoint engines (`ServeRouter` / `ResponsesToChatRouter`) add
+/// to this at the same point they record lifetime usage, and `finish_accounting`
+/// reads the snapshot onto the run's finished `tool_launch` row. Shared across
+/// the router's async tasks via `Arc`, hence atomics.
+#[derive(Debug, Default)]
+pub struct RunTokenTally {
+    prompt: AtomicU64,
+    completion: AtomicU64,
+    cache_read: AtomicU64,
+    cache_creation: AtomicU64,
+}
+
+impl RunTokenTally {
+    /// Fold one usage report into the running totals.
+    pub(crate) fn add(&self, prompt: u64, completion: u64, cache_read: u64, cache_creation: u64) {
+        self.prompt.fetch_add(prompt, Ordering::Relaxed);
+        self.completion.fetch_add(completion, Ordering::Relaxed);
+        self.cache_read.fetch_add(cache_read, Ordering::Relaxed);
+        self.cache_creation
+            .fetch_add(cache_creation, Ordering::Relaxed);
+    }
+
+    /// `(prompt, completion, cache_read, cache_creation)` accumulated so far.
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.prompt.load(Ordering::Relaxed),
+            self.completion.load(Ordering::Relaxed),
+            self.cache_read.load(Ordering::Relaxed),
+            self.cache_creation.load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 struct StatsFileContext {

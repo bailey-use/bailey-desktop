@@ -33,6 +33,7 @@ use crate::services::serve_upstream::{
     send_openai_chat, send_openai_embeddings,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::usage_stats_store::RunTokenTally;
 
 use std::sync::LazyLock;
 
@@ -112,6 +113,10 @@ pub struct ServeRouter {
     usage_sink: Option<SessionStore>,
     /// Tool label for accounted requests (the plugin name); `None` → "serve".
     usage_tool: Option<String>,
+    /// Per-run token tally for the plugin endpoint, so the run's finished log row
+    /// carries timestamped tokens (windowable by `aivo stats --since`). Fed at the
+    /// same point as `usage_sink`; `None` for plain `aivo serve`.
+    run_tally: Option<Arc<RunTokenTally>>,
 }
 
 struct ServeState {
@@ -126,6 +131,7 @@ struct ServeState {
     shutdown: Arc<tokio::sync::Notify>,
     usage_sink: Option<SessionStore>,
     usage_tool: Option<String>,
+    run_tally: Option<Arc<RunTokenTally>>,
 }
 
 struct FailoverEntry {
@@ -145,6 +151,7 @@ impl ServeRouter {
             failover_keys: Vec::new(),
             usage_sink: None,
             usage_tool: None,
+            run_tally: None,
         }
     }
 
@@ -164,6 +171,13 @@ impl ServeRouter {
     pub fn with_usage_accounting(mut self, store: SessionStore, tool: String) -> Self {
         self.usage_sink = Some(store);
         self.usage_tool = Some(tool);
+        self
+    }
+
+    /// Also fold accounted usage into a per-run tally, so the plugin run's
+    /// finished log row carries timestamped tokens for `aivo stats --since`.
+    pub fn with_run_tally(mut self, tally: Arc<RunTokenTally>) -> Self {
+        self.run_tally = Some(tally);
         self
     }
 
@@ -272,6 +286,7 @@ impl ServeRouter {
             shutdown: shutdown.clone(),
             usage_sink: self.usage_sink,
             usage_tool: self.usage_tool,
+            run_tally: self.run_tally,
         });
 
         (tokio::spawn(run_accept_loop(listener, state)), shutdown)
@@ -494,6 +509,11 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                         u.cache_creation,
                     )
                     .await;
+                // Same totals into the per-run tally, so the finished log row is
+                // windowable by `aivo stats --since` (lifetime stats aren't).
+                if let Some(tally) = &state.run_tally {
+                    tally.add(u.prompt, u.completion, u.cache_read, u.cache_creation);
+                }
             }
 
             // Log request (non-blocking, non-fatal)
@@ -825,6 +845,7 @@ fn failover_state(
         shutdown: Arc::new(tokio::sync::Notify::new()),
         usage_sink: None,
         usage_tool: None,
+        run_tally: None,
     }
 }
 
@@ -1300,6 +1321,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_sink: None,
             usage_tool: None,
+            run_tally: None,
         }
     }
 
@@ -1436,6 +1458,7 @@ mod tests {
             shutdown: Arc::new(tokio::sync::Notify::new()),
             usage_sink: None,
             usage_tool: None,
+            run_tally: None,
         };
 
         let context = upstream_context(&state);

@@ -4,8 +4,9 @@
 //! timestamped** records. aivo pulls on demand (`aivo-<name> --aivo-stats
 //! --json`) and owns all filtering/aggregation: `--since` windowing, model-name
 //! normalization, and totals are applied host-side, consistently with native
-//! tools. The plugin only provides data. Best-effort and capability-gated;
-//! aivo falls back to its own proxy accounting / launch counts when absent.
+//! tools. The plugin only provides data. Best-effort: coding-agent plugins are
+//! probed automatically (other types opt in via the `stats` cap), and aivo falls
+//! back to its own proxy accounting / launch counts when a report is absent.
 
 use std::time::Duration;
 
@@ -50,15 +51,19 @@ pub(crate) struct ModelStat {
     pub cache_write_tokens: u64,
 }
 
-/// True when `name`'s manifest declares the `stats` capability — i.e. it
-/// implements `--aivo-stats`. Disclosure-only (the plugin just reads its own
-/// data and reports), so no consent grant is required.
-pub(crate) fn declares_stats(name: &str) -> bool {
+/// True when aivo should pull `name`'s own `--aivo-stats` report. A
+/// **coding-agent** plugin reports usage by nature, so it's probed automatically
+/// (no `stats` cap needed); any other plugin type opts in by declaring the
+/// `stats` capability. The probe is best-effort (`probe_stats`), so a plugin that
+/// doesn't actually implement `--aivo-stats` just yields no report. Either way
+/// it's disclosure-only (the plugin reads its own data), so no consent grant is
+/// required.
+pub(crate) fn probes_stats(name: &str) -> bool {
     super::registry::load()
         .plugins
         .get(name)
         .and_then(|r| r.manifest.as_ref())
-        .is_some_and(|m| m.capabilities.iter().any(|c| c == "stats"))
+        .is_some_and(|m| m.is_coding_agent() || m.capabilities.iter().any(|c| c == "stats"))
 }
 
 /// Run `aivo-<name> --aivo-stats --json` and parse its report. Best-effort: a

@@ -118,54 +118,108 @@ impl StatsCommand {
                 },
             );
         }
-        // Tools with launches but no global source: prefer the plugin's own
-        // `--aivo-stats` report, else recorded per-(tool, model) tokens, else
-        // mark launch-only so the By tool table shows `—` (no fabricated number).
-        // Lifetime data, so skip under --since.
+        // Tools with launches but no global (event) token source. Prefer the
+        // plugin's own `--aivo-stats` report — its per-session `ts` lets us window
+        // it by `--since`, the same way the `--by <tool>` view does, so a
+        // probe-backed tool (e.g. amp) no longer vanishes from a windowed overview.
+        // Without a probe we fall back to recorded per-(tool, model) tokens or a
+        // launch-only `—`; both are lifetime-only counters, so under `--since` a
+        // probe-less tool falls back to the endpoint tokens stamped on its
+        // finished run rows (timestamped), accumulated per model here so the
+        // breakdown below stays consistent with the per-tool totals.
         let mut launch_only: HashSet<String> = HashSet::new();
-        if cutoff.is_none() {
-            for (tool, &count) in &aivo_tool_counts {
-                if tool == "chat" || count == 0 {
-                    continue;
+        let mut plugin_window_models: HashMap<String, ModelTotals> = HashMap::new();
+        // Tools needing a non-global summary: skip chat, zero-launch, and tools
+        // the global (event) source already covers.
+        let pending: Vec<(&String, u64)> = aivo_tool_counts
+            .iter()
+            .filter(|&(tool, &count)| {
+                tool != "chat"
+                    && count > 0
+                    && tool_tokens.get(tool).is_none_or(|t| t.total_tokens() == 0)
+            })
+            .map(|(tool, &count)| (tool, count))
+            .collect();
+        // Each probe spawns the plugin binary (5s timeout) — run them all
+        // concurrently up front instead of serially inside the loop.
+        let probe_reports: HashMap<&str, crate::plugin::stats::PluginStatsReport> =
+            futures::future::join_all(
+                pending
+                    .iter()
+                    .filter(|(tool, _)| crate::plugin::stats::probes_stats(tool))
+                    .map(|(tool, _)| async move {
+                        (tool.as_str(), crate::plugin::stats::probe_stats(tool).await)
+                    }),
+            )
+            .await
+            .into_iter()
+            .filter_map(|(tool, report)| report.map(|r| (tool, r)))
+            .collect();
+        for &(tool, count) in &pending {
+            let report = probe_reports.get(tool.as_str());
+            let summary = match (report, cutoff) {
+                // Probe present: window per-session `ts` by the cutoff (None =
+                // lifetime). Lifetime keeps the launch count when the probe
+                // carries no usage rows; a window shows only its in-window sessions.
+                (Some(r), _) => {
+                    let (cnt, models) = aggregate_plugin_sessions(r, cutoff);
+                    let (i, o, cr, cw) = sum_model_totals(&models);
+                    let sessions = if cutoff.is_none() && cnt == 0 {
+                        count
+                    } else {
+                        cnt
+                    };
+                    Some((sessions, i, o, cr, cw))
                 }
-                let dominated_by_global =
-                    tool_tokens.get(tool).is_some_and(|t| t.total_tokens() > 0);
-                if dominated_by_global {
-                    continue;
+                // No probe, lifetime: fall back to per-key counters / launch count.
+                (None, None) => {
+                    let (i, o, cr, cw) =
+                        sum_model_totals(&per_tool_model_totals(&stats, tool, &key_ids));
+                    Some((count, i, o, cr, cw))
                 }
-                let report = if crate::plugin::stats::declares_stats(tool) {
-                    crate::plugin::stats::probe_stats(tool).await
-                } else {
-                    None
-                };
-                let (sessions, input, output, cache_read, cache_write) = match &report {
-                    Some(r) => {
-                        // Overview is lifetime (this block only runs when cutoff
-                        // is none), so aggregate all sessions.
-                        let (cnt, models) = aggregate_plugin_sessions(r, None);
-                        let (i, o, cr, cw) = sum_model_totals(&models);
-                        (if cnt > 0 { cnt } else { count }, i, o, cr, cw)
+                // No probe under `--since`: lifetime per-key counters can't be
+                // windowed, but the endpoint stamps each run's tokens on its
+                // finished tool_launch row — read those, windowed. Launch count
+                // comes from the started rows in the same window.
+                (None, Some(c)) => {
+                    let (models, windowed_launches) = self.windowed_run_usage(c, tool).await;
+                    let (i, o, cr, cw) = sum_model_totals(&models);
+                    for (model, t) in models {
+                        plugin_window_models.entry(model).or_default().add(
+                            t.input,
+                            t.output,
+                            t.cache_read,
+                            t.cache_write,
+                        );
                     }
-                    None => {
-                        let (i, o, cr, cw) =
-                            sum_model_totals(&per_tool_model_totals(&stats, tool, &key_ids));
-                        (count, i, o, cr, cw)
+                    if i + o + cr + cw == 0 && windowed_launches == 0 {
+                        None
+                    } else {
+                        Some((windowed_launches, i, o, cr, cw))
                     }
-                };
-                if input + output + cache_read + cache_write == 0 {
-                    launch_only.insert(tool.clone());
                 }
-                tool_tokens.insert(
-                    tool.clone(),
-                    ToolTokenSummary {
-                        sessions,
-                        input,
-                        output,
-                        cache_read,
-                        cache_write,
-                    },
-                );
+            };
+            let Some((sessions, input, output, cache_read, cache_write)) = summary else {
+                continue;
+            };
+            // Under `--since`, drop a tool with no in-window activity rather than
+            // fabricating a row from lifetime launch counts.
+            if cutoff.is_some() && sessions == 0 && input + output + cache_read + cache_write == 0 {
+                continue;
             }
+            if input + output + cache_read + cache_write == 0 {
+                launch_only.insert(tool.clone());
+            }
+            tool_tokens.insert(
+                tool.clone(),
+                ToolTokenSummary {
+                    sessions,
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                },
+            );
         }
         // Chat sessions go through the index (timestamped), not the per-key
         // counters (lifetime-only). One walk yields both count and tokens.
@@ -215,6 +269,17 @@ impl StatsCommand {
             entry.cache_write = entry.cache_write.saturating_add(tokens.cache_write_tokens);
         }
         let mut model_tokens = combine_model_tokens(&global, &aivo_model_usage);
+        // Fold in the windowed per-model tokens from probe-less plugin runs (their
+        // endpoint usage isn't in `global`/`aivo_model_usage`), so the breakdown
+        // matches the per-tool totals computed above.
+        for (model, t) in &plugin_window_models {
+            model_tokens.entry(model.clone()).or_default().add(
+                t.input,
+                t.output,
+                t.cache_read,
+                t.cache_write,
+            );
+        }
         // Under --since, surface models that were launched in the window even
         // if no upstream usage was recorded — `logs.db` is the table-of-truth
         // for "what did I run", independent of provider-side `usage` fields.
@@ -489,47 +554,75 @@ impl StatsCommand {
         // A coding-agent plugin that implements `--aivo-stats` reports its own
         // usage (its data folder + format) — the authoritative, complete source.
         // It only provides raw per-session data; aivo windows/aggregates below.
-        if crate::plugin::stats::declares_stats(tool)
+        if crate::plugin::stats::probes_stats(tool)
             && let Some(report) = crate::plugin::stats::probe_stats(tool).await
         {
             return render_plugin_report(tool, &report, args, cutoff, fmt);
         }
-        if cutoff.is_none() {
-            let stats = self.store.load_stats().await.unwrap_or_default();
-            let keys = self.store.get_keys().await.unwrap_or_default();
-            let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
-            let models = per_tool_model_totals(&stats, tool, &key_ids);
-            let (input, output, cache_read, cache_write) = sum_model_totals(&models);
-            if input + output + cache_read + cache_write > 0 {
+        // Per-(tool, model) tokens, then launches. Lifetime reads the per-key
+        // counters in UsageStats; `--since` reads the timestamped tokens the
+        // endpoint stamps on each run's finished row (the per-key counters carry
+        // no timestamp), so a probe-less coding-agent plugin is windowable too.
+        let (models, launches) = match cutoff {
+            None => {
+                let stats = self.store.load_stats().await.unwrap_or_default();
+                let keys = self.store.get_keys().await.unwrap_or_default();
+                let key_ids: HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
                 let plugins = crate::plugin::coding_agent_plugin_names();
                 let launches = aggregate_tool_counts(&stats, &key_ids, &plugins)
                     .get(tool)
                     .copied()
                     .unwrap_or(0);
-                let view = ToolView {
-                    count: launches,
-                    input_tokens: input,
-                    output_tokens: output,
-                    cache_read,
-                    cache_write,
-                    models,
-                };
-                if args.json {
-                    return print_json(&build_tool_view_json(
-                        tool,
-                        &view,
-                        "aivo",
-                        "launches",
-                        args,
-                        None,
-                        &[],
-                    ));
-                }
-                print_tool_view(&view, "launches", fmt, args);
-                return ExitCode::Success;
+                (per_tool_model_totals(&stats, tool, &key_ids), launches)
             }
+            Some(c) => self.windowed_run_usage(c, tool).await,
+        };
+        let (input, output, cache_read, cache_write) = sum_model_totals(&models);
+        if input + output + cache_read + cache_write > 0 {
+            let view = ToolView {
+                count: launches,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read,
+                cache_write,
+                models,
+            };
+            if args.json {
+                let window = cutoff.and_then(|c| args.since.as_deref().map(|raw| (raw, c)));
+                return print_json(&build_tool_view_json(
+                    tool,
+                    &view,
+                    "aivo",
+                    "launches",
+                    args,
+                    window,
+                    &[],
+                ));
+            }
+            print_tool_view(&view, "launches", fmt, args);
+            render_since_footer(args.since.as_deref(), &[]);
+            return ExitCode::Success;
         }
         self.show_tool_launches(tool, args, cutoff, fmt).await
+    }
+
+    /// Windowed per-model tokens + launch count for one tool from logs.db run
+    /// rows: tokens from the finished rows the endpoint stamps, launches from
+    /// the started rows (model-less launches included).
+    async fn windowed_run_usage(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        tool: &str,
+    ) -> (HashMap<String, ModelTotals>, u64) {
+        let logs = self.store.logs();
+        let (tokens, launches) = tokio::join!(
+            logs.aggregate_run_tokens_since(cutoff, Some(tool)),
+            logs.count_runs_since(cutoff, Some(tool)),
+        );
+        (
+            run_model_tokens_to_totals(tokens.unwrap_or_default()),
+            launches.unwrap_or_default(),
+        )
     }
 
     /// Launch-count view for tools with no per-tool token attribution: real
@@ -1065,6 +1158,22 @@ fn per_tool_model_totals(
                     mc.cache_creation_input_tokens,
                 );
         }
+    }
+    models
+}
+
+/// Convert the endpoint's timestamped per-model run tokens (from logs.db) into
+/// the display `ModelTotals` map, normalizing model names the same way the
+/// lifetime path does.
+fn run_model_tokens_to_totals(
+    raw: HashMap<String, crate::services::log_store::RunModelTokens>,
+) -> HashMap<String, ModelTotals> {
+    let mut models: HashMap<String, ModelTotals> = HashMap::new();
+    for (model, t) in raw {
+        models
+            .entry(normalize_model_for_display(&model))
+            .or_default()
+            .add(t.input, t.output, t.cache_read, t.cache_creation);
     }
     models
 }

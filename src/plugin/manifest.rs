@@ -64,6 +64,16 @@ pub(crate) struct PluginManifest {
     pub requires: Vec<Requirement>,
 }
 
+/// The only plugin `type` with host behavior today: stats/logs wrapping and
+/// automatic `--aivo-stats` probing.
+const CODING_AGENT_TYPE: &str = "coding-agent";
+
+impl PluginManifest {
+    pub(crate) fn is_coding_agent(&self) -> bool {
+        self.kind.as_deref() == Some(CODING_AGENT_TYPE)
+    }
+}
+
 /// A plugin's transcript source for `aivo share`: either a built-in `format`
 /// (`pi`/`codex`/`gemini`/`opencode`) aivo reads from `dir`, or `format:
 /// "native"` — the plugin emits its own transcript via `--aivo-export-transcript`
@@ -281,9 +291,7 @@ mod tests {
 
     #[test]
     fn grantable_caps_classified() {
-        for c in ["endpoint"] {
-            assert!(is_grantable_cap(c), "{c} should gate consent");
-        }
+        assert!(is_grantable_cap("endpoint"), "endpoint should gate consent");
         // These are parsed for disclosure/forward-compatibility but never
         // granted in protocol v1.
         for c in [

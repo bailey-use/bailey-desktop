@@ -143,51 +143,15 @@ impl LogStore {
     }
 
     pub async fn list(&self, query: LogQuery) -> Result<Vec<LogEntry>> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Ok(Vec::new());
-            }
-            match open_read_connection(&path).and_then(|conn| list_with_connection(&conn, &query)) {
-                Ok(entries) => Ok(entries),
-                Err(direct_err) => {
-                    with_snapshot_connection(&path, |conn| list_with_connection(conn, &query))
-                        .with_context(|| {
-                            format!(
-                                "Failed to read SQLite logs directly from {:?}: {direct_err:#}",
-                                path
-                            )
-                        })
-                }
-            }
-        })
-        .await
-        .context("Failed to join log query task")?
+        self.read_with_fallback("logs", move |conn| list_with_connection(conn, &query))
+            .await
     }
 
     #[allow(dead_code)]
     pub async fn get(&self, id: &str) -> Result<Option<LogEntry>> {
-        let path = self.path.clone();
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Ok(None);
-            }
-            match open_read_connection(&path).and_then(|conn| get_with_connection(&conn, &id)) {
-                Ok(entry) => Ok(entry),
-                Err(direct_err) => with_snapshot_connection(&path, |conn| {
-                    get_with_connection(conn, &id)
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to read SQLite log entry directly from {:?}: {direct_err:#}",
-                        path
-                    )
-                }),
-            }
-        })
-        .await
-        .context("Failed to join log get task")?
+        self.read_with_fallback("log entry", move |conn| get_with_connection(conn, &id))
+            .await
     }
 
     /// Prefix-matches up to `limit` rows. Matches `id` / `event_group_id`
@@ -362,29 +326,11 @@ impl LogStore {
     }
 
     pub async fn get_by_reference(&self, reference: &str) -> Result<Option<LogEntry>> {
-        let path = self.path.clone();
         let reference = reference.trim().to_string();
-        tokio::task::spawn_blocking(move || {
-            if !path.exists() {
-                return Ok(None);
-            }
-            match open_read_connection(&path)
-                .and_then(|conn| get_by_reference_with_connection(&conn, &reference))
-            {
-                Ok(entry) => Ok(entry),
-                Err(direct_err) => with_snapshot_connection(&path, |conn| {
-                    get_by_reference_with_connection(conn, &reference)
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to read SQLite log entry directly from {:?}: {direct_err:#}",
-                        path
-                    )
-                }),
-            }
+        self.read_with_fallback("log entry by reference", move |conn| {
+            get_by_reference_with_connection(conn, &reference)
         })
         .await
-        .context("Failed to join log reference lookup task")?
     }
 
     /// Counts `tool_launch` events (phase = `started`) since `cutoff`,
@@ -397,32 +343,85 @@ impl LogStore {
         cutoff: chrono::DateTime<chrono::Utc>,
         tool_filter: Option<&str>,
     ) -> Result<HashMap<String, u64>> {
-        let path = self.path.clone();
         let cutoff_str = cutoff.to_rfc3339();
         let tool_filter = tool_filter.map(|t| t.to_string());
+        self.read_with_fallback("run models", move |conn| {
+            aggregate_run_models_with_connection(conn, &cutoff_str, tool_filter.as_deref())
+        })
+        .await
+    }
+
+    /// Counts `tool_launch` *started* rows since `cutoff` — the windowed launch
+    /// count. Unlike `aggregate_run_models_since`, model-less launches count too
+    /// (a run can proxy traffic without ever resolving a model name).
+    pub async fn count_runs_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        tool_filter: Option<&str>,
+    ) -> Result<u64> {
+        let cutoff_str = cutoff.to_rfc3339();
+        let tool_filter = tool_filter.map(|t| t.to_string());
+        self.read_with_fallback("run counts", move |conn| {
+            count_runs_with_connection(conn, &cutoff_str, tool_filter.as_deref())
+        })
+        .await
+    }
+
+    /// Sums per-model token usage from `tool_launch` *finished* rows since
+    /// `cutoff`. These tokens are stamped by the plugin endpoint at run end (see
+    /// `finish_accounting`), so this is the timestamped, windowable view of a
+    /// coding-agent plugin's usage — the counterpart of `aggregate_run_models_since`
+    /// (which counts launches). Native tools carry no tokens on these rows, so a
+    /// `tool_filter` is unnecessary for correctness but scopes the query when set.
+    /// Returns `model → (input, output, cache_read, cache_creation)`, dropping
+    /// zero-token rows (those still surface as launches).
+    pub async fn aggregate_run_tokens_since(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        tool_filter: Option<&str>,
+    ) -> Result<HashMap<String, RunModelTokens>> {
+        let cutoff_str = cutoff.to_rfc3339();
+        let tool_filter = tool_filter.map(|t| t.to_string());
+        self.read_with_fallback("run tokens", move |conn| {
+            aggregate_run_tokens_with_connection(conn, &cutoff_str, tool_filter.as_deref())
+        })
+        .await
+    }
+
+    /// Run a read-only query off the runtime: direct read connection first,
+    /// snapshot-copy fallback when the live DB can't be read. A missing DB
+    /// file yields `T::default()` (no rows yet, not an error).
+    async fn read_with_fallback<T, F>(&self, what: &'static str, op: F) -> Result<T>
+    where
+        T: Default + Send + 'static,
+        F: Fn(&Connection) -> Result<T> + Send + 'static,
+    {
+        let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             if !path.exists() {
-                return Ok(HashMap::new());
+                return Ok(T::default());
             }
-            let direct = open_read_connection(&path).and_then(|conn| {
-                aggregate_run_models_with_connection(&conn, &cutoff_str, tool_filter.as_deref())
-            });
-            match direct {
-                Ok(map) => Ok(map),
-                Err(direct_err) => with_snapshot_connection(&path, |conn| {
-                    aggregate_run_models_with_connection(conn, &cutoff_str, tool_filter.as_deref())
-                })
-                .with_context(|| {
-                    format!(
-                        "Failed to aggregate run models from {:?}: {direct_err:#}",
-                        path
-                    )
-                }),
+            match open_read_connection(&path).and_then(|conn| op(&conn)) {
+                Ok(v) => Ok(v),
+                Err(direct_err) => {
+                    with_snapshot_connection(&path, |conn| op(conn)).with_context(|| {
+                        format!("Failed to read {what} from {path:?}: {direct_err:#}")
+                    })
+                }
             }
         })
         .await
-        .context("Failed to join run-model aggregation task")?
+        .with_context(|| format!("Failed to join {what} read task"))?
     }
+}
+
+/// Per-model token totals summed from `tool_launch` finished rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunModelTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
 }
 
 fn normalize_query_value(value: Option<String>) -> Option<String> {
@@ -820,6 +819,78 @@ fn aggregate_run_models_with_connection(
     Ok(out)
 }
 
+fn count_runs_with_connection(
+    conn: &Connection,
+    cutoff: &str,
+    tool_filter: Option<&str>,
+) -> Result<u64> {
+    let mut sql = String::from(
+        "select count(*) from events \
+         where kind = 'tool_launch' and phase = 'started' and ts_utc >= ?",
+    );
+    let mut params: Vec<SqlValue> = vec![SqlValue::Text(cutoff.to_string())];
+    if let Some(t) = tool_filter {
+        sql.push_str(" and tool = ?");
+        params.push(SqlValue::Text(t.to_string()));
+    }
+    let count: i64 = conn
+        .prepare(&sql)
+        .context("Failed to prepare run-count query")?
+        .query_row(params_from_iter(params), |row| row.get(0))
+        .context("Failed to execute run-count query")?;
+    Ok(count.max(0) as u64)
+}
+
+fn aggregate_run_tokens_with_connection(
+    conn: &Connection,
+    cutoff: &str,
+    tool_filter: Option<&str>,
+) -> Result<HashMap<String, RunModelTokens>> {
+    let mut sql = String::from(
+        "select model, \
+            coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0), \
+            coalesce(sum(cache_read_input_tokens), 0), coalesce(sum(cache_creation_input_tokens), 0) \
+         from events \
+         where kind = 'tool_launch' and phase = 'finished' \
+         and ts_utc >= ? and model is not null and trim(model) != ''",
+    );
+    let mut params: Vec<SqlValue> = vec![SqlValue::Text(cutoff.to_string())];
+    if let Some(t) = tool_filter {
+        sql.push_str(" and tool = ?");
+        params.push(SqlValue::Text(t.to_string()));
+    }
+    // Coalesce each term: `finish_accounting` stamps zero fields as NULL, and a
+    // single all-NULL column would otherwise NULL-poison the sum and drop the group.
+    sql.push_str(
+        " group by model having \
+         coalesce(sum(input_tokens), 0) + coalesce(sum(output_tokens), 0) \
+         + coalesce(sum(cache_read_input_tokens), 0) + coalesce(sum(cache_creation_input_tokens), 0) > 0",
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare run-token aggregation query")?;
+    let rows = stmt
+        .query_map(params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RunModelTokens {
+                    input: row.get::<_, i64>(1)?.max(0) as u64,
+                    output: row.get::<_, i64>(2)?.max(0) as u64,
+                    cache_read: row.get::<_, i64>(3)?.max(0) as u64,
+                    cache_creation: row.get::<_, i64>(4)?.max(0) as u64,
+                },
+            ))
+        })
+        .context("Failed to execute run-token aggregation query")?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (model, tokens) = row.context("Failed to read run-token aggregation row")?;
+        out.insert(model, tokens);
+    }
+    Ok(out)
+}
+
 fn map_log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
     let payload_json: Option<String> = row.get(22)?;
     let payload_json = payload_json.and_then(|raw| serde_json::from_str(&raw).ok());
@@ -1199,6 +1270,148 @@ mod tests {
             .await
             .unwrap();
         assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aggregate_run_tokens_since_sums_finished_rows_by_model_and_tool() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+
+        let finished = |tool: &str, model: &str, i: i64, o: i64, cr: i64, cc: i64| LogEvent {
+            source: "run".to_string(),
+            kind: "tool_launch".to_string(),
+            phase: Some("finished".to_string()),
+            tool: Some(tool.to_string()),
+            model: Some(model.to_string()),
+            // Mirror `finish_accounting`: zero fields are stamped as NULL, not 0.
+            input_tokens: (i > 0).then_some(i),
+            output_tokens: (o > 0).then_some(o),
+            cache_read_input_tokens: (cr > 0).then_some(cr),
+            cache_creation_input_tokens: (cc > 0).then_some(cc),
+            ..Default::default()
+        };
+
+        // Two finished copilot runs on the same model sum together.
+        store
+            .append(finished("copilot", "gpt-5.2", 100, 50, 10, 5))
+            .await
+            .unwrap();
+        store
+            .append(finished("copilot", "gpt-5.2", 20, 10, 0, 0))
+            .await
+            .unwrap();
+        // Zero-token finished row is dropped (it still shows as a launch elsewhere).
+        store
+            .append(finished("copilot", "idle", 0, 0, 0, 0))
+            .await
+            .unwrap();
+        // A different tool is excluded by the tool filter.
+        store
+            .append(finished("claude", "claude-x", 7, 0, 0, 0))
+            .await
+            .unwrap();
+        // A `started` row carrying tokens is excluded by the phase filter.
+        store
+            .append(LogEvent {
+                phase: Some("started".to_string()),
+                ..finished("copilot", "ghost", 999, 999, 0, 0)
+            })
+            .await
+            .unwrap();
+        // Output-only row (input + cache columns NULL): sqlite sum() over an
+        // all-NULL group is NULL, which must not poison the HAVING filter.
+        store
+            .append(finished("copilot", "text-only", 0, 40, 0, 0))
+            .await
+            .unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let map = store
+            .aggregate_run_tokens_since(past, Some("copilot"))
+            .await
+            .unwrap();
+        assert_eq!(
+            map.len(),
+            2,
+            "the summed gpt-5.2 row and the output-only row survive: {map:?}"
+        );
+        let t = map.get("gpt-5.2").copied().unwrap();
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_creation),
+            (120, 60, 10, 5)
+        );
+        let t = map.get("text-only").copied().unwrap();
+        assert_eq!(
+            (t.input, t.output, t.cache_read, t.cache_creation),
+            (0, 40, 0, 0)
+        );
+        assert!(!map.contains_key("idle"));
+        assert!(!map.contains_key("ghost"));
+
+        // No tool filter still excludes the zero-token + started rows, but now
+        // includes the claude row.
+        let all = store.aggregate_run_tokens_since(past, None).await.unwrap();
+        assert_eq!(all.get("claude-x").map(|t| t.input), Some(7));
+        assert!(all.contains_key("gpt-5.2"));
+
+        // A future cutoff windows everything out.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert!(
+            store
+                .aggregate_run_tokens_since(future, Some("copilot"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn count_runs_since_counts_started_rows_including_model_less() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let started = |tool: &str, model: Option<&str>| LogEvent {
+            source: "run".to_string(),
+            kind: "tool_launch".to_string(),
+            phase: Some("started".to_string()),
+            tool: Some(tool.to_string()),
+            model: model.map(|m| m.to_string()),
+            ..Default::default()
+        };
+
+        store
+            .append(started("copilot", Some("gpt-5.2")))
+            .await
+            .unwrap();
+        // A launch that never resolved a model still counts.
+        store.append(started("copilot", None)).await.unwrap();
+        store
+            .append(started("claude", Some("claude-x")))
+            .await
+            .unwrap();
+        // Finished rows are not launches.
+        store
+            .append(LogEvent {
+                phase: Some("finished".to_string()),
+                ..started("copilot", Some("gpt-5.2"))
+            })
+            .await
+            .unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(
+            store.count_runs_since(past, Some("copilot")).await.unwrap(),
+            2
+        );
+        assert_eq!(store.count_runs_since(past, None).await.unwrap(), 3);
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(
+            store
+                .count_runs_since(future, Some("copilot"))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

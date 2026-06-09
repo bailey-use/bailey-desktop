@@ -120,6 +120,9 @@ pub struct UsageAccounting {
     pub key_id: String,
     /// Launching plugin name, for per-(tool, model) stats attribution.
     pub tool: String,
+    /// Per-run tally so the run's finished log row carries timestamped tokens
+    /// (windowable by `aivo stats --since`). Fed alongside the lifetime sink.
+    pub run_tally: Option<Arc<crate::services::usage_stats_store::RunTokenTally>>,
 }
 
 enum ForwardedChatResponse {
@@ -173,7 +176,21 @@ impl ResponsesToChatRouter {
             store,
             key_id,
             tool,
+            run_tally: None,
         });
+        self
+    }
+
+    /// Also fold accounted usage into a per-run tally, so the plugin run's
+    /// finished log row carries timestamped tokens for `aivo stats --since`.
+    /// No-op if usage accounting wasn't enabled.
+    pub fn with_run_tally(
+        mut self,
+        tally: Arc<crate::services::usage_stats_store::RunTokenTally>,
+    ) -> Self {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.run_tally = Some(tally);
+        }
         self
     }
 
@@ -324,6 +341,11 @@ async fn record_endpoint_usage(acct: &UsageAccounting, model: Option<&str>, u: &
             u.cache_creation,
         )
         .await;
+    // Same totals into the per-run tally, so the finished log row is windowable
+    // by `aivo stats --since` (lifetime per-key counters aren't timestamped).
+    if let Some(tally) = &acct.run_tally {
+        tally.add(u.prompt, u.completion, u.cache_read, u.cache_creation);
+    }
 }
 
 /// Quick check on a buffered HTTP/1.1 response string: status starts at byte

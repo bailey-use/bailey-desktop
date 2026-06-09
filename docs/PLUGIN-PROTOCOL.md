@@ -92,9 +92,12 @@ echo "hello: $*"
 `type` is an **open vocabulary** for what the plugin *is* (`coding-agent`, `media`,
 `code-review`, …); aivo validates nothing. Today only **`coding-agent`** carries host behavior:
 
-- aivo owns `-k`/`--key` and `-m`/`--model` in the plugin's argv, strips them before launch (so they
-  don't reach the wrapped tool), opens the key/model picker on a bare flag, and resolves a concrete
-  model — passed as `AIVO_KEY_MODEL`.
+- aivo owns `-k`/`--key`, `-m`/`--model`, `--debug`, and `--dry-run` in the plugin's argv, strips
+  them before launch (so they don't reach the wrapped tool), opens the key/model picker on a bare
+  flag, and resolves a concrete model — passed as `AIVO_KEY_MODEL`.
+- `--dry-run` previews the resolved key, model, endpoint router, injected env, and spawned command,
+  then exits **without** any side effect (no picker, no last-selection write, no endpoint, no
+  accounting, no llama-server spawn, no launch) — the plugin counterpart of `aivo run --dry-run`.
 - the launch is wrapped in the same run accounting native tools get: a `started`/`finished` row pair
   in `aivo logs` / `aivo stats` (launch count, duration, exit code).
 
@@ -148,7 +151,7 @@ since these totals sit under aivo's own usage stats.
 `aivo <name> --help` / `-h` is a **pure passthrough**: aivo never resolves a key, opens a picker,
 stands up an endpoint, or fails on auth to print help. aivo forwards `--help` verbatim, and for a
 top-level request first prints a uniform banner documenting the flags it intercepts
-(`-k`/`-m`/`--debug` for a `coding-agent`) — **unless** the plugin sets
+(`-k`/`-m`/`--debug`/`--dry-run` for a `coding-agent`) — **unless** the plugin sets
 `documents_aivo_flags: true`, in which case the banner is skipped (its own help already covers them).
 Sub-help (`aivo <name> <sub> --help`) never gets the banner.
 

@@ -62,6 +62,10 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // nothing is stripped and a bare `-k` uses the active key (no surprise picker
     // before launch).
     let flags = super::extract_aivo_flags(args);
+    // `--dry-run` previews the resolved plan instead of launching — coding-agent
+    // only (it mirrors native `aivo run --dry-run`; other plugins keep verbatim
+    // argv, so their `--dry-run` reaches the wrapped tool).
+    let dry_run = plan.is_coding_agent && flags.dry_run;
     let debug_log = if plan.is_coding_agent {
         flags.debug_log.clone()
     } else {
@@ -80,7 +84,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
     // strip a positional ref from the wrapped tool's argv (it can't read `hf:`; the
     // model reaches it through the endpoint). Mirrors `aivo run`'s takeover.
     let hf = if plan.is_coding_agent {
-        match take_hf_takeover(model_flag.as_deref(), &mut plugin_args).await {
+        match take_hf_takeover(model_flag.as_deref(), &mut plugin_args, dry_run).await {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("  {} {e:#}", style::red("Error:"));
@@ -93,9 +97,15 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
 
     // The takeover owns the key + model when active; otherwise resolve as usual.
     let key_was_explicit = hf.is_none() && key_flag.is_some();
+    // --dry-run is non-interactive: a bare `-k` (which would open the key picker)
+    // falls back to the active/last-used key for the preview.
+    let key_flag_for_resolve = match (dry_run, key_flag.as_deref()) {
+        (true, Some("")) => None,
+        (_, other) => other,
+    };
     let key = match &hf {
         Some(h) => Some(h.key.clone()),
-        None => resolve_plugin_key(store, key_flag.as_deref(), plan.is_coding_agent).await,
+        None => resolve_plugin_key(store, key_flag_for_resolve, plan.is_coding_agent).await,
     };
     let serve = key.as_ref().map(plugin_serve);
     let servable = serve.is_some_and(PluginServe::is_servable);
@@ -114,20 +124,39 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
         Some(h) => Some(h.model.clone()),
         None => match key.as_ref() {
             Some(k) if plan.is_coding_agent && servable => {
-                resolve_plugin_model(store, k, model_request, model_flag_was_explicit).await
+                resolve_plugin_model(store, k, model_request, model_flag_was_explicit, dry_run)
+                    .await
             }
             _ => model_request,
         },
     };
 
-    // A coding-agent plugin launched with an explicit `-k` records that key as
-    // the last selection, exactly like native `aivo run -k`. A *thin* plugin
-    // drives the endpoint/handoff from `key` directly, but a *fat* plugin (amp)
-    // re-resolves the key from the store itself — without this it never sees the
-    // `-k` we just stripped from its argv. Gated on an explicit `-k` so a bare
-    // launch doesn't clobber the user's last selection.
+    // --dry-run: report the resolved plan and stop before any side effect —
+    // no last-selection write, endpoint, accounting, llama-server, or launch.
+    if dry_run {
+        print_plugin_dry_run(
+            name,
+            bin,
+            &config_dir,
+            key.as_ref(),
+            serve,
+            plan.has("endpoint"),
+            model.as_deref(),
+            debug_log.as_deref(),
+            &plugin_args,
+            hf.is_some(),
+        );
+        return crate::errors::ExitCode::Success.code();
+    }
+
+    // Record this launch as the last selection — the same per-key model memory
+    // native `aivo run` writes (`commands/run.rs`), so a coding-agent plugin and
+    // a native tool agree on the model for a key (`resolve_plugin_model` reads it
+    // back via `remembered_plugin_model`). Fires on every launch, not just an
+    // explicit `-k`: a *fat* plugin (amp) re-resolves the key from the store, and
+    // a bare launch — whose key/model were themselves resolved from this record —
+    // writes back idempotently.
     if plan.is_coding_agent
-        && key_was_explicit
         && let Some(k) = key.as_ref()
     {
         let _ = store.set_last_selection(k, name, model.as_deref()).await;
@@ -401,6 +430,10 @@ fn print_aivo_help_banner(name: &str, plan: &GrantPlan) {
             "model to use (bare -m opens the picker)",
         );
         row("--debug[=<path>]", "log the proxied endpoint traffic");
+        row(
+            "--dry-run",
+            "preview the resolved key/model/command without launching",
+        );
     } else {
         row("-k, --key <id|name>", "aivo key to serve over the endpoint");
         row("--debug[=<path>]", "log the proxied endpoint traffic");
@@ -429,10 +462,13 @@ struct HfTakeover {
 /// The ref is an explicit `-m hf:…`, else the first positional `hf:`/gguf arg —
 /// lifted out of `plugin_args` since the wrapped tool can't interpret it. Spawns
 /// the local llama-server and returns the synthetic loopback key + served model.
-/// `Ok(None)` when the invocation carries no hf ref.
+/// `Ok(None)` when the invocation carries no hf ref. Under `dry_run` the
+/// llama-server is not spawned: the synthetic key carries a placeholder port so
+/// the preview reflects the takeover without the (slow, stateful) launch.
 async fn take_hf_takeover(
     model_flag: Option<&str>,
     plugin_args: &mut Vec<String>,
+    dry_run: bool,
 ) -> anyhow::Result<Option<HfTakeover>> {
     use crate::services::huggingface as hf;
 
@@ -451,11 +487,132 @@ async fn take_hf_takeover(
     };
 
     let hf_ref = hf::parse_hf_ref(&raw)?;
-    let port = hf::ensure_ready(&hf_ref).await?;
+    let port = if dry_run {
+        eprintln!(
+            "  {} {}",
+            style::yellow("Note:"),
+            style::dim("--dry-run shows a placeholder local port; llama-server is not spawned."),
+        );
+        0
+    } else {
+        hf::ensure_ready(&hf_ref).await?
+    };
     Ok(Some(HfTakeover {
         key: hf::local_takeover_key(&hf_ref, port),
         model: hf_ref.display_model_name(),
     }))
+}
+
+/// Render the coding-agent `--dry-run` preview: the resolved key, model, endpoint
+/// router, injected env, and the command aivo would spawn — without standing up
+/// an endpoint, spawning a llama-server, recording accounting, or launching the
+/// plugin. The env mirrors what `dispatch` would inject (`exec_plugin` always
+/// adds `AIVO_CONFIG_DIR`; the endpoint URL/token are shown as placeholders since
+/// the loopback port is assigned at bind time).
+#[allow(clippy::too_many_arguments)]
+fn print_plugin_dry_run(
+    name: &str,
+    bin: &Path,
+    config_dir: &Path,
+    key: Option<&ApiKey>,
+    serve: Option<PluginServe>,
+    endpoint_granted: bool,
+    model: Option<&str>,
+    debug_log: Option<&Path>,
+    plugin_args: &[String],
+    hf_active: bool,
+) {
+    use crate::commands::format_shell_command;
+
+    println!("{} {}", style::bold("Plugin:"), style::cyan(name));
+    println!(
+        "{} {}",
+        style::bold("Binary:"),
+        style::dim(bin.display().to_string())
+    );
+    match key {
+        Some(k) => println!(
+            "{} {} {}",
+            style::bold("Key:"),
+            style::cyan(k.display_name()),
+            style::dim(format!("({})", k.base_url)),
+        ),
+        None => println!(
+            "{} {}",
+            style::bold("Key:"),
+            style::dim("(none — plugin runs on its own auth)"),
+        ),
+    }
+    println!(
+        "{} {}",
+        style::bold("Model:"),
+        model.unwrap_or("(needs -m)")
+    );
+
+    // Build the env aivo would inject and describe the endpoint handoff, reusing
+    // the same classification `dispatch` uses so the preview can't drift.
+    let mut env: Vec<(String, String)> = vec![(
+        "AIVO_CONFIG_DIR".to_string(),
+        config_dir.display().to_string(),
+    )];
+    if let Some(p) = debug_log {
+        env.push(("AIVO_DEBUG_LOG".to_string(), p.display().to_string()));
+    }
+    let endpoint_desc = match (key, serve) {
+        (Some(_), Some(PluginServe::Blocked)) => {
+            "(OAuth credential — plugin runs on its own auth)".to_string()
+        }
+        (Some(k), Some(serve)) if serve.is_servable() && endpoint_granted => {
+            if let Some(m) = model {
+                env.push(("AIVO_KEY_MODEL".to_string(), m.to_string()));
+            }
+            env.push((
+                "AIVO_ENDPOINT_URL".to_string(),
+                "http://127.0.0.1:<port>/v1".to_string(),
+            ));
+            env.push((
+                "AIVO_ENDPOINT_TOKEN".to_string(),
+                "<assigned at launch>".to_string(),
+            ));
+            match serve {
+                PluginServe::Cursor => "Cursor ACP router".to_string(),
+                PluginServe::Serve if use_responses_router(k) => {
+                    "responses-capable proxy".to_string()
+                }
+                _ => "serve proxy".to_string(),
+            }
+        }
+        (Some(_), Some(_)) => {
+            "(plugin lacks the `endpoint` capability — runs on its own auth)".to_string()
+        }
+        _ => "(no key — plugin runs on its own auth)".to_string(),
+    };
+    println!("{} {}", style::bold("Endpoint:"), style::dim(endpoint_desc));
+    println!(
+        "{} {}",
+        style::bold("Command:"),
+        format_shell_command(&bin.to_string_lossy(), plugin_args),
+    );
+
+    println!();
+    println!("{}", style::bold("Environment:"));
+    for (k, v) in &env {
+        println!("  {k}={v}");
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    if hf_active {
+        notes.push(
+            "hf/local-gguf model: a local llama-server is started at launch (skipped here)"
+                .to_string(),
+        );
+    }
+    notes.push("--dry-run resolves the key/model but skips the endpoint and launch".to_string());
+    println!();
+    println!("{}", style::bold("Notes:"));
+    for n in &notes {
+        println!("  {} {}", style::arrow_symbol(), n);
+    }
 }
 
 /// The hf/gguf ref for a coding-agent invocation, or `None`. An explicit `-m`
@@ -533,31 +690,63 @@ fn plugin_serve(key: &ApiKey) -> PluginServe {
     }
 }
 
+/// The remembered model for `key`, preferring the shared `last_selection` (the
+/// per-key model native `aivo run` writes — so a coding-agent plugin and a native
+/// tool agree on the model for a key) and falling back to the per-key `chat_model`
+/// (`aivo chat` and an explicit plugin `-m` also write it). The `__default__`
+/// sentinel — a native "let the tool choose" pin — isn't a concrete model a plugin
+/// can run, so it's skipped in favor of the fallback.
+async fn remembered_plugin_model(store: &SessionStore, key: &ApiKey) -> Option<String> {
+    if let Some(sel) = store.get_last_selection().await.ok().flatten()
+        && sel.key_id == key.id
+        && let Some(m) = sel
+            .model
+            .filter(|m| m.as_str() != crate::constants::MODEL_DEFAULT_PLACEHOLDER)
+    {
+        return Some(m);
+    }
+    store.get_chat_model(&key.id).await.ok().flatten()
+}
+
 /// Resolve the model for a coding-agent plugin. Unlike native tools (which fall
 /// back to their own default), such a plugin needs a concrete model, so this
-/// yields one whenever possible: explicit `-m <value>` is used + remembered; a
-/// bare launch reuses the key's remembered model; otherwise the picker opens —
-/// delegating to the shared `resolve_model_outcome` — and the pick is remembered.
-/// `None` only when nothing resolves (bare launch, nothing saved, no picker) — the
-/// plugin then asks the user to pass `-m`.
+/// yields one whenever possible: explicit `-m <value>` is used; a bare launch
+/// reuses the key's remembered model (see `remembered_plugin_model`); otherwise
+/// the picker opens — delegating to the shared `resolve_model_outcome`. The picked
+/// model is persisted by `dispatch`'s shared last-selection write (plus the
+/// `chat_model` written here for `aivo chat` interop / fallback). `None` only when
+/// nothing resolves (bare launch, nothing saved, no picker) — the plugin then asks
+/// the user to pass `-m`. Under `dry_run` nothing is persisted and the picker never
+/// opens: a saved model is reused, else `None` (the preview shows `(needs -m)`).
 async fn resolve_plugin_model(
     store: &SessionStore,
     key: &ApiKey,
     model_flag: Option<String>,
     explicit_model_flag: bool,
+    dry_run: bool,
 ) -> Option<String> {
     use crate::commands::models::{ModelOutcome, resolve_model_outcome};
 
-    // Explicit `-m <value>`: use it and remember it for next time.
+    // Explicit `-m <value>`: use it. Mirror it into `chat_model` for chat interop
+    // (the shared last-selection write happens in `dispatch`); skipped under
+    // --dry-run, which must not mutate saved state.
     if let Some(m) = model_flag.as_deref().filter(|s| !s.is_empty()) {
-        let _ = store.set_chat_model(&key.id, m).await;
+        if !dry_run {
+            let _ = store.set_chat_model(&key.id, m).await;
+        }
         return Some(m.to_string());
     }
-    // Bare launch: reuse the remembered model rather than re-prompting.
-    if model_flag.is_none()
-        && let Some(saved) = store.get_chat_model(&key.id).await.ok().flatten()
+    // Bare launch reuses the remembered model rather than re-prompting. --dry-run
+    // also reuses it for a bare `-m` (which would otherwise force the picker),
+    // since the preview is non-interactive.
+    if (model_flag.is_none() || dry_run)
+        && let Some(saved) = remembered_plugin_model(store, key).await
     {
         return Some(saved);
+    }
+    // --dry-run never opens the picker: report no resolved model instead.
+    if dry_run {
+        return None;
     }
     // Bare `-m`, or a bare launch with nothing saved: the plugin needs a model, so
     // force the picker (synthesize a bare `-m`) via the shared resolver.
@@ -1084,5 +1273,66 @@ mod tests {
         assert_eq!(hf_key.id, HF_LOCAL_KEY_ID);
         assert_eq!(plugin_serve(&hf_key), PluginServe::Serve);
         assert!(!use_responses_router(&hf_key));
+    }
+
+    #[tokio::test]
+    async fn remembered_model_prefers_last_selection_then_chat_model() {
+        use crate::constants::MODEL_DEFAULT_PLACEHOLDER;
+        use crate::services::session_store::SessionStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::with_path(tmp.path().join("config.json"));
+        let id = store
+            .add_key_with_protocol("k", "https://api.openai.com/v1", None, "sk-test")
+            .await
+            .unwrap();
+        store.set_active_key(&id).await.unwrap();
+        let k = store.get_key_by_id_info(&id).await.unwrap().unwrap();
+
+        // chat_model only → it's the fallback.
+        store.set_chat_model(&id, "chat-pinned").await.unwrap();
+        assert_eq!(
+            super::remembered_plugin_model(&store, &k).await.as_deref(),
+            Some("chat-pinned"),
+        );
+
+        // A last_selection for this key wins over chat_model — this is what makes a
+        // coding-agent plugin agree with native tools on the model for a key.
+        store
+            .set_last_selection(&k, "pi", Some("sel-model"))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::remembered_plugin_model(&store, &k).await.as_deref(),
+            Some("sel-model"),
+        );
+
+        // The native "let the tool choose" sentinel isn't a concrete model a plugin
+        // can run, so it's skipped in favor of the chat_model fallback.
+        store
+            .set_last_selection(&k, "pi", Some(MODEL_DEFAULT_PLACEHOLDER))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::remembered_plugin_model(&store, &k).await.as_deref(),
+            Some("chat-pinned"),
+        );
+
+        // A last_selection for a *different* key doesn't apply to this key — it
+        // still falls back to its own chat_model.
+        let other_id = store
+            .add_key_with_protocol("o", "https://api.openai.com/v1", None, "sk-o")
+            .await
+            .unwrap();
+        let other = store.get_key_by_id_info(&other_id).await.unwrap().unwrap();
+        store
+            .set_last_selection(&other, "pi", Some("other-model"))
+            .await
+            .unwrap();
+        assert_eq!(
+            super::remembered_plugin_model(&store, &k).await.as_deref(),
+            Some("chat-pinned"),
+        );
     }
 }

@@ -140,7 +140,7 @@ pub(crate) fn print_launch_preview(plan: &PreparedLaunch) {
     }
 }
 
-fn format_shell_command(command: &str, args: &[String]) -> String {
+pub(crate) fn format_shell_command(command: &str, args: &[String]) -> String {
     let mut parts = vec![shell_quote(command)];
     parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")

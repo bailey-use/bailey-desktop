@@ -274,19 +274,23 @@ pub(crate) struct AivoFlags {
     pub model: Option<String>,
     /// Resolved debug log path from `--debug` / `--debug=<path>`.
     pub debug_log: Option<PathBuf>,
+    /// `--dry-run` present: preview the resolved key/model/command instead of
+    /// launching (mirrors native `aivo run --dry-run`).
+    pub dry_run: bool,
     /// argv with aivo-owned flags removed. Tool-specific flags and prompt args
     /// are preserved.
     pub rest: Vec<String>,
 }
 
-/// Extract `-k`/`--key` (bare → picker), `-m`/`--model`, and `--debug` from a
-/// coding-agent plugin's argv, stripping them from `rest`. First occurrence of
-/// each wins; a value form consumes the next arg only when it isn't itself a
-/// flag.
+/// Extract `-k`/`--key` (bare → picker), `-m`/`--model`, `--debug`, and
+/// `--dry-run` from a coding-agent plugin's argv, stripping them from `rest`.
+/// First occurrence of each wins; a value form consumes the next arg only when
+/// it isn't itself a flag.
 pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
     let mut key: Option<String> = None;
     let mut model: Option<String> = None;
     let mut debug_log: Option<PathBuf> = None;
+    let mut dry_run = false;
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -319,6 +323,8 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
             debug_log.get_or_insert_with(crate::services::http_debug::default_log_path);
         } else if let Some(rest_path) = a.strip_prefix("--debug=") {
             debug_log.get_or_insert_with(|| debug_path_from_value(rest_path));
+        } else if a == "--dry-run" {
+            dry_run = true;
         } else {
             rest.push(args[i].clone());
         }
@@ -328,6 +334,7 @@ pub(crate) fn extract_aivo_flags(args: &[String]) -> AivoFlags {
         key,
         model,
         debug_log,
+        dry_run,
         rest,
     }
 }
@@ -516,11 +523,19 @@ mod tests {
         assert_eq!(f.debug_log, Some(PathBuf::from("/tmp/plugin-debug.jsonl")));
         assert!(f.rest.is_empty());
 
+        // `--dry-run` is aivo-owned for coding-agent plugins: it sets the flag
+        // and is stripped from the argv handed to the wrapped tool.
+        let f = extract_aivo_flags(&args(&["--dry-run", "-m", "gpt-4o", "-p", "hi"]));
+        assert!(f.dry_run);
+        assert_eq!(f.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(f.rest, args(&["-p", "hi"]));
+
         // No aivo flags → nothing extracted, everything passes through.
         let f = extract_aivo_flags(&args(&["-p", "hello", "--thinking"]));
         assert!(f.key.is_none());
         assert!(f.model.is_none());
         assert!(f.debug_log.is_none());
+        assert!(!f.dry_run);
         assert_eq!(f.rest, args(&["-p", "hello", "--thinking"]));
     }
 }

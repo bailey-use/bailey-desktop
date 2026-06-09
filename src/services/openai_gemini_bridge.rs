@@ -232,6 +232,23 @@ pub fn sanitize_schema_for_gemini(schema: &Value) -> Value {
         }
     }
 
+    // Gemini's schema `type` must be a single string; JSON Schema also allows an
+    // array (e.g. `["string","null"]` for nullable/union). Gemini rejects the array
+    // ("Proto field is not repeating"), so collapse to the first non-null member and
+    // mark the field nullable when "null" was present.
+    if let Some(types) = cleaned.get("type").and_then(|v| v.as_array()).cloned() {
+        let has_null = types.iter().any(|t| t.as_str() == Some("null"));
+        let primary = types
+            .iter()
+            .find(|t| t.as_str().is_some_and(|s| s != "null"))
+            .cloned()
+            .unwrap_or_else(|| json!("object"));
+        cleaned.insert("type".to_string(), primary);
+        if has_null {
+            cleaned.insert("nullable".to_string(), json!(true));
+        }
+    }
+
     // Ensure type and properties exist for object schemas
     // Treat null type the same as missing
     if !cleaned.contains_key("type") || cleaned.get("type").is_some_and(|v| v.is_null()) {
@@ -855,6 +872,43 @@ mod tests {
             converted["contents"][2]["parts"][0]["functionResponse"]["name"],
             "ls"
         );
+    }
+
+    #[test]
+    fn test_sanitize_schema_collapses_array_type_to_single_nullable() {
+        // JSON Schema nullable/union `type: [..]` → Gemini single type + nullable.
+        let nullable = sanitize_schema_for_gemini(&json!({"type": ["string", "null"]}));
+        assert_eq!(nullable["type"], "string");
+        assert_eq!(nullable["nullable"], true);
+
+        // Union without null → first member, no nullable.
+        let union = sanitize_schema_for_gemini(&json!({"type": ["integer", "string"]}));
+        assert_eq!(union["type"], "integer");
+        assert_eq!(union.get("nullable"), None);
+
+        // The real grok case: array type nested in a tool's properties — no array
+        // `type` may survive anywhere (Gemini's proto rejects it with a 400).
+        let tool = sanitize_schema_for_gemini(&json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": ["integer", "null"], "description": "max"}
+            },
+            "required": ["path"]
+        }));
+        assert_eq!(tool["properties"]["limit"]["type"], "integer");
+        assert_eq!(tool["properties"]["limit"]["nullable"], true);
+        assert!(!contains_array_type(&tool));
+    }
+
+    fn contains_array_type(v: &Value) -> bool {
+        match v {
+            Value::Object(o) => {
+                o.get("type").is_some_and(Value::is_array) || o.values().any(contains_array_type)
+            }
+            Value::Array(a) => a.iter().any(contains_array_type),
+            _ => false,
+        }
     }
 
     #[test]

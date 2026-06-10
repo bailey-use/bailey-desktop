@@ -54,16 +54,18 @@ aivo claude --model moonshotai/kimi-k2.5     # pin a model
 
 ## Supported coding agents
 
-- `claude` [Claude Code](https://github.com/anthropics/claude-code)
-- `codex` [Codex](https://github.com/openai/codex)
-- `codex-app` [Codex.app](https://github.com/openai/codex) desktop (macOS only)
-- `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-- `opencode` [OpenCode](https://github.com/anomalyco/opencode)
-- `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
-- `amp` [Amp](https://ampcode.com) (via [plugin](#plugins))
-- `omp` [oh-my-pi](https://github.com/can1357/oh-my-pi) (via [plugin](#plugins))
-- `copilot` [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) (via [plugin](#plugins))
-- `grok` [Grok CLI](https://x.ai/cli) (via [plugin](#plugins))
+| Command | Agent | Type |
+| ------- | ----- | ---- |
+| `claude` | [Claude Code](https://github.com/anthropics/claude-code) | built-in |
+| `codex` | [Codex](https://github.com/openai/codex) | built-in |
+| `codex-app` | [Codex.app](https://github.com/openai/codex) desktop (macOS only) | built-in |
+| `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | built-in |
+| `opencode` | [OpenCode](https://github.com/anomalyco/opencode) | built-in |
+| `pi` | [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | built-in |
+| `amp` | [Amp](https://ampcode.com) | plugin |
+| `omp` | [oh-my-pi](https://github.com/can1357/oh-my-pi) | plugin |
+| `copilot` | [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) | plugin |
+| `grok` | [Grok CLI](https://x.ai/cli) | plugin |
 
 ```bash
 aivo claude                                  # launch with active key

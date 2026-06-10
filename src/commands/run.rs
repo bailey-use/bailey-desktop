@@ -874,11 +874,10 @@ fn inject_codex(rendered: &RenderedContext, mut args: Vec<String>) -> Vec<String
 }
 
 /// Default `--max-context` based on the resolved model.
-/// Precedence: explicit flag → cached `context_window` (≥2M→2m, ≥1M→1m)
-/// → static long-context list from `services::context_window` (covers
-/// providers like Anthropic whose `/v1/models` doesn't expose a context
-/// field, so the cache lookup misses) → hardcoded `aivo/starter`
-/// fallback (which ships before the user can have run `aivo models`).
+/// Precedence: explicit flag → limits cascade (live models-cache, then the
+/// embedded models.dev snapshot; ≥2M→2m, ≥1M→1m — see
+/// `services::model_metadata`) → hardcoded `aivo/starter` fallback (which
+/// ships before the user can have run `aivo models`).
 async fn resolve_max_context(
     cache: &ModelsCache,
     base_url: Option<&str>,
@@ -893,11 +892,9 @@ async fn resolve_max_context(
     let Some(m) = model else {
         return starter_default();
     };
-    let cached = match base_url {
-        Some(url) => cache.get_context_window(url, m).await,
-        None => None,
-    };
-    let ctx = cached.or_else(|| crate::services::context_window::static_context_window(m));
+    let ctx = crate::services::model_metadata::resolve_limits(cache, base_url, m)
+        .await
+        .context;
     match ctx {
         Some(c) if c >= 2_000_000 => Some("2m".to_string()),
         Some(c) if c >= 1_000_000 => Some("1m".to_string()),

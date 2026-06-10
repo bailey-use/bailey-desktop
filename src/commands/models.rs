@@ -40,12 +40,18 @@ pub(crate) struct ModelInfo {
     pub context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output: Option<String>,
+    /// Raw max-output tokens; not exposed via `--json`.
+    #[serde(skip)]
+    pub max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplier: Option<f64>,
+    /// Marked deprecated by models.dev; display-only, never cached.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deprecated: bool,
 }
 
 impl ModelInfo {
@@ -55,9 +61,11 @@ impl ModelInfo {
             context: None,
             context_tokens: None,
             max_output: None,
+            max_output_tokens: None,
             input_price: None,
             output_price: None,
             multiplier: None,
+            deprecated: false,
         }
     }
 }
@@ -81,7 +89,8 @@ impl OpenAIModel {
     fn into_model_info(self) -> ModelInfo {
         let context_tokens = self.find_context();
         let context = context_tokens.map(format_token_count);
-        let max_output = self.find_max_output().map(format_token_count);
+        let max_output_tokens = self.find_max_output();
+        let max_output = max_output_tokens.map(format_token_count);
         let (input_price, output_price) = self.find_pricing();
         let multiplier = self.find_multiplier();
         ModelInfo {
@@ -89,9 +98,11 @@ impl OpenAIModel {
             context,
             context_tokens,
             max_output,
+            max_output_tokens,
             input_price,
             output_price,
             multiplier,
+            deprecated: false,
         }
     }
 
@@ -341,6 +352,14 @@ impl ModelsCommand {
             }
             fresh
         };
+
+        // Fill missing limit columns from the embedded models.dev snapshot so
+        // id-only providers (starter, minimax, cloudflare) still show
+        // context/output. Display-only: the cache write above stores what the
+        // provider actually returned.
+        for model in &mut models {
+            enrich_from_snapshot(model);
+        }
 
         let is_starter = is_aivo_starter_base(&key.base_url);
         models.sort_by(|a, b| {
@@ -633,8 +652,10 @@ impl ColumnWidths {
 }
 
 fn format_model_line(model: &ModelInfo, widths: &ColumnWidths) -> String {
-    let has_info =
-        model.context.is_some() || model.max_output.is_some() || model.multiplier.is_some();
+    let has_info = model.context.is_some()
+        || model.max_output.is_some()
+        || model.multiplier.is_some()
+        || model.deprecated;
     if !has_info {
         return model.id.clone();
     }
@@ -667,6 +688,9 @@ fn format_model_line(model: &ModelInfo, widths: &ColumnWidths) -> String {
     }
     if let Some(mult) = model.multiplier {
         line.push_str(&format!("  {}", style::dim(format_multiplier(mult))));
+    }
+    if model.deprecated {
+        line.push_str(&format!("  {}", style::dim("deprecated")));
     }
     line
 }
@@ -704,6 +728,28 @@ pub(crate) async fn fetch_all_models(client: &Client, key: &ApiKey) -> Result<Ve
         .map(|v| v.into_iter().map(|m| m.id).collect())
 }
 
+/// Fills missing context/max-output columns from the embedded models.dev
+/// snapshot. Provider-reported values always win; never feed the result back
+/// into the models cache.
+fn enrich_from_snapshot(model: &mut ModelInfo) {
+    let Some(snap) = crate::services::model_metadata::snapshot_limits(&model.id) else {
+        return;
+    };
+    model.deprecated = snap.deprecated;
+    if model.context_tokens.is_none()
+        && let Some(context) = snap.context
+    {
+        model.context_tokens = Some(context);
+        model.context = Some(format_token_count(context));
+    }
+    if model.max_output_tokens.is_none()
+        && let Some(output) = snap.output
+    {
+        model.max_output_tokens = Some(output);
+        model.max_output = Some(format_token_count(output));
+    }
+}
+
 /// Pulls every displayed column out of a detailed model list so the cache can
 /// reproduce the table on a warm read. Skips models that returned no
 /// metadata at all (id-only entries from providers like Cloudflare).
@@ -714,6 +760,7 @@ fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelMetadata> {
             let meta = ModelMetadata {
                 context_window: m.context_tokens,
                 max_output: m.max_output.clone(),
+                max_output_tokens: m.max_output_tokens,
                 input_price: m.input_price.clone(),
                 output_price: m.output_price.clone(),
                 multiplier: m.multiplier,
@@ -760,9 +807,11 @@ fn models_from_cache(ids: Vec<String>, metadata: HashMap<String, ModelMetadata>)
                 context: m.context_window.map(format_token_count),
                 context_tokens: m.context_window,
                 max_output: m.max_output,
+                max_output_tokens: m.max_output_tokens,
                 input_price: m.input_price,
                 output_price: m.output_price,
                 multiplier: m.multiplier,
+                deprecated: false,
             }
         })
         .collect()
@@ -986,9 +1035,11 @@ async fn fetch_models_detailed_filtered(
                         context: m.input_token_limit.map(format_token_count),
                         context_tokens: m.input_token_limit,
                         max_output: m.output_token_limit.map(format_token_count),
+                        max_output_tokens: m.output_token_limit,
                         input_price: None,
                         output_price: None,
                         multiplier: None,
+                        deprecated: false,
                         id,
                     }
                 })
@@ -1787,6 +1838,7 @@ mod tests {
             ModelMetadata {
                 context_window: Some(200_000),
                 max_output: Some("32K".to_string()),
+                max_output_tokens: Some(32_000),
                 input_price: Some("$3".to_string()),
                 output_price: Some("$15".to_string()),
                 multiplier: None,
@@ -1832,9 +1884,11 @@ mod tests {
                 context: Some("128K".to_string()),
                 context_tokens: Some(128_000),
                 max_output: Some("8K".to_string()),
+                max_output_tokens: Some(8_000),
                 input_price: Some("$1".to_string()),
                 output_price: Some("$2".to_string()),
                 multiplier: None,
+                deprecated: false,
             },
             ModelInfo::id_only("bare".to_string()),
         ];

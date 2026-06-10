@@ -20,6 +20,9 @@ pub struct ModelMetadata {
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output: Option<String>,
+    /// Numeric twin of `max_output` (which is display-formatted, e.g. "64K").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

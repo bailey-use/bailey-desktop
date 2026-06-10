@@ -77,6 +77,7 @@ pub mod request_log;
 pub mod responses_chat_conversion;
 pub mod responses_to_chat_router;
 pub mod route_cache;
+pub mod router_selection;
 pub mod serve_responses;
 pub mod serve_router;
 pub mod serve_stream_converters;

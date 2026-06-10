@@ -10,13 +10,10 @@ use crate::constants::{
 use crate::services::codex_model_map::map_model_for_codex_cli;
 use crate::services::model_names::{anthropic_native_model_name, google_native_model_name};
 use crate::services::ollama::ollama_openai_base_url;
-use crate::services::provider_profile::{
-    ProviderKind, ProviderProfile, is_direct_openai_base, provider_profile_for_key,
-};
-use crate::services::provider_protocol::{
-    ProviderProtocol, is_anthropic_endpoint, is_google_endpoint, is_official_anthropic_endpoint,
-};
-use crate::services::session_store::{ApiKey, OpenAICompatibilityMode};
+use crate::services::provider_profile::{ProviderKind, ProviderProfile, provider_profile_for_key};
+use crate::services::provider_protocol::{ProviderProtocol, is_official_anthropic_endpoint};
+use crate::services::router_selection::{self, ConnectionMode, use_router_for_opencode};
+use crate::services::session_store::ApiKey;
 
 /// Describes which env vars a tool uses for base URL, auth, and router configuration.
 struct ToolEnvConfig {
@@ -37,15 +34,6 @@ fn router_tool_name(router_prefix: &str) -> Option<&'static str> {
         "AIVO_GEMINI_ROUTER" => Some("gemini"),
         _ => None,
     }
-}
-
-/// How the tool should connect to the upstream provider.
-enum ConnectionMode {
-    Ollama,
-    Copilot,
-    OpenRouter,
-    Direct { base_url: String },
-    Routed { protocol: ProviderProtocol },
 }
 
 /// EnvironmentInjector prepares tool-specific environment variables for AI tools
@@ -154,96 +142,6 @@ fn ensure_google_version_suffix(base_url: &str) -> String {
 }
 
 impl EnvironmentInjector {
-    /// Returns true when the URL points to a native Anthropic endpoint that speaks
-    /// the Anthropic Messages API directly (no format conversion needed).
-    ///
-    /// Invariant: Direct mode requires a native endpoint. The `claude_protocol`
-    /// pin expresses "send this protocol through the router first" and must not
-    /// on its own bypass the router, since the router is where protocol fallback
-    /// runs for generic OpenAI-compatible hosts.
-    fn use_direct_anthropic_for_claude(key: &ApiKey) -> bool {
-        // When the HTTP debug logger is initialized, force the bridge so the
-        // outbound translation/forward call is observable. The bridge's
-        // existing forward sites are instrumented (`.send_logged()`); routing
-        // through them is what makes `--debug` capture native-Anthropic
-        // upstreams (e.g. minimax/deepseek configured with `/anthropic` base
-        // URLs). The override returns `false` so the caller falls into the
-        // routed branch.
-        if crate::services::http_debug::is_debug_active() {
-            return false;
-        }
-        if !is_anthropic_endpoint(&key.base_url) {
-            return false;
-        }
-        match Self::tool_default_protocol(key, "claude") {
-            Some(ProviderProtocol::Anthropic) | None => true,
-            Some(_) => false,
-        }
-    }
-
-    /// The tool's default upstream protocol (the route map's `""` entry) —
-    /// drives the Direct/Routed decision, replacing the old scalar pins.
-    fn tool_default_protocol(key: &ApiKey, tool: &str) -> Option<ProviderProtocol> {
-        key.protocol_routes
-            .get(tool)
-            .and_then(|models| models.get(""))
-            .and_then(|route| ProviderProtocol::parse(&route.protocol))
-    }
-
-    fn use_direct_openai_for_codex(key: &ApiKey) -> bool {
-        // See `use_direct_anthropic_for_claude`: under `--debug`, force the
-        // bridge so outbound traffic flows through `responses_to_chat_router`
-        // (which is instrumented with `.send_logged()`).
-        if crate::services::http_debug::is_debug_active() {
-            return false;
-        }
-        match key.codex_mode {
-            Some(OpenAICompatibilityMode::Direct) => true,
-            Some(OpenAICompatibilityMode::Router) => false,
-            None => is_direct_openai_base(&key.base_url),
-        }
-    }
-
-    fn use_google_native_for_gemini(key: &ApiKey) -> bool {
-        // See `use_direct_anthropic_for_claude`: under `--debug`, force the
-        // bridge so outbound traffic flows through `gemini_router` (which is
-        // instrumented with `.send_logged()`).
-        if crate::services::http_debug::is_debug_active() {
-            return false;
-        }
-        // Same invariant as use_direct_anthropic_for_claude: only a genuinely
-        // Google-native endpoint may skip the router.
-        if !is_google_endpoint(&key.base_url) {
-            return false;
-        }
-        match Self::tool_default_protocol(key, "gemini") {
-            Some(ProviderProtocol::Google) | None => true,
-            Some(_) => false,
-        }
-    }
-
-    fn use_router_for_opencode(key: &ApiKey) -> bool {
-        // OpenCode already routes through the local bridge whenever
-        // `opencode_mode == Router`. Under `--debug`, force the bridge for
-        // direct-mode keys too so outbound traffic is visible.
-        if crate::services::http_debug::is_debug_active() {
-            return true;
-        }
-        matches!(key.opencode_mode, Some(OpenAICompatibilityMode::Router))
-    }
-
-    fn routed_protocol_for_claude(key: &ApiKey) -> ProviderProtocol {
-        Self::tool_default_protocol(key, "claude").unwrap_or_else(|| {
-            provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Anthropic)
-        })
-    }
-
-    fn routed_protocol_for_gemini(key: &ApiKey) -> ProviderProtocol {
-        Self::tool_default_protocol(key, "gemini").unwrap_or_else(|| {
-            provider_profile_for_key(key).upstream_protocol_for_cli(ProviderProtocol::Google)
-        })
-    }
-
     fn should_disable_claude_nonessential_traffic(key: &ApiKey) -> bool {
         !key.is_claude_oauth() && !is_official_anthropic_endpoint(&key.base_url)
     }
@@ -562,26 +460,7 @@ impl EnvironmentInjector {
         }
 
         let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if profile.serve_flags.is_openrouter {
-            ConnectionMode::OpenRouter
-        } else if Self::use_direct_anthropic_for_claude(key) && !profile.serve_flags.is_starter {
-            // Starter must route through the local router — it's the only
-            // place device_fingerprint::maybe_with_starter_headers runs.
-            // Direct mode would skip the X-Aivo-* headers and 403 at the gateway.
-            let base_url = key.base_url.trim_end_matches('/');
-            let base_url = base_url.strip_suffix("/v1").unwrap_or(base_url);
-            ConnectionMode::Direct {
-                base_url: base_url.to_string(),
-            }
-        } else {
-            ConnectionMode::Routed {
-                protocol: Self::routed_protocol_for_claude(key),
-            }
-        };
+        let mode = router_selection::claude_connection_mode(key, &profile);
 
         let cfg = ToolEnvConfig {
             base_url_env: "ANTHROPIC_BASE_URL",
@@ -731,24 +610,7 @@ impl EnvironmentInjector {
         }
 
         let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if !Self::use_direct_openai_for_codex(key) || profile.serve_flags.is_starter {
-            // See for_claude: starter must route through the local router so
-            // device_fingerprint headers attach.
-            // Why ResponsesApi: seeds the router's cascade with `/v1/responses`
-            // first so codex's native protocol is a pass-through; chat
-            // completions remains in the fallback chain for legacy hosts.
-            ConnectionMode::Routed {
-                protocol: profile.upstream_protocol_for_cli(ProviderProtocol::ResponsesApi),
-            }
-        } else {
-            ConnectionMode::Direct {
-                base_url: key.base_url.clone(),
-            }
-        };
+        let mode = router_selection::codex_connection_mode(key, &profile);
 
         let cfg = ToolEnvConfig {
             base_url_env: "OPENAI_BASE_URL",
@@ -862,21 +724,11 @@ impl EnvironmentInjector {
         }
 
         let profile = provider_profile_for_key(key);
-        let mode = if profile.kind == ProviderKind::Ollama {
-            ConnectionMode::Ollama
-        } else if profile.serve_flags.is_copilot {
-            ConnectionMode::Copilot
-        } else if Self::use_google_native_for_gemini(key) && !profile.serve_flags.is_starter {
-            // See for_claude: starter must route through the local router so
-            // device_fingerprint headers attach.
-            ConnectionMode::Direct {
-                base_url: strip_google_version_suffix(&key.base_url).to_string(),
-            }
-        } else {
-            ConnectionMode::Routed {
-                protocol: Self::routed_protocol_for_gemini(key),
-            }
-        };
+        let mode = router_selection::gemini_connection_mode(
+            key,
+            &profile,
+            strip_google_version_suffix(&key.base_url),
+        );
 
         let cfg = ToolEnvConfig {
             base_url_env: "GOOGLE_GEMINI_BASE_URL",
@@ -964,7 +816,7 @@ impl EnvironmentInjector {
             );
             env.insert("AIVO_COPILOT_GITHUB_TOKEN".to_string(), key.key.to_string());
             (PLACEHOLDER_LOOPBACK_URL.to_string(), "copilot".to_string())
-        } else if Self::use_router_for_opencode(key) || profile.serve_flags.is_starter {
+        } else if use_router_for_opencode(key) || profile.serve_flags.is_starter {
             env.insert("AIVO_USE_OPENCODE_ROUTER".to_string(), "1".to_string());
             env.insert(
                 "AIVO_RESPONSES_TO_CHAT_ROUTER_API_KEY".to_string(),
@@ -1335,6 +1187,7 @@ pub(crate) fn redact_env_value(key: &str, value: &str) -> String {
 mod tests {
     use super::*;
     use crate::services::route_cache::PersistedRoute;
+    use crate::services::session_store::OpenAICompatibilityMode;
 
     /// Pin a tool's default (`""`) route, the v2 equivalent of the old
     /// per-CLI `claude_protocol` / `gemini_protocol` scalar pins.
@@ -1377,68 +1230,6 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         crate::services::http_debug::set_test_debug_active(false);
         guard
-    }
-
-    #[test]
-    fn use_direct_anthropic_false_for_generic_openai_host_with_anthropic_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://api.example.com/v1");
-        pin_route(&mut key, "claude", "anthropic");
-        assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
-    }
-
-    #[test]
-    fn use_direct_anthropic_true_for_anthropic_host_with_no_pin() {
-        let _guard = debug_off_guard();
-        let key = test_api_key("https://api.anthropic.com");
-        assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
-    }
-
-    #[test]
-    fn use_direct_anthropic_true_for_anthropic_host_with_anthropic_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://api.anthropic.com");
-        pin_route(&mut key, "claude", "anthropic");
-        assert!(EnvironmentInjector::use_direct_anthropic_for_claude(&key));
-    }
-
-    #[test]
-    fn use_direct_anthropic_false_for_anthropic_host_with_openai_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://api.anthropic.com");
-        pin_route(&mut key, "claude", "openai");
-        assert!(!EnvironmentInjector::use_direct_anthropic_for_claude(&key));
-    }
-
-    #[test]
-    fn use_google_native_false_for_generic_openai_host_with_google_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://api.example.com/v1");
-        pin_route(&mut key, "gemini", "google");
-        assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
-    }
-
-    #[test]
-    fn use_google_native_true_for_google_host_with_no_pin() {
-        let _guard = debug_off_guard();
-        let key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
-        assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
-    }
-
-    #[test]
-    fn use_google_native_true_for_google_host_with_google_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
-        pin_route(&mut key, "gemini", "google");
-        assert!(EnvironmentInjector::use_google_native_for_gemini(&key));
-    }
-
-    #[test]
-    fn use_google_native_false_for_google_host_with_openai_pin() {
-        let _guard = debug_off_guard();
-        let mut key = test_api_key("https://generativelanguage.googleapis.com/v1beta");
-        pin_route(&mut key, "gemini", "openai");
-        assert!(!EnvironmentInjector::use_google_native_for_gemini(&key));
     }
 
     #[test]

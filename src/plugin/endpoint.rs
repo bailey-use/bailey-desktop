@@ -203,6 +203,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
                 if plan.is_coding_agent {
                     if let Some(m) = &model {
                         extra_env.push(("AIVO_KEY_MODEL".to_string(), m.clone()));
+                        extra_env.extend(model_limit_env(key, m).await);
                     }
                     maybe_init_http_debug(debug_log.as_deref()).await;
                     apply_endpoint(
@@ -229,6 +230,7 @@ pub(crate) async fn dispatch(name: &str, bin: &Path, args: &[String], store: &Se
             PluginServe::Serve if plan.has("endpoint") => {
                 if let Some(m) = &model {
                     extra_env.push(("AIVO_KEY_MODEL".to_string(), m.clone()));
+                    extra_env.extend(model_limit_env(key, m).await);
                 }
                 let started = if use_responses_router(key) {
                     maybe_init_http_debug(debug_log.as_deref()).await;
@@ -898,6 +900,36 @@ impl EndpointHandle {
 
 /// Record a started endpoint's env (or warn on failure) — the shared tail of the
 /// serve/responses dispatch arms.
+/// Advisory limit env vars for the resolved model (limits cascade: live
+/// models-cache → embedded snapshot). Emitted only when known; plugins map
+/// them onto their CLI's own config instead of guessing. Contract:
+/// `docs/PLUGIN-PROTOCOL.md`.
+async fn model_limit_env(key: &ApiKey, model: &str) -> Vec<(String, String)> {
+    let cache = crate::services::models_cache::ModelsCache::new();
+    model_limit_env_with_cache(&cache, key, model).await
+}
+
+async fn model_limit_env_with_cache(
+    cache: &crate::services::models_cache::ModelsCache,
+    key: &ApiKey,
+    model: &str,
+) -> Vec<(String, String)> {
+    let cache_base = crate::commands::models::model_cache_key_for_key(key);
+    let limits =
+        crate::services::model_metadata::resolve_limits(cache, Some(&cache_base), model).await;
+    let mut env = Vec::new();
+    if let Some(context) = limits.context {
+        env.push(("AIVO_MODEL_CONTEXT_WINDOW".to_string(), context.to_string()));
+    }
+    if let Some(output) = limits.output {
+        env.push((
+            "AIVO_MODEL_MAX_OUTPUT_TOKENS".to_string(),
+            output.to_string(),
+        ));
+    }
+    env
+}
+
 fn apply_endpoint(
     started: anyhow::Result<EndpointHandle>,
     extra_env: &mut Vec<(String, String)>,
@@ -1166,8 +1198,8 @@ async fn finish_accounting(store: &SessionStore, acct: Accounting, code: i32, du
 #[cfg(test)]
 mod tests {
     use super::{
-        HelpKind, PluginServe, help_kind, missing_grants, plugin_model_request, plugin_serve,
-        retained_grants, take_hf_ref, use_responses_router,
+        HelpKind, PluginServe, help_kind, missing_grants, model_limit_env_with_cache,
+        plugin_model_request, plugin_serve, retained_grants, take_hf_ref, use_responses_router,
     };
     use crate::plugin::manifest::grantable_capabilities;
     use crate::services::claude_oauth::CLAUDE_OAUTH_SENTINEL;
@@ -1183,6 +1215,28 @@ mod tests {
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn model_limit_env_emits_known_limits_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = crate::services::models_cache::ModelsCache::with_path(
+            dir.path().join("models-cache.json"),
+        );
+        let k = key("https://api.example.com");
+        // Snapshot-known model → both advisory vars.
+        let env = model_limit_env_with_cache(&cache, &k, "claude-sonnet-4-6").await;
+        assert!(env.contains(&(
+            "AIVO_MODEL_CONTEXT_WINDOW".to_string(),
+            "1000000".to_string()
+        )));
+        assert!(env.contains(&(
+            "AIVO_MODEL_MAX_OUTPUT_TOKENS".to_string(),
+            "64000".to_string()
+        )));
+        // Unknown model → nothing (plugins keep their own defaults).
+        let env = model_limit_env_with_cache(&cache, &k, "totally-unknown-model-xyz").await;
+        assert!(env.is_empty());
     }
 
     #[test]

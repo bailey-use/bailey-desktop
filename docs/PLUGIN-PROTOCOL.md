@@ -35,7 +35,7 @@ runs) and sets:
 |---|---|---|
 | `AIVO_CONFIG_DIR` | always | aivo's config dir. The key store is `<dir>/config.json`, **AES-256-GCM encrypted** — read keys through the [endpoint handoff](#endpoint-handoff), never this file. |
 | `AIVO_DEBUG_LOG` | `--debug` in argv | log path (`--debug=<path>` overrides the default) |
-| `AIVO_ENDPOINT_*`, `AIVO_KEY_MODEL` | `endpoint` granted | see [Endpoint handoff](#endpoint-handoff) |
+| `AIVO_ENDPOINT_*`, `AIVO_KEY_MODEL`, `AIVO_MODEL_*` | `endpoint` granted | see [Endpoint handoff](#endpoint-handoff) |
 
 Secrets are passed **as env only, never argv**, so they never appear in `ps`.
 
@@ -209,11 +209,20 @@ active key (or one named by `-k`/`--key <id>` in the plugin's argv) and injects:
 | `AIVO_ENDPOINT_URL` | `http://127.0.0.1:<port>/v1` (OS-assigned loopback port) |
 | `AIVO_ENDPOINT_TOKEN` | a random per-launch bearer token |
 | `AIVO_KEY_MODEL` | the resolved model, for `coding-agent` plugins |
+| `AIVO_MODEL_CONTEXT_WINDOW` | the resolved model's context window in tokens — **advisory, only when known** |
+| `AIVO_MODEL_MAX_OUTPUT_TOKENS` | the resolved model's max output tokens — **advisory, only when known** |
 
 Point the client's base URL at `AIVO_ENDPOINT_URL` and send `Authorization: Bearer
 $AIVO_ENDPOINT_TOKEN` (the proxy also accepts `x-api-key`; missing/wrong → `401`). **The upstream
 secret never leaves aivo** — there is no raw-key env. The proxy starts at launch and is torn down on
 exit.
+
+The two `AIVO_MODEL_*` limit vars accompany `AIVO_KEY_MODEL` and carry plain integers resolved from
+provider metadata (the key's `/v1/models`) with a [models.dev](https://models.dev) snapshot as
+fallback. Use them to configure the wrapped CLI's own context/output settings instead of letting it
+assume a default (most CLIs guess 128k for unknown models). Absent vars mean aivo doesn't know —
+keep the CLI's defaults. Per-model limits for the full catalog are available from the endpoint's
+`/v1/models` (`context_length` / `max_output_tokens` fields, present when known).
 
 ### Inbound
 

@@ -1056,10 +1056,12 @@ impl KeysCommand {
         };
 
         match action {
-            None if keys_args.ping => self.list_keys_with_ping(keys_args.json).await,
-            None => self.list_keys(keys_args.json).await,
+            None | Some("list" | "ls") if keys_args.ping => {
+                self.list_keys_with_ping(keys_args.json).await
+            }
+            None | Some("list" | "ls") => self.list_keys(keys_args.json).await,
             Some("add") => self.add_key(first, add_options).await,
-            Some("rm") => self.remove_key(first).await,
+            Some("rm" | "remove") => self.remove_key(first).await,
             Some("use") => self.use_key(first).await,
             Some("cat") => self.cat_key(first).await,
             Some("edit") => self.edit_key(first).await,
@@ -1070,7 +1072,7 @@ impl KeysCommand {
             Some("import") => self.import_keys_action(first, keys_args).await,
             Some(action) => {
                 eprintln!(
-                    "{} Unknown action '{}'. Valid actions: use, add, rm, cat, edit, reauth, ping, reset-route, export, import.",
+                    "{} Unknown action '{}'. Valid actions: list, use, add, rm, cat, edit, reauth, ping, reset-route, export, import.",
                     style::red("Error:"),
                     action
                 );
@@ -3178,7 +3180,7 @@ impl KeysCommand {
         match action {
             Some("use") => print_help_use(),
             Some("add") => print_help_add(),
-            Some("rm") => print_help_rm(),
+            Some("rm" | "remove") => print_help_rm(),
             Some("cat") => print_help_cat(),
             Some("edit") => print_help_edit(),
             Some("reauth") => print_help_reauth(),
@@ -3208,7 +3210,7 @@ fn print_help_overview() {
     );
     println!();
     println!("{}", style::bold("Commands:"));
-    keys_help_row("(no command)", "List all API keys");
+    keys_help_row("list", "List all API keys (default when omitted)");
     keys_help_row("use [id|name]", "Activate a specific API key");
     keys_help_row("cat [id|name]", "Display details for a key");
     keys_help_row("rm [id|name]", "Remove an API key");
@@ -3775,13 +3777,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_keys_list_action_is_rejected() {
+    async fn test_keys_list_and_ls_actions_list() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         let store = crate::services::session_store::SessionStore::with_path(config_path);
         let cmd = KeysCommand::new(store);
-        let code = cmd.execute(keys_args(Some("list"), &[])).await;
-        assert_eq!(code, crate::errors::ExitCode::UserError);
+        for action in ["list", "ls"] {
+            let code = cmd.execute(keys_args(Some(action), &[])).await;
+            assert_eq!(code, crate::errors::ExitCode::Success);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keys_remove_synonym_matches_rm() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = crate::services::session_store::SessionStore::with_path(config_path);
+        let cmd = KeysCommand::new(store);
+        // Empty store: both verbs reach remove_key and fail identically.
+        let rm = cmd.execute(keys_args(Some("rm"), &[])).await;
+        let remove = cmd.execute(keys_args(Some("remove"), &[])).await;
+        assert_eq!(rm, remove);
     }
 
     #[tokio::test]

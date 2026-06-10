@@ -69,10 +69,9 @@ aivo claude --model moonshotai/kimi-k2.5     # pin a model
 aivo claude                                  # launch with active key
 aivo claude "fix the login bug"              # pass-through args
 aivo claude -m moonshotai/kimi-k2.5          # pin a model (bare -m opens picker)
-aivo claude -k openrouter                    # use a specific saved key
-aivo claude --1m                             # Claude only: 1M context window
-aivo claude --dry-run                        # preview command + env, don't launch
-aivo claude --debug                          # JSONL log of upstream HTTP traffic
+aivo codex -k openrouter                     # use a specific saved key
+aivo pi --dry-run                            # preview command + env, don't launch
+aivo opencode --debug                        # JSONL log of upstream HTTP traffic
 ```
 
 
@@ -260,7 +259,7 @@ aivo plugins install cargo:aivo-bar          # cargo install from crates.io
 aivo amp --help                              # runs the sibling aivo-amp
 aivo plugins list                            # installed, with version/roles/caps
 aivo plugins update amp                      # re-fetch / re-resolve the recorded source
-aivo plugins remove amp
+aivo plugins rm amp
 ```
 
 ## License

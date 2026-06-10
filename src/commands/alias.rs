@@ -33,11 +33,12 @@ impl AliasCommand {
     }
 
     async fn execute_internal(&self, args: AliasArgs) -> Result<ExitCode> {
-        // `rm <name>` keyword form (matches what the help advertises) and
-        // `--rm <name>` flag form. The keyword form only triggers when the
-        // first positional is *exactly* "rm"; `rm=model` still creates an
-        // alias literally named `rm`.
-        let rm_keyword = args.assignment.as_deref() == Some("rm");
+        // `rm <name>` / `remove <name>` keyword forms (matching the verbs the
+        // other commands accept) and the `--rm <name>` flag form. A keyword
+        // only triggers when the first positional is *exactly* the bare word;
+        // `rm=model` falls through to creation, where the reserved-name
+        // check rejects it.
+        let rm_keyword = matches!(args.assignment.as_deref(), Some("rm" | "remove"));
         if args.rm || rm_keyword {
             if args.json {
                 anyhow::bail!("--json only applies to listing aliases");
@@ -48,6 +49,13 @@ impl AliasCommand {
                 args.assignment.as_deref()
             };
             return self.remove_alias(name).await;
+        }
+
+        // `list` / `ls` keyword with no trailing args — same as bare
+        // `aivo alias`. With trailing args it falls through to creation,
+        // where the reserved-name check applies.
+        if matches!(args.assignment.as_deref(), Some("list" | "ls")) && args.rest.is_empty() {
+            return self.list_aliases(args.json).await;
         }
 
         // `aivo alias name=model`, `aivo alias name model`, or
@@ -408,6 +416,42 @@ mod tests {
         assert!(!has_cycle(&m, "a"));
     }
 
+    fn alias_args(assignment: Option<&str>, rest: &[&str]) -> AliasArgs {
+        AliasArgs {
+            assignment: assignment.map(String::from),
+            rest: rest.iter().map(|s| s.to_string()).collect(),
+            rm: false,
+            json: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_keyword_matches_rm_keyword() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+        for keyword in ["rm", "remove"] {
+            store
+                .set_alias("fast".to_string(), "claude-haiku".to_string())
+                .await
+                .unwrap();
+            let cmd = AliasCommand::new(store.clone());
+            let code = cmd.execute(alias_args(Some(keyword), &["fast"])).await;
+            assert_eq!(code, ExitCode::Success, "`alias {keyword} fast` failed");
+            assert!(store.get_aliases().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_and_ls_keywords_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+        let cmd = AliasCommand::new(store);
+        for keyword in ["list", "ls"] {
+            let code = cmd.execute(alias_args(Some(keyword), &[])).await;
+            assert_eq!(code, ExitCode::Success, "`alias {keyword}` failed");
+        }
+    }
+
     #[tokio::test]
     async fn set_and_get_aliases() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -494,7 +538,9 @@ mod tests {
 
     #[test]
     fn validate_alias_name_rejects_reserved_names() {
-        for reserved in &["claude", "run", "alias", "use", "ping", "ls"] {
+        for reserved in &[
+            "claude", "run", "alias", "use", "ping", "ls", "list", "rm", "remove",
+        ] {
             assert!(
                 validate_alias_name(reserved).is_err(),
                 "expected '{reserved}' to be rejected"

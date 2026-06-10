@@ -218,7 +218,7 @@ pub enum PluginsSubcommand {
     Update(PluginUpdateArgs),
 
     /// Remove an installed plugin by name
-    #[command(alias = "rm")]
+    #[command(name = "rm", alias = "remove")]
     Remove(PluginRemoveArgs),
 }
 
@@ -266,7 +266,8 @@ pub struct PluginRemoveArgs {
 /// Arguments for `aivo alias`
 #[derive(Args, Debug, Clone)]
 pub struct AliasArgs {
-    /// Alias name, `name=model` shorthand, or the `rm` keyword.
+    /// Alias name, `name=model` shorthand, or the `rm`/`remove`/`list`/`ls`
+    /// keywords.
     #[arg(value_name = "NAME[=MODEL]")]
     pub assignment: Option<String>,
 
@@ -292,10 +293,10 @@ pub struct AliasArgs {
 /// Arguments for the keys command
 #[derive(Args, Debug, Clone)]
 pub struct KeysArgs {
-    /// The action to perform (use, rm, add, cat, edit, export, import)
+    /// The action to perform (list, use, add, rm, cat, edit, reauth, ping, reset-route, export, import)
     #[arg(
         value_name = "ACTION",
-        help = "Action to perform: use, rm, add, cat, edit, export, import"
+        help = "Action to perform: list, use, add, rm, cat, edit, reauth, ping, reset-route, export, import"
     )]
     pub action: Option<String>,
 
@@ -630,7 +631,7 @@ pub struct InfoArgs {
 /// Arguments for the logs command
 #[derive(Args, Debug, Clone)]
 pub struct LogsArgs {
-    /// Action: show, share, or prune
+    /// Action: list (default), show, share, or prune
     #[arg(value_name = "ACTION")]
     pub action: Option<String>,
 

@@ -1,4 +1,4 @@
-//! `aivo plugins` — manage sibling-binary plugins (install/update/list/remove).
+//! `aivo plugins` — manage sibling-binary plugins (install/update/list/rm).
 //! Plugins are `aivo-<name>` executables in `~/.config/aivo/plugins/`; dispatch
 //! lives in `crate::plugin`.
 
@@ -77,7 +77,7 @@ impl PluginsCommand {
             "update [name]",
             "Re-install from the recorded source (all plugins if no name)",
         );
-        row("remove <name> [-y]", "Remove an installed plugin");
+        row("rm <name> [-y]", "Remove an installed plugin");
         println!();
         println!("{}", style::bold("Examples:"));
         for ex in [
@@ -87,7 +87,7 @@ impl PluginsCommand {
             "aivo plugins install npm:aivo-foo",
             "aivo plugins install cargo:aivo-bar",
             "aivo plugins update amp",
-            "aivo plugins remove amp",
+            "aivo plugins rm amp",
             "aivo amp --help        # run an installed plugin",
         ] {
             println!("  {}", style::dim(ex));

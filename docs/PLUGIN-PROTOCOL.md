@@ -413,5 +413,5 @@ component with its own consent, not a tweak to this endpoint.
 aivo plugins list
 aivo plugins install <source> [--name N] [--force] [--trust]   # path | url | github:/gh: | npm: | cargo:
 aivo plugins update [name]    # re-fetch / re-resolve from the recorded source
-aivo plugins remove <name>
+aivo plugins rm <name>
 ```

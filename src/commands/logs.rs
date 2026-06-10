@@ -264,10 +264,10 @@ impl LogsCommand {
             Some("show") => self.show_entry(&args).await,
             Some("share") => self.share_session(args).await,
             Some("prune") => self.prune_orphans(&args).await,
+            None | Some("list" | "ls") => self.list_entries(&args).await,
             Some(other) => anyhow::bail!(
-                "Unknown action '{other}'. Valid actions: show, share, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
+                "Unknown action '{other}'. Valid actions: list, show, share, prune.\nRun `aivo logs --help` for details (use -s <query> to search)."
             ),
-            None => self.list_entries(&args).await,
         }
     }
 
@@ -526,8 +526,8 @@ fn print_help_overview() {
     println!();
     println!("{}", style::bold("Commands:"));
     logs_help_row(
-        "(default)",
-        "List recent rows from all sources (newest first)",
+        "list",
+        "List recent rows from all sources (newest first; default when omitted)",
     );
     logs_help_row(
         "show [id]",
@@ -710,7 +710,8 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
     if args.json && args.jsonl {
         anyhow::bail!("--json and --jsonl cannot be combined");
     }
-    if args.watch && args.action.is_some() {
+    let is_list = matches!(args.action.as_deref(), None | Some("list" | "ls"));
+    if args.watch && !is_list {
         anyhow::bail!("--watch is only supported for `aivo logs` list output");
     }
     let is_share = args.action.as_deref() == Some("share");

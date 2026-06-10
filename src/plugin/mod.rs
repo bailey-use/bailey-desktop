@@ -20,17 +20,23 @@ use crate::style;
 
 pub(crate) const PLUGIN_PREFIX: &str = "aivo-";
 
-/// AI tools aivo once shipped natively but now distributes only as plugins.
-/// Invoking one without its plugin installed prints a `plugins install` hint
-/// instead of letting clap reject the name as unknown. `(tool, install_source)`.
-const PLUGIN_ONLY_TOOLS: &[(&str, &str)] = &[("amp", "github:yuanchuan/aivo-amp")];
+/// Well-known aivo plugins with a canonical install source. Invoking one that
+/// isn't installed offers to install it on the spot instead of letting clap
+/// reject the name as unknown. `(name, install_source)`.
+const KNOWN_PLUGINS: &[(&str, &str)] = &[
+    ("amp", "github:yuanchuan/aivo-amp"),
+    ("copilot", "github:yuanchuan/aivo-copilot"),
+    ("grok", "github:yuanchuan/aivo-grok"),
+    ("omp", "github:yuanchuan/aivo-omp"),
+];
 
 /// Run the matching `aivo-<name>` plugin and return its exit code, or `None` if
 /// none applies. Call before `Cli::parse_from` — clap rejects unknown subcommands.
 /// Granted plugins (and `coding-agent` types) get a key/endpoint handoff and run
 /// accounting via `endpoint::dispatch`; everything else spawns plain. A known
-/// plugin-only tool (e.g. `amp`) that isn't installed yields a non-zero code
-/// after pointing the user at `aivo plugins install`.
+/// plugin (e.g. `amp`, `omp`) that isn't installed is offered an install on
+/// the spot (TTY) — accepted installs run the original invocation; declined or
+/// non-interactive ones get the `aivo plugins install` hint and a non-zero code.
 pub async fn try_dispatch(
     raw_args: &[String],
     bundles: &HashMap<String, BundleAlias>,
@@ -39,29 +45,83 @@ pub async fn try_dispatch(
     let (name, plugin_args) = resolve_invocation(raw_args, bundles)?;
     match discover(name) {
         Some(bin) => Some(endpoint::dispatch(name, &bin, plugin_args, store).await),
-        // Not installed: nudge for the former-native tools; otherwise fall
-        // through to clap (typo / unknown name / bare-prompt rewrite).
+        // Not installed: offer the install for the well-known plugins;
+        // otherwise fall through to clap (typo / unknown name / bare-prompt
+        // rewrite).
         None => {
-            let source = plugin_only_tool_source(name)?;
-            print_missing_plugin_hint(name, source);
-            Some(ExitCode::UserError.code())
+            let source = known_plugin_source(name)?;
+            Some(install_and_dispatch(name, source, plugin_args, store).await)
         }
     }
 }
 
-/// The `aivo plugins install` source for a former-native tool now shipped only
-/// as a plugin, or `None` if `name` isn't one. Pure lookup.
-fn plugin_only_tool_source(name: &str) -> Option<&'static str> {
-    PLUGIN_ONLY_TOOLS
+/// Install-on-demand for an uninstalled well-known plugin: ask, install from
+/// its known source, then run the original invocation. Non-interactive or
+/// declined → the `plugins install` hint and a user-error code.
+async fn install_and_dispatch(
+    name: &str,
+    source: &str,
+    plugin_args: &[String],
+    store: &SessionStore,
+) -> i32 {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        print_missing_plugin_hint(name, source);
+        return ExitCode::UserError.code();
+    }
+    // Declining needs no follow-up — the prompt already named the source.
+    if !prompt_install_plugin(name, source) {
+        return ExitCode::UserError.code();
+    }
+    if let Err(e) = crate::commands::plugins::install_for_dispatch(name, source).await {
+        eprintln!("{} {e:#}", style::red("Error:"));
+        return crate::errors::exit_code_for_error(&e).code();
+    }
+    // The install prompt's consent covered execution, so the first-dispatch
+    // run gate would be a redundant second ask.
+    registry::approve_run(name);
+    match discover(name) {
+        Some(bin) => endpoint::dispatch(name, &bin, plugin_args, store).await,
+        None => {
+            print_missing_plugin_hint(name, source);
+            ExitCode::UserError.code()
+        }
+    }
+}
+
+/// Offer to install a well-known plugin right now. Caller gates on a TTY;
+/// defaults to yes like the native-tool install prompt. Showing the source
+/// makes this consent cover the binary's first run.
+fn prompt_install_plugin(name: &str, source: &str) -> bool {
+    use std::io::Write;
+    eprintln!(
+        "  {} {} is not installed.",
+        style::yellow("?"),
+        style::cyan(format!("`{name}`")),
+    );
+    eprint!("    Install it from {}? [Y/n] ", style::cyan(source));
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        // EOF (^D) is a non-answer — only an actual Enter takes the default.
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(input.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"),
+    }
+}
+
+/// The `aivo plugins install` source for a well-known plugin, or `None` if
+/// `name` isn't one. Pure lookup.
+fn known_plugin_source(name: &str) -> Option<&'static str> {
+    KNOWN_PLUGINS
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, source)| *source)
 }
 
-/// Tell the user a former-native tool now lives in a plugin and how to add it.
+/// Tell the user the name is an aivo plugin and how to add it.
 fn print_missing_plugin_hint(name: &str, source: &str) {
     eprintln!(
-        "{} `{name}` is now an aivo plugin and isn't installed.",
+        "{} `{name}` is an aivo plugin and isn't installed.",
         style::red("Error:"),
     );
     eprintln!(
@@ -287,18 +347,12 @@ pub(crate) fn prompt_first_run(name: &str, source: &str) -> bool {
 pub(crate) fn prompt_capability_grant(name: &str, caps: &[String]) -> bool {
     use std::io::Write;
     eprintln!(
-        "  {} plugin `{}` requests {}",
+        "  {} {} requests {} — a per-launch local endpoint for your selected key.",
         style::yellow("?"),
-        name,
-        caps.join(", "),
+        style::cyan(format!("`{name}`")),
+        style::cyan(caps.join(", ")),
     );
-    eprintln!(
-        "    {}",
-        style::dim(
-            "granting hands it a per-launch local endpoint for your selected key — only allow plugins you trust"
-        )
-    );
-    eprint!("  {} grant these capabilities? [y/N] ", style::yellow("?"));
+    eprint!("    Grant it? [y/N] ");
     let _ = std::io::stderr().flush();
     let mut input = String::new();
     if std::io::stdin().read_line(&mut input).is_err() {
@@ -484,16 +538,23 @@ mod tests {
     }
 
     #[test]
-    fn plugin_only_tools_have_install_sources() {
-        // `amp` is a former-native tool, so an uninstalled `aivo amp` is nudged
-        // toward its plugin source rather than rejected by clap.
-        assert_eq!(
-            plugin_only_tool_source("amp"),
-            Some("github:yuanchuan/aivo-amp")
-        );
-        // Live native tools and genuinely unknown names are not plugin-only.
-        assert_eq!(plugin_only_tool_source("claude"), None);
-        assert_eq!(plugin_only_tool_source("foobar"), None);
+    fn known_plugins_have_install_sources() {
+        // An uninstalled well-known plugin is offered its install source
+        // rather than rejected by clap.
+        for name in ["amp", "copilot", "grok", "omp"] {
+            assert_eq!(
+                known_plugin_source(name),
+                Some(format!("github:yuanchuan/aivo-{name}")).as_deref(),
+            );
+            // The offer is only reachable if the name dispatches as a plugin.
+            assert!(
+                !is_reserved_plugin_name(name),
+                "{name} must be dispatchable"
+            );
+        }
+        // Live native tools and genuinely unknown names get no offer.
+        assert_eq!(known_plugin_source("claude"), None);
+        assert_eq!(known_plugin_source("foobar"), None);
     }
 
     #[test]

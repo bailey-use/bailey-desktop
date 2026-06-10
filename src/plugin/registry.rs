@@ -92,6 +92,19 @@ pub(crate) fn forget(name: &str) {
     });
 }
 
+/// Mark a plugin's first run as user-approved without touching anything else —
+/// used when install-on-demand consent already covered execution, so the
+/// first-dispatch gate must not ask again.
+pub(crate) fn approve_run(name: &str) {
+    apply_default(|reg| approve_run_in(reg, name));
+}
+
+fn approve_run_in(reg: &mut Registry, name: &str) {
+    if let Some(rec) = reg.plugins.get_mut(name) {
+        rec.run_approved = true;
+    }
+}
+
 /// Resolve the managed dir and `apply`; a persist failure only costs a future
 /// `update`, so it warns rather than aborts.
 fn apply_default(f: impl FnOnce(&mut Registry)) {
@@ -281,6 +294,23 @@ mod tests {
     fn missing_files_yield_empty() {
         let dir = TempDir::new().unwrap();
         assert!(read_view(dir.path()).plugins.is_empty());
+    }
+
+    #[test]
+    fn approve_run_flips_only_the_flag() {
+        let dir = TempDir::new().unwrap();
+        let mut reg = Registry::default();
+        reg.plugins.insert("amp".to_string(), rec("/abs/aivo-amp"));
+        save_to(dir.path(), &reg).unwrap();
+
+        apply(dir.path(), |reg| approve_run_in(reg, "amp")).unwrap();
+        let back = read_view(dir.path());
+        assert!(back.plugins["amp"].run_approved);
+        assert_eq!(back.plugins["amp"].source, "/abs/aivo-amp");
+
+        // An unknown name is a no-op, not an insert.
+        apply(dir.path(), |reg| approve_run_in(reg, "ghost")).unwrap();
+        assert!(!read_view(dir.path()).plugins.contains_key("ghost"));
     }
 
     #[test]

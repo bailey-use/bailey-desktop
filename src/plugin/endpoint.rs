@@ -333,12 +333,26 @@ impl GrantPlan {
 async fn grant_plan(name: &str, bin: &Path) -> Option<GrantPlan> {
     let reg = registry::load();
     match reg.plugins.get(name) {
-        // Already probed at install — honor the recorded grants.
+        // Already probed — honor the recorded grants, but re-ask (TTY) for
+        // requested caps not yet granted: a past decline means "not that
+        // time", not forever, else the plugin is stuck cap-less until a
+        // reinstall. Accepted grants persist so the prompt doesn't recur.
         Some(rec) if rec.manifest.is_some() => {
             let manifest = rec.manifest.as_ref().unwrap();
             let requested = grantable_capabilities(&manifest.capabilities);
+            let mut granted = retained_grants(&requested, &rec.granted_caps);
+            let missing = missing_grants(&requested, &rec.granted_caps);
+            if !missing.is_empty()
+                && std::io::stdin().is_terminal()
+                && super::prompt_capability_grant(name, &missing)
+            {
+                granted.extend(missing);
+                let mut updated = rec.clone();
+                updated.granted_caps = granted.clone();
+                registry::record(name, updated);
+            }
             Some(GrantPlan {
-                caps: retained_grants(&requested, &rec.granted_caps),
+                caps: granted,
                 is_coding_agent: manifest.is_coding_agent(),
                 documents_aivo_flags: manifest.documents_aivo_flags,
             })

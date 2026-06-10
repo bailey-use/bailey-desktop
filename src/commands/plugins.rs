@@ -244,6 +244,31 @@ fn list_action() -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// Install-on-demand entry used by plugin dispatch when a known plugin is
+/// invoked uninstalled. Leaner than `plugins install`: the plugin runs next,
+/// so the run-hint/path/disclosure lines would be noise — the dispatch that
+/// follows probes the manifest and seeks any capability consent.
+pub(crate) async fn install_for_dispatch(name: &str, source: &str) -> Result<()> {
+    let dir =
+        plugins_dir().context("could not resolve the home directory for ~/.config/aivo/plugins")?;
+    let prior = registry::load()
+        .plugins
+        .get(name)
+        .map(|r| r.granted_caps.clone())
+        .unwrap_or_default();
+    let outcome = reinstall_animated(name, source, &dir, false, "Installing", false).await?;
+    let granted = resolve_grants(name, outcome.manifest.as_ref(), &prior, false);
+    record_install(
+        name,
+        source,
+        outcome.checksum.clone(),
+        outcome.manifest.clone(),
+        granted,
+    );
+    eprintln!("  {} Installed plugin `{name}`", style::success_symbol());
+    Ok(())
+}
+
 async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
     let dir =
         plugins_dir().context("could not resolve the home directory for ~/.config/aivo/plugins")?;

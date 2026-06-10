@@ -498,7 +498,9 @@ async fn handle_models_request(
         let status = response.status().as_u16();
         let body = response.text().await.unwrap_or_default();
         let models = extract_openai_model_ids(&body)?;
-        let body = model_list_response::build_models_response_body_for_owner(&models, "copilot")
+        // "copilot" is the sentinel base_url copilot keys cache under.
+        let body = enriched_models_body(&models, "copilot", "copilot")
+            .await
             .to_string();
         return Ok(http_utils::http_json_response(status, &body));
     }
@@ -511,9 +513,28 @@ async fn handle_models_request(
         config.api_key.clone(),
     );
     let models = crate::commands::models::fetch_models(client, &key).await?;
-    let body =
-        model_list_response::build_models_response_body_for_owner(&models, "aivo").to_string();
+    let body = enriched_models_body(&models, &config.target_base_url, "aivo")
+        .await
+        .to_string();
     Ok(http_utils::http_json_response(200, &body))
+}
+
+/// Models body with limits resolved through the cascade (live cache →
+/// embedded snapshot). Local cache instance: lazy one-time disk read on an
+/// endpoint that already pays a network fetch.
+async fn enriched_models_body(models: &[String], cache_base: &str, owned_by: &str) -> Value {
+    let cache = crate::services::models_cache::ModelsCache::new();
+    let mut entries = Vec::with_capacity(models.len());
+    for id in models {
+        let limits =
+            crate::services::model_metadata::resolve_limits(&cache, Some(cache_base), id).await;
+        entries.push(model_list_response::ModelListEntry {
+            id: id.clone(),
+            owned_by: owned_by.to_string(),
+            limits,
+        });
+    }
+    model_list_response::build_models_response_body(entries)
 }
 
 fn extract_openai_model_ids(body: &str) -> Result<Vec<String>> {

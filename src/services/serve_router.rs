@@ -592,14 +592,36 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
 
 async fn handle_models(state: &ServeState) -> Result<RouterResponse> {
     let models = fetch_models(&state.client, &state.key).await?;
-    let mut entries: Vec<(String, String)> = models
-        .into_iter()
-        .map(|id| (id, "aivo".to_string()))
-        .collect();
+    // Local cache instance: lazy one-time disk read, and this endpoint
+    // already pays a network fetch per call.
+    let cache = crate::services::models_cache::ModelsCache::new();
+    let cache_base = crate::commands::models::model_cache_key_for_key(&state.key);
+    let mut entries = Vec::with_capacity(models.len() + state.config.aliases.len());
+    for id in models {
+        let limits =
+            crate::services::model_metadata::resolve_limits(&cache, Some(&cache_base), &id).await;
+        entries.push(model_list_response::ModelListEntry {
+            id,
+            owned_by: "aivo".to_string(),
+            limits,
+        });
+    }
     let mut alias_names: Vec<&String> = state.config.aliases.keys().collect();
     alias_names.sort();
     for name in alias_names {
-        entries.push((name.clone(), "aivo-alias".to_string()));
+        // Aliases inherit the limits of the model they resolve to.
+        let limits = match state.config.aliases.get(name) {
+            Some(target) => {
+                crate::services::model_metadata::resolve_limits(&cache, Some(&cache_base), target)
+                    .await
+            }
+            None => Default::default(),
+        };
+        entries.push(model_list_response::ModelListEntry {
+            id: name.clone(),
+            owned_by: "aivo-alias".to_string(),
+            limits,
+        });
     }
     let resp = model_list_response::build_models_response_body(entries);
     Ok(RouterResponse::buffered(

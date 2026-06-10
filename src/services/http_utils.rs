@@ -712,11 +712,28 @@ pub fn current_unix_ts() -> u64 {
         .as_secs()
 }
 
-/// Parses a JSON value as a `u64`, accepting JSON integers, floats, and numeric strings.
+/// Parses a JSON value as a `u64`, accepting JSON integers, floats, numeric
+/// strings, and K/M-suffixed display strings.
 pub fn parse_token_u64(v: &Value) -> Option<u64> {
     v.as_u64()
         .or_else(|| v.as_f64().map(|f| f as u64))
-        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .or_else(|| v.as_str().and_then(parse_token_str))
+}
+
+/// `"1048576"`, `"131K"`, `"1M"`, `"1.5m"` — some providers (e.g. the aivo
+/// gateway) surface human-formatted limits in `/v1/models` as-is.
+fn parse_token_str(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return Some(n);
+    }
+    let multiplier = match s.chars().last()? {
+        'k' | 'K' => 1_000f64,
+        'm' | 'M' => 1_000_000f64,
+        _ => return None,
+    };
+    let number: f64 = s[..s.len() - 1].trim().parse().ok()?;
+    (number >= 0.0).then_some((number * multiplier) as u64)
 }
 
 /// Returns the SSE payload for a `data:` line.
@@ -1299,6 +1316,19 @@ mod tests {
     #[test]
     fn test_parse_token_u64_invalid_string() {
         assert_eq!(parse_token_u64(&json!("not_a_number")), None);
+    }
+
+    #[test]
+    fn test_parse_token_u64_suffixed_display_strings() {
+        // The aivo gateway surfaces "1M"/"384K" in /v1/models as-is.
+        assert_eq!(parse_token_u64(&json!("1M")), Some(1_000_000));
+        assert_eq!(parse_token_u64(&json!("384K")), Some(384_000));
+        assert_eq!(parse_token_u64(&json!("131k")), Some(131_000));
+        assert_eq!(parse_token_u64(&json!("1.5m")), Some(1_500_000));
+        assert_eq!(parse_token_u64(&json!(" 200K ")), Some(200_000));
+        assert_eq!(parse_token_u64(&json!("M")), None);
+        assert_eq!(parse_token_u64(&json!("-1M")), None);
+        assert_eq!(parse_token_u64(&json!("1G")), None);
     }
 
     #[test]

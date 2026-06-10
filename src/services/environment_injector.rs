@@ -954,6 +954,7 @@ impl EnvironmentInjector {
         key: &ApiKey,
         model: Option<&str>,
         catalog: &[String],
+        limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
     ) -> HashMap<String, String> {
         let mut env = HashMap::new();
         let profile = provider_profile_for_key(key);
@@ -969,6 +970,7 @@ impl EnvironmentInjector {
                 "openai-completions",
                 model,
                 catalog,
+                limits,
             );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_CURSOR_ROUTER".to_string(), "1".to_string());
@@ -987,6 +989,7 @@ impl EnvironmentInjector {
                 "openai-completions",
                 model,
                 catalog,
+                limits,
             );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
@@ -998,6 +1001,7 @@ impl EnvironmentInjector {
                 "openai-completions",
                 model,
                 catalog,
+                limits,
             );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_COPILOT_ROUTER".to_string(), "1".to_string());
@@ -1011,6 +1015,7 @@ impl EnvironmentInjector {
                 "openai-completions",
                 model,
                 catalog,
+                limits,
             );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_STARTER_ROUTER".to_string(), "1".to_string());
@@ -1035,6 +1040,7 @@ impl EnvironmentInjector {
                 "openai-completions",
                 model,
                 catalog,
+                limits,
             );
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_USE_PI_ROUTER".to_string(), "1".to_string());
@@ -1082,7 +1088,8 @@ impl EnvironmentInjector {
             } else {
                 &key.key
             };
-            let models_json = build_pi_models_json(&resolved_url, auth, pi_api, model, catalog);
+            let models_json =
+                build_pi_models_json(&resolved_url, auth, pi_api, model, catalog, limits);
             env.insert("AIVO_PI_MODELS_JSON".to_string(), models_json);
             env.insert("AIVO_SETUP_PI_AGENT_DIR".to_string(), "1".to_string());
         }
@@ -1132,13 +1139,18 @@ fn build_pi_models_json(
     api_type: &str,
     model: Option<&str>,
     catalog: &[String],
+    limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
 ) -> String {
     // Pi doesn't auto-discover — its `/model` picker shows only what's listed
-    // here. List the whole catalog so it's a real picker. The pinned (or
-    // "default") id stays first so pi defaults to it; the rest follow sorted.
-    // Empty catalog (discovery off/failed) collapses to that single entry —
-    // the pre-discovery behavior, which is also the soft-fail fallback.
-    let default_id = model.unwrap_or("default");
+    // here. List the whole catalog so it's a real picker. The pinned id stays
+    // first so pi defaults to it; the rest follow sorted. Without a pinned
+    // model, default to the catalog's first entry — a literal "default"
+    // placeholder is not a real id and nothing rewrites it, so upstreams 400
+    // ("unknown model 'default'"). The placeholder survives only when
+    // discovery failed AND no model is pinned (nothing better exists).
+    let default_id = model
+        .or_else(|| catalog.first().map(String::as_str))
+        .unwrap_or("default");
     let mut rest: Vec<&str> = catalog
         .iter()
         .map(String::as_str)
@@ -1146,9 +1158,23 @@ fn build_pi_models_json(
         .collect();
     rest.sort_unstable();
     rest.dedup();
+    // Pi assumes 128k context for models without an explicit contextWindow;
+    // carry the resolved limits so its footer and compaction math match the
+    // real model.
     let models: Vec<Value> = std::iter::once(default_id)
         .chain(rest)
-        .map(|id| json!({ "id": id, "name": id }))
+        .map(|id| {
+            let mut entry = json!({ "id": id, "name": id });
+            if let Some(l) = limits.get(id) {
+                if let Some(context) = l.context {
+                    entry["contextWindow"] = json!(context);
+                }
+                if let Some(output) = l.output {
+                    entry["maxTokens"] = json!(output);
+                }
+            }
+            entry
+        })
         .collect();
     let models_json = json!({
         "providers": {
@@ -1336,7 +1362,7 @@ mod tests {
             "{}testaccount1",
             crate::services::cursor_acp::CURSOR_SHADOW_PREFIX
         ));
-        let env = injector.for_pi(&key, Some("composer-2.5"), &[]);
+        let env = injector.for_pi(&key, Some("composer-2.5"), &[], &HashMap::new());
 
         assert_eq!(env.get("AIVO_USE_CURSOR_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
@@ -3205,7 +3231,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
-        let env = injector.for_pi(&key, Some("gemini-2.5-flash"), &[]);
+        let env = injector.for_pi(&key, Some("gemini-2.5-flash"), &[], &HashMap::new());
 
         let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
         let parsed: Value = serde_json::from_str(models_json).unwrap();
@@ -3227,7 +3253,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://generativelanguage.googleapis.com".to_string();
-        let env = injector.for_pi(&key, Some("gemini-2.5-flash"), &[]);
+        let env = injector.for_pi(&key, Some("gemini-2.5-flash"), &[], &HashMap::new());
 
         let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
         let parsed: Value = serde_json::from_str(models_json).unwrap();
@@ -3248,7 +3274,7 @@ mod tests {
 
         let injector = EnvironmentInjector::new();
         let key = ollama_key();
-        let env = injector.for_pi(&key, Some("llama3.2"), &[]);
+        let env = injector.for_pi(&key, Some("llama3.2"), &[], &HashMap::new());
 
         let models_json = env.get("AIVO_PI_MODELS_JSON").unwrap();
         let parsed: Value = serde_json::from_str(models_json).unwrap();
@@ -3276,7 +3302,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic".to_string();
-        let env = injector.for_pi(&key, Some("MiniMax-M1"), &[]);
+        let env = injector.for_pi(&key, Some("MiniMax-M1"), &[], &HashMap::new());
 
         assert_eq!(env.get("AIVO_USE_PI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(
@@ -3308,7 +3334,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://api.minimax.io/anthropic".to_string();
-        let env = injector.for_pi(&key, Some("MiniMax-M1"), &[]);
+        let env = injector.for_pi(&key, Some("MiniMax-M1"), &[], &HashMap::new());
 
         assert_eq!(env.get("AIVO_SETUP_PI_AGENT_DIR"), Some(&"1".to_string()));
         assert!(!env.contains_key("AIVO_USE_PI_ROUTER"));
@@ -3330,7 +3356,7 @@ mod tests {
             "o3".to_string(),
             "gpt-4o".to_string(), // duplicate is dropped
         ];
-        let env = injector.for_pi(&key, Some("o3"), &catalog);
+        let env = injector.for_pi(&key, Some("o3"), &catalog, &HashMap::new());
 
         let parsed: Value = serde_json::from_str(env.get("AIVO_PI_MODELS_JSON").unwrap()).unwrap();
         let ids: Vec<&str> = parsed["providers"]["aivo"]["models"]
@@ -3344,6 +3370,69 @@ mod tests {
     }
 
     #[test]
+    fn test_for_pi_carries_resolved_limits_per_model() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+        crate::services::transform_mode::set_active(false);
+
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.openai.com/v1");
+        let catalog = ["aivo/starter".to_string(), "mystery-model-xyz".to_string()];
+        let mut limits = HashMap::new();
+        limits.insert(
+            "aivo/starter".to_string(),
+            crate::services::model_metadata::ResolvedLimits {
+                context: Some(1_000_000),
+                output: Some(384_000),
+                caps: None,
+            },
+        );
+        let env = injector.for_pi(&key, Some("aivo/starter"), &catalog, &limits);
+        let parsed: Value = serde_json::from_str(env.get("AIVO_PI_MODELS_JSON").unwrap()).unwrap();
+        let models = parsed["providers"]["aivo"]["models"].as_array().unwrap();
+        // Known limits become pi's contextWindow/maxTokens (else pi assumes 128k).
+        assert_eq!(models[0]["id"], "aivo/starter");
+        assert_eq!(models[0]["contextWindow"], 1_000_000);
+        assert_eq!(models[0]["maxTokens"], 384_000);
+        // Unknown models omit the fields so pi's own defaults apply.
+        assert_eq!(models[1]["id"], "mystery-model-xyz");
+        assert!(models[1].get("contextWindow").is_none());
+        assert!(models[1].get("maxTokens").is_none());
+    }
+
+    #[test]
+    fn test_for_pi_without_model_defaults_to_first_catalog_entry() {
+        let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::services::http_debug::set_test_debug_active(false);
+        crate::services::transform_mode::set_active(false);
+
+        let injector = EnvironmentInjector::new();
+        let key = test_api_key("https://api.openai.com/v1");
+        // No pinned model: the catalog's first entry becomes pi's default.
+        // A literal "default" placeholder would be sent verbatim upstream
+        // and 400 ("unknown model 'default'").
+        let catalog = ["MiniMax-M2.7".to_string(), "MiniMax-M2".to_string()];
+        let env = injector.for_pi(&key, None, &catalog, &HashMap::new());
+        let parsed: Value = serde_json::from_str(env.get("AIVO_PI_MODELS_JSON").unwrap()).unwrap();
+        let ids: Vec<&str> = parsed["providers"]["aivo"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["MiniMax-M2.7", "MiniMax-M2"]);
+
+        // Empty catalog AND no model: the placeholder soft-fail survives.
+        let env = injector.for_pi(&key, None, &[], &HashMap::new());
+        let parsed: Value = serde_json::from_str(env.get("AIVO_PI_MODELS_JSON").unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["aivo"]["models"][0]["id"], "default");
+    }
+
+    #[test]
     fn test_for_pi_transform_forces_router_without_debug() {
         let _guard = crate::services::http_debug::DEBUG_TEST_MUTEX
             .lock()
@@ -3354,7 +3443,7 @@ mod tests {
         let injector = EnvironmentInjector::new();
         let mut key = test_key();
         key.base_url = "https://openrouter.ai/api/v1".to_string();
-        let env = injector.for_pi(&key, Some("claude-sonnet-4-6"), &[]);
+        let env = injector.for_pi(&key, Some("claude-sonnet-4-6"), &[], &HashMap::new());
 
         assert_eq!(env.get("AIVO_USE_PI_ROUTER"), Some(&"1".to_string()));
         assert_eq!(

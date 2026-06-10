@@ -777,12 +777,33 @@ impl AILauncher {
         } else {
             Vec::new()
         };
+        // Resolved limits for pi's models.json — pi assumes 128k context for
+        // entries without an explicit contextWindow.
+        let pi_model_limits = if options.tool == AIToolType::Pi {
+            let cache_base = crate::commands::models::model_cache_key_for_key(&key);
+            let mut limits = HashMap::new();
+            for id in pi_models.iter().map(String::as_str).chain(model.as_deref()) {
+                if !limits.contains_key(id) {
+                    let resolved = crate::services::model_metadata::resolve_limits(
+                        &self.cache,
+                        Some(&cache_base),
+                        id,
+                    )
+                    .await;
+                    limits.insert(id.to_string(), resolved);
+                }
+            }
+            limits
+        } else {
+            HashMap::new()
+        };
         let tool_config = self.get_tool_config(
             options.tool,
             &key,
             model.as_deref(),
             opencode_models.as_deref(),
             &pi_models,
+            &pi_model_limits,
             &options.claude_overrides,
         );
         Ok(ResolvedLaunchContext {
@@ -992,6 +1013,7 @@ impl AILauncher {
     }
 
     /// Gets tool-specific configuration including command and environment variables
+    #[allow(clippy::too_many_arguments)]
     fn get_tool_config(
         &self,
         tool: AIToolType,
@@ -999,6 +1021,7 @@ impl AILauncher {
         model: Option<&str>,
         opencode_models: Option<&[String]>,
         pi_models: &[String],
+        pi_model_limits: &HashMap<String, crate::services::model_metadata::ResolvedLimits>,
         claude_overrides: &ClaudeModelOverrides,
     ) -> ToolConfig {
         // claude_overrides.{slot fields} are non-empty only on the Claude
@@ -1013,7 +1036,9 @@ impl AILauncher {
             AIToolType::Codex | AIToolType::CodexApp => self.env_injector.for_codex(key, model),
             AIToolType::Gemini => self.env_injector.for_gemini(key, model),
             AIToolType::Opencode => self.env_injector.for_opencode(key, model, opencode_models),
-            AIToolType::Pi => self.env_injector.for_pi(key, model, pi_models),
+            AIToolType::Pi => self
+                .env_injector
+                .for_pi(key, model, pi_models, pi_model_limits),
         };
 
         ToolConfig {

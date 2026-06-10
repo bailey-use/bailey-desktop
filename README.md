@@ -52,11 +52,7 @@ aivo claude
 aivo claude --model moonshotai/kimi-k2.5     # pin a model
 ```
 
-## run
-
-Launch a coding agent with the active provider key. The `run` keyword is optional: `aivo claude` is equivalent to `aivo run claude`. Extra arguments are passed through.
-
-Supported coding agents:
+## Supported coding agents
 
 - `claude` [Claude Code](https://github.com/anthropics/claude-code)
 - `codex` [Codex](https://github.com/openai/codex)
@@ -64,13 +60,10 @@ Supported coding agents:
 - `gemini` [Gemini CLI](https://github.com/google-gemini/gemini-cli)
 - `opencode` [OpenCode](https://github.com/anomalyco/opencode)
 - `pi` [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
-
-Two more ship as [plugins](#plugins) — [Amp](https://ampcode.com) and [oh-my-pi](https://github.com/can1357/oh-my-pi).
-
-```bash
-aivo plugins install github:yuanchuan/aivo-amp
-aivo plugins install github:yuanchuan/aivo-omp
-```
+- `amp` [Amp](https://ampcode.com) (via [plugin](#plugins))
+- `omp` [oh-my-pi](https://github.com/can1357/oh-my-pi) (via [plugin](#plugins))
+- `copilot` [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/copilot-cli) (via [plugin](#plugins))
+- `grok` [Grok CLI](https://x.ai/cli) (via [plugin](#plugins))
 
 ```bash
 aivo claude                                  # launch with active key
@@ -83,7 +76,7 @@ aivo claude --debug                          # JSONL log of upstream HTTP traffi
 ```
 
 
-Without a tool name, `aivo run` opens the interactive start flow and remembers the last selection.
+Without a tool name, `aivo run` opens the tool picker — native agents and installed coding-agent plugins.
 
 ## keys
 

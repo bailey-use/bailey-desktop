@@ -136,6 +136,24 @@ pub fn coding_agent_plugin_names() -> std::collections::HashSet<String> {
         .collect()
 }
 
+/// Sorted `type: coding-agent` plugins whose binary is still discoverable —
+/// offered alongside native tools in the start flow's tool picker.
+pub fn launchable_coding_agents() -> Vec<String> {
+    let mut names: Vec<String> = coding_agent_plugin_names()
+        .into_iter()
+        .filter(|name| discover(name).is_some())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Dispatch an installed plugin by name through the standard grant/endpoint
+/// path, returning its exit code — `None` when no `aivo-<name>` binary exists.
+pub async fn dispatch_installed(name: &str, args: &[String], store: &SessionStore) -> Option<i32> {
+    let bin = discover(name)?;
+    Some(endpoint::dispatch(name, &bin, args, store).await)
+}
+
 /// argv → `(plugin_name, args_after_name)`, or `None` if no plugin applies.
 /// `aivo amp …` and `aivo run amp …` both yield the same `aivo-amp …`.
 fn resolve_invocation<'a>(

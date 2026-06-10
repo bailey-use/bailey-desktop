@@ -31,6 +31,22 @@ struct Resolved<T> {
     interactive: bool,
 }
 
+/// A picked launch target: a native tool, or an installed coding-agent plugin
+/// (which owns its key/model resolution via the plugin dispatch).
+enum StartTool {
+    Native(AIToolType),
+    Plugin(String),
+}
+
+impl StartTool {
+    fn name(&self) -> &str {
+        match self {
+            StartTool::Native(tool) => tool.as_str(),
+            StartTool::Plugin(name) => name,
+        }
+    }
+}
+
 pub struct StartCommand {
     session_store: SessionStore,
     ai_launcher: AILauncher,
@@ -70,8 +86,17 @@ impl StartCommand {
         let key_explicit = args.key.is_some();
         let model_explicit = args.model.is_some();
 
-        // Resolve tool first (uses last selection for default)
-        let tool = self.resolve_tool(args.tool.as_deref(), last_sel.as_ref())?;
+        // Resolve tool first (uses last selection for the picker default)
+        let tool = self.resolve_tool(args.tool.as_deref(), last_sel.as_ref(), args.yes)?;
+        let tool = match tool.value {
+            // Plugins resolve their own key/model (and write the shared last
+            // selection) inside the standard dispatch — hand off the flags.
+            StartTool::Plugin(name) => return self.dispatch_plugin(&name, &args).await,
+            StartTool::Native(t) => Resolved {
+                value: t,
+                interactive: tool.interactive,
+            },
+        };
 
         let key = self
             .resolve_key(args.key.as_deref(), last_sel.as_ref())
@@ -301,17 +326,32 @@ impl StartCommand {
         &self,
         tool_arg: Option<&str>,
         last_sel: Option<&LastSelection>,
-    ) -> Result<Resolved<AIToolType>> {
+        yes: bool,
+    ) -> Result<Resolved<StartTool>> {
+        let plugins = crate::plugin::launchable_coding_agents();
+        let parse = |name: &str| -> Option<StartTool> {
+            if let Some(tool) = AIToolType::parse(name) {
+                Some(StartTool::Native(tool))
+            } else if plugins.iter().any(|p| p == name) {
+                Some(StartTool::Plugin(name.to_string()))
+            } else {
+                None
+            }
+        };
+
         if let Some(tool) = tool_arg {
             return Ok(Resolved {
-                value: AIToolType::parse(tool)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown AI tool '{}'", tool))?,
+                value: parse(tool).ok_or_else(|| anyhow::anyhow!("Unknown AI tool '{}'", tool))?,
                 interactive: false,
             });
         }
 
-        if let Some(sel) = last_sel
-            && let Some(tool) = AIToolType::parse(&sel.tool)
+        // The remembered tool: replayed verbatim under `-y` or headless;
+        // otherwise it pre-selects the picker row so Enter replays it.
+        let remembered = last_sel.and_then(|sel| parse(&sel.tool));
+        let remembered_name = remembered.as_ref().map(|t| t.name().to_string());
+        if (yes || !std::io::stderr().is_terminal())
+            && let Some(tool) = remembered
         {
             return Ok(Resolved {
                 value: tool,
@@ -319,22 +359,58 @@ impl StartCommand {
             });
         }
 
-        let tools = AIToolType::all();
-        let items = tools
+        let mut items = AIToolType::all()
             .iter()
             .map(|t| t.as_str().to_string())
             .collect::<Vec<_>>();
+        items.extend(plugins.iter().cloned());
+        let default_idx = remembered_name
+            .and_then(|name| items.iter().position(|item| *item == name))
+            .unwrap_or(0);
         let selected = FuzzySelect::new()
             .with_prompt("Select tool")
             .items(&items)
-            .default(0)
+            .default(default_idx)
             .interact_opt()
             .ok()
             .flatten()
             .ok_or_else(|| anyhow::anyhow!("Cancelled"))?;
         Ok(Resolved {
-            value: tools[selected],
+            value: parse(&items[selected]).expect("picker items are parseable"),
             interactive: true,
+        })
+    }
+
+    /// Hand a coding-agent plugin to the standard plugin dispatch, which owns
+    /// key/model resolution, consent gates, the endpoint, and accounting.
+    /// `-k`/`-m`/`--dry-run` forward as the flags `aivo <plugin>` accepts.
+    async fn dispatch_plugin(&self, name: &str, args: &StartFlowArgs) -> Result<ExitCode> {
+        let mut plugin_args: Vec<String> = Vec::new();
+        match args.key.as_deref() {
+            Some("") => plugin_args.push("-k".to_string()),
+            Some(key) => plugin_args.push(format!("--key={key}")),
+            None => {}
+        }
+        match args.model.as_deref() {
+            Some("") => plugin_args.push("-m".to_string()),
+            Some(model) => plugin_args.push(format!("--model={model}")),
+            None => {}
+        }
+        if args.dry_run {
+            plugin_args.push("--dry-run".to_string());
+        }
+        if !args.envs.is_empty() {
+            eprintln!(
+                "{} `-e` overrides are not passed to plugins; ignoring.",
+                style::yellow("Note:")
+            );
+        }
+        let code = crate::plugin::dispatch_installed(name, &plugin_args, &self.session_store)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Plugin `aivo-{name}` is no longer installed."))?;
+        Ok(match code {
+            0 => ExitCode::Success,
+            n => ExitCode::ToolExit(n),
         })
     }
 

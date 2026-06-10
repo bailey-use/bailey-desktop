@@ -425,6 +425,11 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Without a tool name: skip the tool picker and replay the last
+    /// selection as-is (no prompts)
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
     /// Force a fresh OAuth login for the selected key before launching.
     /// Only applies to OAuth keys (codex / gemini / claude); errors out
     /// on plain API keys. Useful when the stored credential has been

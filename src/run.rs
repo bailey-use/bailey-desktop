@@ -365,7 +365,7 @@ pub async fn run() -> ! {
                         tool: None,
                         dry_run,
                         refresh,
-                        yes: false,
+                        yes: run_args.yes,
                         envs: env_strings,
                     })
                     .await

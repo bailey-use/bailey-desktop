@@ -12,6 +12,7 @@ use crate::commands::truncate_url_for_display;
 use crate::tui::{FuzzyOutcome, FuzzySelect};
 
 use crate::errors::ExitCode;
+use crate::services::models_cache::ModelsCache;
 use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::style;
@@ -457,6 +458,7 @@ fn display_secret(key: &ApiKey) -> String {
 
 pub struct KeysCommand {
     session_store: SessionStore,
+    models_cache: ModelsCache,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -998,7 +1000,18 @@ fn sync_models_in_background(key_id: &str, base_url: &str) {
 impl KeysCommand {
     /// Creates a new KeysCommand instance
     pub fn new(session_store: SessionStore) -> Self {
-        Self { session_store }
+        Self {
+            session_store,
+            models_cache: ModelsCache::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_models_cache(session_store: SessionStore, models_cache: ModelsCache) -> Self {
+        Self {
+            session_store,
+            models_cache,
+        }
     }
 
     /// Returns the active key ID from last_selection or active_key_id.
@@ -1262,8 +1275,9 @@ impl KeysCommand {
     /// Activates a specific API key by ID or name
     /// Clears all learned routing state for a key so the next launch re-probes:
     /// `claude_protocol`, `gemini_protocol`, `claude_path_variant`,
-    /// `gemini_path_variant`, `responses_api_supported`. Useful when an upstream
-    /// provider gains/loses support for a protocol and the cached pin is stale.
+    /// `gemini_path_variant`, `responses_api_supported`, plus the key's cached
+    /// model list. Useful when an upstream provider gains/loses support for a
+    /// protocol or changes its catalog and the cached state is stale.
     async fn reset_route(&self, key_id_or_name: Option<&str>) -> Result<ExitCode> {
         let selection = self
             .resolve_key_selection(
@@ -1303,6 +1317,11 @@ impl KeysCommand {
         let _ = self
             .session_store
             .set_key_responses_api_supported(&key.id, None)
+            .await;
+        // A stale route usually means the endpoint changed; drop its cached
+        // model list too so pickers re-fetch instead of serving the old catalog.
+        self.models_cache
+            .remove(&crate::commands::models::model_cache_key_for_key(&key))
             .await;
         println!(
             "{} Cleared learned routing state for {}.",
@@ -3719,6 +3738,40 @@ mod tests {
         assert_eq!(reloaded.gemini_path_variant, None);
         assert_eq!(reloaded.responses_api_supported, None);
         assert!(reloaded.protocol_routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reset_route_clears_models_cache() {
+        use crate::services::models_cache::{ModelsCache, full_catalog_key};
+        use crate::services::session_store::{ClaudeProviderProtocol, SessionStore};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+        let base_url = "https://api.example.com";
+        let key_id = store
+            .add_key_with_protocol(
+                "myKey",
+                base_url,
+                Some(ClaudeProviderProtocol::Anthropic),
+                "sk-1",
+            )
+            .await
+            .unwrap();
+
+        let cache = ModelsCache::with_path(temp_dir.path().join("models-cache.json"));
+        cache.set(base_url, vec!["gpt-4o".to_string()]).await;
+        cache
+            .set(&full_catalog_key(base_url), vec!["gpt-4o".to_string()])
+            .await;
+
+        let cmd = KeysCommand::with_models_cache(store, cache.clone());
+        let code = cmd
+            .execute(keys_args(Some("reset-route"), &[key_id.as_str()]))
+            .await;
+        assert_eq!(code, crate::errors::ExitCode::Success);
+
+        assert!(cache.get(base_url).await.is_none());
+        assert!(cache.get(&full_catalog_key(base_url)).await.is_none());
     }
 
     #[tokio::test]

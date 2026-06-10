@@ -178,6 +178,28 @@ impl ModelsCache {
         }
     }
 
+    /// Drops the entries stored under `cache_key` and its `#all` catalog twin
+    /// (models and metadata), persisting the change. Used by `keys
+    /// reset-route` so the next launch re-fetches instead of serving a stale
+    /// catalog.
+    pub async fn remove(&self, cache_key: &str) {
+        let entries = self.entries().await;
+        let json = {
+            let mut state = entries.write().await;
+            let removed = state.remove(cache_key).is_some()
+                | state.remove(&full_catalog_key(cache_key)).is_some();
+            removed
+                .then(|| serde_json::to_string_pretty(&*state).ok())
+                .flatten()
+        };
+        if let Some(json) = json {
+            if let Some(parent) = self.cache_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&self.cache_path, json).await;
+        }
+    }
+
     /// Lower-level: returns metadata stored under `cache_key`, ignoring TTL.
     pub async fn get_metadata(&self, cache_key: &str, model_id: &str) -> Option<ModelMetadata> {
         let entries = self.entries().await;
@@ -360,6 +382,56 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn remove_drops_picker_and_catalog_entries_and_persists() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("models-cache.json");
+        let cache = ModelsCache::with_path(path.clone());
+        let base = "https://api.example.com";
+        cache.set(base, vec!["gpt-4o".to_string()]).await;
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "gpt-4o".to_string(),
+            ModelMetadata {
+                context_window: Some(128_000),
+                ..Default::default()
+            },
+        );
+        cache
+            .set_with_metadata(
+                &full_catalog_key(base),
+                vec!["gpt-4o".to_string()],
+                metadata,
+            )
+            .await;
+
+        cache.remove(base).await;
+
+        assert!(cache.get(base).await.is_none());
+        assert!(cache.get(&full_catalog_key(base)).await.is_none());
+        assert!(
+            cache
+                .get_metadata(&full_catalog_key(base), "gpt-4o")
+                .await
+                .is_none()
+        );
+        // Removal must survive a fresh load from disk.
+        let reloaded = ModelsCache::with_path(path);
+        assert!(reloaded.get(base).await.is_none());
+        assert!(reloaded.get(&full_catalog_key(base)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_missing_key_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let cache = make_cache(&dir);
+        cache
+            .set("https://api.kept.com", vec!["m".to_string()])
+            .await;
+        cache.remove("https://api.example.com").await;
+        assert!(cache.get("https://api.kept.com").await.is_some());
     }
 
     #[tokio::test]

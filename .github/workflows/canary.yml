@@ -54,14 +54,17 @@ jobs:
             tool_run: '-p --dangerously-skip-permissions'
           - tool: codex
             package: '@openai/codex'
-            # exec refuses a non-git dir without --skip-git-repo-check; the tool
-            # round-trip additionally needs a writable sandbox.
+            # exec refuses a non-git dir without --skip-git-repo-check; codex's
+            # own linux-sandbox can't nest inside the Actions runner (bwrap
+            # loopback fails), so bypass it — the runner is the isolation.
             text_run: 'exec --skip-git-repo-check'
-            tool_run: 'exec --skip-git-repo-check -s workspace-write'
+            tool_run: 'exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox'
           - tool: gemini
             package: '@google/gemini-cli'
             text_run: '-p'
-            tool_run: '-p --approval-mode yolo'
+            # `-p` takes the prompt as its value, so it must come LAST (the
+            # harness appends the prompt right after tool_run).
+            tool_run: '--approval-mode yolo -p'
             # Gemini CLI refuses headless runs in an untrusted dir without this.
             extra_env: 'GEMINI_CLI_TRUST_WORKSPACE=true'
           - tool: opencode

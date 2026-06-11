@@ -390,3 +390,124 @@ fn direct_url_returning_html_is_rejected() {
         "no broken binary should be written",
     );
 }
+
+/// A manifest-capable widget binary tagged with `version`; the differing
+/// version string also makes v1 and v2 differ byte-for-byte.
+fn widget_release_tgz(work: &TempDir, version: &str) -> Vec<u8> {
+    let exe = work.path().join("aivo-widget");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--aivo-manifest\" ]; then\n  printf '%s' '{{\"name\":\"widget\",\"version\":\"{version}\",\"protocol\":\"1\",\"roles\":[\"subcommand\"],\"capabilities\":[\"endpoint\"],\"description\":\"demo\"}}'\n  exit 0\nfi\necho \"widget {version}\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tar_czf(work.path(), "aivo-widget")
+}
+
+fn widget_routes(base: &str, tgz: Vec<u8>) -> Vec<Route> {
+    let release = format!(
+        r#"{{"tag_name":"v1","assets":[{{"name":"aivo-widget.tar.gz","browser_download_url":"{base}/dl/aivo-widget.tar.gz","size":{}}}]}}"#,
+        tgz.len()
+    );
+    vec![
+        route(
+            "/repos/o/aivo-widget/releases/latest",
+            "application/json",
+            release.into_bytes(),
+        ),
+        route("/dl/aivo-widget.tar.gz", "application/octet-stream", tgz),
+    ]
+}
+
+/// A remote binary that changes underneath an already-approved plugin must
+/// have its consent cleared on `update`, so the next dispatch re-prompts the
+/// first-run + capability gates instead of inheriting the old approval.
+#[test]
+fn update_resets_consent_when_remote_binary_changes() {
+    let home = TempDir::new().unwrap();
+
+    // Install v1, then run it once so it becomes run-approved with a captured
+    // manifest (the state a trojaned update would otherwise inherit).
+    let work1 = TempDir::new().unwrap();
+    let (l1, base1) = bind();
+    serve(
+        l1,
+        widget_routes(&base1, widget_release_tgz(&work1, "1.0.0")),
+    );
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base1)
+        .args(["plugins", "install", "github:o/aivo-widget"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run = aivo(&home).args(["widget"]).output().expect("spawn aivo");
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("widget 1.0.0"),
+        "first run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let before = registry(&home);
+    let rec = &before["plugins"]["widget"];
+    assert_eq!(
+        rec["run_approved"], true,
+        "plugin should be run-approved after first run: {rec}"
+    );
+    assert_eq!(
+        rec["manifest"]["version"], "1.0.0",
+        "manifest should be captured: {rec}"
+    );
+    let checksum_v1 = rec["checksum"].as_str().expect("checksum pin").to_string();
+
+    // A different binary now sits at the same source. `update` must NOT inherit
+    // the old approval.
+    let work2 = TempDir::new().unwrap();
+    let (l2, base2) = bind();
+    serve(
+        l2,
+        widget_routes(&base2, widget_release_tgz(&work2, "2.0.0")),
+    );
+    let out = aivo(&home)
+        .env("AIVO_GITHUB_API", &base2)
+        .args(["plugins", "update", "widget"])
+        .output()
+        .expect("spawn aivo");
+    assert!(
+        out.status.success(),
+        "update failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("binary changed"),
+        "update should announce the binary change:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let after = registry(&home);
+    let rec = &after["plugins"]["widget"];
+    // Consent reset: manifest dropped, run-approval cleared, caps cleared, new pin.
+    assert!(
+        rec["manifest"].is_null(),
+        "manifest must be dropped on change: {rec}"
+    );
+    assert!(
+        !rec["run_approved"].as_bool().unwrap_or(false),
+        "run approval must be cleared on change: {rec}"
+    );
+    assert!(
+        rec["granted_caps"].as_array().is_none_or(|a| a.is_empty()),
+        "granted caps must be cleared on change: {rec}"
+    );
+    assert_ne!(
+        rec["checksum"].as_str(),
+        Some(checksum_v1.as_str()),
+        "checksum pin must advance to the new binary: {rec}"
+    );
+}

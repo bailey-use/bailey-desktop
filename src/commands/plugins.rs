@@ -256,7 +256,7 @@ pub(crate) async fn install_for_dispatch(name: &str, source: &str) -> Result<()>
         .get(name)
         .map(|r| r.granted_caps.clone())
         .unwrap_or_default();
-    let outcome = reinstall_animated(name, source, &dir, false, "Installing", false).await?;
+    let outcome = reinstall_animated(name, source, &dir, false, "Installing", false, None).await?;
     let granted = resolve_grants(name, outcome.manifest.as_ref(), &prior, false);
     record_install(
         name,
@@ -306,7 +306,8 @@ async fn install_action(args: PluginInstallArgs) -> Result<ExitCode> {
         .get(&name)
         .map(|r| r.granted_caps.clone())
         .unwrap_or_default();
-    let outcome = reinstall_animated(&name, &source, &dir, false, "Installing", false).await?;
+    let outcome =
+        reinstall_animated(&name, &source, &dir, false, "Installing", false, None).await?;
 
     let version = outcome
         .manifest
@@ -394,30 +395,56 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
         let prior_checksum = rec.checksum.clone();
         let prior_version = rec.manifest.as_ref().map(|m| m.version.clone());
         let prior_granted = rec.granted_caps.clone();
+        // A remote source can serve a different binary than we recorded; a local
+        // path is the user's own file. Only remote drift needs re-consent.
+        let is_remote = !matches!(source::classify(&source), Ok(SourceKind::LocalPath));
         // Re-probe only a plugin aivo has already run (manifest cached), so the
         // displayed version/caps refresh in place without executing a never-run
-        // remote binary at update time.
+        // remote binary at update time. `reinstall` additionally skips the probe
+        // when the fetched bytes changed, so a changed remote binary is never
+        // executed at update time.
         let reprobe = rec.manifest.is_some();
 
         // A spinner animates the fetch (TTY); the per-plugin result line below is
         // the lasting signal, so the resolve/download chatter stays muted.
-        match reinstall_animated(name, &source, &dir, reprobe, "Updating", true).await {
+        match reinstall_animated(
+            name,
+            &source,
+            &dir,
+            reprobe,
+            "Updating",
+            true,
+            prior_checksum.as_deref(),
+        )
+        .await
+        {
             Ok(outcome) => {
-                // Carry the cached manifest forward when a re-probe yields nothing
-                // (best-effort probe failed), so update never wipes it.
-                let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
-                // Preserve prior grants; only a newly-requested cap prompts (TTY).
-                let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
-                let new_version = manifest.as_ref().map(|m| m.version.clone());
                 // Same bytes as before → nothing actually changed. A missing pin
                 // (legacy record) is treated as changed, since we can't prove otherwise.
                 let changed = match (&prior_checksum, &outcome.checksum) {
                     (Some(a), Some(b)) => a != b,
                     _ => true,
                 };
-                record_install(name, &source, outcome.checksum.clone(), manifest, granted);
 
-                if changed {
+                if changed && is_remote {
+                    // The binary changed underneath us. Drop the cached manifest
+                    // and clear consent so the next dispatch re-probes the new
+                    // binary behind a fresh first-run + capability prompt, rather
+                    // than inheriting the old binary's approval.
+                    record_install(name, &source, outcome.checksum.clone(), None, Vec::new());
+                    updated += 1;
+                    eprintln!(
+                        "  {} {col}  {}  {}",
+                        style::yellow("⚠"),
+                        style::yellow("binary changed — will re-verify on next run"),
+                        style::dim(collapse_tilde(&source)),
+                    );
+                } else if changed {
+                    // Local source edited by the user: refresh in place, no re-consent.
+                    let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
+                    let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
+                    let new_version = manifest.as_ref().map(|m| m.version.clone());
+                    record_install(name, &source, outcome.checksum.clone(), manifest, granted);
                     updated += 1;
                     eprintln!(
                         "  {} {col}  {}  {}",
@@ -426,6 +453,12 @@ async fn update_action(args: PluginUpdateArgs) -> Result<ExitCode> {
                         style::dim(collapse_tilde(&source)),
                     );
                 } else {
+                    // Unchanged: carry the cached manifest forward (a failed
+                    // re-probe yields None) and preserve prior grants.
+                    let manifest = outcome.manifest.clone().or_else(|| rec.manifest.clone());
+                    let granted = resolve_grants(name, manifest.as_ref(), &prior_granted, false);
+                    let new_version = manifest.as_ref().map(|m| m.version.clone());
+                    record_install(name, &source, outcome.checksum.clone(), manifest, granted);
                     unchanged += 1;
                     let v = new_version.map(|v| format!(" · v{v}")).unwrap_or_default();
                     eprintln!(
@@ -580,6 +613,7 @@ async fn reinstall_animated(
     reprobe: bool,
     verb: &str,
     is_update: bool,
+    prior_checksum: Option<&str>,
 ) -> Result<InstallOutcome> {
     let tty = std::io::stderr().is_terminal();
     let kind = source::classify(source).ok();
@@ -593,11 +627,11 @@ async fn reinstall_animated(
     let quiet = spin || (is_update && !tty && !instant_or_noisy);
 
     if !spin {
-        return reinstall(name, source, dir, reprobe, quiet).await;
+        return reinstall(name, source, dir, reprobe, quiet, prior_checksum).await;
     }
     let label = format!(" {verb} {name}…");
     let (spinning, handle) = style::start_spinner(Some(label.as_str()));
-    let result = reinstall(name, source, dir, reprobe, quiet).await;
+    let result = reinstall(name, source, dir, reprobe, quiet, prior_checksum).await;
     style::stop_spinner(&spinning);
     let _ = handle.await;
     result
@@ -609,9 +643,18 @@ async fn reinstall(
     dir: &Path,
     reprobe: bool,
     quiet: bool,
+    prior_checksum: Option<&str>,
 ) -> Result<InstallOutcome> {
     let materialized = source::materialize(source, name, dir, quiet).await?;
-    let manifest = if materialized.trusted_local || reprobe {
+    // A remote binary whose bytes differ from what we recorded is untrusted
+    // until the user re-consents on next dispatch — don't execute it here (the
+    // manifest probe is an execution). `trusted_local` is the user's own file,
+    // so re-probing it carries no new trust.
+    let changed = match (prior_checksum, &materialized.checksum) {
+        (Some(p), Some(n)) => p != n,
+        _ => true,
+    };
+    let manifest = if materialized.trusted_local || (reprobe && !changed) {
         probe_manifest(&materialized.primary, name).await
     } else {
         None

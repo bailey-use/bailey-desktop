@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.29.0
+
+Security hardening release.
+
+- feat(keys): OS-keyring-backed v5 encryption, opt-in via AIVO_KEYCHAIN=1 (2d30fff)
+- feat(router): bearer-gate native loopback routers with a per-launch token (c3c3700)
+- feat(plugins): re-consent when an update changes a remote plugin's binary (e264cfa)
+- feat(update): verify self-update downloads with an embedded minisign key (3ac11c9)
+- fix: harden self-update verification and Windows keyring edges (f36ec10)
+- fix(launch): pin claude env via a 0600 settings file (c0c9de1)
+- fix(plugins): bind consent to binary identity, fail closed off-TTY (88719e1)
+- fix(keys): create the keyring master secret only under the config lock (f698f22)
+- chore(data): re-sync model limits from models.dev (513adc9)
+
 ## v0.28.1
 
 - feat(plugins): aivo owns -k/-m for all endpoint-granted plugins (fec42af)

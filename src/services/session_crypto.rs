@@ -139,11 +139,31 @@ pub fn is_encrypted(value: &str) -> bool {
 /// Returns true if the value uses the version `encrypt` would write today
 /// (v5 when the OS keyring is active, otherwise v4). v5 values are always
 /// current so disabling the keyring never downgrades them.
+/// May CREATE the keyring master secret on first use — call only under the
+/// config lock (see `would_rewrite_encryption` for lock-free pre-flight).
 pub fn is_current_encryption(value: &str) -> bool {
     if value.starts_with(V5_ENCRYPTION_MARKER) {
         return true;
     }
     value.starts_with(V4_ENCRYPTION_MARKER) && v5_write_key().is_none()
+}
+
+/// Lock-free pre-flight twin of `!is_current_encryption`: true when a
+/// migration pass *might* rewrite this value. Never touches the keyring, so
+/// it can't create the master secret outside the config lock — on Linux and
+/// Windows the store primitives overwrite, and a racing pre-lock creation
+/// can re-encrypt keys under a secret the keyring no longer holds.
+/// Over-approximates: an enabled-but-unavailable keyring still returns true
+/// for v4 values; the under-lock re-check then finds nothing to rewrite.
+pub fn would_rewrite_encryption(value: &str) -> bool {
+    if !is_encrypted(value) || value.starts_with(V5_ENCRYPTION_MARKER) {
+        return false;
+    }
+    if value.starts_with(V4_ENCRYPTION_MARKER) {
+        return os_keyring::keyring_enabled();
+    }
+    // v3 and older always migrate forward.
+    true
 }
 
 type Aes256Gcm16 = AesGcm<Aes256, U16, U16>;
@@ -240,7 +260,7 @@ mod tests {
     use super::{
         Aes256Gcm16, ENCRYPTION_MARKER, IV_LENGTH, V3_ENCRYPTION_MARKER, V4_ENCRYPTION_MARKER,
         V5_ENCRYPTION_MARKER, decrypt, derive_key, derive_key_v3, encrypt, is_current_encryption,
-        is_encrypted,
+        is_encrypted, would_rewrite_encryption,
     };
     use crate::services::os_keyring;
     use aes_gcm::aead::{Aead, KeyInit, generic_array::GenericArray};
@@ -293,6 +313,25 @@ mod tests {
         assert!(!is_current_encryption("enc3:abc123"));
         assert!(!is_current_encryption("enc:abc123"));
         assert!(!is_current_encryption("plain-text"));
+    }
+
+    #[test]
+    fn test_would_rewrite_encryption_pre_flight() {
+        // Keyring opted in: v4 would migrate, v5 is current, v3/v0 always migrate.
+        os_keyring::test_state::set(true, Some([7u8; 32]));
+        assert!(would_rewrite_encryption("enc4:abc123"));
+        assert!(!would_rewrite_encryption("enc5:abc123"));
+        assert!(would_rewrite_encryption("enc3:abc123"));
+        assert!(would_rewrite_encryption("enc:abc123"));
+        assert!(!would_rewrite_encryption("plain-text"));
+        // Enabled but secret-less: over-approximates (true) rather than touch
+        // the keyring — the under-lock re-check finds nothing to rewrite.
+        os_keyring::test_state::set(true, None);
+        assert!(would_rewrite_encryption("enc4:abc123"));
+        // Keyring off: v4 is the write version — nothing to rewrite.
+        os_keyring::test_state::set(false, None);
+        assert!(!would_rewrite_encryption("enc4:abc123"));
+        assert!(would_rewrite_encryption("enc3:abc123"));
     }
 
     #[test]

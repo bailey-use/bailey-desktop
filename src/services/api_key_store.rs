@@ -5,7 +5,9 @@ use zeroize::Zeroizing;
 
 use crate::errors::{CLIError, ErrorCategory};
 use crate::services::route_cache::PersistedRoute;
-use crate::services::session_crypto::{decrypt, encrypt, is_current_encryption, is_encrypted};
+use crate::services::session_crypto::{
+    decrypt, encrypt, is_current_encryption, is_encrypted, would_rewrite_encryption,
+};
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
     StoredConfig,
@@ -248,9 +250,11 @@ impl ApiKeyStore {
     /// Re-encrypts any keys still using an older encryption version to the
     /// current one (v5 when the OS keyring is active, otherwise v4).
     async fn maybe_migrate_encryption(&self, keys: &[ApiKey]) {
-        let needs_migration = keys
-            .iter()
-            .any(|k| is_encrypted(&k.key) && !is_current_encryption(&k.key));
+        // Lock-free pre-flight only — `is_current_encryption` can CREATE the
+        // keyring master secret, which must stay serialized by the config
+        // lock (racing first-runs would brick keys on Linux/Windows, where
+        // the keyring store primitives overwrite).
+        let needs_migration = keys.iter().any(|k| would_rewrite_encryption(&k.key));
         if !needs_migration {
             return;
         }

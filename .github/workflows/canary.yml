@@ -133,3 +133,90 @@ jobs:
             echo "::error title=canary failure::$TOOL round-trip failed (CLI $CLI_VER)"
             exit 1
           fi
+
+  # Protocol-transform coverage: point each CLI at a LOCAL fake that speaks
+  # ONLY OpenAI, via a synthesized key. The CLI's native protocol
+  # (Anthropic/Google/Responses) is thus FORCED through aivo's cross-protocol
+  # converters — the matrix the starter path (native pass-through) bypasses.
+  # No secret/cost: the fake is deterministic and returns a canned CANARY_OK.
+  transform:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: claude
+            package: '@anthropic-ai/claude-code'
+            run: '-p'
+            transform: 'Anthropic -> OpenAI'
+          - tool: gemini
+            package: '@google/gemini-cli'
+            run: '-p'
+            extra_env: 'GEMINI_CLI_TRUST_WORKSPACE=true'
+            transform: 'Google -> OpenAI'
+          - tool: codex
+            package: '@openai/codex'
+            run: 'exec --skip-git-repo-check'
+            transform: 'Responses -> Chat'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v5
+        with:
+          name: aivo-bin
+      - name: Install tool (latest)
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: npm install -g "$PACKAGE"
+      - name: Force cross-protocol transform via local OpenAI fake
+        env:
+          TOOL: ${{ matrix.tool }}
+          RUN_ARGS: ${{ matrix.run }}
+          EXTRA_ENV: ${{ matrix.extra_env }}
+          TRANSFORM: ${{ matrix.transform }}
+        run: |
+          chmod +x aivo
+          AIVO="$PWD/aivo"
+          CLI_VER=$("$TOOL" --version 2>/dev/null | head -1 || echo "?")
+
+          # Start the OpenAI-only fake; it prints its bound port and logs the
+          # paths it receives so we can PROVE the transform reached it.
+          export FAKE_SEEN_LOG="$PWD/fake_seen.log"
+          python3 .github/canary/fake_openai.py 0 > fake_port.txt 2>/dev/null &
+          FAKE_PID=$!
+          sleep 1
+          PORT=$(head -1 fake_port.txt)
+          echo "fake OpenAI provider on 127.0.0.1:$PORT"
+
+          export HOME
+          HOME=$(mktemp -d)
+          WORK=$(mktemp -d)
+          # Synthesized key → a generic OpenAI host (the fake). aivo routes the
+          # CLI's native protocol through its converter to reach it.
+          "$AIVO" keys add --name cfake --base-url "http://127.0.0.1:$PORT/v1" --key sk-fake >/dev/null 2>&1
+
+          OUT=$(cd "$WORK" && timeout 180 env $EXTRA_ENV "$AIVO" "$TOOL" -k cfake $RUN_ARGS "Reply with exactly this token and nothing else: CANARY_OK" 2>&1) || true
+          kill "$FAKE_PID" 2>/dev/null || true
+          echo "$OUT"
+          echo "--- paths the fake received ---"; sort -u "$FAKE_SEEN_LOG" || true
+
+          fail=0
+          if ! echo "$OUT" | grep -q CANARY_OK; then
+            echo "❌ \`$TOOL\` $TRANSFORM (CLI $CLI_VER) — no CANARY_OK after transform" >> "$GITHUB_STEP_SUMMARY"
+            fail=1
+          elif ! grep -q "chat/completions" "$FAKE_SEEN_LOG"; then
+            # Round-trip "worked" but never reached the OpenAI fake → the
+            # transform didn't actually fire; that's a false pass to reject.
+            echo "❌ \`$TOOL\` $TRANSFORM (CLI $CLI_VER) — reply seen but fake got no OpenAI request" >> "$GITHUB_STEP_SUMMARY"
+            fail=1
+          else
+            echo "✅ \`$TOOL\` $TRANSFORM (CLI $CLI_VER) — transform exercised + round-trip OK" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error title=transform failure::$TOOL $TRANSFORM failed (CLI $CLI_VER)"
+            exit 1
+          fi

@@ -3,11 +3,20 @@ name: Canary
 # Nightly upstream-drift detector: build aivo from main, then drive each real
 # coding-agent CLI (latest from npm) through aivo's loopback router against the
 # free `aivo/starter` provider — no API key/secret needed. Catches the case
-# where an upstream CLI release silently breaks aivo's integration (settings
-# precedence, model-catalog shape, auth wiring) before users report it.
+# where an upstream CLI release silently breaks aivo's integration before users
+# report it.
 #
-# Each tool is its own matrix leg (fail-fast: false) so one tool's breakage is
-# reported without masking the others. Adding a tool is one matrix entry.
+# Two layers per tool:
+#   1. liveness    — a plain text reply, exercising the request/response
+#                    envelope conversion + launch wiring.
+#   2. tool round-trip — the agent must create a sentinel file, which it cannot
+#                    do without a full tool_call -> tool_result cycle through
+#                    aivo's (O(N^2)) format converters. This is where the real
+#                    fragility lives.
+#
+# Each tool is its own matrix leg (fail-fast: false); the two layers are
+# separate assertions so a failure says WHICH layer broke. Adding a tool is one
+# matrix entry.
 
 on:
   schedule:
@@ -41,22 +50,28 @@ jobs:
         include:
           - tool: claude
             package: '@anthropic-ai/claude-code'
-            run: '-p'
+            text_run: '-p'
+            tool_run: '-p --dangerously-skip-permissions'
           - tool: codex
             package: '@openai/codex'
-            # codex exec refuses to run outside a git repo without this.
-            run: 'exec --skip-git-repo-check'
+            # exec refuses a non-git dir without --skip-git-repo-check; the tool
+            # round-trip additionally needs a writable sandbox.
+            text_run: 'exec --skip-git-repo-check'
+            tool_run: 'exec --skip-git-repo-check -s workspace-write'
           - tool: gemini
             package: '@google/gemini-cli'
-            run: '-p'
+            text_run: '-p'
+            tool_run: '-p --approval-mode yolo'
             # Gemini CLI refuses headless runs in an untrusted dir without this.
             extra_env: 'GEMINI_CLI_TRUST_WORKSPACE=true'
           - tool: opencode
             package: 'opencode-ai'
-            run: 'run'
+            text_run: 'run'
+            tool_run: 'run --dangerously-skip-permissions'
           - tool: pi
             package: '@earendil-works/pi-coding-agent'
-            run: '-p'
+            text_run: '-p'
+            tool_run: '-p -a'
     steps:
       - uses: actions/setup-node@v5
         with:
@@ -74,32 +89,47 @@ jobs:
       - name: Smoke through aivo against starter
         env:
           TOOL: ${{ matrix.tool }}
-          RUN_ARGS: ${{ matrix.run }}
+          TEXT_RUN: ${{ matrix.text_run }}
+          TOOL_RUN: ${{ matrix.tool_run }}
           EXTRA_ENV: ${{ matrix.extra_env }}
         run: |
           chmod +x aivo
           AIVO="$PWD/aivo"
-
-          # Capture the CLI version for the report (best effort).
           CLI_VER=$("$TOOL" --version 2>/dev/null | head -1 || echo "?")
+          TEXT_PROMPT='Reply with exactly this token and nothing else: CANARY_OK'
+          TOOL_PROMPT='Create a file named canary_done.txt in the current working directory with exactly this content: CANARY_OK'
+          fail=0
 
+          # Layer 1 — liveness: launch + request/response envelope conversion.
           # Fresh HOME → aivo's `aivo/starter` provider activates on first run,
           # so the canary needs no API key or repo secret.
           export HOME
           HOME=$(mktemp -d)
           WORK=$(mktemp -d)
-          PROMPT='Reply with exactly this token and nothing else: CANARY_OK'
-
-          set +e
-          OUT=$(cd "$WORK" && timeout 180 env $EXTRA_ENV "$AIVO" "$TOOL" $RUN_ARGS "$PROMPT" 2>&1)
-          rc=$?
-          set -e
-          echo "$OUT"
-
+          OUT=$(cd "$WORK" && timeout 180 env $EXTRA_ENV "$AIVO" "$TOOL" $TEXT_RUN "$TEXT_PROMPT" 2>&1) || true
           if echo "$OUT" | grep -q CANARY_OK; then
-            echo "✅ \`$TOOL\` (CLI $CLI_VER) — round-trip OK" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ \`$TOOL\` liveness (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "❌ \`$TOOL\` (CLI $CLI_VER) — exit $rc, no CANARY_OK in output" >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=canary failure::round-trip failed (CLI $CLI_VER, exit $rc)"
+            echo "❌ \`$TOOL\` liveness (CLI $CLI_VER) — no CANARY_OK in reply" >> "$GITHUB_STEP_SUMMARY"
+            echo "--- $TOOL liveness output ---"; echo "$OUT"
+            fail=1
+          fi
+
+          # Layer 2 — tool round-trip: the agent must create the sentinel file,
+          # exercising the full tool_call -> tool_result path through aivo's
+          # format converters.
+          HOME=$(mktemp -d)
+          WORK=$(mktemp -d)
+          TOOL_OUT=$(cd "$WORK" && timeout 180 env $EXTRA_ENV "$AIVO" "$TOOL" $TOOL_RUN "$TOOL_PROMPT" 2>&1) || true
+          if [ -f "$WORK/canary_done.txt" ] && grep -q CANARY_OK "$WORK/canary_done.txt"; then
+            echo "✅ \`$TOOL\` tool round-trip (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ \`$TOOL\` tool round-trip (CLI $CLI_VER) — sentinel file not created" >> "$GITHUB_STEP_SUMMARY"
+            echo "--- $TOOL tool round-trip output ---"; echo "$TOOL_OUT"
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error title=canary failure::$TOOL round-trip failed (CLI $CLI_VER)"
             exit 1
           fi

@@ -959,11 +959,11 @@ impl EndpointHandle {
         self
     }
 
-    /// Stop the proxy and drain its task (bounded), so the ephemeral port is
-    /// released even when the plugin exits abruptly. First persists any learned
-    /// routes (after the run, before teardown). A router with a notify
-    /// (`ServeRouter`) exits gracefully within the timeout; one without
-    /// (`ResponsesToChatRouter`) is aborted on timeout.
+    /// Stop the proxy and release the ephemeral port, persisting learned routes
+    /// first. The plugin has already exited, so nothing is in flight: a router
+    /// with a notify (`ServeRouter`) gets a bounded graceful wind-down; one
+    /// without (`ResponsesToChatRouter`) never finishes and is aborted at once
+    /// rather than burning the full timeout on every teardown.
     async fn shutdown(self) {
         if let Some(p) = self.persist {
             crate::services::launch_runtime::persist_runtime_discoveries(
@@ -974,15 +974,18 @@ impl EndpointHandle {
             )
             .await;
         }
-        if let Some(notify) = &self.shutdown {
-            notify.notify_one();
-        }
-        let abort = self.handle.abort_handle();
-        if tokio::time::timeout(Duration::from_secs(3), self.handle)
-            .await
-            .is_err()
-        {
-            abort.abort();
+        match self.shutdown {
+            Some(notify) => {
+                notify.notify_one();
+                let abort = self.handle.abort_handle();
+                if tokio::time::timeout(Duration::from_secs(3), self.handle)
+                    .await
+                    .is_err()
+                {
+                    abort.abort();
+                }
+            }
+            None => self.handle.abort(),
         }
     }
 }

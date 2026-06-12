@@ -11,10 +11,9 @@ const SERVICE: &str = "aivo";
 const ACCOUNT: &str = "master-secret";
 pub const SECRET_LEN: usize = 32;
 
-/// Write-side default: v5 stays opt-in (AIVO_KEYCHAIN=1) until the
-/// read-capable release has been out long enough to make downgrades safe.
+/// Write-side default: v5 keyring custody on; AIVO_KEYCHAIN=0 opts out.
 #[cfg(not(test))]
-const DEFAULT_ENABLED: bool = false;
+const DEFAULT_ENABLED: bool = true;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MasterSecret([u8; SECRET_LEN]);
@@ -81,8 +80,13 @@ pub fn ensure_master_secret() -> Option<MasterSecret> {
         use rand::RngCore;
         let mut fresh = [0u8; SECRET_LEN];
         rand::thread_rng().fill_bytes(&mut fresh);
-        backend_store(&fresh);
+        let attempted = backend_store(&fresh);
         fresh.zeroize();
+        if !attempted {
+            // Cache Unavailable so encrypt degrades to v4 without retrying.
+            *cache = Some(Lookup::Unavailable);
+            return None;
+        }
         // The read-back is the source of truth: if another writer raced us,
         // everyone converges on whatever the keyring actually holds.
         let outcome = backend_lookup();
@@ -117,13 +121,14 @@ fn backend_lookup() -> Lookup {
     platform::lookup()
 }
 
+/// False = backend can't take writes right now; caller degrades to v4.
 #[cfg(not(test))]
-fn backend_store(secret: &[u8; SECRET_LEN]) {
+fn backend_store(secret: &[u8; SECRET_LEN]) -> bool {
     #[cfg(feature = "__internal_test_fast_crypto")]
     if std::env::var("AIVO_TEST_MASTER_SECRET").is_ok() {
-        return;
+        return true;
     }
-    platform::store(&encode_hex(secret));
+    platform::store(&encode_hex(secret))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -228,15 +233,24 @@ mod platform {
                 None => Lookup::Unavailable,
             };
         }
-        // errSecItemNotFound; anything else (e.g. locked keychain) is Unavailable.
-        if output.code == Some(44) || output.stderr.contains("could not be found") {
+        // errSecItemNotFound; match stays item-specific because a missing
+        // default keychain also says "could not be found".
+        if output.code == Some(44) || output.stderr.contains("specified item could not be found") {
             Lookup::Absent
         } else {
             Lookup::Unavailable
         }
     }
 
-    pub(super) fn store(hex: &str) {
+    pub(super) fn store(hex: &str) -> bool {
+        // Without a default keychain (fresh HOME), add-generic-password
+        // pops a blocking GUI dialog — probe non-interactively first.
+        let mut probe = Command::new("/usr/bin/security");
+        probe.args(["default-keychain", "-d", "user"]);
+        match run(probe, None) {
+            Some(out) if out.success => {}
+            _ => return false,
+        }
         // `security -i` keeps the secret out of argv; no -U so the first
         // writer wins and racing creators converge via read-back.
         let mut cmd = Command::new("/usr/bin/security");
@@ -245,6 +259,7 @@ mod platform {
             "add-generic-password -s \"{SERVICE}\" -a \"{ACCOUNT}\" -w \"{hex}\" -T \"/usr/bin/security\"\n"
         );
         let _ = run(cmd, Some(&script));
+        true
     }
 }
 
@@ -274,7 +289,7 @@ mod platform {
         }
     }
 
-    pub(super) fn store(hex: &str) {
+    pub(super) fn store(hex: &str) -> bool {
         let mut cmd = Command::new("secret-tool");
         cmd.args([
             "store",
@@ -285,7 +300,8 @@ mod platform {
             "account",
             ACCOUNT,
         ]);
-        let _ = run(cmd, Some(hex));
+        // Missing secret-tool / no DBus / watchdog-killed prompt → v4.
+        matches!(run(cmd, Some(hex)), Some(out) if out.success)
     }
 }
 
@@ -332,7 +348,7 @@ mod platform {
         }
     }
 
-    pub(super) fn store(hex: &str) {
+    pub(super) fn store(hex: &str) -> bool {
         let target = wide(TARGET);
         let username = wide("aivo");
         let mut blob = hex.as_bytes().to_vec();
@@ -353,7 +369,7 @@ mod platform {
             TargetAlias: std::ptr::null_mut(),
             UserName: username.as_ptr() as *mut u16,
         };
-        unsafe { CredWriteW(&credential, 0) };
+        unsafe { CredWriteW(&credential, 0) != 0 }
     }
 }
 
@@ -368,7 +384,9 @@ mod platform {
         Lookup::Unavailable
     }
 
-    pub(super) fn store(_hex: &str) {}
+    pub(super) fn store(_hex: &str) -> bool {
+        false
+    }
 }
 
 /// Unit tests never touch the real OS keyring: state is thread-local so

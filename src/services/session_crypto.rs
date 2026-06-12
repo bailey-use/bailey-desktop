@@ -120,8 +120,8 @@ fn derive_key_v5(secret: &os_keyring::MasterSecret) -> SecretKey {
     SecretKey(hasher.finalize().into())
 }
 
-/// v5 write key when the OS keyring is opted in and usable; creates the
-/// master secret on first use. None falls back to v4 (today's behavior).
+/// v5 write key when the OS keyring is enabled and usable; creates the
+/// master secret on first use. None falls back to v4.
 fn v5_write_key() -> Option<SecretKey> {
     if !os_keyring::keyring_enabled() {
         return None;
@@ -208,7 +208,7 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
     }
 
     let (key, marker_len) = if encrypted_data.starts_with(V5_ENCRYPTION_MARKER) {
-        // Reads ignore the AIVO_KEYCHAIN opt-in gate: opting out must never
+        // Reads ignore the AIVO_KEYCHAIN write gate: opting out must never
         // brick existing v5 values.
         let secret = os_keyring::master_secret().ok_or_else(|| {
             anyhow::Error::new(crate::errors::CLIError::new(

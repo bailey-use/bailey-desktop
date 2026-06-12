@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, HashSet};
 use zeroize::Zeroizing;
 
 use crate::errors::{CLIError, ErrorCategory};
+use crate::services::os_keyring;
 use crate::services::route_cache::PersistedRoute;
 use crate::services::session_crypto::{
-    decrypt, encrypt, is_current_encryption, is_encrypted, would_rewrite_encryption,
+    V5_ENCRYPTION_MARKER, decrypt, encrypt, is_current_encryption, is_encrypted,
+    would_rewrite_encryption,
 };
 use crate::services::session_store::{
     ApiKey, ClaudeProviderProtocol, ConfigContext, GeminiProviderProtocol, OpenAICompatibilityMode,
@@ -65,6 +67,39 @@ fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
         .retain(|_, session| session.key_id != key_id);
 }
 
+/// Write-path guard: when stored v5 values exist but the keyring item is
+/// gone, encrypting anything would mint a FRESH master secret — splitting
+/// the store across two secrets and masking the lockout. Fail loudly
+/// instead. A present-but-mismatched secret is deliberately NOT blocked:
+/// re-entering values via add/edit is the recovery path.
+fn refuse_masked_lockout(keys: &[ApiKey]) -> Result<()> {
+    if !os_keyring::keyring_enabled() || !os_keyring::master_secret_absent() {
+        return Ok(());
+    }
+    let locked = keys
+        .iter()
+        .filter(|k| k.key.starts_with(V5_ENCRYPTION_MARKER))
+        .count();
+    if locked == 0 {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(CLIError::new(
+        format!(
+            "refusing to write: {locked} stored key(s) are encrypted with a keyring \
+             master secret that no longer exists"
+        ),
+        ErrorCategory::Auth,
+        Some(
+            "writing now would create a fresh \"aivo / master-secret\" keyring item \
+             and silently split the store across two secrets",
+        ),
+        Some(
+            "restore the keyring item from a backup, or remove the locked keys \
+             (`aivo keys rm <name>`) and re-add them",
+        ),
+    )))
+}
+
 /// Re-encrypts keys on older encryption versions in place; returns whether
 /// anything changed. Caller must hold the config lock: re-encrypt may CREATE
 /// the keyring master secret.
@@ -114,9 +149,12 @@ impl ApiKeyStore {
     ) -> Result<String> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
+        refuse_masked_lockout(&config.api_keys)?;
 
         // Migrate existing keys too so a version bump doesn't leave a mixed store.
-        migrate_keys_in_place(&mut config.api_keys);
+        if migrate_keys_in_place(&mut config.api_keys) {
+            self.backup_before_encryption_rewrite().await;
+        }
 
         let existing_ids: HashSet<String> = config.api_keys.iter().map(|k| k.id.clone()).collect();
         let id = generate_key_id(&existing_ids)?;
@@ -213,8 +251,11 @@ impl ApiKeyStore {
     ) -> Result<ImportReport> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
+        refuse_masked_lockout(&config.api_keys)?;
         // Same as add: migrate existing keys while we hold the lock anyway.
-        migrate_keys_in_place(&mut config.api_keys);
+        if migrate_keys_in_place(&mut config.api_keys) {
+            self.backup_before_encryption_rewrite().await;
+        }
         let mut report = ImportReport::default();
 
         for mut incoming in records {
@@ -288,9 +329,30 @@ impl ApiKeyStore {
         let Ok(mut config) = self.ctx.load().await else {
             return;
         };
+        // Read path: skip silently rather than error the whole listing; the
+        // lockout itself surfaces loudly when any v5 value is decrypted.
+        if refuse_masked_lockout(&config.api_keys).is_err() {
+            return;
+        }
 
         if migrate_keys_in_place(&mut config.api_keys) {
+            self.backup_before_encryption_rewrite().await;
             let _ = self.ctx.save_raw(&config).await;
+        }
+    }
+
+    /// Snapshots config.json beside itself before a whole-store re-encryption
+    /// is saved over it. Callers hold the config lock with the rewrite still
+    /// unsaved, so the on-disk file is the pre-migration store. Non-fatal:
+    /// the migration matters more than its safety net.
+    async fn backup_before_encryption_rewrite(&self) {
+        let src = &self.ctx.config_path;
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let dst = src.with_file_name(format!("config.json.pre-migration-{stamp}.bak"));
+        if let Err(e) = tokio::fs::copy(src, &dst).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("Warning: config backup before encryption migration failed: {e}");
         }
     }
 
@@ -299,11 +361,13 @@ impl ApiKeyStore {
         if is_encrypted(&key.key) {
             let plaintext = decrypt(&key.key).map_err(|e| {
                 // A CLIError carries its own actionable message + suggestion;
-                // wrapping would hide it (top-level display is outermost only).
-                if e.downcast_ref::<crate::errors::CLIError>().is_some() {
-                    e
-                } else {
-                    e.context(format!("failed to decrypt key '{}'", key.display_name()))
+                // wrapping would hide it (top-level display is outermost only)
+                // — rebuild it with the key name folded into the message.
+                match e.downcast_ref::<CLIError>() {
+                    Some(cli) => anyhow::Error::new(
+                        cli.with_message_prefix(&format!("key '{}': ", key.display_name())),
+                    ),
+                    None => e.context(format!("failed to decrypt key '{}'", key.display_name())),
                 }
             })?;
             key.key = Zeroizing::new(plaintext);
@@ -359,6 +423,7 @@ impl ApiKeyStore {
     ) -> Result<(bool, bool)> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
+        refuse_masked_lockout(&config.api_keys)?;
         if let Some(entry) = config.api_keys.iter_mut().find(|k| k.id == id) {
             let base_url_changed = entry.base_url != base_url;
             entry.name = name.to_string();
@@ -666,6 +731,92 @@ mod tests {
                 config_dir,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn add_refuses_fresh_secret_when_v5_values_locked_out() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        os_keyring::test_state::set(true, Some([7u8; os_keyring::SECRET_LEN]));
+        store
+            .add_key_with_protocol("first", "https://api.example.com/v1", None, "sk-first")
+            .await
+            .unwrap();
+
+        // The keyring item vanished (deleted/re-created elsewhere): writes
+        // must refuse to mint a fresh secret over the undecryptable v5 store.
+        os_keyring::test_state::set(true, None);
+        let err = store
+            .add_key_with_protocol("second", "https://api.example.com/v1", None, "sk-second")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("master secret"), "unexpected error: {err}");
+
+        // Explicit keyring opt-out still writes (v4 fallback), no fresh mint.
+        os_keyring::test_state::set(false, None);
+        store
+            .add_key_with_protocol("third", "https://api.example.com/v1", None, "sk-third")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn whole_store_migration_backs_up_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+
+        os_keyring::test_state::set(false, None);
+        store
+            .add_key_with_protocol("legacy", "https://api.example.com/v1", None, "sk-legacy")
+            .await
+            .unwrap();
+
+        // Keyring appears: the next write migrates the whole store to v5 and
+        // must snapshot the pre-migration file first.
+        os_keyring::test_state::set(true, Some([9u8; os_keyring::SECRET_LEN]));
+        store
+            .add_key_with_protocol("fresh", "https://api.example.com/v1", None, "sk-fresh")
+            .await
+            .unwrap();
+
+        let backups: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.json.pre-migration-")
+            })
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "expected exactly one pre-migration backup"
+        );
+        let backup_text = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert!(backup_text.contains("enc4:"));
+        assert!(!backup_text.contains("enc5:"));
+    }
+
+    #[test]
+    fn decrypt_error_keeps_key_name_with_cli_error() {
+        os_keyring::test_state::set(true, Some([1u8; os_keyring::SECRET_LEN]));
+        let enc = encrypt("sk-x").unwrap();
+        let mut key = ApiKey::new_with_protocol(
+            "abc".to_string(),
+            "mykey".to_string(),
+            "https://api.example.com/v1".to_string(),
+            None,
+            enc,
+        );
+        os_keyring::test_state::set(true, Some([2u8; os_keyring::SECRET_LEN]));
+        let err = ApiKeyStore::decrypt_key_secret(&mut key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mykey"), "unexpected error: {err}");
+        assert!(err.contains("does not match"), "unexpected error: {err}");
     }
 
     #[test]

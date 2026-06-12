@@ -61,6 +61,22 @@ pub fn master_secret() -> Option<MasterSecret> {
     }
 }
 
+/// True when the backend answered definitively that NO master secret exists
+/// (as opposed to being unreachable). Write paths use this to refuse minting
+/// a fresh secret while v5 values from a previous one are still stored.
+pub fn master_secret_absent() -> bool {
+    #[cfg(test)]
+    return test_state::secret().is_none();
+    #[cfg(not(test))]
+    {
+        let mut cache = lock_cache();
+        if cache.is_none() {
+            *cache = Some(backend_lookup());
+        }
+        matches!(cache.as_ref(), Some(Lookup::Absent))
+    }
+}
+
 /// Lookup that creates the secret on first use. Used by encrypt/migration;
 /// callers hold the config lock, which serializes competing first writes.
 pub fn ensure_master_secret() -> Option<MasterSecret> {
@@ -111,9 +127,14 @@ fn lock_cache() -> std::sync::MutexGuard<'static, Option<Lookup>> {
 
 #[cfg(not(test))]
 fn backend_lookup() -> Lookup {
-    #[cfg(feature = "__internal_test_fast_crypto")]
-    if let Ok(hex) = std::env::var("AIVO_TEST_MASTER_SECRET") {
-        return match decode_secret_hex(&hex) {
+    // Fast-crypto is a test-only feature: such builds NEVER touch the real
+    // OS keyring (`cargo test` once minted a real keychain item and bricked
+    // a developer store). No env override = behave as if no keyring exists.
+    if cfg!(feature = "__internal_test_fast_crypto") {
+        return match std::env::var("AIVO_TEST_MASTER_SECRET")
+            .ok()
+            .and_then(|hex| decode_secret_hex(&hex))
+        {
             Some(bytes) => Lookup::Found(MasterSecret(bytes)),
             None => Lookup::Unavailable,
         };
@@ -124,9 +145,8 @@ fn backend_lookup() -> Lookup {
 /// False = backend can't take writes right now; caller degrades to v4.
 #[cfg(not(test))]
 fn backend_store(secret: &[u8; SECRET_LEN]) -> bool {
-    #[cfg(feature = "__internal_test_fast_crypto")]
-    if std::env::var("AIVO_TEST_MASTER_SECRET").is_ok() {
-        return true;
+    if cfg!(feature = "__internal_test_fast_crypto") {
+        return std::env::var("AIVO_TEST_MASTER_SECRET").is_ok();
     }
     platform::store(&encode_hex(secret))
 }

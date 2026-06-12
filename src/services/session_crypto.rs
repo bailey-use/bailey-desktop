@@ -207,7 +207,8 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
         return Err(anyhow::anyhow!("Invalid encrypted data: missing marker"));
     }
 
-    let (key, marker_len) = if encrypted_data.starts_with(V5_ENCRYPTION_MARKER) {
+    let is_v5 = encrypted_data.starts_with(V5_ENCRYPTION_MARKER);
+    let (key, marker_len) = if is_v5 {
         // Reads ignore the AIVO_KEYCHAIN write gate: opting out must never
         // brick existing v5 values.
         let secret = os_keyring::master_secret().ok_or_else(|| {
@@ -247,9 +248,28 @@ pub fn decrypt(encrypted_data: &str) -> Result<String> {
     let ciphertext = &data[IV_LENGTH..];
     let nonce = GenericArray::from_slice(iv);
 
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("Decryption failed - key may be from different machine"))?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        if is_v5 {
+            // The keyring HAS a secret, just not the one that encrypted this
+            // value — the item was deleted and re-created at some point.
+            anyhow::Error::new(crate::errors::CLIError::new(
+                "Decryption failed - the OS keychain/keyring master secret does not match \
+                 the one that encrypted this value",
+                crate::errors::ErrorCategory::Auth,
+                Some(
+                    "the \"aivo / master-secret\" keyring item was likely deleted and \
+                     re-created; values encrypted under the old secret cannot be recovered \
+                     without it",
+                ),
+                Some(
+                    "restore the original keyring item from a backup, or re-enter the \
+                     affected keys (`aivo keys edit`, or `keys rm` + `keys add`)",
+                ),
+            ))
+        } else {
+            anyhow::anyhow!("Decryption failed - key may be from different machine")
+        }
+    })?;
 
     String::from_utf8(plaintext)
         .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in decrypted data: {}", e))
@@ -382,6 +402,16 @@ mod tests {
         os_keyring::test_state::set(false, None);
         let err = decrypt(&v5_encrypted).unwrap_err().to_string();
         assert!(err.contains("master secret"));
+    }
+
+    #[test]
+    fn test_v5_wrong_secret_error_names_the_mismatch() {
+        os_keyring::test_state::set(true, Some([1u8; 32]));
+        let v5_encrypted = encrypt("locked-out").unwrap();
+
+        os_keyring::test_state::set(true, Some([2u8; 32]));
+        let err = decrypt(&v5_encrypted).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "unexpected error: {err}");
     }
 
     #[test]

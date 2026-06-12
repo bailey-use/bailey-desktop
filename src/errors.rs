@@ -79,6 +79,18 @@ impl CLIError {
     pub fn exit_code(&self) -> ExitCode {
         self.category.exit_code()
     }
+
+    /// Copy with `prefix` prepended to the message; details/suggestion kept.
+    /// Lets store-level wrappers attach context (e.g. the key name) without
+    /// burying the error under an opaque anyhow context layer.
+    pub fn with_message_prefix(&self, prefix: &str) -> Self {
+        Self {
+            message: format!("{prefix}{}", self.message),
+            category: self.category,
+            details: self.details.clone(),
+            suggestion: self.suggestion.clone(),
+        }
+    }
 }
 
 /// Exit code for an error chain at a command boundary: a wrapped [`CLIError`]

@@ -155,6 +155,9 @@ impl UpdateCommand {
         println!("  Current: {}", style::dim(current_version));
         println!("  Latest:  {}", style::green(&latest_version));
 
+        // Fail before any download when the binary can't be replaced in place.
+        check_install_dir_writable(&get_install_path()?)?;
+
         let binary_name = get_binary_name()?;
         let base_url = format!("{}/v{}", DOWNLOAD_BASE, latest_version);
         let binary_url = format!("{}/{}", base_url, binary_name);
@@ -504,10 +507,38 @@ impl UpdateCommand {
     fn handle_error(&self, error: anyhow::Error) {
         eprintln!("{} {:#}", style::red("Error:"), error);
         eprintln!();
-        eprintln!(
-            "{} Check your internet connection and try again.",
-            style::yellow("Suggestion:")
-        );
+        if is_permission_denied(&error) {
+            #[cfg(not(windows))]
+            if resolve_command_path("sudo").is_some() {
+                eprintln!(
+                    "{} Re-run with elevated permissions:",
+                    style::yellow("Suggestion:")
+                );
+                eprintln!("  {}", style::green("sudo aivo update"));
+            } else {
+                eprintln!(
+                    "{} Reinstall to a directory you can write to:",
+                    style::yellow("Suggestion:")
+                );
+                eprintln!(
+                    "  {}",
+                    style::green(
+                        "curl -fsSL https://getaivo.dev/install.sh | AIVO_INSTALL_DIR=\"$HOME/.local/bin\" bash"
+                    )
+                );
+            }
+            #[cfg(windows)]
+            eprintln!(
+                "{} Re-run {} from an elevated (Administrator) terminal.",
+                style::yellow("Suggestion:"),
+                style::green("aivo update")
+            );
+        } else {
+            eprintln!(
+                "{} Check your internet connection and try again.",
+                style::yellow("Suggestion:")
+            );
+        }
     }
 
     /// Delegates update to Homebrew
@@ -754,6 +785,39 @@ fn get_install_path() -> Result<PathBuf> {
     }
     let current_exe = env::current_exe()?;
     Ok(current_exe)
+}
+
+/// Pre-flight: replacing the binary needs write access to its directory no
+/// matter where the download is staged, so prove it by opening the actual
+/// `aivo.tmp` staging path (also sweeping up a stale one) before any bytes
+/// are downloaded — e.g. a root-owned /usr/local/bin fails here, actionably.
+fn check_install_dir_writable(exec_path: &Path) -> Result<()> {
+    let probe = exec_path.with_extension("tmp");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => {
+            let dir = exec_path.parent().unwrap_or_else(|| Path::new("."));
+            Err(anyhow::Error::new(e).context(format!("No write access to {}", dir.display())))
+        }
+    }
+}
+
+/// True when any cause in the chain is an EACCES-style I/O error.
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 #[cfg(not(windows))]
@@ -1051,6 +1115,57 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
             normalize_install_path(path),
             "c:/users/user/appdata/roaming/npm/node_modules/@yuanchuan/aivo/aivo.exe"
         );
+    }
+
+    #[test]
+    fn is_permission_denied_detects_io_cause_through_context() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ))
+        .context("Failed to create temporary file");
+        assert!(is_permission_denied(&err));
+
+        assert!(!is_permission_denied(&anyhow::anyhow!("HTTP 404")));
+        let other_io =
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
+        assert!(!is_permission_denied(&other_io));
+    }
+
+    #[test]
+    fn preflight_accepts_writable_dir_and_cleans_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec_path = dir.path().join("aivo");
+        check_install_dir_writable(&exec_path).unwrap();
+        assert!(!exec_path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn preflight_removes_stale_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec_path = dir.path().join("aivo");
+        let stale = exec_path.with_extension("tmp");
+        std::fs::write(&stale, b"stale").unwrap();
+        check_install_dir_writable(&exec_path).unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_unwritable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let exec_path = dir.path().join("aivo");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = check_install_dir_writable(&exec_path);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Root bypasses directory permissions; only assert when the probe failed.
+        if let Err(err) = result {
+            assert!(is_permission_denied(&err), "unexpected error: {err:#}");
+        }
     }
 
     #[test]

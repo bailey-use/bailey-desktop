@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.30.0
+
+OS-keyring custody is now the default: API keys are encrypted under a master
+secret held in the OS keychain/keyring (macOS Keychain, Linux Secret Service,
+Windows Credential Manager). `AIVO_KEYCHAIN=0` opts out; machines without a
+usable keyring keep the previous encryption automatically.
+
+**Cross-machine copies**: once a store is keyring-backed, copying
+`~/.config/aivo/config.json` to another machine no longer carries decryptable
+keys — the master secret stays in the source machine's keychain. Use
+`aivo keys export <file>` / `aivo keys import <file>` to move keys between
+machines. The aivo-amp plugin must be ≥ v0.1.7 to read keyring-backed stores.
+
+- feat(keys): enable OS-keyring custody by default (3f17626)
+- feat(keys): migrate the whole store to current encryption on add/import (9681fa6)
+- feat(ci): nightly canary smoke-testing latest agent CLIs against starter (9553f22)
+- feat(ci): add pi to the nightly canary matrix (cd74fd9)
+- feat(ci): add tool-call round-trip layer to canary (deb720a)
+- feat(ci): canary protocol-transform layer via local OpenAI fake (23daf3d)
+- feat(ci): cross-protocol tool round-trip in canary transform layer (199b026)
+- fix(keys): harden keyring custody after a master-secret lockout (cca6a22)
+- fix(serve): remove ordering-dependent unwraps from streaming converters (cc6ef52)
+- chore(run): mark codex-app as experimental (e44637e)
+- chore(data): re-sync model limits from models.dev (acb80f6)
+
 ## v0.29.0
 
 Security hardening release.

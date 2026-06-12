@@ -30,3 +30,6 @@ npm/native/
 npm/*.tgz
 
 memory/
+
+# Python cache (canary fake provider)
+__pycache__/

@@ -194,11 +194,11 @@ jobs:
 
           # run_layer MODE RUN_ARGS PROMPT → starts a fresh fake in MODE, points
           # the CLI at it via a synthesized key, runs it. Sets LAYER_OUT /
-          # LAYER_SEEN / LAYER_WORK for the caller's assertions.
+          # LAYER_SEEN / LAYER_WORK / LAYER_DUMP for the caller's assertions.
           run_layer() {
             local mode="$1" run_args="$2" prompt="$3"
-            local seen="$PWD/seen_$mode.log"
-            FAKE_MODE="$mode" FAKE_SEEN_LOG="$seen" \
+            local seen="$PWD/seen_$mode.log" dump="$PWD/dump_$mode.log"
+            FAKE_MODE="$mode" FAKE_SEEN_LOG="$seen" FAKE_DUMP_LOG="$dump" \
               python3 .github/canary/fake_openai.py 0 > port_$mode.txt 2>/dev/null &
             local fpid=$! port home work
             sleep 1
@@ -209,18 +209,23 @@ jobs:
             LAYER_OUT=$( cd "$work" && HOME="$home" timeout 180 \
               env $EXTRA_ENV "$AIVO" "$TOOL" -k cfake $run_args "$prompt" 2>&1 ) || true
             kill "$fpid" 2>/dev/null || true
-            LAYER_SEEN="$seen"; LAYER_WORK="$work"
+            LAYER_SEEN="$seen"; LAYER_WORK="$work"; LAYER_DUMP="$dump"
             echo "--- $mode layer output ---"; echo "$LAYER_OUT"
             echo "--- fake ($mode) received ---"; sort -u "$seen" || true
           }
 
           # Layer A — envelope transform (text reply).
           run_layer text "$TEXT_RUN" "Reply with exactly this token and nothing else: CANARY_OK"
-          if echo "$LAYER_OUT" | grep -q CANARY_OK && grep -q "chat/completions" "$LAYER_SEEN"; then
-            echo "✅ \`$TOOL\` $TRANSFORM envelope (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "❌ \`$TOOL\` $TRANSFORM envelope (CLI $CLI_VER) — no transformed round-trip" >> "$GITHUB_STEP_SUMMARY"
+          if ! echo "$LAYER_OUT" | grep -q CANARY_OK; then
+            echo "❌ \`$TOOL\` $TRANSFORM envelope (CLI $CLI_VER) — no CANARY_OK after transform" >> "$GITHUB_STEP_SUMMARY"
             fail=1
+          elif ! grep -q "chat/completions" "$LAYER_SEEN"; then
+            # Reply "worked" but never reached the OpenAI fake → the transform
+            # didn't actually fire; that's a false pass to reject.
+            echo "❌ \`$TOOL\` $TRANSFORM envelope (CLI $CLI_VER) — reply seen but fake got no OpenAI request" >> "$GITHUB_STEP_SUMMARY"
+            fail=1
+          else
+            echo "✅ \`$TOOL\` $TRANSFORM envelope (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           # Layer B — tool-call transform: the agent's native tool_use is
@@ -233,6 +238,7 @@ jobs:
             echo "✅ \`$TOOL\` $TRANSFORM tool-call (CLI $CLI_VER)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "❌ \`$TOOL\` $TRANSFORM tool-call (CLI $CLI_VER) — sentinel not created across transform" >> "$GITHUB_STEP_SUMMARY"
+            echo "--- fake (tool) debug dump ---"; cat "$LAYER_DUMP" 2>/dev/null || true
             fail=1
           fi
 

@@ -454,7 +454,9 @@ impl RunCommand {
             Some("codex") => println!("{}", style::dim("Launch Codex with a local API key.")),
             Some("codex-app") => println!(
                 "{}",
-                style::dim("Launch Codex Desktop App with a local API key.")
+                style::dim(
+                    "Launch Codex Desktop App with a local API key (experimental, macOS only)."
+                )
             ),
             Some("gemini") => println!("{}", style::dim("Launch Gemini with a local API key.")),
             Some("opencode") => println!("{}", style::dim("Launch OpenCode with a local API key.")),
@@ -581,7 +583,7 @@ impl RunCommand {
             };
             print_tool("claude", "Claude Code");
             print_tool("codex", "Codex");
-            print_tool("codex-app", "Codex Desktop App");
+            print_tool("codex-app", "Codex Desktop App (experimental)");
             print_tool("gemini", "Gemini");
             print_tool("opencode", "OpenCode");
             print_tool("pi", "Pi");

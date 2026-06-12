@@ -58,7 +58,7 @@ aivo claude --model moonshotai/kimi-k2.5     # pin a model
 | ------- | ----- | ---- |
 | `claude` | [Claude Code](https://github.com/anthropics/claude-code) | built-in |
 | `codex` | [Codex](https://github.com/openai/codex) | built-in |
-| `codex-app` | [Codex.app](https://github.com/openai/codex) desktop (macOS only) | built-in |
+| `codex-app` | [Codex.app](https://github.com/openai/codex) desktop (macOS only, experimental) | built-in |
 | `gemini` | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | built-in |
 | `opencode` | [OpenCode](https://github.com/anomalyco/opencode) | built-in |
 | `pi` | [Pi Coding Agent](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | built-in |

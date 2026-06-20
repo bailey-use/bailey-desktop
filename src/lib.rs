@@ -1,6 +1,7 @@
 //! Library exports for the aivo CLI.
 //! Re-exports all public modules for testing and library use.
 
+pub mod agent;
 pub mod cli;
 pub mod cli_args;
 pub mod commands;

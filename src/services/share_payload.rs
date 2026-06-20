@@ -225,6 +225,9 @@ pub fn extract_chat_full(
             map_chat_message(m, timestamp)
         })
         .collect();
+    // Fold agent `tool_result` turns inline with their call, as the claude/codex
+    // extractors do; a plain (tool-free) chat has none, so this is a no-op there.
+    let share_messages = merge_tool_result_turns(share_messages);
 
     let project = ProjectInfo {
         root: project_root
@@ -255,6 +258,16 @@ pub fn extract_chat_full(
 }
 
 fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
+    // Agent turns persist `tool_call`/`tool_result` entries (see `aivo chat`'s
+    // engine bridge). Decode them into structured blocks so the viewer renders
+    // tools instead of raw JSON; `merge_tool_result_turns` later folds the
+    // result inline with its call, matching the claude/codex extractors.
+    match m.role.as_str() {
+        "tool_call" => return map_chat_tool_call(&m.content, timestamp),
+        "tool_result" => return map_chat_tool_result(&m.content, timestamp),
+        _ => {}
+    }
+
     let mut content: Vec<ContentBlock> = Vec::new();
     if !m.content.is_empty() {
         content.push(ContentBlock::Text { text: m.content });
@@ -271,6 +284,59 @@ fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> S
         model: None,
         reasoning: m.reasoning_content,
         content,
+    }
+}
+
+/// A `tool_call` entry stores `{"name","args"}`; surface it as the assistant's
+/// tool invocation. Falls back to text if the JSON is unexpectedly malformed.
+fn map_chat_tool_call(raw: &str, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
+    let block = serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|decoded| {
+            let name = decoded.get("name").and_then(Value::as_str)?.to_string();
+            let arguments = decoded.get("args").cloned().unwrap_or(Value::Null);
+            Some(ContentBlock::ToolCall {
+                id: None,
+                name,
+                arguments,
+            })
+        })
+        .unwrap_or_else(|| ContentBlock::Text {
+            text: raw.to_string(),
+        });
+    ShareMessage {
+        role: "assistant".to_string(),
+        timestamp,
+        model: None,
+        reasoning: None,
+        content: vec![block],
+    }
+}
+
+/// A `tool_result` entry stores the raw tool output; an error is prefixed
+/// `error: ` by the engine bridge. Map it to a `tool` role with a structured
+/// result so the viewer folds it inline with the preceding call.
+fn map_chat_tool_result(raw: &str, timestamp: Option<DateTime<Utc>>) -> ShareMessage {
+    let block = match raw.strip_prefix("error: ") {
+        Some(err) => ContentBlock::ToolResult {
+            id: None,
+            ok: false,
+            output: String::new(),
+            error: Some(err.to_string()),
+        },
+        None => ContentBlock::ToolResult {
+            id: None,
+            ok: true,
+            output: raw.to_string(),
+            error: None,
+        },
+    };
+    ShareMessage {
+        role: "tool".to_string(),
+        timestamp,
+        model: None,
+        reasoning: None,
+        content: vec![block],
     }
 }
 
@@ -1194,6 +1260,7 @@ mod tests {
             cwd: "/Users/alice/project/aivo".into(),
             model: "gpt-4o".into(),
             messages: encrypted,
+            engine_messages: None,
             updated_at: "2026-04-01T10:01:00Z".into(),
             created_at: "2026-04-01T09:55:00Z".into(),
         };
@@ -1259,6 +1326,7 @@ mod tests {
             cwd: "/tmp".into(),
             model: "m".into(),
             messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            engine_messages: None,
             updated_at: String::new(),
             created_at: String::new(),
         };
@@ -1295,6 +1363,105 @@ mod tests {
     }
 
     #[test]
+    fn extract_chat_full_maps_agent_tool_turns() {
+        use crate::services::session_crypto::encrypt;
+
+        let messages = vec![
+            StoredChatMessage {
+                role: "user".into(),
+                content: "create out.txt".into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "tool_call".into(),
+                content: r#"{"name":"write_file","args":{"path":"out.txt"}}"#.into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "tool_result".into(),
+                content: "wrote out.txt".into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "tool_call".into(),
+                content: r#"{"name":"read_file","args":{"path":"missing"}}"#.into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "tool_result".into(),
+                content: "error: no such file".into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+            StoredChatMessage {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                reasoning_content: None,
+                id: None,
+                timestamp: None,
+                attachments: None,
+            },
+        ];
+        let state = ChatSessionState {
+            session_id: "s".into(),
+            key_id: "k".into(),
+            base_url: "u".into(),
+            cwd: "/tmp".into(),
+            model: "m".into(),
+            messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            engine_messages: None,
+            updated_at: String::new(),
+            created_at: String::new(),
+        };
+
+        let payload = extract_chat_full(&state, None).unwrap();
+        // user, tool_call(+folded result), tool_call(+folded result), assistant.
+        assert_eq!(payload.messages.len(), 4);
+
+        // First tool turn: ToolCall + folded successful ToolResult.
+        assert_eq!(payload.messages[1].role, "assistant");
+        match &payload.messages[1].content[0] {
+            ContentBlock::ToolCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "write_file");
+                assert_eq!(arguments["path"], "out.txt");
+            }
+            other => panic!("expected tool call, got {other:?}"),
+        }
+        match &payload.messages[1].content[1] {
+            ContentBlock::ToolResult { ok, output, .. } => {
+                assert!(ok);
+                assert_eq!(output, "wrote out.txt");
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        // Second tool turn: the `error: ` prefix marks the result as failed.
+        match &payload.messages[2].content[1] {
+            ContentBlock::ToolResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.as_deref(), Some("no such file"));
+            }
+            other => panic!("expected failed tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn extract_chat_full_surfaces_decryption_error() {
         let state = ChatSessionState {
             session_id: "s".into(),
@@ -1303,6 +1470,7 @@ mod tests {
             cwd: String::new(),
             model: "m".into(),
             messages: "not-actually-encrypted".into(),
+            engine_messages: None,
             updated_at: String::new(),
             created_at: String::new(),
         };

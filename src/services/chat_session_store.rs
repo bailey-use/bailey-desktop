@@ -14,6 +14,13 @@ pub(crate) struct ChatSessionStore {
     pub(crate) ctx: ConfigContext,
 }
 
+/// Only user/assistant prose makes a readable title/preview. Agent turns also
+/// store `tool_call` (JSON) and `tool_result` (raw output) entries — skip those
+/// so the resume list shows conversation text, not tool noise.
+fn is_conversational_role(role: &str) -> bool {
+    matches!(role, "user" | "assistant")
+}
+
 fn compute_session_title(messages: &[StoredChatMessage], model: &str) -> String {
     let last_user = messages
         .iter()
@@ -23,7 +30,7 @@ fn compute_session_title(messages: &[StoredChatMessage], model: &str) -> String 
     let fallback = messages
         .iter()
         .rev()
-        .find(|m| !m.content.trim().is_empty())
+        .find(|m| is_conversational_role(&m.role) && !m.content.trim().is_empty())
         .map(|m| first_non_empty_line(&m.content));
     last_user
         .or(fallback)
@@ -35,7 +42,7 @@ fn compute_session_preview(messages: &[StoredChatMessage], model: &str) -> Strin
     let snippets: Vec<String> = messages
         .iter()
         .rev()
-        .filter(|m| !m.content.trim().is_empty())
+        .filter(|m| is_conversational_role(&m.role) && !m.content.trim().is_empty())
         .take(2)
         .map(|m| m.content.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect();
@@ -333,46 +340,34 @@ impl ChatSessionStore {
     pub(crate) async fn list_chat_sessions(
         &self,
         key_id: &str,
-        base_url: &str,
+        _base_url: &str,
         cwd: &str,
     ) -> Result<Vec<SessionIndexEntry>> {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;
 
-        let mut index = match self.load_index().await {
+        let index = match self.load_index().await {
             Ok(idx) => idx,
             Err(_) => self.rebuild_index().await?,
         };
 
-        // Validate key still exists; prune stale entries
-        let key_is_valid = {
+        // Show sessions whose key still exists. Read-only: NEVER delete files
+        // here. The base_url is deliberately NOT compared — a key's stored
+        // base_url can differ from the URL a session was saved with (e.g. the
+        // `aivo-starter` sentinel vs the resolved api.getaivo.dev), and an
+        // earlier version deleted those sessions on that false mismatch.
+        let key_exists = {
             let config = self.ctx.load().await?;
-            config
-                .api_keys
-                .iter()
-                .any(|k| k.id == key_id && k.base_url == base_url)
+            config.api_keys.iter().any(|k| k.id == key_id)
         };
 
-        let mut stale_ids: Vec<String> = Vec::new();
         let mut entries: Vec<SessionIndexEntry> = Vec::new();
-
-        for entry in &index.entries {
-            if entry.key_id != key_id || entry.cwd != cwd {
-                continue;
+        if key_exists {
+            for entry in &index.entries {
+                if entry.key_id == key_id && entry.cwd == cwd {
+                    entries.push(entry.clone());
+                }
             }
-            if !key_is_valid || entry.base_url != base_url {
-                stale_ids.push(entry.session_id.clone());
-            } else {
-                entries.push(entry.clone());
-            }
-        }
-
-        if !stale_ids.is_empty() {
-            for session_id in &stale_ids {
-                let _ = tokio::fs::remove_file(self.session_file_path(session_id)).await;
-            }
-            index.entries.retain(|e| !stale_ids.contains(&e.session_id));
-            self.save_index(&index).await?;
         }
 
         entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -478,19 +473,17 @@ impl ChatSessionStore {
         let json = serde_json::to_string(messages).context("Failed to serialize messages")?;
         let encrypted = encrypt(&json)?;
         let now = Utc::now().to_rfc3339();
+        let existing = self.load_session_file(session_id).await.ok();
         // Preserve created_at from existing session file; use now for new sessions.
-        let created_at = self
-            .load_session_file(session_id)
-            .await
-            .ok()
-            .and_then(|s| {
-                if s.created_at.is_empty() {
-                    None
-                } else {
-                    Some(s.created_at)
-                }
-            })
+        let created_at = existing
+            .as_ref()
+            .map(|s| s.created_at.clone())
+            .filter(|c| !c.is_empty())
             .unwrap_or_else(|| now.clone());
+        // Preserve any durable agent-engine transcript across this (text-only) save
+        // so a per-turn or heartbeat persist can't wipe it; `save_agent_messages`
+        // refreshes it after a turn (when the engine is lockable).
+        let engine_messages = existing.and_then(|s| s.engine_messages);
         let state = ChatSessionState {
             session_id: session_id.to_string(),
             key_id: key_id.to_string(),
@@ -498,6 +491,7 @@ impl ChatSessionStore {
             cwd: cwd.to_string(),
             model: model.to_string(),
             messages: encrypted,
+            engine_messages,
             updated_at: now.clone(),
             created_at: created_at.clone(),
         };
@@ -544,11 +538,49 @@ impl ChatSessionStore {
         self.save_index(&index).await
     }
 
+    /// Refresh only the durable agent-engine transcript of an existing chat
+    /// session (the engine's raw OpenAI conversation, for exact resume). No-op
+    /// when the session file doesn't exist yet — `save_chat_session_with_id`
+    /// creates it first, then this overwrites the preserved blob with the latest.
+    /// Best-effort: callers treat a failure as non-fatal.
+    pub(crate) async fn save_agent_messages(
+        &self,
+        session_id: &str,
+        engine_messages: &[serde_json::Value],
+    ) -> Result<()> {
+        let _lock = self.acquire_session_lock()?;
+        let Ok(mut state) = self.load_session_file(session_id).await else {
+            return Ok(());
+        };
+        let json = serde_json::to_string(engine_messages)
+            .context("Failed to serialize engine messages")?;
+        state.engine_messages = Some(encrypt(&json)?);
+        self.save_session_file(&state).await
+    }
+
     pub(crate) async fn count_chat_sessions(&self) -> u64 {
         self.load_index()
             .await
             .map(|idx| idx.entries.len() as u64)
             .unwrap_or(0)
+    }
+
+    /// The cumulative token total stored for a session's index entry (zero if the
+    /// session is unknown or predates token tracking). Used to re-seed the live
+    /// running total when a chat is resumed so later turns keep accumulating on
+    /// top of the prior total instead of overwriting it with only the new turns.
+    pub(crate) async fn chat_session_tokens(&self, session_id: &str) -> SessionTokens {
+        self.load_index()
+            .await
+            .ok()
+            .and_then(|idx| idx.entries.into_iter().find(|e| e.session_id == session_id))
+            .map(|e| SessionTokens {
+                prompt_tokens: e.prompt_tokens,
+                completion_tokens: e.completion_tokens,
+                cache_read_tokens: e.cache_read_tokens,
+                cache_write_tokens: e.cache_write_tokens,
+            })
+            .unwrap_or_default()
     }
 
     /// Walks the session index once, returning the count of entries inside
@@ -722,6 +754,84 @@ mod tests {
         let messages = session.decrypt_messages().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello world");
+    }
+
+    /// Durable resume: `save_agent_messages` stores the engine's raw transcript
+    /// (tool_calls + results with ids) encrypted; it round-trips via
+    /// `decrypt_engine_messages`, survives a later text-only save (heartbeat must
+    /// not wipe it), and is a no-op on a missing session.
+    #[tokio::test]
+    async fn engine_messages_roundtrip_and_survive_text_save() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+
+        let text_save = |store: ChatSessionStore, key_id: String| async move {
+            store
+                .save_chat_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/t",
+                    "s1",
+                    "gpt-4o",
+                    None,
+                    &sample_messages(),
+                    "t",
+                    "t",
+                    SessionTokens::default(),
+                )
+                .await
+                .unwrap();
+        };
+
+        // New session: no engine transcript yet.
+        text_save(store.clone(), key_id.clone()).await;
+        assert!(
+            store
+                .get_chat_session("s1")
+                .await
+                .unwrap()
+                .unwrap()
+                .engine_messages
+                .is_none()
+        );
+
+        // Persist a transcript with a tool-call / result pair (ids preserved).
+        let convo = vec![
+            serde_json::json!({"role": "user", "content": "read it"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}}]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call_1", "content": "BODY"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        store.save_agent_messages("s1", &convo).await.unwrap();
+
+        let restored = store
+            .get_chat_session("s1")
+            .await
+            .unwrap()
+            .unwrap()
+            .decrypt_engine_messages()
+            .unwrap();
+        assert_eq!(restored.len(), 4);
+        assert_eq!(restored[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(restored[2]["tool_call_id"], "call_1");
+        assert_eq!(restored[2]["content"], "BODY");
+
+        // A later text-only (heartbeat) save must NOT wipe the transcript.
+        text_save(store.clone(), key_id.clone()).await;
+        let after = store
+            .get_chat_session("s1")
+            .await
+            .unwrap()
+            .unwrap()
+            .decrypt_engine_messages();
+        assert_eq!(after.map(|m| m.len()), Some(4), "text save preserved it");
+
+        // Missing session → no-op, not an error.
+        store.save_agent_messages("nope", &convo).await.unwrap();
     }
 
     #[tokio::test]
@@ -1060,6 +1170,35 @@ mod tests {
         let messages: Vec<StoredChatMessage> = vec![];
         let preview = compute_session_preview(&messages, "gpt-4o");
         assert_eq!(preview, "gpt-4o");
+    }
+
+    #[test]
+    fn title_and_preview_skip_agent_tool_entries() {
+        let msg = |role: &str, content: &str| StoredChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            id: None,
+            timestamp: None,
+            attachments: None,
+        };
+        // An agent turn ends on tool steps before the final assistant reply.
+        let messages = vec![
+            msg("user", "create out.txt"),
+            msg("assistant", "Sure, creating it."),
+            msg(
+                "tool_call",
+                r#"{"name":"write_file","args":{"path":"out.txt"}}"#,
+            ),
+            msg("tool_result", "wrote out.txt"),
+        ];
+        // Title prefers the user message; the tool JSON never leaks in.
+        assert_eq!(compute_session_title(&messages, "model"), "create out.txt");
+        // Preview uses the last two conversational entries, skipping tool steps.
+        assert_eq!(
+            compute_session_preview(&messages, "model"),
+            "create out.txt · Sure, creating it."
+        );
     }
 
     #[test]

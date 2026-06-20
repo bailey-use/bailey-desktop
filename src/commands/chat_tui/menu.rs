@@ -1,7 +1,7 @@
 use super::*;
 
-const SELECT_BG: Color = Color::Rgb(78, 108, 136);
-const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
+pub(super) const SELECT_BG: Color = Color::Rgb(78, 108, 136);
+pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 245, 247);
 const SELECT_ACCENT: Color = SELECT_WARM;
 
 fn picker_content_width(width: u16) -> usize {
@@ -22,6 +22,26 @@ pub(super) fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpe
             prefix_matches.push(command);
         } else if matches_fuzzy(query, command.name) {
             fuzzy_matches.push(command);
+        }
+    }
+    prefix_matches.extend(fuzzy_matches);
+    prefix_matches
+}
+
+/// Filter discovered skill slash commands by `query` (the text after `/`), prefix
+/// matches ranked before fuzzy ones — the same ranking as `filter_slash_commands`.
+/// Returns clones so the result can outlive the borrow of `commands`.
+pub(super) fn filter_skill_commands(commands: &[SkillCommand], query: &str) -> Vec<SkillCommand> {
+    if query.is_empty() {
+        return commands.to_vec();
+    }
+    let mut prefix_matches = Vec::new();
+    let mut fuzzy_matches = Vec::new();
+    for command in commands {
+        if command.name.starts_with(query) {
+            prefix_matches.push(command.clone());
+        } else if matches_fuzzy(query, &command.name) {
+            fuzzy_matches.push(command.clone());
         }
     }
     prefix_matches.extend(fuzzy_matches);
@@ -250,6 +270,7 @@ pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
         PickerKind::Key => "keys",
         PickerKind::Model { .. } => "models",
         PickerKind::Session => "chats",
+        PickerKind::Rewind => "turns",
     }
 }
 
@@ -258,6 +279,7 @@ pub(super) fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
         PickerKind::Key => "filter key name or endpoint",
         PickerKind::Model { .. } => "filter model names",
         PickerKind::Session => "filter saved chats",
+        PickerKind::Rewind => "filter turns",
     }
 }
 
@@ -554,35 +576,108 @@ pub(super) fn centered_rect(width_pct: u16, height_pct: u16, area: Rect) -> Rect
         .split(vertical[1])[1]
 }
 
+/// Wrap the composer `draft` into visual rows, hard-wrapping each logical line
+/// (split on `\n`) at `text_width` display columns. Returns each row's
+/// `[start, end)` byte range into `draft`. Every visual row carries the same
+/// 2-col left margin in the render (the `> ` prompt on row 0, a hanging indent
+/// elsewhere), so callers wrap at `composer_width - COMPOSER_PREFIX_WIDTH`.
+///
+/// Always returns at least one row (an empty draft → a single empty row), and a
+/// trailing `\n` yields a final empty row so the cursor can rest on the new line.
+/// This is the single wrap model shared by rendering, cursor placement, mouse
+/// hit-testing, and visual-line cursor movement — so they never disagree.
+pub(super) fn composer_visual_rows(draft: &str, text_width: usize) -> Vec<(usize, usize)> {
+    let text_width = text_width.max(1);
+    let mut rows = Vec::new();
+    let mut line_start = 0usize;
+    loop {
+        let rel_nl = draft[line_start..].find('\n');
+        let line_end = rel_nl.map_or(draft.len(), |idx| line_start + idx);
+        let mut row_start = line_start;
+        let mut col = 0usize;
+        let mut pos = line_start;
+        for ch in draft[line_start..line_end].chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if ch_width > 0 && col + ch_width > text_width {
+                rows.push((row_start, pos));
+                row_start = pos;
+                col = 0;
+            }
+            col += ch_width;
+            pos += ch.len_utf8();
+        }
+        rows.push((row_start, line_end));
+        match rel_nl {
+            Some(idx) => line_start += idx + 1,
+            None => break,
+        }
+    }
+    rows
+}
+
+/// The cursor's `(visual row, display column)` within `rows`. The column counts
+/// the 2-col prompt indent every row carries. At a soft-wrap boundary the cursor
+/// belongs to the *start* of the next row (the last row whose start ≤ cursor).
+pub(super) fn composer_cursor_rowcol(
+    draft: &str,
+    cursor: usize,
+    rows: &[(usize, usize)],
+) -> (usize, usize) {
+    let cursor = cursor.min(draft.len());
+    let row = rows
+        .iter()
+        .rposition(|(start, _)| *start <= cursor)
+        .unwrap_or(0);
+    let (start, _) = rows[row.min(rows.len().saturating_sub(1))];
+    let mut col = usize::from(COMPOSER_PREFIX_WIDTH);
+    for ch in draft[start..cursor.max(start)].chars() {
+        col += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    (row, col)
+}
+
+/// Inverse of [`composer_cursor_rowcol`]: the byte offset on visual `row` nearest
+/// to display column `target_col` (used by mouse clicks and visual up/down). Lands
+/// on the last character boundary at or before `target_col`.
+pub(super) fn composer_offset_for_col(
+    draft: &str,
+    rows: &[(usize, usize)],
+    row: usize,
+    target_col: usize,
+) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let (start, end) = rows[row.min(rows.len() - 1)];
+    let prefix = usize::from(COMPOSER_PREFIX_WIDTH);
+    if target_col <= prefix {
+        return start;
+    }
+    let mut col = prefix;
+    let mut pos = start;
+    for ch in draft[start..end].chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + ch_width > target_col {
+            break;
+        }
+        col += ch_width;
+        pos += ch.len_utf8();
+    }
+    pos
+}
+
+/// Cursor `(x, y)` for the composer, in the same hanging-indent wrap model the
+/// composer renders with. `y` is the visual row; `x` includes the prompt indent.
 pub(super) fn cursor_position(
     text: &str,
     cursor: usize,
     width: u16,
     line_prefix_width: u16,
 ) -> (u16, u16) {
-    let width = usize::from(width.max(1));
-    let text_before = &text[..cursor.min(text.len())];
-    let line_prefix_width = usize::from(line_prefix_width);
-    let mut x = line_prefix_width.min(width.saturating_sub(1));
-    let mut y = 0usize;
-
-    for ch in text_before.chars() {
-        if ch == '\n' {
-            y += 1;
-            x = line_prefix_width.min(width.saturating_sub(1));
-            continue;
-        }
-
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if ch_width == 0 {
-            continue;
-        }
-        if x + ch_width > width {
-            y += 1;
-            x = 0;
-        }
-        x += ch_width;
-    }
-
-    (x as u16, y as u16)
+    let prefix = usize::from(line_prefix_width);
+    let text_width = usize::from(width).saturating_sub(prefix).max(1);
+    let rows = composer_visual_rows(text, text_width);
+    let (row, col) = composer_cursor_rowcol(text, cursor, &rows);
+    let x = col.min(usize::from(width).saturating_sub(1).max(prefix));
+    (x as u16, row as u16)
 }

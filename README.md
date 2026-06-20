@@ -29,12 +29,6 @@ PowerShell (Windows):
 irm https://getaivo.dev/install.ps1 | iex
 ```
 
-Npm
-
-```bash
-npm install -g @yuanchuan/aivo
-```
-
 ## Quick Start
 
 The built-in `aivo/starter` provider activates on first run, so no key is required to try it:
@@ -120,32 +114,25 @@ aivo models --json | jq '.models[].id'
 
 ## chat
 
-Interactive chat TUI, or one-shot `-p` mode for scripting and pipelines.
+`aivo chat` is the built-in coding agent in your terminal.
+
+![aivo](https://getaivo.dev/aivo-chat.webp)
 
 ```bash
-aivo chat                                    # full-screen TUI
+aivo chat                                    # full-screen agent TUI
 aivo chat -m gpt-4o                          # pick a model (remembered per key)
-aivo chat --attach README.md --attach screenshot.png
+aivo chat --agent reviewer                   # start as a named agent profile
+aivo chat --attach README.md                 # attach a file for the agent to read
+```
 
-aivo "Summarize this repo"                   # bare quoted prompt → one-shot chat
+One-shot mode with `-p`:
+
+```bash
 aivo -p "Summarize this repo"                # same, via the explicit flag
 git diff | aivo -p "Write a commit message"  # piped stdin appended as context
 cat error.log | aivo -p                      # stdin alone becomes the prompt
-aivo -p "hi" --json | jq -r '.choices[0].message.content'
 ```
 
-Slash commands inside the TUI:
-
-| Command | Description |
-| ------- | ----------- |
-| `/new` | Start a fresh chat |
-| `/resume [query]` | Resume a saved chat from this directory |
-| `/model [name]` | Switch the chat model |
-| `/key [id\|name]` | Switch saved key |
-| `/attach <path>` | Attach a text file or image |
-| `/detach <n>` | Remove a queued attachment |
-| `/help` · `/exit` | Help · Quit |
-| `//message` | Send a literal leading slash |
 
 ## hf
 

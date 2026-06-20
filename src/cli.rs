@@ -736,9 +736,20 @@ pub struct ChatArgs {
     )]
     pub key: Option<String>,
 
+    /// Start as a named agent profile from .aivo/agents or .claude/agents
+    /// (folds its role + tool scope in). Switch in-chat with `/agent`.
+    #[arg(long, value_name = "NAME")]
+    pub agent: Option<String>,
+
     /// Bypass cache and fetch fresh model list for the model picker
     #[arg(short = 'r', long)]
     pub refresh: bool,
+
+    /// Resume a saved chat: bare opens the session picker, `last` reopens the
+    /// most recent chat, or pass a session id to jump straight to it (same as
+    /// the in-chat `/resume [query]`).
+    #[arg(long, value_name = "last|SESSION_ID", num_args = 0..=1, default_missing_value = "")]
+    pub resume: Option<String>,
 
     /// Send one prompt and exit; reads stdin when no value given
     #[arg(
@@ -765,6 +776,10 @@ pub struct ChatArgs {
     /// URL query params are redacted.
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     pub debug: Option<String>,
+
+    /// Print the resolved key, model, endpoint, and agent without connecting
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE
@@ -1190,6 +1205,30 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_command_resume_variants() {
+        // No flag → None (fresh chat).
+        let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
+        let Some(Commands::Chat(args)) = cli.command else {
+            panic!("Expected Chat command");
+        };
+        assert_eq!(args.resume, None);
+
+        // Bare --resume → Some("") (opens the session picker).
+        let cli = Cli::try_parse_from(["aivo", "chat", "--resume"]).unwrap();
+        let Some(Commands::Chat(args)) = cli.command else {
+            panic!("Expected Chat command");
+        };
+        assert_eq!(args.resume, Some(String::new()));
+
+        // --resume <id> → Some(id) (jumps to that session).
+        let cli = Cli::try_parse_from(["aivo", "chat", "--resume", "abc123"]).unwrap();
+        let Some(Commands::Chat(args)) = cli.command else {
+            panic!("Expected Chat command");
+        };
+        assert_eq!(args.resume, Some("abc123".to_string()));
+    }
+
+    #[test]
     fn test_run_args_key_flag() {
         let cli = Cli::try_parse_from(["aivo", "run", "claude", "--key", "my-key"]).unwrap();
         if let Some(Commands::Run(run_args)) = cli.command {
@@ -1295,6 +1334,26 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hello"]).unwrap();
         if let Some(Commands::Chat(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello".to_string()));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_dry_run_flag() {
+        let cli = Cli::try_parse_from(["aivo", "chat", "--dry-run"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert!(chat_args.dry_run);
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_dry_run_defaults_off() {
+        let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
+        if let Some(Commands::Chat(chat_args)) = cli.command {
+            assert!(!chat_args.dry_run);
         } else {
             panic!("Expected Chat command");
         }

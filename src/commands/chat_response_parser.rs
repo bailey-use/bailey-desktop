@@ -26,6 +26,10 @@ struct ChunkDelta {
 pub(crate) enum ChatResponseChunk {
     Content(String),
     Reasoning(String),
+    /// Running provider-measured token usage, emitted mid-stream so the chat
+    /// footer can grow its context-fill stat during the turn instead of only at
+    /// the end. Carries the merged absolute totals, not a per-chunk delta.
+    Usage(TokenUsage),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]

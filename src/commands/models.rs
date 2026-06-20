@@ -817,6 +817,25 @@ fn models_from_cache(ids: Vec<String>, metadata: HashMap<String, ModelMetadata>)
         .collect()
 }
 
+/// Best-effort warm of the per-model metadata cache (context window, pricing)
+/// for a key's full catalog, so `model_metadata::resolve_limits` can answer
+/// from cache without a picker/`aivo models` run first. Used by `aivo chat` to
+/// populate the footer context-utilization stat on the `-m <model>` path, which
+/// otherwise never fetches the catalog. Silently no-ops on fetch failure.
+pub(crate) async fn warm_full_catalog_metadata(client: &Client, key: &ApiKey, cache: &ModelsCache) {
+    if key.is_any_oauth() || crate::services::provider_profile::is_ollama_base(&key.base_url) {
+        return;
+    }
+    let Ok(models) = fetch_models_detailed_filtered(client, key, false).await else {
+        return;
+    };
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+    let metadata = build_metadata_map(&models);
+    cache
+        .set_with_metadata(&full_catalog_cache_key_for_key(key), ids, metadata)
+        .await;
+}
+
 /// Cached variant of `fetch_all_models`.
 pub(crate) async fn fetch_all_models_cached(
     client: &Client,

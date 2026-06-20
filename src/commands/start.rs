@@ -4,6 +4,7 @@ use anyhow::Result;
 use console::{Key, Term};
 
 use crate::cli::parse_env_vars;
+use crate::commands::ChatCommand;
 use crate::commands::keys::prompt_pick_key_without_activation;
 use crate::commands::models::{model_display_label, resolve_model_placeholder};
 use crate::commands::print_launch_preview;
@@ -31,10 +32,12 @@ struct Resolved<T> {
     interactive: bool,
 }
 
-/// A picked launch target: a native tool, or an installed coding-agent plugin
-/// (which owns its key/model resolution via the plugin dispatch).
+/// A picked launch target: a native tool, aivo's own in-process chat agent, or
+/// an installed coding-agent plugin (which owns its key/model resolution via the
+/// plugin dispatch).
 enum StartTool {
     Native(AIToolType),
+    Chat,
     Plugin(String),
 }
 
@@ -42,6 +45,7 @@ impl StartTool {
     fn name(&self) -> &str {
         match self {
             StartTool::Native(tool) => tool.as_str(),
+            StartTool::Chat => "chat",
             StartTool::Plugin(name) => name,
         }
     }
@@ -92,6 +96,9 @@ impl StartCommand {
             // Plugins resolve their own key/model (and write the shared last
             // selection) inside the standard dispatch — hand off the flags.
             StartTool::Plugin(name) => return self.dispatch_plugin(&name, &args).await,
+            // The in-process chat agent owns its model picker, sandbox, and
+            // conversation loop — hand off the resolved key + model flags.
+            StartTool::Chat => return self.dispatch_chat(&args).await,
             StartTool::Native(t) => Resolved {
                 value: t,
                 interactive: tool.interactive,
@@ -330,7 +337,9 @@ impl StartCommand {
     ) -> Result<Resolved<StartTool>> {
         let plugins = crate::plugin::launchable_coding_agents();
         let parse = |name: &str| -> Option<StartTool> {
-            if let Some(tool) = AIToolType::parse(name) {
+            if name.eq_ignore_ascii_case("chat") {
+                Some(StartTool::Chat)
+            } else if let Some(tool) = AIToolType::parse(name) {
                 Some(StartTool::Native(tool))
             } else if plugins.iter().any(|p| p == name) {
                 Some(StartTool::Plugin(name.to_string()))
@@ -360,17 +369,7 @@ impl StartCommand {
         }
 
         let plugin_details = crate::plugin::coding_agent_descriptions();
-        let mut entries: Vec<(String, String)> = AIToolType::all()
-            .iter()
-            .filter(|t| t.supported_on_current_platform())
-            .map(|t| {
-                let mut detail = t.description().to_string();
-                if !t.looks_installed() {
-                    detail.push_str(" (not installed)");
-                }
-                (t.as_str().to_string(), detail)
-            })
-            .collect();
+        let mut entries = builtin_tool_entries();
         entries.extend(plugins.iter().map(|name| {
             let detail = plugin_details.get(name).cloned().unwrap_or_default();
             (name.clone(), detail)
@@ -424,6 +423,52 @@ impl StartCommand {
             0 => ExitCode::Success,
             n => ExitCode::ToolExit(n),
         })
+    }
+
+    /// Launch aivo's in-process chat agent. Resolves the key the same way the
+    /// native launch flow does (honoring `-k`, the last selection, then the
+    /// active key) and forwards the model; `aivo chat` owns its own model
+    /// picker, sandbox, and conversation loop from there.
+    async fn dispatch_chat(&self, args: &StartFlowArgs) -> Result<ExitCode> {
+        // An `hf:`/local-gguf model runs against a synthetic local key, so the
+        // real key store is irrelevant — skip resolution (which would otherwise
+        // error for a user with no keys yet) and let chat spawn llama-server.
+        let model_is_hf = args
+            .model
+            .as_deref()
+            .is_some_and(crate::services::huggingface::is_hf_or_local_gguf);
+        let key_override = if model_is_hf {
+            None
+        } else {
+            let last_sel = self.session_store.get_last_selection().await?;
+            Some(
+                self.resolve_key(args.key.as_deref(), last_sel.as_ref())
+                    .await?
+                    .value,
+            )
+        };
+        // `-k` without `-m` forces the model picker, matching the native flow;
+        // otherwise hand the model through (None lets chat reuse its own saved
+        // selection or open its picker).
+        let model = match args.model.clone() {
+            Some(m) => Some(m),
+            None if args.key.is_some() => Some(String::new()),
+            None => None,
+        };
+        let command = ChatCommand::new(self.session_store.clone(), self.cache.clone());
+        Ok(command
+            .execute(
+                model,
+                None,
+                Vec::new(),
+                args.refresh,
+                key_override,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await)
     }
 
     async fn resolve_model(
@@ -543,6 +588,31 @@ impl StartCommand {
     }
 }
 
+/// The built-in picker rows as `(name, detail)` pairs: aivo's own in-process
+/// chat agent first (no install, shares the same keys as the tools below), then
+/// every native tool supported on this platform. Plugins are appended by the
+/// caller (they need runtime discovery). Standalone so the headline ordering is
+/// unit-tested.
+fn builtin_tool_entries() -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = vec![(
+        "chat".to_string(),
+        "aivo's built-in chat agent (no install needed).".to_string(),
+    )];
+    entries.extend(
+        AIToolType::all()
+            .iter()
+            .filter(|t| t.supported_on_current_platform())
+            .map(|t| {
+                let mut detail = t.description().to_string();
+                if !t.looks_installed() {
+                    detail.push_str(" (not installed)");
+                }
+                (t.as_str().to_string(), detail)
+            }),
+    );
+    entries
+}
+
 /// Aligned `<name>  <detail>` picker rows; detail is painted dim so the name
 /// stays the visual anchor (same convention as `format_key_choice`).
 fn render_tool_rows(entries: &[(String, String)]) -> Vec<String> {
@@ -624,5 +694,16 @@ mod tests {
             .filter(|t| t.supported_on_current_platform())
             .any(|t| *t == AIToolType::CodexApp);
         assert_eq!(offered, cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn chat_leads_the_builtin_picker_rows() {
+        let entries = super::builtin_tool_entries();
+        // aivo's own agent is the headline row, ahead of the native tools.
+        assert_eq!(entries[0].0, "chat");
+        assert!(!entries[0].1.is_empty(), "chat row carries a description");
+        // The native tools still follow it.
+        assert!(entries.iter().any(|(name, _)| name == "claude"));
+        assert!(entries.iter().any(|(name, _)| name == "codex"));
     }
 }

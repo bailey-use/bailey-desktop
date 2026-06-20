@@ -9,8 +9,28 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::commands::chat::ChatMessage;
 use crate::commands::chat_response_parser::TokenUsage;
 
+/// Formats a live elapsed clock for the in-stream status line, scaling the
+/// units up as the wait grows so a long turn reads `12m 50s` / `1h 23m` /
+/// `2d 3h` instead of an unwieldy raw second count. Seconds are kept at the
+/// minute scale (the clock is ticking) but dropped at the hour/day scale to
+/// stay compact.
 pub(super) fn format_request_elapsed(elapsed: Duration) -> String {
-    format!("{}s", elapsed.as_secs())
+    let secs = elapsed.as_secs();
+    let (days, hours, minutes, seconds) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 pub(super) fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> String {
@@ -27,18 +47,31 @@ pub(super) fn format_token_count(tokens: u64, usage: Option<TokenUsage>) -> Stri
     }
 }
 
-fn format_token_count_value(tokens: u64) -> String {
+pub(super) fn format_token_count_value(tokens: u64) -> String {
     if tokens < 1_000 {
         return tokens.to_string();
     }
+    // k below ~1M, then M (so a 1,000,000-token window reads "1M", not "1000k").
+    // The cutoff sits just under 1M so values that would round up to "1000k"
+    // render as "1M" instead.
+    if tokens < 999_950 {
+        format_scaled(tokens, 1_000, 'k')
+    } else {
+        format_scaled(tokens, 1_000_000, 'M')
+    }
+}
 
-    let rounded_tenths = (tokens + 50) / 100;
-    let thousands = rounded_tenths / 10;
+/// Format `tokens` as a value in `unit`s with one optional decimal place,
+/// rounded to the nearest tenth of a unit (e.g. 1_500_000 in M → "1.5M",
+/// 200_000 in k → "200k").
+fn format_scaled(tokens: u64, unit: u64, suffix: char) -> String {
+    let rounded_tenths = (tokens + unit / 20) / (unit / 10);
+    let whole = rounded_tenths / 10;
     let tenths = rounded_tenths % 10;
     if tenths == 0 {
-        format!("{thousands}k")
+        format!("{whole}{suffix}")
     } else {
-        format!("{thousands}.{tenths}k")
+        format!("{whole}.{tenths}{suffix}")
     }
 }
 
@@ -60,18 +93,46 @@ pub(super) fn estimate_context_tokens(history: &[ChatMessage]) -> u64 {
     (total_chars / 4) as u64
 }
 
-pub(super) fn build_footer_text(model: &str, base_url: &str, cwd: &str, width: u16) -> String {
+pub(super) fn build_footer_text(
+    model: &str,
+    base_url: &str,
+    cwd: &str,
+    branch: Option<&str>,
+    agent: Option<&str>,
+    width: u16,
+) -> String {
     let host = footer_host_label(base_url);
-    let cwd_label = footer_cwd_label(cwd);
+    // Prefer the full (home-abbreviated) path so the agent's working dir is clear;
+    // fall back to the basename, then drop the cwd, as width shrinks.
+    let cwd_full = footer_cwd_label(cwd);
+    let cwd_base = footer_cwd_basename(cwd);
+    // When the cwd is a git repo, the branch trails the path as ` (branch)`. It's
+    // kept alongside the basename fallback, then dropped as the width tightens.
+    let branch_suffix = branch
+        .filter(|b| !b.is_empty())
+        .map(|b| format!(" ({b})"))
+        .unwrap_or_default();
+    // An active top-level agent profile shows as a leading `[name]` badge, kept
+    // until the last (model-only) fallback so "which agent" survives a tight width.
+    let prefix = agent
+        .filter(|a| !a.is_empty())
+        .map(|a| format!("[{a}] "))
+        .unwrap_or_default();
     let candidates = [
-        format!("{model} · {host} · {cwd_label}"),
-        format!("{model} · {host}"),
+        format!("{prefix}{model} · {host} · {cwd_full}{branch_suffix}"),
+        format!("{prefix}{model} · {host} · {cwd_base}{branch_suffix}"),
+        format!("{prefix}{model} · {host} · {cwd_base}"),
+        format!("{prefix}{model} · {host}"),
+        format!("{prefix}{model}"),
         model.to_string(),
     ];
 
     candidates
         .into_iter()
-        .find(|candidate| candidate.chars().count() <= usize::from(width.max(1)))
+        // `width` is a terminal-column budget, so pick by display width — a CJK
+        // path/model (each glyph 2 columns) would otherwise count as half its
+        // real width and be chosen even though it overflows the footer.
+        .find(|candidate| display_width(candidate) <= usize::from(width.max(1)))
         .unwrap_or_else(|| truncate_for_width(model, width))
 }
 
@@ -93,13 +154,75 @@ pub(super) fn footer_host_label(base_url: &str) -> String {
         .to_string()
 }
 
+/// The working directory abbreviated with `~` for the home dir, e.g.
+/// `~/project/work/aivo` or `/private/tmp/hi`.
 fn footer_cwd_label(cwd: &str) -> String {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    if !home.is_empty() {
+        if cwd == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = cwd.strip_prefix(&format!("{home}/")) {
+            return format!("~/{rest}");
+        }
+    }
+    cwd.to_string()
+}
+
+/// Just the final path component (width fallback when the full path won't fit).
+fn footer_cwd_basename(cwd: &str) -> String {
     Path::new(cwd)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(cwd)
         .to_string()
+}
+
+/// The current git branch for `dir` (walking up to the repo root), or `None`
+/// when `dir` isn't inside a git work tree. Reads `.git/HEAD` directly — no
+/// subprocess — so it's cheap enough to poll on the footer's refresh throttle.
+/// A detached HEAD yields the short commit hash. An empty `dir` is rejected up
+/// front so a relative `.git` lookup can't latch onto the process's own repo.
+pub(super) fn git_branch_for(dir: &str) -> Option<String> {
+    if dir.is_empty() {
+        return None;
+    }
+    let mut cur = Path::new(dir);
+    loop {
+        let dot_git = cur.join(".git");
+        if dot_git.is_dir() {
+            return read_head_branch(&dot_git);
+        }
+        if dot_git.is_file() {
+            // A linked worktree / submodule: `.git` is a file `gitdir: <path>`.
+            let contents = std::fs::read_to_string(&dot_git).ok()?;
+            let target = contents.strip_prefix("gitdir:")?.trim();
+            let git_dir = if Path::new(target).is_absolute() {
+                std::path::PathBuf::from(target)
+            } else {
+                cur.join(target)
+            };
+            return read_head_branch(&git_dir);
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Parse the branch from a git dir's `HEAD`: `ref: refs/heads/<branch>` → the
+/// branch; a raw commit hash (detached HEAD) → its short form.
+fn read_head_branch(git_dir: &Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return (!branch.is_empty()).then(|| branch.to_string());
+    }
+    if head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(head[..7].to_string());
+    }
+    None
 }
 
 #[allow(dead_code)]
@@ -218,8 +341,8 @@ pub(super) fn truncate_for_width(text: &str, width: u16) -> String {
 mod tests {
     use super::{
         build_footer_text, display_width, format_request_elapsed, format_session_match_count,
-        format_time_ago_short, format_token_count, truncate_for_display_width, truncate_for_width,
-        wrapped_text_line_count,
+        format_time_ago_short, format_token_count, format_token_count_value, git_branch_for,
+        truncate_for_display_width, truncate_for_width, wrapped_text_line_count,
     };
     use crate::commands::chat::TokenUsage;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -241,18 +364,216 @@ mod tests {
 
     #[test]
     fn test_build_footer_text_prefers_whole_segments() {
+        // Wide: the full path (so an agent's working dir is unambiguous).
         assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 80),
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                None,
+                80
+            ),
+            "gpt-4o · openrouter.ai · /tmp/project"
+        );
+        // Medium: full path won't fit → fall back to the basename.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                None,
+                34
+            ),
             "gpt-4o · openrouter.ai · project"
         );
+        // Narrow: drop the cwd.
         assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 22),
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                None,
+                22
+            ),
             "gpt-4o · openrouter.ai"
         );
+        // Tiny: model only.
         assert_eq!(
-            build_footer_text("gpt-4o", "https://openrouter.ai/api/v1", "/tmp/project", 6),
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                None,
+                6
+            ),
             "gpt-4o"
         );
+    }
+
+    #[test]
+    fn test_build_footer_text_appends_git_branch() {
+        // Wide: the branch trails the full path as ` (branch)`.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                Some("feat/agent"),
+                None,
+                80
+            ),
+            "gpt-4o · openrouter.ai · /tmp/project (feat/agent)"
+        );
+        // The branch is kept alongside the basename when the full path won't fit.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                Some("main"),
+                None,
+                40
+            ),
+            "gpt-4o · openrouter.ai · project (main)"
+        );
+        // Tighter: drop the branch before the basename.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                Some("main"),
+                None,
+                35
+            ),
+            "gpt-4o · openrouter.ai · project"
+        );
+        // Empty branch → no suffix (same as None / not a repo).
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                Some(""),
+                None,
+                80
+            ),
+            "gpt-4o · openrouter.ai · /tmp/project"
+        );
+    }
+
+    #[test]
+    fn test_build_footer_text_shows_agent_badge() {
+        // An active agent shows as a leading `[name]` badge at a wide width.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                Some("reviewer"),
+                80
+            ),
+            "[reviewer] gpt-4o · openrouter.ai · /tmp/project"
+        );
+        // The badge is kept while segments drop (model + badge fit before host/cwd).
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                Some("reviewer"),
+                20
+            ),
+            "[reviewer] gpt-4o"
+        );
+        // Tiniest width: the badge is dropped before the model is lost.
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/project",
+                None,
+                Some("reviewer"),
+                6
+            ),
+            "gpt-4o"
+        );
+        // Empty agent → no badge (same as None).
+        assert_eq!(
+            build_footer_text(
+                "gpt-4o",
+                "https://openrouter.ai/api/v1",
+                "/tmp/p",
+                None,
+                Some(""),
+                80
+            ),
+            "gpt-4o · openrouter.ai · /tmp/p"
+        );
+    }
+
+    #[test]
+    fn test_build_footer_text_uses_display_width_for_cjk() {
+        // A CJK cwd: each glyph is 2 columns, so the full-path candidate is 34
+        // columns wide while only 32 chars. With width=32 a char-count check
+        // would wrongly keep it (32 ≤ 32) and overflow the footer; display width
+        // must fall back to the basename, which fits.
+        let out = build_footer_text(
+            "gpt-4o",
+            "https://openrouter.ai/api/v1",
+            "/tmp/项目",
+            None,
+            None,
+            32,
+        );
+        assert_eq!(out, "gpt-4o · openrouter.ai · 项目");
+        assert!(
+            display_width(&out) <= 32,
+            "footer overflows {} cols",
+            display_width(&out)
+        );
+    }
+
+    #[test]
+    fn test_git_branch_for_reads_head() {
+        let base = std::env::temp_dir().join(format!("aivo-gitbranch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let git = base.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+
+        // On a branch.
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        assert_eq!(
+            git_branch_for(base.to_str().unwrap()).as_deref(),
+            Some("feat/x")
+        );
+        // A nested subdir resolves up to the repo root.
+        let sub = base.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            git_branch_for(sub.to_str().unwrap()).as_deref(),
+            Some("feat/x")
+        );
+        // Detached HEAD → short commit hash.
+        std::fs::write(
+            git.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_branch_for(base.to_str().unwrap()).as_deref(),
+            Some("0123456")
+        );
+        // An empty path never latches onto the process's own repo.
+        assert_eq!(git_branch_for(""), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -292,6 +613,20 @@ mod tests {
     }
 
     #[test]
+    fn test_format_token_count_value_scales_to_m() {
+        // k tier (unchanged).
+        assert_eq!(format_token_count_value(999), "999");
+        assert_eq!(format_token_count_value(200_000), "200k");
+        assert_eq!(format_token_count_value(128_000), "128k");
+        // M tier — a 1M-token window reads "1M", not "1000k".
+        assert_eq!(format_token_count_value(1_000_000), "1M");
+        assert_eq!(format_token_count_value(1_500_000), "1.5M");
+        assert_eq!(format_token_count_value(2_000_000), "2M");
+        // Rollover boundary never shows "1000k".
+        assert_eq!(format_token_count_value(999_999), "1M");
+    }
+
+    #[test]
     fn test_format_session_match_count() {
         assert_eq!(format_session_match_count(0, 0), "0 chats");
         assert_eq!(format_session_match_count(4, 4), "4 chats");
@@ -314,5 +649,11 @@ mod tests {
     #[test]
     fn test_format_request_elapsed() {
         assert_eq!(format_request_elapsed(Duration::from_secs(54)), "54s");
+        // Minute scale keeps the ticking seconds.
+        assert_eq!(format_request_elapsed(Duration::from_secs(770)), "12m 50s");
+        assert_eq!(format_request_elapsed(Duration::from_secs(60)), "1m 0s");
+        // Hour/day scale drops the smallest unit to stay compact.
+        assert_eq!(format_request_elapsed(Duration::from_secs(3_661)), "1h 1m");
+        assert_eq!(format_request_elapsed(Duration::from_secs(90_061)), "1d 1h");
     }
 }

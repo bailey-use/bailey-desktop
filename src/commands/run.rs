@@ -202,7 +202,7 @@ impl RunCommand {
             Some(t) => t,
             None => {
                 eprintln!(
-                    "{} Unknown tool '{}'. Valid tools: claude, codex, codex-app, gemini, opencode, pi.",
+                    "{} Unknown tool '{}'. Valid tools: chat, claude, codex, codex-app, gemini, opencode, pi.",
                     style::red("Error:"),
                     tool
                 );

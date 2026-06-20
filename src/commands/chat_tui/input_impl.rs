@@ -65,53 +65,44 @@ impl ChatTuiApp {
         }
     }
 
-    pub(super) fn cursor_up(&mut self) {
-        use unicode_width::UnicodeWidthStr;
-        let before = &self.draft[..self.cursor];
-        let Some(prev_nl) = before.rfind('\n') else {
-            return;
-        };
-        let col = UnicodeWidthStr::width(&before[prev_nl + 1..]);
-        let before_prev = &before[..prev_nl];
-        let prev_line_start = before_prev.rfind('\n').map(|pos| pos + 1).unwrap_or(0);
-        self.advance_cursor_to_visual_col(prev_line_start, col);
+    /// Move the cursor up one *visual* (wrapped) row, keeping its display column
+    /// where possible. Returns false when already on the top row, so the caller
+    /// can fall back to history recall (Claude-Code style: history at the edge).
+    pub(super) fn composer_cursor_up(&mut self) -> bool {
+        let rows = composer_visual_rows(&self.draft, self.composer_text_width());
+        let (row, col) = composer_cursor_rowcol(&self.draft, self.cursor, &rows);
+        if row == 0 {
+            return false;
+        }
+        self.cursor = composer_offset_for_col(&self.draft, &rows, row - 1, col);
+        true
     }
 
-    pub(super) fn cursor_down(&mut self) {
-        use unicode_width::UnicodeWidthStr;
-        let before = &self.draft[..self.cursor];
-        let col = if let Some(prev_nl) = before.rfind('\n') {
-            UnicodeWidthStr::width(&before[prev_nl + 1..])
-        } else {
-            UnicodeWidthStr::width(before)
-        };
-        let after = &self.draft[self.cursor..];
-        let Some(next_nl_offset) = after.find('\n') else {
-            return;
-        };
-        let next_line_start = self.cursor + next_nl_offset + 1;
-        self.advance_cursor_to_visual_col(next_line_start, col);
+    /// Move the cursor down one visual row. Returns false when already on the
+    /// bottom row (caller falls back to forward history navigation).
+    pub(super) fn composer_cursor_down(&mut self) -> bool {
+        let rows = composer_visual_rows(&self.draft, self.composer_text_width());
+        let (row, col) = composer_cursor_rowcol(&self.draft, self.cursor, &rows);
+        if row + 1 >= rows.len() {
+            return false;
+        }
+        self.cursor = composer_offset_for_col(&self.draft, &rows, row + 1, col);
+        true
     }
 
-    fn advance_cursor_to_visual_col(&mut self, line_start: usize, target_col: usize) {
-        use unicode_width::UnicodeWidthStr;
-        self.cursor = line_start;
-        let mut acc_width = 0usize;
-        while self.cursor < self.draft.len() {
-            let rest = &self.draft[self.cursor..];
-            if rest.starts_with('\n') {
-                break;
-            }
-            let mut next_end = self.cursor + 1;
-            while next_end < self.draft.len() && !self.draft.is_char_boundary(next_end) {
-                next_end += 1;
-            }
-            let segment_width = UnicodeWidthStr::width(&self.draft[self.cursor..next_end]);
-            if acc_width + segment_width > target_col {
-                break;
-            }
-            acc_width += segment_width;
-            self.cursor = next_end;
+    /// Up / Ctrl+P: move up a visual row, or — once on the top row — recall the
+    /// previous draft from history (Claude-Code style: history at the edge).
+    pub(super) fn composer_up_or_history_prev(&mut self) {
+        if !self.composer_cursor_up() {
+            self.history_prev();
+        }
+    }
+
+    /// Down / Ctrl+N: move down a visual row, or step forward through history
+    /// once on the bottom row.
+    pub(super) fn composer_down_or_history_next(&mut self) {
+        if !self.composer_cursor_down() {
+            self.history_next();
         }
     }
 
@@ -179,6 +170,24 @@ impl ChatTuiApp {
         Some(&self.draft[1..])
     }
 
+    /// Inline ghost hint shown right after a bare slash command in the composer
+    /// (Claude-Code style), e.g. `/mcp [add … | rm <name>]`. Only while the draft
+    /// is exactly the command with no arguments typed yet and the cursor is at the
+    /// end — once a real argument is typed, `trim_end()` keeps a space so no
+    /// single-token name matches and the hint clears.
+    pub(super) fn composer_command_hint(&self) -> Option<&'static str> {
+        if self.overlay.blocks_input()
+            || self.is_busy()
+            || self.cursor != self.draft.len()
+            || !self.draft.starts_with('/')
+            || self.draft.starts_with("//")
+            || self.draft.contains('\n')
+        {
+            return None;
+        }
+        command_usage_hint(self.draft[1..].trim_end())
+    }
+
     pub(super) fn active_attach_query(&self) -> Option<&str> {
         if self.overlay.blocks_input()
             || self.is_busy()
@@ -191,22 +200,51 @@ impl ChatTuiApp {
         Some(&self.draft["/attach ".len()..])
     }
 
+    /// Whether the draft is a `!cmd` local shell command — a single line whose
+    /// first non-space char is a lone `!` (not the `!!` literal-`!` escape). Drives
+    /// the composer's shell-command highlight; mirrors `prepare_submit_action`'s
+    /// shell branch (which trims and treats a multi-line draft as a plain message).
+    pub(super) fn draft_is_shell_command(&self) -> bool {
+        if self.draft.contains('\n') {
+            return false;
+        }
+        let trimmed = self.draft.trim_start();
+        trimmed.starts_with('!') && !trimmed.starts_with("!!")
+    }
+
+    /// The `/` menu entries for `query`: built-in commands first, then discovered
+    /// skill commands (`/repo-study`). A skill whose name collides with a built-in
+    /// is dropped — the built-in wins — so a stray skill can't shadow `/model` etc.
+    pub(super) fn matching_command_entries(&self, query: &str) -> Vec<ComposerMenuEntry> {
+        let mut entries: Vec<ComposerMenuEntry> = filter_slash_commands(query)
+            .into_iter()
+            .map(ComposerMenuEntry::Command)
+            .collect();
+        for skill in filter_skill_commands(&self.skill_commands, query) {
+            if !SLASH_COMMANDS.iter().any(|c| c.name == skill.name) {
+                entries.push(ComposerMenuEntry::Skill(skill));
+            }
+        }
+        entries
+    }
+
     pub(super) fn visible_command_menu(&self) -> Option<VisibleCommandMenu> {
         if self.command_menu.dismissed {
             return None;
         }
+        // The command is fully typed and showing its inline arg ghost — the
+        // single-row dropdown would just echo it, so drop it (Claude-Code style).
+        if self.composer_command_hint().is_some() {
+            return None;
+        }
         let (kind, entries) = if let Some(query) = self.active_command_query() {
-            (
-                MenuKind::Commands,
-                filter_slash_commands(query)
-                    .into_iter()
-                    .map(ComposerMenuEntry::Command)
-                    .collect::<Vec<_>>(),
-            )
+            (MenuKind::Commands, self.matching_command_entries(query))
         } else if let Some(query) = self.active_attach_query() {
             (
                 MenuKind::AttachPath,
-                collect_attach_path_suggestions(&self.cwd, query)
+                // Suggest from the real launch dir (where relative paths actually
+                // resolve at queue time), NOT chat's empty sandbox (`self.cwd`).
+                collect_attach_path_suggestions(self.persist_cwd(), query)
                     .into_iter()
                     .map(ComposerMenuEntry::Path)
                     .collect::<Vec<_>>(),
@@ -250,9 +288,9 @@ impl ChatTuiApp {
         }
 
         let matches = if self.active_command_query().is_some() {
-            filter_slash_commands(&query).len()
+            self.matching_command_entries(&query).len()
         } else {
-            collect_attach_path_suggestions(&self.cwd, &query).len()
+            collect_attach_path_suggestions(self.persist_cwd(), &query).len()
         };
         if matches == 0 {
             self.command_menu.selected = 0;
@@ -318,13 +356,18 @@ impl ChatTuiApp {
                 self.command_menu.dismissed = true;
                 self.command_menu.placement = None;
             }
+            ComposerMenuEntry::Skill(skill) => {
+                self.draft = skill.insertion_text();
+                self.cursor = self.draft.len();
+                self.command_menu.dismissed = true;
+                self.command_menu.placement = None;
+            }
             ComposerMenuEntry::Path(path) => {
                 self.draft = path.insertion_text;
                 self.cursor = self.draft.len();
                 // Keep the menu open for directories so the user can continue
                 // navigating into the selected directory with subsequent Tab presses.
                 self.command_menu.dismissed = !path.is_dir;
-                // Only reset placement when dismissing — same rule as dismiss_command_menu.
                 // When the menu stays open (directory), preserve placement to avoid jumping.
                 if !path.is_dir {
                     self.command_menu.placement = None;
@@ -341,6 +384,12 @@ impl ChatTuiApp {
         match entry {
             ComposerMenuEntry::Command(command) => {
                 self.draft = command.command_label();
+                self.cursor = self.draft.len();
+                self.command_menu.reset();
+                self.submit_draft().await
+            }
+            ComposerMenuEntry::Skill(skill) => {
+                self.draft = skill.command_label();
                 self.cursor = self.draft.len();
                 self.command_menu.reset();
                 self.submit_draft().await

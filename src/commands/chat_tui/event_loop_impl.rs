@@ -15,10 +15,19 @@ impl ChatTuiApp {
         match event {
             RuntimeEvent::Delta(delta) => self.apply_runtime_delta(delta),
             RuntimeEvent::Finished { result, format } => {
-                self.finish_response(result, format).await?;
+                // Hold the finish until the typewriter has revealed the whole
+                // reply, so the tail types out instead of snapping in.
+                if self.incoming_buffer.is_empty() {
+                    self.finish_response(result, format).await?;
+                } else {
+                    self.pending_finish = Some(DeferredFinish::Chat { result, format });
+                }
             }
             RuntimeEvent::ModelsLoaded(result) => {
                 self.apply_loaded_models(result).await?;
+            }
+            RuntimeEvent::ContextWindowResolved(window) => {
+                self.context_window = window;
             }
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
@@ -30,16 +39,621 @@ impl ChatTuiApp {
                 if self.key.is_cursor_acp() && self.cursor_acp_session.is_none() {
                     self.cursor_acp_session = Some(session);
                 }
-                // Otherwise the session drops here, killing its child cleanly.
             }
+            RuntimeEvent::AgentContext { tokens, measured } => {
+                self.apply_agent_context(tokens, measured);
+            }
+            RuntimeEvent::AgentToolCall { id, name, args } => {
+                self.apply_agent_tool_call(id, name, args)
+            }
+            RuntimeEvent::AgentToolUpdate {
+                id,
+                args,
+                result,
+                failed,
+            } => self.apply_agent_tool_update(id, args, result, failed),
+            RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
+            RuntimeEvent::McpConnected { client, generation } => {
+                // Drop a connect that started before a `/mcp` toggle changed the
+                // server set; only the current generation's result is applied.
+                if generation == self.mcp_connect_gen {
+                    self.apply_mcp_connected(client);
+                }
+            }
+            RuntimeEvent::McpServerProgress {
+                name,
+                status,
+                health,
+                generation,
+            } => {
+                // One server resolved mid-connect: stash its status and repaint the
+                // open overlay so that row flips now. Stale-generation events (a
+                // connect superseded by a toggle) are dropped.
+                if generation == self.mcp_connect_gen {
+                    self.mcp_connect_progress.insert(name, (status, health));
+                    self.refresh_mcp_overlay_status();
+                }
+            }
+            RuntimeEvent::McpAuthorizeUrl { url } => {
+                self.notice = Some((MUTED, format!("Authorize in your browser: {url}")));
+            }
+            RuntimeEvent::McpAuthorized { name, result } => match result {
+                Ok(cred) => match crate::services::mcp_token_store::save(&name, &cred).await {
+                    Ok(()) => {
+                        self.notice = Some((MUTED, format!("Authorized `{name}` — reconnecting…")));
+                        // Reconnect so the now-authorized server's tools appear
+                        // (live if the /mcp overlay is open, else next turn).
+                        self.reset_mcp_after_config_change();
+                        self.restart_mcp_connect_for_overlay();
+                    }
+                    Err(e) => {
+                        self.notice = Some((
+                            ERROR,
+                            format!("Authorized `{name}` but couldn't save the token: {e}"),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    self.notice = Some((ERROR, format!("Authorization for `{name}` failed: {e}")));
+                }
+            },
+            RuntimeEvent::AgentPlan(items) => self.apply_agent_plan(items),
+            RuntimeEvent::AgentNotice(text) => self.notice = Some((MUTED, text)),
+            RuntimeEvent::AgentPermission {
+                tool,
+                preview,
+                reply,
+            } => {
+                self.agent_permission = Some(PendingPermission {
+                    tool,
+                    preview,
+                    reply,
+                });
+                // The card floats above the composer (drawn every frame
+                // regardless of scroll), so don't yank the transcript to the
+                // bottom — a user reading earlier output keeps their place.
+            }
+            RuntimeEvent::AgentFinished {
+                steps,
+                tokens,
+                context_tokens,
+            } => {
+                // Same deferral as the chat path: let the final assistant text
+                // finish typing out before the turn commits.
+                if self.incoming_buffer.is_empty() {
+                    self.finish_agent_turn(steps, tokens, context_tokens)
+                        .await?;
+                } else {
+                    self.pending_finish = Some(DeferredFinish::Agent {
+                        steps,
+                        tokens,
+                        context_tokens,
+                    });
+                }
+            }
+            RuntimeEvent::LocalCommandLine { is_err, line } => {
+                self.apply_local_command_line(is_err, line)
+            }
+            RuntimeEvent::LocalCommandDone {
+                exit_code,
+                truncated,
+            } => self.finish_local_command(exit_code, truncated).await?,
         }
         Ok(())
     }
 
-    fn apply_runtime_delta(&mut self, delta: ChatResponseChunk) {
-        if let ChatResponseChunk::Content(text) = delta {
-            self.pending_response.push_str(&text);
+    /// Append one streamed `!cmd` output line to the in-progress run. The output
+    /// lives on `local_command` (not history) while running, so it renders in the
+    /// volatile transcript tail without busting the memoized history body.
+    fn apply_local_command_line(&mut self, is_err: bool, line: String) {
+        let Some(run) = self.local_command.as_mut() else {
+            return;
+        };
+        let buf = if is_err {
+            &mut run.stderr
+        } else {
+            &mut run.stdout
+        };
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+
+    /// Commit a finished `!cmd` run: stash its full output for the ctrl+o pager and
+    /// push a bounded preview to history, then point the user at the pager when the
+    /// transcript elided lines.
+    async fn finish_local_command(&mut self, exit_code: i64, truncated: bool) -> Result<()> {
+        let Some(run) = self.local_command.take() else {
+            return Ok(());
+        };
+        let total = self.record_local_output(
+            run.command,
+            run.stdout,
+            run.stderr,
+            exit_code,
+            truncated,
+            false,
+        );
+        if truncated || total > MAX_OUTPUT_LINES {
+            self.notice = Some((
+                MUTED,
+                format!("Output elided — ctrl+o to view all {total} lines"),
+            ));
         }
+        self.persist_history().await?;
+        Ok(())
+    }
+
+    /// Stash a finished/interrupted `!cmd` run's FULL output in `last_local_output`
+    /// (the source the ctrl+o pager reads) and push a BOUNDED preview to history as
+    /// a `local_command` entry (the shape `render_local_command` reads), so the
+    /// persisted session stays small while the whole output stays viewable for the
+    /// session. The true line count rides along as `total_lines` so the transcript's
+    /// "+N more" marker counts everything, not just the preview. Returns that total.
+    pub(super) fn record_local_output(
+        &mut self,
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i64,
+        truncated: bool,
+        interrupted: bool,
+    ) -> usize {
+        let total = stdout.lines().count() + stderr.lines().count();
+
+        let mut entry = serde_json::json!({
+            "command": command.clone(),
+            "stdout": first_lines(&stdout, MAX_PERSISTED_OUTPUT_LINES),
+            "stderr": first_lines(&stderr, MAX_PERSISTED_OUTPUT_LINES),
+            "exit_code": exit_code,
+            "total_lines": total,
+        });
+        if truncated {
+            entry["truncated"] = serde_json::Value::Bool(true);
+        }
+        if interrupted {
+            entry["interrupted"] = serde_json::Value::Bool(true);
+        }
+        self.history.push(ChatMessage {
+            role: "local_command".to_string(),
+            content: entry.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        trim_history(&mut self.history, MAX_HISTORY_MESSAGES);
+
+        self.last_local_output = Some(LocalCommandOutput {
+            command,
+            stdout,
+            stderr,
+            exit_code,
+            truncated,
+            interrupted,
+        });
+        self.follow_output = true;
+        total
+    }
+
+    /// Commit any streamed assistant text into a history entry. Called before a
+    /// tool step (so prose precedes the call) and at turn end.
+    pub(super) fn flush_pending_assistant(&mut self) {
+        // Reveal any buffered text before committing so a tool step never lands
+        // ahead of prose the typewriter hadn't shown yet.
+        self.drain_incoming_buffer();
+        if !self.pending_response.is_empty() {
+            let content = std::mem::take(&mut self.pending_response);
+            self.history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content,
+                reasoning_content: None,
+                attachments: vec![],
+            });
+        }
+        self.pending_reasoning.clear();
+    }
+
+    /// Live context-fill from the agent engine. A measured step total flows
+    /// through `live_usage` so the footer shows it exactly (no `~`, and without
+    /// re-adding streamed text on top); a pre-usage estimate updates the baseline
+    /// `context_tokens` so the footer's estimate counts the real request (system
+    /// prompt + tool schemas), not just the visible transcript.
+    pub(super) fn apply_agent_context(&mut self, tokens: u64, measured: bool) {
+        if measured {
+            self.live_usage = Some(TokenUsage {
+                prompt_tokens: tokens,
+                ..Default::default()
+            });
+        } else {
+            self.live_usage = None;
+            self.context_tokens = tokens;
+        }
+    }
+
+    pub(super) fn apply_agent_tool_call(
+        &mut self,
+        id: Option<String>,
+        name: String,
+        args: serde_json::Value,
+    ) {
+        self.flush_pending_assistant();
+        let mut obj = serde_json::Map::new();
+        obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        obj.insert("args".to_string(), args);
+        if let Some(id) = id {
+            obj.insert("id".to_string(), serde_json::Value::String(id));
+        }
+        let content = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(name);
+        self.history.push(ChatMessage {
+            role: "tool_call".to_string(),
+            content,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        // Don't force-follow: if the user scrolled up to read earlier output,
+        // a streamed tool step shouldn't yank the view back to the bottom. The
+        // render already follows new output while `follow_output` is set, and
+        // scrolling back to the bottom re-arms it.
+    }
+
+    /// Enrich the matching tool-call entry in place (cursor reports the resolved
+    /// path/pattern and the result in a later `tool_call_update`, keyed by id):
+    /// swap in the real args and attach a compact result / failed flag. Bumps the
+    /// transcript revision so the memoized body re-renders.
+    pub(super) fn apply_agent_tool_update(
+        &mut self,
+        id: String,
+        args: Option<serde_json::Value>,
+        result: Option<String>,
+        failed: bool,
+    ) {
+        let Some(entry) = self.history.iter_mut().rev().find(|m| {
+            m.role == "tool_call"
+                && serde_json::from_str::<serde_json::Value>(&m.content)
+                    .ok()
+                    .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(str::to_string))
+                    .as_deref()
+                    == Some(id.as_str())
+        }) else {
+            return;
+        };
+        let mut obj = serde_json::from_str::<serde_json::Value>(&entry.content)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(args) = args {
+            obj["args"] = args;
+        }
+        if let Some(result) = result {
+            obj["result"] = serde_json::Value::String(result);
+        }
+        if failed {
+            obj["failed"] = serde_json::Value::Bool(true);
+        }
+        entry.content = obj.to_string();
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    }
+
+    /// A background MCP connect resolved: cache the client and, if it brought
+    /// tools, arrange for the engine to advertise them. The engine is rebuilt (not
+    /// mutated in place) because it's behind a mutex and may be mid-turn; rebuild
+    /// re-seeds from history, so the conversation survives. Deferred until the
+    /// turn finishes when one is in flight.
+    pub(super) fn apply_mcp_connected(
+        &mut self,
+        client: std::sync::Arc<crate::agent::mcp::McpClient>,
+    ) {
+        self.mcp_connecting = false;
+        // The full client now answers every status query; the interim per-server
+        // map is superseded.
+        self.mcp_connect_progress.clear();
+        // Surface connect failures so a mis-configured server isn't a silent no-op.
+        // Don't raise a scary "failed" notice for servers that merely need OAuth
+        // — the /mcp roster shows those as "needs authorization", and a freshly
+        // added one auto-authorizes below. Config-file parse errors (whose source
+        // is a filename, not a server) and genuine failures still surface.
+        let hard_errors: Vec<&(String, String)> = client
+            .errors()
+            .iter()
+            .filter(|(source, _)| !client.needs_auth(source))
+            .collect();
+        if let Some((source, reason)) = hard_errors.first() {
+            let msg = if hard_errors.len() == 1 {
+                format!("MCP server failed — {source}: {reason}")
+            } else {
+                format!(
+                    "{} MCP servers failed — {source}: {reason}; …",
+                    hard_errors.len()
+                )
+            };
+            self.notice = Some((WARNING, msg));
+        }
+        let has_tools = client.has_tools();
+        self.mcp_client = Some(client);
+        // If the `/mcp` overlay is open, refresh its rows from the now-resolved
+        // client so each "connecting…" flips to the real tool count or failure
+        // live (done before the no-tools early-return so failures still update).
+        self.refresh_mcp_overlay_status();
+        // A freshly-added HTTP server that came back 401 auto-starts its OAuth
+        // flow (one-step add), so the browser opens without a separate Ctrl+O.
+        // One that connected fine — or failed for another reason — is just
+        // dropped from the queue. Done before the no-tools return: a needs-auth
+        // server has no tools.
+        if !self.pending_mcp_auth.is_empty() {
+            let pending = std::mem::take(&mut self.pending_mcp_auth);
+            let to_auth: Vec<(String, String)> = pending
+                .into_iter()
+                .filter(|(name, _)| self.mcp_client.as_ref().is_some_and(|c| c.needs_auth(name)))
+                .collect();
+            for (name, url) in to_auth {
+                self.start_mcp_authorize(name, url);
+            }
+        }
+        if !has_tools {
+            return; // no servers / no mcp.json — nothing to attach
+        }
+        if self.sending {
+            self.mcp_rebuild_pending = true;
+        } else {
+            self.agent_engine = None; // next turn rebuilds with the MCP tools
+        }
+    }
+
+    /// Drop the engine so the next turn rebuilds it with the freshly-connected MCP
+    /// tools. Called after a turn finishes (the deferred half of
+    /// `apply_mcp_connected`).
+    pub(super) fn maybe_apply_mcp_rebuild(&mut self) {
+        if self.mcp_rebuild_pending {
+            self.mcp_rebuild_pending = false;
+            self.agent_engine = None;
+        }
+    }
+
+    pub(super) fn apply_agent_tool_result(&mut self, content: String) {
+        self.history.push(ChatMessage {
+            role: "tool_result".to_string(),
+            content,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        // Same as the tool-call append: leave `follow_output` alone so a user
+        // reading scrolled-up output isn't snapped to the bottom each step.
+    }
+
+    /// Render an `update_plan` call as a SINGLE checklist card. The model resends
+    /// the full plan on every call, so the transcript keeps just one card: each
+    /// update drops the previous one and re-appends the latest at the current
+    /// point of work. This keeps the plan current and near the live cursor instead
+    /// of stacking a near-identical copy after every batch of tool calls.
+    pub(super) fn apply_agent_plan(&mut self, items: serde_json::Value) {
+        self.flush_pending_assistant();
+        let content = items.to_string();
+        self.history.retain(|m| m.role != "plan");
+        self.history.push(ChatMessage {
+            role: "plan".to_string(),
+            content,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        // Removing the prior card can leave history length and the last entry
+        // unchanged (e.g. a status-only edit), so bump the revision unconditionally
+        // to invalidate the transcript render cache.
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        // Don't force-follow on a plan refresh; respect the user's scroll position.
+    }
+
+    async fn finish_agent_turn(
+        &mut self,
+        _steps: usize,
+        tokens: u64,
+        context_tokens: u64,
+    ) -> Result<()> {
+        self.flush_pending_assistant();
+        self.sending = false;
+        self.request_started_at = None;
+        self.response_task = None;
+        self.pending_submit = None;
+        self.agent_permission = None;
+        self.stop_agent_serve();
+        // Prefer the engine's provider-measured fill (last step's prompt+completion);
+        // fall back to the chars/4 transcript estimate only when no usage was reported.
+        if context_tokens > 0 {
+            self.context_tokens = context_tokens;
+            self.context_is_estimate = false;
+        } else {
+            self.context_tokens = estimate_context_tokens(&self.history);
+            self.context_is_estimate = true;
+        }
+        self.last_usage = None;
+        self.live_usage = None;
+        // Fold this turn's real provider-measured split into the session's running
+        // total BEFORE a possible MCP rebuild drops the engine, so the chat index
+        // entry (and thus `aivo stats --since`) carries actual chat tokens.
+        if let Some(session) = self.agent_engine.as_ref() {
+            let turn = session.engine.lock().await.take_turn_usage();
+            self.session_tokens = self.session_tokens.merge(turn);
+        }
+        // If MCP tools landed mid-turn, drop the engine now so the next turn
+        // rebuilds with them (must happen while not sending).
+        self.maybe_apply_mcp_rebuild();
+        self.persist_history().await?;
+        self.log_agent_turn(tokens).await;
+        // Pick up skills created/edited during the turn (e.g. via `/create-skill`):
+        // refresh the `/` menu and, if the set changed, rebuild the engine next turn
+        // so the model sees the new skills. Runs while not sending, so the engine
+        // reset stays lossless.
+        self.refresh_skill_commands().await;
+        self.drain_queued_message().await?;
+        // Autonomous `/goal` loop: if active (and a queued message didn't already
+        // start the next turn), continue toward the goal or stop on completion/cap.
+        self.maybe_continue_goal().await?;
+        Ok(())
+    }
+
+    /// Record the agent turn in `aivo logs`. The per-turn loopback serve only
+    /// logs low-level, cwd-less `serve_request` rows; this adds the same
+    /// `chat_turn` entry the HTTP path writes (prompt title, conversation body)
+    /// under the real cwd so the turn shows in the project's logs. The accurate
+    /// per-tool token split lives in `aivo stats` (the serve's usage accounting);
+    /// here we only have the turn total.
+    pub(super) async fn log_agent_turn(&self, tokens: u64) {
+        let Some(user_message) = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .cloned()
+        else {
+            return;
+        };
+        let assistant_content = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let usage = TokenUsage {
+            completion_tokens: tokens,
+            ..Default::default()
+        };
+        let _ = log_chat_turn(
+            &self.session_store,
+            &self.key,
+            &self.raw_model,
+            Some(self.persist_cwd()),
+            Some(&self.session_id),
+            &user_message,
+            &assistant_content,
+            None,
+            &usage,
+        )
+        .await;
+    }
+
+    fn apply_runtime_delta(&mut self, delta: ChatResponseChunk) {
+        match delta {
+            // Buffer the chunk; `tick_typewriter` reveals it into the displayed
+            // reply over the next frames so output reads as fast typing instead
+            // of arriving in network-sized bursts.
+            ChatResponseChunk::Content(text) => self.incoming_buffer.push_str(&text),
+            // Live provider-measured usage — the footer's context-fill reads this
+            // while `sending` so the stat grows during the turn, not just at the end.
+            ChatResponseChunk::Usage(usage) => self.live_usage = Some(usage),
+            ChatResponseChunk::Reasoning(_) => {}
+        }
+    }
+
+    /// Reveals the next slice of buffered stream text into the displayed reply.
+    /// Returns true if anything was revealed (caller repaints). Paced by the
+    /// animating frame cadence; see [`TYPEWRITER_MIN_CHARS`] for the rate.
+    pub(super) fn tick_typewriter(&mut self) -> bool {
+        if self.incoming_buffer.is_empty() {
+            return false;
+        }
+        let remaining = self.incoming_buffer.chars().count();
+        let step = TYPEWRITER_MIN_CHARS
+            .max(remaining / TYPEWRITER_CATCHUP_DIVISOR)
+            .min(remaining);
+        // Cut on a char boundary so multi-byte glyphs are never split.
+        let byte_idx = self
+            .incoming_buffer
+            .char_indices()
+            .nth(step)
+            .map_or(self.incoming_buffer.len(), |(idx, _)| idx);
+        let revealed: String = self.incoming_buffer.drain(..byte_idx).collect();
+        self.pending_response.push_str(&revealed);
+        true
+    }
+
+    /// Reveals all remaining buffered text at once. Used when a boundary needs
+    /// the full reply now — committing a turn, a tool step, an interrupt, or
+    /// exit — so no received text is lost or left to type out of order.
+    pub(super) fn drain_incoming_buffer(&mut self) {
+        if !self.incoming_buffer.is_empty() {
+            let rest = std::mem::take(&mut self.incoming_buffer);
+            self.pending_response.push_str(&rest);
+        }
+    }
+
+    /// Runs a finish event that was deferred until the typewriter caught up,
+    /// once the buffer is empty. Returns true if a finish ran (caller repaints).
+    pub(super) async fn run_deferred_finish_if_ready(&mut self) -> Result<bool> {
+        if !self.incoming_buffer.is_empty() {
+            return Ok(false);
+        }
+        match self.pending_finish.take() {
+            Some(DeferredFinish::Chat { result, format }) => {
+                self.finish_response(result, format).await?;
+                Ok(true)
+            }
+            Some(DeferredFinish::Agent {
+                steps,
+                tokens,
+                context_tokens,
+            }) => {
+                self.finish_agent_turn(steps, tokens, context_tokens)
+                    .await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Watchdog for a response task that ended WITHOUT delivering its terminal
+    /// event: a panic in `run_turn` (or the chat/cursor task) never sends
+    /// `AgentFinished`/`Finished`, leaving `sending` stuck true forever — a frozen
+    /// composer and a stalled `/goal` loop. Salvage partial text, reset the turn,
+    /// and surface the failure. Returns true if it recovered a dead turn.
+    pub(super) async fn recover_dead_response_task(&mut self) -> Result<bool> {
+        // Only suspect a still-sending turn whose finish isn't deferred behind
+        // the typewriter.
+        if !self.sending || self.pending_finish.is_some() || !self.incoming_buffer.is_empty() {
+            return Ok(false);
+        }
+        if !self.response_task.as_ref().is_some_and(|t| t.is_finished()) {
+            return Ok(false);
+        }
+        // A normal finish sends its terminal event just BEFORE the task returns,
+        // so drain once more — don't mistake a clean finish for a crash.
+        self.handle_runtime_events().await?;
+        if !self.sending {
+            return Ok(false);
+        }
+        // Still sending with a finished task ⇒ it died without finishing.
+        let Some(task) = self.response_task.take() else {
+            return Ok(false);
+        };
+        let detail = match task.await {
+            Err(e) if e.is_panic() => "the agent turn crashed",
+            _ => "the agent turn ended unexpectedly",
+        };
+        self.drain_incoming_buffer();
+        if !self.pending_response.is_empty() {
+            let partial = std::mem::take(&mut self.pending_response);
+            self.history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: partial,
+                reasoning_content: None,
+                attachments: vec![],
+            });
+        }
+        self.pending_reasoning.clear();
+        // Reset the turn, fail-closed like an interrupt.
+        self.sending = false;
+        self.request_started_at = None;
+        self.pending_submit = None;
+        self.agent_permission = None;
+        self.queued_messages.clear();
+        self.stop_agent_serve();
+        self.follow_output = true;
+        // A crash mid-loop must NOT auto-continue the goal into a likely repeat.
+        let goal_stopped = self.goal_mode.take().is_some();
+        let mut msg = detail.to_string();
+        if goal_stopped {
+            msg.push_str(" — goal mode stopped");
+        }
+        self.notice = Some((ERROR, msg));
+        if !self.history.is_empty() {
+            let _ = self.persist_history().await;
+        }
+        Ok(true)
     }
 
     async fn finish_response(
@@ -57,6 +671,10 @@ impl ChatTuiApp {
             Err(err) => self.finish_failed_response(err),
         }
 
+        // Keep the `/` menu in sync with any skills added/edited during the turn
+        // (parity with the agent path's `finish_agent_turn`).
+        self.refresh_skill_commands().await;
+        self.drain_queued_message().await?;
         Ok(())
     }
 
@@ -84,28 +702,40 @@ impl ChatTuiApp {
 
     async fn finish_successful_response(&mut self, turn: ChatTurnResult) -> Result<()> {
         self.persist_chat_route().await;
-        let content = if self.pending_response.is_empty() {
-            turn.content.clone()
-        } else {
+
+        // History already holds everything sent to the model this turn (the user
+        // input plus any assistant/tool segments flushed while streaming); capture
+        // it for the usage estimate before appending the final reply.
+        let prompt_text: String = self.history.iter().map(|m| m.content.as_str()).collect();
+
+        // Streaming paths accumulate the reply in `pending_response`; a
+        // non-streaming HTTP reply arrives in `turn.content`. When a turn ends on
+        // a tool step (cursor agents), the prose was already flushed as earlier
+        // entries and `turn.content` holds the full accumulation — re-pushing it
+        // would duplicate the transcript, so emit nothing.
+        let ended_on_tool = matches!(
+            self.history.last().map(|m| m.role.as_str()),
+            Some("tool_call" | "tool_result")
+        );
+        let content = if !self.pending_response.is_empty() {
             self.pending_response.clone()
+        } else if ended_on_tool {
+            String::new()
+        } else {
+            turn.content.clone()
         };
         self.pending_submit = None;
         self.pending_response.clear();
         self.pending_reasoning.clear();
-        self.history.push(ChatMessage {
-            role: "assistant".to_string(),
-            content,
-            reasoning_content: None,
-            attachments: vec![],
-        });
+        if !content.is_empty() {
+            self.history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content,
+                reasoning_content: None,
+                attachments: vec![],
+            });
+        }
 
-        let prompt_text: String = self
-            .history
-            .iter()
-            .rev()
-            .skip(1) // skip the assistant message we just pushed
-            .map(|m| m.content.as_str())
-            .collect();
         let usage = turn.usage_or_estimate(&prompt_text);
         // Cache for subsequent heartbeat saves, which run without a turn.
         if let Some(ref model) = turn.model {
@@ -123,23 +753,39 @@ impl ChatTuiApp {
                 usage.cache_creation_input_tokens,
             )
             .await?;
+        // Fold the same split into the session's running total so the chat index
+        // entry feeds `aivo stats --since` (the non-agent / cursor path).
+        self.session_tokens =
+            self.session_tokens
+                .merge(crate::services::session_store::SessionTokens {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cache_read_tokens: usage.cache_read_input_tokens,
+                    cache_write_tokens: usage.cache_creation_input_tokens,
+                });
         self.context_tokens = if turn.usage.is_some() {
             usage.total_tokens()
         } else {
             estimate_context_tokens(&self.history)
         };
+        // cursor ACP returns no usage → the figure is a transcript estimate.
+        self.context_is_estimate = turn.usage.is_none();
         self.last_usage = turn.usage;
+        self.live_usage = None;
 
+        // The turn's reply for the log: the most recent assistant entry (the final
+        // text, or the last flushed segment when the turn ended on a tool step).
         let assistant_content = self
             .history
-            .last()
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
             .map(|message| message.content.clone())
             .unwrap_or_default();
         let user_message = self
             .history
             .iter()
             .rev()
-            .skip(1)
             .find(|message| message.role == "user")
             .cloned();
         if let Some(user_message) = user_message {
@@ -147,7 +793,7 @@ impl ChatTuiApp {
                 &self.session_store,
                 &self.key,
                 &self.raw_model,
-                Some(&self.cwd),
+                Some(self.persist_cwd()),
                 Some(&self.session_id),
                 &user_message,
                 &assistant_content,
@@ -164,6 +810,8 @@ impl ChatTuiApp {
 
     fn finish_failed_response(&mut self, err: String) {
         self.pending_response.clear();
+        self.incoming_buffer.clear();
+        self.pending_finish = None;
         self.pending_reasoning.clear();
         restore_cancelled_submission(
             &mut self.history,
@@ -251,6 +899,10 @@ impl ChatTuiApp {
         // pressing Ctrl-C) so a just-finished turn is captured in history.
         let _ = self.handle_runtime_events().await;
 
+        // Reveal anything still buffered so the full received reply (not just
+        // the typed-out prefix) is what we salvage below.
+        self.drain_incoming_buffer();
+
         // If the response was still streaming at exit, salvage the partial
         // assistant text the same way an explicit interrupt does — otherwise
         // the user's prompt and any visible reply would be lost.
@@ -283,6 +935,24 @@ impl ChatTuiApp {
                 Err(err) => break Err(err),
             }
 
+            // Keep the selection growing while a drag rests on the top/bottom edge.
+            if self.tick_drag_autoscroll() {
+                needs_redraw = true;
+            }
+
+            // Reveal buffered stream text a slice at a time (typewriter), then
+            // run any finish that was waiting for the buffer to drain.
+            if self.tick_typewriter() {
+                needs_redraw = true;
+            }
+            if self.run_deferred_finish_if_ready().await? {
+                needs_redraw = true;
+            }
+            // Watchdog: recover a turn left stuck "sending" by a task that died silently.
+            if self.recover_dead_response_task().await? {
+                needs_redraw = true;
+            }
+
             // Animations repaint without input.
             if self.is_animating() {
                 needs_redraw = true;
@@ -295,20 +965,14 @@ impl ChatTuiApp {
                 needs_redraw = false;
             }
 
-            match event::poll(Duration::from_millis(0)) {
-                Ok(true) => match event::read() {
-                    Ok(event) => {
-                        needs_redraw = true;
-                        if let Some(should_exit) = self.handle_terminal_event(event).await?
-                            && should_exit
-                        {
-                            break Ok(());
-                        }
-                    }
-                    Err(err) => break Err(err.into()),
-                },
+            // Drain every buffered input event in one pass before the next
+            // repaint. Processing one event per tick caps consumption at the
+            // idle cadence (~40/s), far below the rate a fast drag emits, so the
+            // selection would otherwise trail the cursor by a growing backlog.
+            match self.drain_input(&mut needs_redraw).await {
+                Ok(true) => break Ok(()),
                 Ok(false) => {}
-                Err(err) => break Err(err.into()),
+                Err(err) => break Err(err),
             }
 
             // Spinner advances only while animating.
@@ -335,6 +999,7 @@ impl ChatTuiApp {
         // itself shuts down at process exit.
         let response_task = self.response_task.take();
         let resume_task = self.resume_task.take();
+        let local_command = self.local_command.take();
         self.loading_resume = None;
         self.resume_restore_state = None;
         if let Some(task) = response_task {
@@ -345,8 +1010,171 @@ impl ChatTuiApp {
             task.abort();
             let _ = task.await;
         }
+        if let Some(mut run) = local_command {
+            let _ = run.killer.kill();
+            run.task.abort();
+            let _ = run.task.await;
+        }
         restore_terminal(terminal)?;
         run_result
+    }
+
+    /// Consumes all input events currently buffered, handling each in arrival
+    /// order, and returns `Ok(true)` when one of them asks the app to exit.
+    /// Sets `needs_redraw` if anything was handled. Bounded by
+    /// [`MAX_INPUT_EVENTS_PER_TICK`] so a flood can't starve the repaint —
+    /// the remainder is picked up on the next loop pass.
+    async fn drain_input(&mut self, needs_redraw: &mut bool) -> Result<bool> {
+        let mut drained = 0usize;
+        // Reassemble mouse reports that crossterm split at the ESC byte. A fast
+        // SGR mouse report (`\x1b[<b;x;y` then `M`/`m`) whose leading ESC lands in
+        // a separate read surfaces as a bare `Esc` key (which would spuriously
+        // close an overlay) followed by its tail `[<…M` as literal `Char`s typed
+        // into the composer. We withhold a bare Esc for one event to see whether
+        // that tail follows in the same burst; if so the Esc is dropped, the tail
+        // swallowed, and the scroll the user meant is re-synthesized.
+        let mut esc = EscReassembly::Idle;
+        while event::poll(Duration::from_millis(0))? {
+            let event = event::read()?;
+            *needs_redraw = true;
+            drained += 1;
+
+            let event = match self.step_esc_reassembly(&mut esc, event).await? {
+                EscStep::Consumed => {
+                    if drained >= MAX_INPUT_EVENTS_PER_TICK {
+                        break;
+                    }
+                    continue;
+                }
+                EscStep::Exit => return Ok(true),
+                EscStep::Passthrough(event) => event,
+            };
+
+            if let Some(true) = self.handle_terminal_event(event).await? {
+                return Ok(true);
+            }
+            if drained >= MAX_INPUT_EVENTS_PER_TICK {
+                break;
+            }
+        }
+        // Burst ended: flush whatever we were still holding — a real lone Esc, or
+        // an incomplete fragment that never resolved into a mouse report.
+        if self.flush_esc_reassembly(esc).await? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Feeds one freshly-read event through the [`EscReassembly`] state machine.
+    /// Returns whether it was [`EscStep::Consumed`] (folded into a held Esc or a
+    /// mouse fragment), should [`EscStep::Exit`], or is a plain
+    /// [`EscStep::Passthrough`] event the caller should handle normally. Any
+    /// held input that turns out to be real text is replayed inside here so it is
+    /// never lost.
+    pub(super) async fn step_esc_reassembly(
+        &mut self,
+        esc: &mut EscReassembly,
+        event: Event,
+    ) -> Result<EscStep> {
+        match esc {
+            EscReassembly::Idle => {
+                if is_bare_esc(&event) {
+                    *esc = EscReassembly::PendingEsc;
+                    return Ok(EscStep::Consumed);
+                }
+                Ok(EscStep::Passthrough(event))
+            }
+            EscReassembly::PendingEsc => {
+                // `\x1b[` is the CSI lead of a split mouse report — start swallowing.
+                if char_press(&event) == Some('[') {
+                    *esc = EscReassembly::Sgr("[".to_string());
+                    return Ok(EscStep::Consumed);
+                }
+                // A genuine lone Esc: deliver it, then let this event through.
+                *esc = EscReassembly::Idle;
+                if self.deliver_esc().await? {
+                    return Ok(EscStep::Exit);
+                }
+                Ok(EscStep::Passthrough(event))
+            }
+            EscReassembly::Sgr(buf) => {
+                let Some(c) = char_press(&event) else {
+                    // A non-character event interrupted the fragment: replay what
+                    // we held as text, then handle this event normally.
+                    let buffered = std::mem::take(buf);
+                    *esc = EscReassembly::Idle;
+                    if self.replay_held(&buffered).await? {
+                        return Ok(EscStep::Exit);
+                    }
+                    return Ok(EscStep::Passthrough(event));
+                };
+                buf.push(c);
+                match sgr_mouse_frag_step(buf) {
+                    FragStep::Continue => Ok(EscStep::Consumed),
+                    FragStep::Final => {
+                        let frag = std::mem::take(buf);
+                        *esc = EscReassembly::Idle;
+                        if self.dispatch_leaked_scroll(&frag).await? {
+                            return Ok(EscStep::Exit);
+                        }
+                        Ok(EscStep::Consumed)
+                    }
+                    FragStep::Invalid => {
+                        // Not a mouse report after all; the just-pushed char is
+                        // part of a plainly textual run, so replay the whole held
+                        // sequence (the suppressed Esc plus the buffer) as text.
+                        let buffered = std::mem::take(buf);
+                        *esc = EscReassembly::Idle;
+                        if self.replay_held(&buffered).await? {
+                            return Ok(EscStep::Exit);
+                        }
+                        Ok(EscStep::Consumed)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flushes input held by the reassembler when the input burst ends.
+    pub(super) async fn flush_esc_reassembly(&mut self, esc: EscReassembly) -> Result<bool> {
+        match esc {
+            EscReassembly::Idle => Ok(false),
+            EscReassembly::PendingEsc => self.deliver_esc().await,
+            EscReassembly::Sgr(buf) => self.replay_held(&buf).await,
+        }
+    }
+
+    /// Delivers a synthesized `Esc` keypress (the held bare Esc was real).
+    async fn deliver_esc(&mut self) -> Result<bool> {
+        self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+    }
+
+    /// Replays a withheld Esc followed by `buffered` as ordinary keystrokes — the
+    /// path taken when a suspected mouse fragment turns out to be real text.
+    async fn replay_held(&mut self, buffered: &str) -> Result<bool> {
+        if self.deliver_esc().await? {
+            return Ok(true);
+        }
+        for c in buffered.chars() {
+            if self
+                .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Re-synthesizes the wheel scroll from a reassembled SGR mouse fragment so a
+    /// split report still scrolls instead of being silently dropped. Non-scroll
+    /// reports (clicks, drags) are discarded — rebuilding those is not worth it.
+    async fn dispatch_leaked_scroll(&mut self, frag: &str) -> Result<bool> {
+        match parse_sgr_scroll(frag) {
+            Some(mouse) => self.handle_mouse(mouse).await,
+            None => Ok(false),
+        }
     }
 
     async fn handle_terminal_event(&mut self, event: Event) -> Result<Option<bool>> {
@@ -382,45 +1210,52 @@ impl ChatTuiApp {
             MouseEventKind::ScrollDown if self.mouse_over_transcript(mouse) => {
                 self.scroll_down_lines(self.scroll_speed)
             }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.should_show_input_cursor()
+                    && self.composer_offset_for_mouse(mouse).is_some() =>
+            {
+                if let Some(offset) = self.composer_offset_for_mouse(mouse) {
+                    self.clear_transcript_selection();
+                    self.cursor = offset;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(point) = self.transcript_point_for_mouse(mouse, false) {
-                    self.transcript_selection = Some(TranscriptSelection {
-                        anchor: point,
-                        focus: point,
-                    });
-                    self.transcript_drag_active = true;
+                let Some(point) = self.transcript_point_for_mouse(mouse, false) else {
+                    return Ok(false);
+                };
+                let clicks = self.register_click(point);
+                self.selection_flash_until = None;
+                match clicks {
+                    // Double-click selects the word under the cursor; triple-click
+                    // selects the whole visual row. Both copy + flash, matching the
+                    // drag-to-copy model. They fall through to a caret drag when the
+                    // click lands on blank space (no word/row to grab).
+                    2 if self.select_word_at(point) => {
+                        self.transcript_drag_active = false;
+                        self.copy_selection_to_clipboard();
+                    }
+                    3 if self.select_line_at(point) => {
+                        self.transcript_drag_active = false;
+                        self.copy_selection_to_clipboard();
+                    }
+                    _ => {
+                        self.transcript_selection = Some(TranscriptSelection {
+                            anchor: point,
+                            focus: point,
+                        });
+                        self.transcript_drag_active = true;
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.transcript_drag_active => {
-                if let Some(point) = self.transcript_point_for_mouse(mouse, true)
-                    && let Some(selection) = &mut self.transcript_selection
-                {
-                    selection.focus = point;
-                }
+                self.set_drag_focus(mouse);
+                self.update_drag_autoscroll(mouse);
             }
             MouseEventKind::Up(MouseButton::Left) if self.transcript_drag_active => {
                 self.transcript_drag_active = false;
-                if let Some(point) = self.transcript_point_for_mouse(mouse, true)
-                    && let Some(selection) = &mut self.transcript_selection
-                {
-                    selection.focus = point;
-                }
-                match self
-                    .selected_transcript_text()
-                    .filter(|text| !text.is_empty())
-                {
-                    Some(selected) => match write_system_clipboard(&selected) {
-                        Ok(()) => {
-                            self.show_copy_toast("Copied selection");
-                        }
-                        Err(err) => {
-                            self.notice = Some((ERROR, format!("Copy failed: {err}")));
-                        }
-                    },
-                    None => {
-                        self.transcript_selection = None;
-                    }
-                }
+                self.drag_autoscroll = None;
+                self.set_drag_focus(mouse);
+                self.copy_selection_to_clipboard();
             }
             _ => {}
         }
@@ -428,12 +1263,199 @@ impl ChatTuiApp {
         Ok(false)
     }
 
-    fn show_copy_toast(&mut self, text: impl Into<String>) {
+    /// Records a left-click and returns how many consecutive clicks it forms
+    /// (1, 2, or 3) — the basis for word/line selection.
+    pub(super) fn register_click(&mut self, point: TranscriptPoint) -> u8 {
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some(prev)
+                if now.duration_since(prev.at) <= MULTI_CLICK_INTERVAL
+                    && prev.point.row == point.row
+                    && prev.point.column.abs_diff(point.column) <= 1 =>
+            {
+                (prev.count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some(ClickTracker {
+            at: now,
+            point,
+            count,
+        });
+        count
+    }
+
+    /// Selects the word at `point`. Returns false (leaving selection untouched)
+    /// when the click lands on whitespace or past the row's text.
+    pub(super) fn select_word_at(&mut self, point: TranscriptPoint) -> bool {
+        let Some((start, end)) = self
+            .transcript_hitbox
+            .as_ref()
+            .and_then(|hitbox| hitbox.rows.get(point.row))
+            .and_then(|row| word_bounds_at(row, point.column))
+        else {
+            return false;
+        };
+        self.transcript_selection = Some(TranscriptSelection {
+            anchor: TranscriptPoint {
+                row: point.row,
+                column: start,
+            },
+            focus: TranscriptPoint {
+                row: point.row,
+                column: end,
+            },
+        });
+        true
+    }
+
+    /// Selects the entire visual row at `point`. Returns false for empty rows.
+    pub(super) fn select_line_at(&mut self, point: TranscriptPoint) -> bool {
+        let width = self
+            .transcript_hitbox
+            .as_ref()
+            .and_then(|hitbox| hitbox.rows.get(point.row))
+            .map(|row| row_display_width(row))
+            .unwrap_or(0);
+        if width == 0 {
+            return false;
+        }
+        self.transcript_selection = Some(TranscriptSelection {
+            anchor: TranscriptPoint {
+                row: point.row,
+                column: 0,
+            },
+            focus: TranscriptPoint {
+                row: point.row,
+                column: width,
+            },
+        });
+        true
+    }
+
+    /// Extends the live selection to follow the dragged mouse position.
+    fn set_drag_focus(&mut self, mouse: MouseEvent) {
+        if let Some(point) = self.transcript_point_for_mouse(mouse, true)
+            && let Some(selection) = &mut self.transcript_selection
+        {
+            selection.focus = point;
+        }
+    }
+
+    /// Arms or disarms edge auto-scroll based on the drag position. The
+    /// transcript sits flush with the top of the screen, so there is no room
+    /// *above* it for the pointer — scroll-up therefore arms on the top edge
+    /// *row* of the viewport. Scroll-down keeps requiring the pointer to cross
+    /// *below* the transcript (into the composer), so resting on the last
+    /// visible line never steals it from a normal selection. A step only fires
+    /// when there is hidden content that way, so arming with nothing left to
+    /// reveal is a no-op.
+    pub(super) fn update_drag_autoscroll(&mut self, mouse: MouseEvent) {
+        self.drag_autoscroll = self.transcript_hitbox.as_ref().and_then(|hitbox| {
+            let area = hitbox.area;
+            if area.height == 0 {
+                return None;
+            }
+            let max_x = area.x.saturating_add(area.width.saturating_sub(1));
+            let column = mouse.column.clamp(area.x, max_x).saturating_sub(area.x);
+            if mouse.row <= area.y {
+                Some(DragAutoscroll { dir: -1, column })
+            } else if mouse.row >= area.y.saturating_add(area.height) {
+                Some(DragAutoscroll { dir: 1, column })
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Drives one throttled auto-scroll step while a drag sits at an edge, then
+    /// re-anchors the selection focus to the newly exposed row. Returns true if
+    /// the view moved (caller repaints).
+    pub(super) fn tick_drag_autoscroll(&mut self) -> bool {
+        let Some(auto) = self.drag_autoscroll else {
+            return false;
+        };
+        if !self.transcript_drag_active {
+            self.drag_autoscroll = None;
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_autoscroll
+            && now.duration_since(last) < DRAG_AUTOSCROLL_INTERVAL
+        {
+            return false;
+        }
+        self.last_autoscroll = Some(now);
+
+        let before = self.transcript_scroll;
+        if auto.dir < 0 {
+            self.scroll_up_lines(1);
+        } else {
+            self.scroll_down_lines(1);
+        }
+        if self.transcript_scroll == before {
+            return false; // already at the top/bottom — nothing exposed
+        }
+
+        let row_count = self
+            .transcript_hitbox
+            .as_ref()
+            .map(|hitbox| hitbox.rows.len())
+            .unwrap_or(0);
+        let view_height = usize::from(self.transcript_view_height);
+        let focus_row = if auto.dir < 0 {
+            self.transcript_scroll
+        } else {
+            self.transcript_scroll + view_height.saturating_sub(1)
+        }
+        .min(row_count.saturating_sub(1));
+        if let Some(selection) = &mut self.transcript_selection {
+            selection.focus = TranscriptPoint {
+                row: focus_row,
+                column: auto.column,
+            };
+        }
+        true
+    }
+
+    /// Copies the current selection to the clipboard, toasts, and lights the
+    /// brief flash. An empty selection is cleared instead.
+    fn copy_selection_to_clipboard(&mut self) {
+        match self
+            .selected_transcript_text()
+            .filter(|text| !text.is_empty())
+        {
+            Some(selected) => match write_system_clipboard(&selected) {
+                Ok(()) => {
+                    let chars = selected.chars().count();
+                    let lines = selected.lines().count().max(1);
+                    let char_label = if chars == 1 { "char" } else { "chars" };
+                    let mut detail = format!("Copied {chars} {char_label}");
+                    if lines > 1 {
+                        detail.push_str(&format!(" · {lines} lines"));
+                    }
+                    self.show_toast(detail);
+                    self.selection_flash_until = Some(Instant::now() + SELECTION_FLASH_DURATION);
+                }
+                Err(err) => {
+                    self.notice = Some((ERROR, format!("Copy failed: {err}")));
+                }
+            },
+            None => {
+                self.transcript_selection = None;
+            }
+        }
+    }
+
+    /// Flash a brief, self-expiring toast bottom-right (copy confirmations, mode
+    /// toggles). Unlike `notice`, it fades on its own instead of lingering until
+    /// the next turn.
+    pub(super) fn show_toast(&mut self, text: impl Into<String>) {
         let created_at = Instant::now();
-        self.copy_toast = Some(CopyToast {
+        self.toast = Some(Toast {
             text: text.into(),
             created_at,
-            expires_at: created_at + COPY_TOAST_DURATION,
+            expires_at: created_at + TOAST_DURATION,
         });
     }
 
@@ -441,6 +1463,30 @@ impl ChatTuiApp {
         self.transcript_hitbox
             .as_ref()
             .is_some_and(|hitbox| rect_contains(hitbox.area, (mouse.column, mouse.row)))
+    }
+
+    /// Byte offset in the draft for a click inside the composer, or `None` when
+    /// the click misses it. Maps the click row (minus the attachment rows above
+    /// the draft, plus the draft scroll) and column to the draft via the shared
+    /// wrap model, so a click lands exactly where the caret renders.
+    pub(super) fn composer_offset_for_mouse(&self, mouse: MouseEvent) -> Option<usize> {
+        let area = self.composer_text_area?;
+        if !rect_contains(area, (mouse.column, mouse.row)) {
+            return None;
+        }
+        if self.draft.is_empty() {
+            return Some(0);
+        }
+        let attach = self.draft_attachments.len() as u16;
+        let rel_y = mouse.row.saturating_sub(area.y);
+        if rel_y < attach {
+            // Clicked an attachment row above the draft → caret to the start.
+            return Some(0);
+        }
+        let rows = composer_visual_rows(&self.draft, self.composer_text_width());
+        let row = (usize::from(rel_y - attach) + self.composer_scroll).min(rows.len() - 1);
+        let target_col = usize::from(mouse.column.saturating_sub(area.x));
+        Some(composer_offset_for_col(&self.draft, &rows, row, target_col))
     }
 
     fn transcript_point_for_mouse(
@@ -478,7 +1524,57 @@ impl ChatTuiApp {
 
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
         match (&self.overlay, mouse.kind) {
-            (Overlay::Help, _) => Ok(Some(false)),
+            (Overlay::Help { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Help { scroll } = &mut self.overlay {
+                    *scroll = wheel_scroll(*scroll, up);
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Help { .. }, _) => Ok(Some(false)),
+            (Overlay::Output { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Output { scroll } = &mut self.overlay {
+                    *scroll = wheel_scroll(*scroll, up);
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Output { .. }, _) => Ok(Some(false)),
+            // The /skills and /mcp toggle lists scroll on the wheel the same way
+            // they do on ↑/↓: a drill-in scrolls its body, otherwise the wheel
+            // moves the selection (the list follows it), and add-input ignores it.
+            (Overlay::Skills(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Skills(state) = &mut self.overlay {
+                    if state.viewing.is_some() {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if state.adding.is_none() {
+                        if up {
+                            state.select_prev();
+                        } else {
+                            state.select_next();
+                        }
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Skills(_), _) => Ok(Some(false)),
+            (Overlay::Mcp(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Mcp(state) = &mut self.overlay {
+                    if state.viewing.is_some() {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if state.adding.is_none() {
+                        if up {
+                            state.select_prev();
+                        } else {
+                            state.select_next();
+                        }
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Mcp(_), _) => Ok(Some(false)),
             (Overlay::Picker(picker), MouseEventKind::ScrollUp) if !picker.loading => {
                 if let Overlay::Picker(picker) = &mut self.overlay {
                     picker.select_prev();
@@ -521,4 +1617,117 @@ impl ChatTuiApp {
 
         Ok(Some(false))
     }
+}
+
+/// State for stitching a mouse report that crossterm split at its leading ESC
+/// back together (see `drain_input`). `Idle` is the common case; `PendingEsc`
+/// holds a bare Esc whose fate is undecided; `Sgr` accumulates the `[<…`
+/// fragment once the CSI lead is confirmed.
+pub(super) enum EscReassembly {
+    Idle,
+    PendingEsc,
+    Sgr(String),
+}
+
+/// Outcome of feeding one event through the reassembler.
+pub(super) enum EscStep {
+    /// The event was folded into held state; nothing more to do.
+    Consumed,
+    /// Handling held input asked the app to exit.
+    Exit,
+    /// A plain event the caller should handle as usual.
+    Passthrough(Event),
+}
+
+/// How an SGR mouse fragment (always starting `[`) grows one character at a time.
+pub(super) enum FragStep {
+    /// A valid-so-far prefix of `[<{params}` — keep accumulating.
+    Continue,
+    /// A complete `[<{params}{M|m}` report.
+    Final,
+    /// The run can't be an SGR mouse report; treat what we held as text.
+    Invalid,
+}
+
+/// Steps an overlay scroll offset by one mouse-wheel notch (`up` decreases it).
+/// Clamping is left to the renderer, so over-scrolling past the end is harmless.
+fn wheel_scroll(offset: u16, up: bool) -> u16 {
+    const WHEEL_LINES: u16 = 3;
+    if up {
+        offset.saturating_sub(WHEEL_LINES)
+    } else {
+        offset.saturating_add(WHEEL_LINES)
+    }
+}
+
+/// `true` when `event` is an unmodified `Esc` keypress.
+fn is_bare_esc(event: &Event) -> bool {
+    matches!(event, Event::Key(k)
+        if k.kind == KeyEventKind::Press && k.code == KeyCode::Esc && k.modifiers.is_empty())
+}
+
+/// The character of a `Char` keypress, else `None` (ignores modifiers — the
+/// leaked fragment bytes arrive as plain unmodified characters).
+fn char_press(event: &Event) -> Option<char> {
+    match event {
+        Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+            KeyCode::Char(c) => Some(c),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Classifies how `buf` (the accumulated fragment, always beginning with `[`)
+/// fits the SGR mouse grammar `[<{digits and ';'}{M|m}`.
+pub(super) fn sgr_mouse_frag_step(buf: &str) -> FragStep {
+    let Some(body) = buf.strip_prefix("[<") else {
+        // Only `[` so far: still waiting for the `<` that marks SGR mouse.
+        return if buf == "[" {
+            FragStep::Continue
+        } else {
+            FragStep::Invalid
+        };
+    };
+    let Some(last) = body.chars().last() else {
+        return FragStep::Continue; // exactly `[<`
+    };
+    if last == 'M' || last == 'm' {
+        let params = &body[..body.len() - last.len_utf8()];
+        if !params.is_empty() && params.chars().all(|c| c.is_ascii_digit() || c == ';') {
+            FragStep::Final
+        } else {
+            FragStep::Invalid
+        }
+    } else if last.is_ascii_digit() || last == ';' {
+        FragStep::Continue
+    } else {
+        FragStep::Invalid
+    }
+}
+
+/// Parses a reassembled SGR fragment (`[<{button};{col};{row}{M|m}`) into a
+/// wheel-scroll `MouseEvent`. Returns `None` for non-scroll buttons or malformed
+/// input. SGR coordinates are 1-based; crossterm's `MouseEvent` is 0-based.
+pub(super) fn parse_sgr_scroll(frag: &str) -> Option<MouseEvent> {
+    let body = frag.strip_prefix("[<")?;
+    let body = body.strip_suffix('M').or_else(|| body.strip_suffix('m'))?;
+    let mut parts = body.split(';');
+    let button: u16 = parts.next()?.parse().ok()?;
+    let col: u16 = parts.next()?.parse().ok()?;
+    let row: u16 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let kind = match button {
+        64 => MouseEventKind::ScrollUp,
+        65 => MouseEventKind::ScrollDown,
+        _ => return None,
+    };
+    Some(MouseEvent {
+        kind,
+        column: col.saturating_sub(1),
+        row: row.saturating_sub(1),
+        modifiers: KeyModifiers::NONE,
+    })
 }

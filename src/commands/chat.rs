@@ -113,6 +113,20 @@ fn chat_sandbox_dir() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Human-readable endpoint for the `--dry-run` preview: the sentinel base URLs
+/// (`copilot`, `ollama`, the aivo-starter sentinel) are resolved to a friendly
+/// label / real URL so the preview doesn't leak internal placeholders.
+fn friendly_base_url(base_url: &str) -> String {
+    match base_url {
+        "copilot" => "GitHub Copilot".to_string(),
+        "ollama" => "Ollama (local)".to_string(),
+        u if u == crate::constants::AIVO_STARTER_SENTINEL => {
+            crate::constants::AIVO_STARTER_REAL_URL.to_string()
+        }
+        u => u.to_string(),
+    }
+}
+
 fn detect_initial_chat_format(base_url: &str) -> ChatFormat {
     use crate::services::provider_protocol::detect_provider_protocol;
     match detect_provider_protocol(base_url) {
@@ -186,6 +200,65 @@ fn chat_route_to_persist(
         return None;
     }
     Some((model, route))
+}
+
+/// If `cwd` is too broad to be a safe agent workspace, return a phrase naming
+/// why (for the confirmation prompt); else `None`. "Too broad" means the agent's
+/// free-write zone would engulf the home directory, the filesystem root, or any
+/// directory holding aivo's own config/key store. Pure — `canonicalize` is
+/// best-effort, falling back to the literal path so non-existent paths still
+/// compare lexically.
+fn overbroad_workspace_reason(
+    cwd: &Path,
+    home: Option<&Path>,
+    config_dir: &Path,
+) -> Option<&'static str> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let cwd = canon(cwd);
+    // Filesystem root (no parent) — e.g. "/" or "C:\".
+    if cwd.parent().is_none() {
+        return Some("the filesystem root");
+    }
+    if let Some(home) = home
+        && canon(home) == cwd
+    {
+        return Some("your home directory");
+    }
+    // The key store lives under cwd → the agent could rewrite it without a
+    // prompt. Catches `~`, `~/.config`, and any other ancestor of the store.
+    if canon(config_dir).starts_with(&cwd) {
+        return Some("a directory that holds aivo's config and key store");
+    }
+    None
+}
+
+/// Warn that the workspace is over-broad and ask whether to proceed. The safe
+/// default is NO; off a TTY we fail closed unless `AIVO_AGENT_TRUST_CWD` opts in.
+fn confirm_overbroad_workspace(reason: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    if std::env::var("AIVO_AGENT_TRUST_CWD").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return true;
+    }
+    eprintln!("  {} Starting the agent in {}.", style::yellow("!"), reason);
+    eprintln!(
+        "    It can read and write freely here without per-file prompts — including \
+shell startup files, ~/.ssh, and the key store."
+    );
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "    Refusing in a non-interactive run — cd into a project, or set \
+AIVO_AGENT_TRUST_CWD=1 to override."
+        );
+        return false;
+    }
+    eprint!("    Continue anyway? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        // EOF (^D) / read error is a non-answer → take the safe default (no).
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+    }
 }
 
 /// ChatCommand provides an interactive REPL for chatting with AI models
@@ -266,6 +339,126 @@ impl ChatCommand {
         model_names::transform_model_for_provider(base_url, model)
     }
 
+    /// Read-only preview for `aivo chat --dry-run`: resolves the key, model,
+    /// endpoint, agent profile, sandbox dir, and mode the way a real launch
+    /// would — but performs no HTTP, persistence, model picker, or server spawn.
+    /// HF refs show a placeholder endpoint (llama-server is not started).
+    async fn print_chat_dry_run(
+        &self,
+        model_input: Option<String>,
+        attachments: &[String],
+        key_override: Option<ApiKey>,
+        one_shot: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<ExitCode> {
+        let hf = model_input.as_deref().is_some_and(|m| {
+            huggingface::is_hf_or_local_gguf(m) || huggingface::is_bare_hf_picker_trigger(m)
+        });
+
+        // Agent profile is read-only (discovered from disk, never persisted).
+        let (agent_label, agent_model) = match agent {
+            Some(name) if !crate::agent::subagents::is_default_agent_name(name) => {
+                let cwd_path = std::env::current_dir().unwrap_or_default();
+                match crate::agent::subagents::discover_subagents(&cwd_path)
+                    .into_iter()
+                    .find(|s| s.name == name)
+                {
+                    Some(p) => (name.to_string(), p.model),
+                    None => (format!("default (no agent named '{name}')"), None),
+                }
+            }
+            _ => ("default".to_string(), None),
+        };
+
+        println!("{}", style::bold("Dry run — aivo chat would start with:"));
+        println!();
+
+        if hf {
+            let label = model_input.clone().unwrap_or_default();
+            println!(
+                "{} {} {}",
+                style::bold("Key:   "),
+                style::cyan("hf-local"),
+                style::dim("(local llama-server — not spawned in dry run)"),
+            );
+            println!("{} {}", style::bold("Model: "), label);
+        } else {
+            let key = match key_override {
+                Some(k) => Some(k),
+                None => self.session_store.get_active_key().await.ok().flatten(),
+            };
+            match &key {
+                Some(k) => println!(
+                    "{} {} {}",
+                    style::bold("Key:   "),
+                    style::cyan(k.display_name()),
+                    style::dim(format!("({})", friendly_base_url(&k.base_url))),
+                ),
+                None => println!(
+                    "{} {}",
+                    style::bold("Key:   "),
+                    style::dim("(none — run `aivo keys add`)"),
+                ),
+            }
+            // Model precedence, read-only: explicit `-m` > agent profile model >
+            // per-key persisted model > last selection > picker (shown as a hint).
+            let model = match model_input.as_deref() {
+                Some(m) if !m.is_empty() => Some(m.to_string()),
+                _ => {
+                    let mut m = agent_model.clone();
+                    if m.is_none()
+                        && let Some(k) = &key
+                    {
+                        m = self
+                            .session_store
+                            .get_chat_model(&k.id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if m.is_none()
+                            && let Ok(Some(sel)) = self.session_store.get_last_selection().await
+                            && sel.key_id == k.id
+                        {
+                            m = sel
+                                .model
+                                .filter(|x| x != crate::constants::MODEL_DEFAULT_PLACEHOLDER);
+                        }
+                    }
+                    m
+                }
+            };
+            println!(
+                "{} {}",
+                style::bold("Model: "),
+                model.as_deref().unwrap_or("(model picker)"),
+            );
+        }
+
+        println!("{} {}", style::bold("Agent: "), agent_label);
+        println!(
+            "{} {}",
+            style::bold("Mode:  "),
+            if one_shot.is_some() {
+                "one-shot (-p)"
+            } else {
+                "interactive TUI"
+            },
+        );
+        if let Ok(dir) = chat_sandbox_dir() {
+            println!(
+                "{} {}",
+                style::bold("Sandbox:"),
+                style::dim(dir.to_string_lossy()),
+            );
+        }
+        if !attachments.is_empty() {
+            println!("{} {}", style::bold("Attach:"), attachments.join(", "),);
+        }
+        Ok(ExitCode::Success)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
@@ -275,9 +468,22 @@ impl ChatCommand {
         refresh: bool,
         key_override: Option<ApiKey>,
         json: bool,
+        resume: Option<String>,
+        agent: Option<String>,
+        dry_run: bool,
     ) -> ExitCode {
         match self
-            .execute_internal(model, one_shot, attachments, refresh, key_override, json)
+            .execute_internal(
+                model,
+                one_shot,
+                attachments,
+                refresh,
+                key_override,
+                json,
+                resume,
+                agent,
+                dry_run,
+            )
             .await
         {
             Ok(code) => code,
@@ -288,6 +494,7 @@ impl ChatCommand {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_internal(
         &self,
         model_flag: Option<String>,
@@ -296,7 +503,38 @@ impl ChatCommand {
         refresh: bool,
         key_override: Option<ApiKey>,
         json: bool,
+        resume: Option<String>,
+        agent: Option<String>,
+        dry_run: bool,
     ) -> Result<ExitCode> {
+        // `--dry-run` previews resolution and exits before any side effect
+        // (no HTTP, persistence, model picker, llama-server spawn, or TUI).
+        // Placed first so it also skips the over-broad-workspace prompt below.
+        if dry_run {
+            return self
+                .print_chat_dry_run(
+                    model_flag,
+                    &attachments,
+                    key_override,
+                    one_shot.as_deref(),
+                    agent.as_deref(),
+                )
+                .await;
+        }
+
+        // Refuse to treat an over-broad directory as a free-write workspace
+        // without explicit confirmation: in the home dir, the filesystem root,
+        // or any directory holding aivo's own config/key store, the agent could
+        // silently rewrite shell rc files, ~/.ssh, or the encrypted key store.
+        if let Some(reason) = overbroad_workspace_reason(
+            &std::env::current_dir().unwrap_or_default(),
+            crate::services::system_env::home_dir().as_deref(),
+            self.session_store.config_dir(),
+        ) && !confirm_overbroad_workspace(reason)
+        {
+            return Ok(ExitCode::UserError);
+        }
+
         // Bare `hf:` opens a picker; rewrite to a concrete ref.
         let model_flag = match model_flag.as_deref() {
             Some(m) if huggingface::is_bare_hf_picker_trigger(m) => {
@@ -364,12 +602,44 @@ impl ChatCommand {
         // `aivo run claude` / `aivo run codex` / etc.
         let cwd = chat_sandbox_dir()?.to_string_lossy().into_owned();
 
+        // Resolve `--agent` up front (before model resolution) so a profile's
+        // pinned `model:` can seed the model when `--model` wasn't given. `default`
+        // (and aliases) mean the built-in agent (no profile); an unknown name falls
+        // back to default with a startup notice — reported now, not on the first
+        // turn — so `initial_agent` reaching the TUI is always a real profile or
+        // None.
+        let (initial_agent, agent_notice, agent_model) = match agent.as_deref() {
+            None => (None, None, None),
+            Some(name) if crate::agent::subagents::is_default_agent_name(name) => {
+                (None, None, None)
+            }
+            Some(name) => {
+                let cwd_path = std::env::current_dir().unwrap_or_default();
+                match crate::agent::subagents::discover_subagents(&cwd_path)
+                    .into_iter()
+                    .find(|s| s.name == name)
+                {
+                    Some(profile) => (Some(name.to_string()), None, profile.model),
+                    None => (
+                        None,
+                        Some(format!(
+                            "No agent named '{name}' — using the default agent."
+                        )),
+                        None,
+                    ),
+                }
+            }
+        };
+
         // HF mode already has the model set; skip `resolve_model` to
         // avoid persisting it under the ephemeral synthetic key id.
         let resolved = if hf_active {
             Some(model_flag.clone().unwrap_or_default())
         } else {
-            self.resolve_model(&client, &key, model_flag).await?
+            // Precedence: explicit `--model` > the `--agent` profile's `model:` >
+            // the per-key persisted model > last selection > picker.
+            let effective = model_flag.clone().or(agent_model);
+            self.resolve_model(&client, &key, effective).await?
         };
         let raw_model = match resolved {
             Some(m) => m,
@@ -480,7 +750,7 @@ impl ChatCommand {
                     return Ok(());
                 }
                 match chunk {
-                    ChatResponseChunk::Reasoning(_) => {}
+                    ChatResponseChunk::Reasoning(_) | ChatResponseChunk::Usage(_) => {}
                     ChatResponseChunk::Content(text) => {
                         if current_section != Some("answer") {
                             if current_section.is_some() {
@@ -508,6 +778,11 @@ impl ChatCommand {
                     let mapped = match chunk {
                         CursorChunk::Content(t) => ChatResponseChunk::Content(t.to_string()),
                         CursorChunk::Reasoning(t) => ChatResponseChunk::Reasoning(t.to_string()),
+                        // Tool steps are progress, not the answer — omit from
+                        // one-shot output (which scripts may parse).
+                        CursorChunk::ToolCall { .. } | CursorChunk::ToolUpdate { .. } => {
+                            return Ok(());
+                        }
                     };
                     on_chunk(mapped)
                 };
@@ -645,7 +920,14 @@ impl ChatCommand {
 
         let initial_session = new_chat_session_id();
         let initial_history = Vec::new();
-        let startup_notice = attachment_notice(&pending_attachments);
+
+        // The agent notice (if any, from the early `--agent` resolution) leads; an
+        // attachment notice follows.
+        let startup_notice = match (agent_notice, attachment_notice(&pending_attachments)) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
 
         self.session_store
             .record_selection(&key.id, "chat", Some(&raw_model))
@@ -664,6 +946,8 @@ impl ChatCommand {
             initial_history,
             initial_draft_attachments: pending_attachments,
             startup_notice,
+            initial_resume: resume,
+            initial_agent,
         })
         .await?;
 
@@ -689,7 +973,7 @@ impl ChatCommand {
         println!(
             "{}",
             style::dim(
-                "Slash commands are available inside chat: /new, /resume, /model, /key, /attach, /detach, /help, /exit."
+                "Slash commands are available inside chat: /new, /resume, /model, /key, /agent, /attach, /detach, /help, /exit."
             )
         );
         println!();
@@ -710,6 +994,10 @@ impl ChatCommand {
             "Select API key by ID or name (-k opens key picker)",
         );
         print_opt(
+            "--agent <name>",
+            "Start as an agent profile from .aivo/agents or .claude/agents",
+        );
+        print_opt(
             "-p, --prompt [prompt]",
             "Send one prompt and exit (reads stdin when no value given; -x is a legacy alias)",
         );
@@ -718,12 +1006,20 @@ impl ChatCommand {
             "Bypass model cache and fetch a fresh list for the picker",
         );
         print_opt(
+            "--resume [last|id]",
+            "Resume a saved chat: picker (bare), most recent (last), or by session id",
+        );
+        print_opt(
             "--attach <path>",
             "Queue a text file or image for the next message",
         );
         print_opt(
             "--json",
             "Print upstream provider's raw JSON response (requires -p; useful for scripting)",
+        );
+        print_opt(
+            "--dry-run",
+            "Print the resolved key, model, endpoint, and agent without connecting",
         );
         println!();
         println!("{}", style::bold("Slash Commands:"));
@@ -746,6 +1042,18 @@ impl ChatCommand {
             "Attach a text file or image to the next message",
         );
         print_cmd("/detach <n>", "Remove one queued attachment by number");
+        print_cmd(
+            "/agent [name]",
+            "Switch agent profile (name, or 'default' to reset); only at chat start",
+        );
+        print_cmd(
+            "/goal <objective>",
+            "Work autonomously toward a goal until done ('/goal stop' to end)",
+        );
+        print_cmd(
+            "/rewind",
+            "Rewind to an earlier turn and revert file edits made since",
+        );
         print_cmd("/help / /exit", "Open command help / leave chat");
         print_cmd("//message", "Send a literal leading slash");
         println!();
@@ -1316,7 +1624,14 @@ async fn log_chat_turn(
             output_tokens: Some(usage.completion_tokens as i64),
             cache_read_input_tokens: Some(usage.cache_read_input_tokens as i64),
             cache_creation_input_tokens: Some(usage.cache_creation_input_tokens as i64),
-            title: Some(log_title(&user_message.content)),
+            // A skill invocation's content is the whole inlined SKILL.md body;
+            // log the compact `/name args` the user typed (so `aivo logs` shows
+            // the real input, e.g. `/baidu-search 歌曲`) and keep the full
+            // expanded body in the searchable body_text for debugging.
+            title: Some(log_title(
+                &chat_tui::skill_invocation_label(&user_message.content)
+                    .unwrap_or_else(|| user_message.content.clone()),
+            )),
             body_text: Some(format!(
                 "User:\n{}\n\nAssistant:\n{}",
                 user_message.content, assistant_content
@@ -1420,6 +1735,25 @@ where
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Request failed")))
 }
 
+/// Append a stream chunk to `buf` and drain every complete `\n`-terminated line
+/// (trailing `\r`/`\n` stripped). Accumulates RAW BYTES so a multi-byte char
+/// (CJK, emoji) straddling a chunk boundary is reassembled — decoding each chunk
+/// alone would split it into replacement chars. The partial trailing line stays
+/// buffered for the next chunk.
+fn drain_sse_lines(buf: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
+    buf.extend_from_slice(chunk);
+    let mut lines = Vec::new();
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+        lines.push(
+            String::from_utf8_lossy(&line_bytes)
+                .trim_end_matches(['\n', '\r'])
+                .to_string(),
+        );
+    }
+    lines
+}
+
 /// Sends a chat completion request and prints the response.
 /// Tries streaming first; falls back to non-streaming if the server returns a 5xx error.
 /// Returns the full assistant message content.
@@ -1471,7 +1805,7 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut done = false;
 
     while !done {
@@ -1486,13 +1820,7 @@ where
         }) else {
             break;
         };
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
                     done = true;
@@ -1500,6 +1828,9 @@ where
                 }
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 capture_model(&mut response_model, parse_openai_model_chunk, data);
                 if let Some(chunk) = parse_sse_chunk(data) {
@@ -1509,6 +1840,7 @@ where
                         ChatResponseChunk::Reasoning(reasoning) => {
                             full_reasoning.push_str(reasoning);
                         }
+                        ChatResponseChunk::Usage(_) => {}
                     }
                     on_chunk(chunk)?;
                 }
@@ -1516,7 +1848,8 @@ where
         }
     }
 
-    let tail = line_buf.trim();
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
             if let Some(tokens) = parse_openai_usage_chunk(data) {
@@ -1530,6 +1863,7 @@ where
                 match &chunk {
                     ChatResponseChunk::Content(content) => full_content.push_str(content),
                     ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                    ChatResponseChunk::Usage(_) => {}
                 }
                 on_chunk(chunk)?;
             }
@@ -1630,6 +1964,38 @@ where
     })
 }
 
+/// Finalize a non-streaming Responses-API body into a turn result: extract the
+/// message / usage / model, fail on empty, emit the content, and carry the raw
+/// body for `--json`. Shared by the direct and Copilot Responses senders (the
+/// Responses counterpart to [`emit_openai_chat_value`]).
+fn emit_responses_chat_value<F>(
+    body: serde_json::Value,
+    spinning: &Arc<AtomicBool>,
+    on_chunk: &mut F,
+) -> Result<ChatTurnResult>
+where
+    F: FnMut(ChatResponseChunk) -> Result<()>,
+{
+    let response = extract_responses_message(&body);
+    let usage = extract_responses_usage(&body);
+    let response_model = extract_response_model(&body);
+
+    if response.content.is_empty() {
+        style::stop_spinner(spinning);
+        anyhow::bail!("Provider returned an empty response");
+    }
+
+    style::stop_spinner(spinning);
+    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
+
+    Ok(ChatTurnResult {
+        content: response.content,
+        usage,
+        model: response_model,
+        raw_body: Some(body),
+    })
+}
+
 /// Sends a chat request via GitHub Copilot (token exchange + Copilot API).
 #[allow(clippy::too_many_arguments)]
 async fn send_copilot_request<F>(
@@ -1700,7 +2066,7 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut done = false;
 
     while !done {
@@ -1715,13 +2081,7 @@ where
         }) else {
             break;
         };
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if data.trim() == "[DONE]" {
                     done = true;
@@ -1729,6 +2089,9 @@ where
                 }
                 if let Some(tokens) = parse_openai_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 capture_model(&mut response_model, parse_openai_model_chunk, data);
                 if let Some(chunk) = parse_sse_chunk(data) {
@@ -1738,6 +2101,7 @@ where
                         ChatResponseChunk::Reasoning(reasoning) => {
                             full_reasoning.push_str(reasoning);
                         }
+                        ChatResponseChunk::Usage(_) => {}
                     }
                     on_chunk(chunk)?;
                 }
@@ -1745,7 +2109,8 @@ where
         }
     }
 
-    let tail = line_buf.trim();
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
     if !tail.is_empty() {
         if let Some(data) = sse_data_payload(tail) {
             if let Some(tokens) = parse_openai_usage_chunk(data) {
@@ -1759,6 +2124,7 @@ where
                 match &chunk {
                     ChatResponseChunk::Content(content) => full_content.push_str(content),
                     ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                    ChatResponseChunk::Usage(_) => {}
                 }
                 on_chunk(chunk)?;
             }
@@ -1838,29 +2204,7 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
-    let response = extract_openai_message(&body);
-    let usage = extract_openai_usage(&body);
-    let response_model = extract_response_model(&body);
-
-    if response.content.is_empty() && response.reasoning_content.is_none() {
-        style::stop_spinner(spinning);
-        anyhow::bail!("Provider returned an empty response");
-    }
-
-    style::stop_spinner(spinning);
-    if let Some(reasoning) = response.reasoning_content.clone() {
-        on_chunk(ChatResponseChunk::Reasoning(reasoning))?;
-    }
-    if !response.content.is_empty() {
-        on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
-    }
-
-    Ok(ChatTurnResult {
-        content: response.content,
-        usage,
-        model: response_model,
-        raw_body: Some(body),
-    })
+    emit_openai_chat_value(body, spinning, on_chunk)
 }
 
 /// Sends a chat request via GitHub Copilot using the Responses API.
@@ -1930,19 +2274,16 @@ where
     let mut full_content = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await? {
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 capture_model(&mut response_model, parse_responses_model_chunk, data);
                 if let Some(chunk) = parse_responses_chunk(data) {
@@ -1956,7 +2297,8 @@ where
         }
     }
 
-    let tail = line_buf.trim();
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
     {
@@ -2029,24 +2371,7 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
-    let response = extract_responses_message(&body);
-    let usage = extract_responses_usage(&body);
-    let response_model = extract_response_model(&body);
-
-    if response.content.is_empty() {
-        style::stop_spinner(spinning);
-        anyhow::bail!("Provider returned an empty response");
-    }
-
-    style::stop_spinner(spinning);
-    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
-
-    Ok(ChatTurnResult {
-        content: response.content,
-        usage,
-        model: response_model,
-        raw_body: Some(body),
-    })
+    emit_responses_chat_value(body, spinning, on_chunk)
 }
 
 /// Trims chat history to keep at most `max_messages` messages.
@@ -2148,19 +2473,16 @@ where
     let mut full_content = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await? {
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_responses_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 capture_model(&mut response_model, parse_responses_model_chunk, data);
                 if let Some(chunk) = parse_responses_chunk(data) {
@@ -2174,7 +2496,8 @@ where
         }
     }
 
-    let tail = line_buf.trim();
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
     {
@@ -2236,24 +2559,7 @@ where
     }
 
     let body: serde_json::Value = response.json().await?;
-    let response = extract_responses_message(&body);
-    let usage = extract_responses_usage(&body);
-    let response_model = extract_response_model(&body);
-
-    if response.content.is_empty() {
-        style::stop_spinner(spinning);
-        anyhow::bail!("Provider returned an empty response");
-    }
-
-    style::stop_spinner(spinning);
-    on_chunk(ChatResponseChunk::Content(response.content.clone()))?;
-
-    Ok(ChatTurnResult {
-        content: response.content,
-        usage,
-        model: response_model,
-        raw_body: Some(body),
-    })
+    emit_responses_chat_value(body, spinning, on_chunk)
 }
 
 /// Sends a request using Anthropic's native /v1/messages API.
@@ -2309,19 +2615,16 @@ where
     let mut full_reasoning = String::new();
     let mut usage = None;
     let mut response_model: Option<String> = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await? {
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_anthropic_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 capture_model(&mut response_model, parse_anthropic_model_chunk, data);
                 if let Some(chunk) = parse_anthropic_chunk(data) {
@@ -2331,6 +2634,7 @@ where
                         ChatResponseChunk::Reasoning(reasoning) => {
                             full_reasoning.push_str(reasoning);
                         }
+                        ChatResponseChunk::Usage(_) => {}
                     }
                     on_chunk(chunk)?;
                 }
@@ -2338,21 +2642,28 @@ where
         }
     }
 
-    if full_content.is_empty() {
-        let tail = line_buf.trim();
-        if let Some(data) = sse_data_payload(tail) {
-            if let Some(tokens) = parse_anthropic_usage_chunk(data) {
-                merge_token_usage(&mut usage, tokens);
+    // Drain a final, non-newline-terminated SSE line left in the buffer (a
+    // truncated stream). Process it whenever present — NOT only when no content
+    // arrived — so the last fragment of a truncated reply isn't dropped. The
+    // other five senders already do this; gating on `full_content.is_empty()`
+    // here was the lone divergence and silently lost that fragment.
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
+    if !tail.is_empty()
+        && let Some(data) = sse_data_payload(tail)
+    {
+        if let Some(tokens) = parse_anthropic_usage_chunk(data) {
+            merge_token_usage(&mut usage, tokens);
+        }
+        capture_model(&mut response_model, parse_anthropic_model_chunk, data);
+        if let Some(chunk) = parse_anthropic_chunk(data) {
+            style::stop_spinner(spinning);
+            match &chunk {
+                ChatResponseChunk::Content(text) => full_content.push_str(text),
+                ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
+                ChatResponseChunk::Usage(_) => {}
             }
-            capture_model(&mut response_model, parse_anthropic_model_chunk, data);
-            if let Some(chunk) = parse_anthropic_chunk(data) {
-                style::stop_spinner(spinning);
-                match &chunk {
-                    ChatResponseChunk::Content(text) => full_content.push_str(text),
-                    ChatResponseChunk::Reasoning(reasoning) => full_reasoning.push_str(reasoning),
-                }
-                on_chunk(chunk)?;
-            }
+            on_chunk(chunk)?;
         }
     }
 
@@ -2496,19 +2807,16 @@ where
 
     let mut full_content = String::new();
     let mut usage = None;
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = response.chunk().await? {
-        let text = String::from_utf8_lossy(&chunk);
-        line_buf.push_str(&text);
-
-        while let Some(pos) = line_buf.find('\n') {
-            let line = line_buf[..pos].trim_end_matches('\r').to_string();
-            line_buf = line_buf[pos + 1..].to_string();
-
+        for line in drain_sse_lines(&mut line_buf, &chunk) {
             if let Some(data) = sse_data_payload(&line) {
                 if let Some(tokens) = parse_google_usage_chunk(data) {
                     merge_token_usage(&mut usage, tokens);
+                    if let Some(usage) = usage {
+                        on_chunk(ChatResponseChunk::Usage(usage))?;
+                    }
                 }
                 if let Some(chunk) = parse_google_chunk(data) {
                     style::stop_spinner(spinning);
@@ -2522,7 +2830,8 @@ where
     }
 
     // Process any remaining data in the buffer
-    let tail = line_buf.trim();
+    let tail_str = String::from_utf8_lossy(&line_buf);
+    let tail = tail_str.trim();
     if !tail.is_empty()
         && let Some(data) = sse_data_payload(tail)
     {
@@ -2614,6 +2923,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overbroad_workspace_flags_home_root_and_keystore_ancestors() {
+        let home = Path::new("/home/alice");
+        let config = Path::new("/home/alice/.config/aivo");
+
+        // Home directory itself, the filesystem root, and ancestors of the key
+        // store are all over-broad.
+        assert!(overbroad_workspace_reason(home, Some(home), config).is_some());
+        assert!(overbroad_workspace_reason(Path::new("/"), Some(home), config).is_some());
+        assert!(
+            overbroad_workspace_reason(Path::new("/home/alice/.config"), Some(home), config)
+                .is_some(),
+            "a directory containing the key store is over-broad"
+        );
+
+        // An ordinary project directory is fine, even when it shares a prefix
+        // with the home path.
+        assert!(
+            overbroad_workspace_reason(Path::new("/home/alice/projects/app"), Some(home), config)
+                .is_none()
+        );
+        // A sibling of the config dir does not contain it.
+        assert!(
+            overbroad_workspace_reason(Path::new("/home/alice/.cache"), Some(home), config)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {
         let user_history = vec![ChatMessage {
             role: "user".to_string(),
@@ -2672,6 +3009,48 @@ mod tests {
     }
 
     #[test]
+    fn test_friendly_base_url_resolves_sentinels() {
+        // Sentinel base URLs must not leak into the --dry-run preview.
+        assert_eq!(friendly_base_url("copilot"), "GitHub Copilot");
+        assert_eq!(friendly_base_url("ollama"), "Ollama (local)");
+        assert_eq!(
+            friendly_base_url(crate::constants::AIVO_STARTER_SENTINEL),
+            crate::constants::AIVO_STARTER_REAL_URL
+        );
+        // A real URL passes through untouched.
+        assert_eq!(
+            friendly_base_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1"
+        );
+    }
+
+    #[test]
+    fn test_drain_sse_lines_reassembles_split_multibyte() {
+        // A 3-byte char (`中`) split across two chunks must be reassembled, not
+        // corrupted into replacement chars.
+        let line = "data: 中文\n";
+        let bytes = line.as_bytes();
+        let split = line.find('中').unwrap() + 1; // mid-`中`
+        let mut buf: Vec<u8> = Vec::new();
+        // First chunk ends mid-char → no complete line yet.
+        assert!(drain_sse_lines(&mut buf, &bytes[..split]).is_empty());
+        // Second chunk completes it → the full, intact line.
+        assert_eq!(
+            drain_sse_lines(&mut buf, &bytes[split..]),
+            vec!["data: 中文".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_drain_sse_lines_splits_and_strips_cr() {
+        let mut buf: Vec<u8> = Vec::new();
+        let lines = drain_sse_lines(&mut buf, b"a\r\nb\nc");
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+        // The partial `c` stays buffered until its newline arrives.
+        assert_eq!(drain_sse_lines(&mut buf, b"\n"), vec!["c".to_string()]);
+    }
+
+    #[test]
     fn test_compose_one_shot_prompt_with_stdin_context() {
         let out = compose_one_shot_prompt("Summarize in one sentence", Some("diff --git a b"));
         assert!(out.contains("Summarize in one sentence"));
@@ -2723,6 +3102,140 @@ mod tests {
 
         assert_eq!(headers.get("x-api-key").unwrap(), "sk-test");
         assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    /// End-to-end smoke of the OpenAI streaming sender against a fake SSE server,
+    /// exercising the trailing-tail path: the final `data:` line is NOT
+    /// newline-terminated, so it stays in the leftover buffer and must be drained
+    /// by the post-loop tail handling (content + usage), not the main loop. Also
+    /// covers model capture and cross-chunk content accumulation. (The senders
+    /// otherwise had no end-to-end coverage — only the parse helpers did.)
+    #[tokio::test]
+    async fn send_chat_request_accumulates_stream_including_trailing_tail() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let body = "data: {\"model\":\"deepseek-v4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let key = ApiKey::new_with_protocol(
+            "test".to_string(),
+            "test".to_string(),
+            format!("http://127.0.0.1:{port}"),
+            None,
+            "sk-test".to_string(),
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let spinning = Arc::new(AtomicBool::new(false));
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }];
+        let mut streamed = String::new();
+        let result = send_chat_request(
+            &client,
+            &key,
+            "deepseek-v4",
+            &messages,
+            &spinning,
+            false,
+            &mut |chunk| {
+                if let ChatResponseChunk::Content(c) = &chunk {
+                    streamed.push_str(c);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        // " world" (tail line) is folded in alongside the loop's "Hello", and the
+        // tail also carried the usage — proving the leftover-buffer path runs.
+        assert_eq!(result.content, "Hello world");
+        assert_eq!(streamed, "Hello world");
+        assert_eq!(result.model.as_deref(), Some("deepseek-v4"));
+        assert_eq!(result.usage.map(|u| u.total_tokens()), Some(12));
+    }
+
+    /// Regression: a truncated Anthropic stream whose final content_block_delta
+    /// lacks a trailing newline (arriving AFTER content already streamed) must
+    /// still have that fragment recovered from the leftover buffer. It used to be
+    /// dropped because the tail was gated on `full_content.is_empty()` — the lone
+    /// sender that diverged from the others' `!tail.is_empty()`.
+    #[tokio::test]
+    async fn send_anthropic_request_recovers_trailing_content_fragment() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+
+        let body = "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+
+        let key = ApiKey::new_with_protocol(
+            "test".to_string(),
+            "test".to_string(),
+            format!("http://127.0.0.1:{port}"),
+            None,
+            "sk-test".to_string(),
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let spinning = Arc::new(AtomicBool::new(false));
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }];
+        let result = send_anthropic_request(
+            &client,
+            &key,
+            "claude-x",
+            &messages,
+            &spinning,
+            false,
+            &mut |_chunk| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        // " world" (the un-terminated tail line) is recovered even though "Hello"
+        // already streamed — pre-fix the tail was skipped once content existed.
+        assert_eq!(result.content, "Hello world");
+        assert_eq!(result.model.as_deref(), Some("claude-x"));
     }
 
     #[test]

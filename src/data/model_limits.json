@@ -1,5 +1,4 @@
 {
-  "_generated": "by .claude/skills/providers-sync/scripts/sync_model_limits.py from models.dev api.json \u2014 do not hand-edit",
   "models": {
     "abliterated-model": [150000,8192,"tai",""],
     "active-speaker-detection": [null,4096,"af",""],

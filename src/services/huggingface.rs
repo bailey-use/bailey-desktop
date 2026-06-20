@@ -2412,11 +2412,36 @@ async fn stream_to_file(
         anyhow::bail!("Download of {} returned HTTP {status}", file.filename);
     }
 
-    // Server honored `Range` → append. Anything else (incl. 200 OK when we
-    // asked for a range) means we can't trust the partial; truncate and restart.
-    let resuming = resume_offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    let starting_offset = if resuming { resume_offset } else { 0 };
-    let mut out = if resuming {
+    // A 206 body may only be appended at the offset the server actually starts
+    // at — not blindly at the partial's end. Some caching/forward proxies honor
+    // `Range` but realign the start *down* to a block boundary, so the response
+    // re-sends bytes we already have. Appending that overlap duplicates it and
+    // the file ends up larger than the real size (then loads as garbage). Read
+    // the response's own `Content-Range` start and truncate the partial back to
+    // it before appending. Anything we can't place cleanly (200 OK, a missing
+    // header, or a start past our resume point) restarts the whole download.
+    let resume_start = if resume_offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+    {
+        match content_range_start(resp.headers()) {
+            Some(s) if s <= resume_offset => Some(s),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let starting_offset = resume_start.unwrap_or(0);
+    let mut out = if let Some(s) = resume_start {
+        // Drop any bytes past the server's range start (normally a no-op, since
+        // `s == resume_offset`), then append the body from there.
+        let f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("Failed to open {} for resume", tmp.display()))?;
+        f.set_len(s)
+            .await
+            .with_context(|| format!("Failed to truncate {} to {s}", tmp.display()))?;
+        drop(f);
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(&tmp)
@@ -2474,10 +2499,40 @@ async fn stream_to_file(
         .with_context(|| format!("Failed to flush {}", tmp.display()))?;
     drop(out);
 
+    // Integrity gate: the assembled file must be exactly the expected size
+    // before it reaches the cache. A short file (interrupted) or an over-long
+    // one (a proxy that realigned a resume range and duplicated bytes) is
+    // corrupt — a GGUF that loads but emits garbage tokens. Drop the partial so
+    // the next run starts clean instead of resuming from corruption.
+    if file.size_bytes > 0 && downloaded != file.size_bytes {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        anyhow::bail!(
+            "Downloaded {} is {} but expected {} — the transfer was corrupted \
+             (often a flaky network or proxy). Re-run to download it again.",
+            file.filename,
+            human_size(downloaded),
+            human_size(file.size_bytes),
+        );
+    }
+
     tokio::fs::rename(&tmp, dest)
         .await
         .with_context(|| format!("Failed to rename {} → {}", tmp.display(), dest.display()))?;
     Ok(())
+}
+
+/// Start byte of a `Content-Range: bytes START-END/TOTAL` response header
+/// (e.g. `bytes 1024-4095/4096` → `1024`). `None` if absent or unparseable.
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    raw.trim()
+        .strip_prefix("bytes")?
+        .trim_start()
+        .split('-')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// Segments rather than a literal `"a/b/c"` so Windows `PathBuf::join`
@@ -2863,6 +2918,40 @@ pub fn stop_if_we_started() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn headers_with_content_range(value: &str) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::CONTENT_RANGE, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn content_range_start_parses_resume_offset() {
+        // Normal CDN resume: range begins exactly where we asked.
+        assert_eq!(
+            content_range_start(&headers_with_content_range("bytes 1024-4095/4096")),
+            Some(1024)
+        );
+        // A proxy that realigned the start down to a block boundary.
+        assert_eq!(
+            content_range_start(&headers_with_content_range("bytes 0-4095/4096")),
+            Some(0)
+        );
+        // Unsatisfied/unknown total still yields the start.
+        assert_eq!(
+            content_range_start(&headers_with_content_range("bytes 512-1023/*")),
+            Some(512)
+        );
+        // Missing or malformed headers are ignored (caller restarts).
+        assert_eq!(
+            content_range_start(&reqwest::header::HeaderMap::new()),
+            None
+        );
+        assert_eq!(
+            content_range_start(&headers_with_content_range("bytes */4096")),
+            None
+        );
+    }
 
     #[test]
     fn is_huggingface_ref_accepts_both_forms() {

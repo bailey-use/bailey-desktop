@@ -121,6 +121,10 @@ pub struct ServeRouter {
     /// carries timestamped tokens (windowable by `aivo stats --since`). Fed at the
     /// same point as `usage_sink`; `None` for plain `aivo serve`.
     run_tally: Option<Arc<RunTokenTally>>,
+    /// Suppress the router's progress lines (protocol auto-switch, failover) on
+    /// stderr. `aivo chat` runs this router in-process behind a raw-mode TUI, so
+    /// stray `eprintln!`s would corrupt the screen / land in the prompt box.
+    quiet: bool,
 }
 
 struct ServeState {
@@ -140,6 +144,8 @@ struct ServeState {
     usage_sink: Option<SessionStore>,
     usage_tool: Option<String>,
     run_tally: Option<Arc<RunTokenTally>>,
+    /// Mirror of `ServeRouter::quiet` — suppresses stderr progress lines.
+    quiet: bool,
 }
 
 struct FailoverEntry {
@@ -162,11 +168,19 @@ impl ServeRouter {
             usage_sink: None,
             usage_tool: None,
             run_tally: None,
+            quiet: false,
         }
     }
 
     pub fn with_logger(mut self, logger: Option<RequestLogger>) -> Self {
         self.logger = logger;
+        self
+    }
+
+    /// Silence the router's stderr progress lines (protocol auto-switch,
+    /// failover). Set by `aivo chat`, whose TUI owns the terminal.
+    pub fn quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
         self
     }
 
@@ -305,6 +319,7 @@ impl ServeRouter {
             usage_sink: self.usage_sink,
             usage_tool: self.usage_tool,
             run_tally: self.run_tally,
+            quiet: self.quiet,
         });
 
         (tokio::spawn(run_accept_loop(listener, state)), shutdown)
@@ -878,6 +893,7 @@ fn failover_state(
     entry: &FailoverEntry,
     client: &reqwest::Client,
     log_store: &LogStore,
+    quiet: bool,
 ) -> ServeState {
     ServeState {
         config: entry.config.clone(), // Arc clone — O(1) atomic increment
@@ -892,6 +908,7 @@ fn failover_state(
         usage_sink: None,
         usage_tool: None,
         run_tally: None,
+        quiet,
     }
 }
 
@@ -915,22 +932,26 @@ macro_rules! impl_with_failover {
                 return Ok(response);
             }
 
-            eprintln!(
-                "  \u{21bb} Primary key returned {}; trying failover keys...",
-                status
-            );
+            if !state.quiet {
+                eprintln!(
+                    "  \u{21bb} Primary key returned {}; trying failover keys...",
+                    status
+                );
+            }
             for entry in state.failover_keys.iter() {
-                let fstate = failover_state(entry, &state.client, &state.log_store);
+                let fstate = failover_state(entry, &state.client, &state.log_store, state.quiet);
                 if let Ok(resp) = $handler(request, &fstate).await {
                     let s = match &resp {
                         RouterResponse::Buffered { status, .. } => *status,
                         RouterResponse::Streaming { .. } => 200,
                     };
                     if !is_failover_status(s) {
-                        eprintln!(
-                            "  \u{2713} Failover to {} succeeded",
-                            entry.key.display_name()
-                        );
+                        if !state.quiet {
+                            eprintln!(
+                                "  \u{2713} Failover to {} succeeded",
+                                entry.key.display_name()
+                            );
+                        }
                         return Ok(resp);
                     }
                 }
@@ -1039,7 +1060,7 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         if !is_protocol_mismatch(status) {
             commit_protocol_switch(slot.route_atom(), protocol, PathVariant::Default, attempt);
             slot.confirm();
-            if attempt > 0 {
+            if attempt > 0 && !state.quiet {
                 eprintln!("  \u{2022} Protocol auto-switched to {}", protocol.as_str());
             }
             success = Some(response);
@@ -1421,6 +1442,7 @@ mod tests {
             usage_sink: None,
             usage_tool: None,
             run_tally: None,
+            quiet: false,
         }
     }
 
@@ -1563,6 +1585,7 @@ mod tests {
             usage_sink: None,
             usage_tool: None,
             run_tally: None,
+            quiet: false,
         };
 
         let context = upstream_context(&state);
@@ -1733,7 +1756,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()), false);
 
         assert_eq!(
             state.config.upstream_base_url,
@@ -1771,7 +1794,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()), false);
 
         // Arc should be a clone of the same allocation, not a new copy
         assert!(Arc::ptr_eq(&entry.config, &state.config));
@@ -1802,7 +1825,7 @@ mod tests {
         };
 
         let client = http_utils::router_http_client();
-        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()));
+        let state = failover_state(&entry, &client, &LogStore::new(std::env::temp_dir()), false);
 
         // Failover state should have no failover keys (no cascading)
         assert!(state.failover_keys.is_empty());

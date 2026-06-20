@@ -42,9 +42,13 @@ type Writer = Arc<Mutex<ChildStdin>>;
 type RequestTimings = Arc<std::sync::Mutex<HashMap<u64, Instant>>>;
 
 /// Caller-supplied policy for server-initiated `session/request_permission`
-/// requests. The closure is invoked from the reader task, so it must be
-/// `Send + Sync` and cheap (no blocking I/O). Reading an env var is fine.
-pub type PermissionFn = Arc<dyn Fn(&Value) -> PermissionDecision + Send + Sync>;
+/// requests. Invoked from the reader task with the request `params` (owned, so
+/// the returned future can be `'static`). It may `await` a decision — e.g. an
+/// interactive permission card — because while it's pending the agent is itself
+/// blocked on this permission request, so the reader pausing is harmless. `Send
+/// + Sync` so it rides on the reader task.
+pub type PermissionFn =
+    Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, PermissionDecision> + Send + Sync>;
 
 /// One of the two `outcome.outcome` shapes the ACP spec defines for
 /// `session/request_permission` replies. The encoder picks a matching
@@ -89,7 +93,11 @@ impl AcpClient {
     /// callers want [`spawn_with_permission_policy`] so they can opt into
     /// allowing tool execution.
     pub async fn spawn(cmd: Command) -> Result<Self> {
-        Self::spawn_with_permission_policy(cmd, Arc::new(|_| PermissionDecision::Reject)).await
+        Self::spawn_with_permission_policy(
+            cmd,
+            Arc::new(|_| Box::pin(async { PermissionDecision::Reject })),
+        )
+        .await
     }
 
     pub async fn spawn_with_permission_policy(
@@ -307,9 +315,9 @@ async fn dispatch_inbound(
             handle_notification(method, value.get("params"), sessions).await;
         }
         (Some(id), Some("session/request_permission")) => {
-            let params = value.get("params").unwrap_or(&Value::Null);
-            let decision = permission_fn(params);
-            let resp = build_permission_response(id, params, decision);
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let decision = permission_fn(params.clone()).await;
+            let resp = build_permission_response(id, &params, decision);
             let _ = write_frame(writer, &resp, None).await;
         }
         (Some(id), Some(method)) => {

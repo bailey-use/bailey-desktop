@@ -8,7 +8,7 @@ use std::process;
 use clap::{Command, CommandFactory, Parser};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{ChatArgs, Cli, Commands};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
     resolve_alias_in_memory, rewrite_cli_args,
@@ -71,6 +71,21 @@ fn is_hf_takeover(model: Option<&str>) -> bool {
     }
 }
 
+/// `aivo chat <REF>`'s positional is HF-only, but a non-HF positional is the
+/// user's one-shot prompt — the same way the top-level `aivo "..."` rewrites to
+/// `aivo chat -p "..."`. Without this, `aivo chat "hello world"` would dead-end
+/// on a "ref only" error. Lift such a positional into `prompt` (an explicit
+/// `-p` still wins) and clear the ref slot so it never reaches the
+/// model-ref/HF path.
+fn lift_chat_positional_to_prompt(args: &mut ChatArgs) {
+    if let Some(raw) = args.reference.clone()
+        && !is_hf_takeover(Some(raw.as_str()))
+    {
+        args.prompt.get_or_insert(raw);
+        args.reference = None;
+    }
+}
+
 async fn maybe_init_http_debug(value: &Option<String>) {
     let Some(raw) = value else {
         return;
@@ -91,6 +106,21 @@ async fn maybe_init_http_debug(value: &Option<String>) {
 /// CLI entry point. Parses argv, routes to the matching command handler, and
 /// exits the process with the resulting code. Never returns.
 pub async fn run() -> ! {
+    // Internal re-exec for the agent's `run_bash` sandbox: the binary launches
+    // itself as `aivo __agent-sandbox --workspace <cwd> -- <shell…>` so it can
+    // install a Landlock ruleset (Linux) in a fresh process before running the
+    // shell. Handle it FIRST — before clap (which would reject the unknown
+    // subcommand), the fast-crypto guard, and all service init — since it needs
+    // none of them. (Linux-only; macOS uses the external `sandbox-exec` wrapper
+    // and never emits this subcommand.)
+    #[cfg(target_os = "linux")]
+    {
+        let raw_args: Vec<String> = std::env::args().collect();
+        if raw_args.get(1).map(String::as_str) == Some("__agent-sandbox") {
+            crate::agent::sandbox::run_sandbox_child(&raw_args);
+        }
+    }
+
     fast_crypto_guard();
     // Must run before any reqwest client is built or `spawn_blocking` is
     // launched — reqwest snapshots proxy env at construction, and env
@@ -186,29 +216,28 @@ pub async fn run() -> ! {
             command.execute(keys_args).await
         }
 
-        Commands::Chat(chat_args) => {
+        Commands::Chat(mut chat_args) => {
             maybe_init_http_debug(&chat_args.debug).await;
             let key_explicit = chat_args.key.is_some();
-            // Reject non-HF, non-local-path positionals up-front, matching `aivo serve`.
-            if let Some(ref raw) = chat_args.reference
-                && !is_hf_takeover(Some(raw.as_str()))
-            {
-                eprintln!(
-                    "{} `aivo chat <REF>` only accepts a HuggingFace ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`) or a local `.gguf` path. Got: {}",
-                    style::red("Error:"),
-                    raw,
-                );
-                eprintln!(
-                    "  {}",
-                    style::dim("For a remote provider, pass `--model <name>` instead."),
-                );
-                process::exit(ExitCode::UserError.code());
-            }
-            // Positional lifts into model; explicit -m still wins.
+            lift_chat_positional_to_prompt(&mut chat_args);
+            // Positional lifts into model; explicit -m still wins. A `--agent`
+            // whose profile pins a `model:` contributes a DEFAULT model — below an
+            // explicit -m/positional, above the remembered model — so `-m` and
+            // `--agent` compose: `-m` owns the model axis, `--agent` the role +
+            // tools, and the profile's model only fills in when no `-m` is given.
+            let agent_model: Option<String> = chat_args.agent.as_deref().and_then(|name| {
+                let cwd = std::env::current_dir().ok()?;
+                crate::agent::subagents::discover_subagents(&cwd)
+                    .into_iter()
+                    .find(|s| s.name == name)
+                    .and_then(|s| s.model)
+            });
             let model_input = chat_args
                 .model
                 .clone()
-                .or_else(|| chat_args.reference.clone());
+                .or_else(|| chat_args.reference.clone())
+                .or_else(|| agent_model.clone());
+            let have_model_input = model_input.is_some();
             // Expand alias before the HF check so `-m <alias-to-hf-ref>`
             // takes the HF path. `run`'s flow does the same.
             let expanded_model = resolve_model_alias(&session_store, model_input).await;
@@ -225,8 +254,10 @@ pub async fn run() -> ! {
                     .await,
                 )
             };
-            // When -k is used without -m, force model picker (same as run/start)
-            let model = if chat_args.model.is_some() || chat_args.reference.is_some() {
+            // When -k is used without -m (and no --agent model), force model picker
+            // (same as run/start). A resolved -m / positional / --agent-default
+            // model takes the concrete path.
+            let model = if have_model_input {
                 expanded_model
             } else if key_explicit {
                 Some(String::new())
@@ -242,6 +273,9 @@ pub async fn run() -> ! {
                     chat_args.refresh,
                     key_override,
                     chat_args.json,
+                    chat_args.resume,
+                    chat_args.agent,
+                    chat_args.dry_run,
                 )
                 .await
         }
@@ -343,16 +377,34 @@ pub async fn run() -> ! {
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
-            if run_args.tool.is_none() {
+            // Bare `aivo run` opens the saved `start` picker; `aivo run chat`
+            // names aivo's own in-process agent. Both route through the start
+            // flow — `chat` isn't an external `AIToolType`, so it can't take the
+            // launcher pipeline below; the picker dispatches it to `aivo chat`.
+            let chat_selected = run_args.tool.as_deref() == Some("chat");
+            if run_args.tool.is_none() || chat_selected {
                 if !remaining_args.is_empty() {
-                    eprintln!(
-                        "{} `aivo run` without a tool does not accept passthrough args",
-                        style::red("Error:")
-                    );
-                    eprintln!(
-                        "  {}",
-                        style::dim("Use `aivo run <tool> ...` for passthrough flags.")
-                    );
+                    if chat_selected {
+                        eprintln!(
+                            "{} `aivo run chat` does not accept passthrough args",
+                            style::red("Error:")
+                        );
+                        eprintln!(
+                            "  {}",
+                            style::dim(
+                                "Use `aivo chat \"<prompt>\"` for a one-shot message, or `aivo chat` for the TUI."
+                            )
+                        );
+                    } else {
+                        eprintln!(
+                            "{} `aivo run` without a tool does not accept passthrough args",
+                            style::red("Error:")
+                        );
+                        eprintln!(
+                            "  {}",
+                            style::dim("Use `aivo run <tool> ...` for passthrough flags.")
+                        );
+                    }
                     process::exit(ExitCode::UserError.code());
                 }
 
@@ -361,7 +413,7 @@ pub async fn run() -> ! {
                     .execute(StartFlowArgs {
                         model,
                         key: key_flag,
-                        tool: None,
+                        tool: run_args.tool.clone(),
                         dry_run,
                         refresh,
                         yes: run_args.yes,
@@ -1024,5 +1076,57 @@ async fn resolve_model_alias(
             Err(_) => model,
         },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn chat_args(argv: &[&str]) -> ChatArgs {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Commands::Chat(a)) => a,
+            other => panic!("expected chat args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_hf_positional_becomes_one_shot_prompt() {
+        // The reported bug: `aivo chat "hello world"` dead-ended on a "ref only"
+        // error. It must become a one-shot prompt instead.
+        let mut a = chat_args(&["aivo", "chat", "hello world"]);
+        lift_chat_positional_to_prompt(&mut a);
+        assert_eq!(a.prompt.as_deref(), Some("hello world"));
+        assert_eq!(a.reference, None);
+    }
+
+    #[test]
+    fn bare_word_positional_becomes_prompt() {
+        // A single bare word is ambiguous at the top level (falls through as a
+        // subcommand), but after an explicit `chat` it's unambiguously a prompt.
+        let mut a = chat_args(&["aivo", "chat", "hello"]);
+        lift_chat_positional_to_prompt(&mut a);
+        assert_eq!(a.prompt.as_deref(), Some("hello"));
+        assert_eq!(a.reference, None);
+    }
+
+    #[test]
+    fn hf_positional_stays_a_model_ref() {
+        let mut a = chat_args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]);
+        lift_chat_positional_to_prompt(&mut a);
+        assert_eq!(
+            a.reference.as_deref(),
+            Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
+        );
+        assert_eq!(a.prompt, None);
+    }
+
+    #[test]
+    fn explicit_prompt_wins_over_positional() {
+        let mut a = chat_args(&["aivo", "chat", "POS", "-p", "PFLAG"]);
+        lift_chat_positional_to_prompt(&mut a);
+        assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
+        assert_eq!(a.reference, None);
     }
 }

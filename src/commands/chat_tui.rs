@@ -22,7 +22,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
 };
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -36,7 +37,7 @@ use super::chat_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
     format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
-    truncate_for_display_width, truncate_for_width,
+    format_token_count_value, git_branch_for, truncate_for_display_width, truncate_for_width,
 };
 use super::*;
 
@@ -71,6 +72,7 @@ mod session_impl;
 
 use self::menu::*;
 use self::render::*;
+pub(crate) use self::runtime_impl::skill_invocation_label;
 pub(crate) use self::shared::ChatTuiParams;
 use self::shared::*;
 use self::storage::*;
@@ -86,6 +88,8 @@ impl ChatTuiApp {
             .or(Some((MUTED, "Ready".to_string())));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
+        // Remembered across sessions (the user picked "remember last choice").
+        let auto_approve = params.session_store.get_chat_auto_approve().await;
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,
@@ -93,6 +97,11 @@ impl ChatTuiApp {
             key: params.key,
             copilot_tm: params.copilot_tm,
             cwd: params.cwd,
+            real_cwd: std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            git_branch: None,
+            git_branch_checked_at: None,
             raw_model: params.raw_model,
             model: params.model,
             billed_model: None,
@@ -102,6 +111,7 @@ impl ChatTuiApp {
             draft_attachments: params.initial_draft_attachments,
             cursor: 0,
             command_menu: CommandMenuState::default(),
+            skill_commands: Vec::new(),
             draft_history: load_persisted_draft_history(),
             draft_history_index: None,
             draft_history_stash: None,
@@ -109,21 +119,36 @@ impl ChatTuiApp {
             overlay: Overlay::None,
             notice: startup_notice,
             pending_response: String::new(),
+            incoming_buffer: String::new(),
+            pending_finish: None,
             pending_reasoning: String::new(),
             pending_submit: None,
             sending: false,
             request_started_at: None,
             last_usage: None,
+            live_usage: None,
             context_tokens: 0,
+            session_tokens: crate::services::session_store::SessionTokens::default(),
+            context_window: 0,
+            context_is_estimate: true,
             follow_output: true,
+            transcript_revision: 0,
             transcript_scroll: 0,
             transcript_width: 0,
             transcript_view_height: 0,
             transcript_hitbox: None,
+            composer_text_area: None,
+            composer_scroll: 0,
+            transcript_cache: None,
+            volatile_tail_cache: None,
             transcript_selection: None,
             transcript_drag_active: false,
+            drag_autoscroll: None,
+            last_autoscroll: None,
+            last_click: None,
+            selection_flash_until: None,
             scroll_speed: chat_scroll_speed(),
-            copy_toast: None,
+            toast: None,
             tx,
             rx,
             response_task: None,
@@ -136,6 +161,27 @@ impl ChatTuiApp {
             picker_hitbox: None,
             exit_confirm_pending: false,
             cursor_acp_session: None,
+            active_agent: params.initial_agent,
+            pending_agent_messages: None,
+            goal_mode: None,
+            agent_engine: None,
+            mcp_client: None,
+            mcp_connecting: false,
+            mcp_connect_progress: std::collections::HashMap::new(),
+            mcp_connect_gen: 0,
+            mcp_rebuild_pending: false,
+            pending_mcp_auth: std::collections::HashMap::new(),
+            agent_serve: None,
+            agent_permission: None,
+            agent_auto_approve: auto_approve,
+            auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                auto_approve,
+            )),
+            queued_messages: Vec::new(),
+            project_mcp_consent: ProjectMcpConsent::default(),
+            pending_mcp_consent: None,
+            local_command: None,
+            last_local_output: None,
         })
     }
 }
@@ -153,9 +199,64 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
         );
         original_hook(info);
     }));
+    let initial_resume = params.initial_resume.clone();
     let mut app = ChatTuiApp::new(params).await?;
+    app.refresh_context_window().await;
+    // Surface discovered skills as `/`-typeable slash commands (e.g. `/repo-study`)
+    // before the first keystroke, so the command menu suggests them right away.
+    app.refresh_skill_commands().await;
+    // The `-m <model>` path never fetches the catalog, so the window is often
+    // unknown at startup. Warm it in the background and update the footer stat
+    // when it resolves — best-effort, silent if the provider omits the window.
+    if app.context_window == 0 {
+        let cache = app.cache.clone();
+        let key = app.key.clone();
+        let model = app.model.clone();
+        let client = app.client.clone();
+        let tx = app.tx.clone();
+        tokio::spawn(async move {
+            crate::commands::models::warm_full_catalog_metadata(&client, &key, &cache).await;
+            let window = crate::services::model_metadata::resolve_limits(
+                &cache,
+                Some(&key.base_url),
+                &model,
+            )
+            .await
+            .context
+            .unwrap_or(0);
+            if window > 0 {
+                let _ = tx.send(RuntimeEvent::ContextWindowResolved(window));
+            }
+        });
+    }
+    // `--resume`: open the session picker (empty arg) or jump straight to a
+    // session by id. Mirrors the in-chat `/resume [query]`; failure is
+    // non-fatal — surface it as a notice and fall back to a fresh chat.
+    if let Some(query) = initial_resume {
+        let query = (!query.is_empty()).then_some(query);
+        if let Err(err) = app.open_resume_picker(query).await {
+            app.notice = Some((ERROR, format!("Resume failed: {err:#}")));
+        }
+    }
     let result = app.run().await;
     app.persist_draft_history();
+    // Remember the auto-approve toggle for next time (best-effort).
+    app.session_store
+        .set_chat_auto_approve(app.agent_auto_approve)
+        .await
+        .ok();
+    // After a clean exit, point the user back to this exact conversation by id
+    // (the terminal is already restored inside `run`, so this lands in normal
+    // scrollback). Skipped for an untouched chat — nothing was saved.
+    if result.is_ok()
+        && let Some(id) = app.resumable_session_id()
+    {
+        println!(
+            "\n{}  {}",
+            crate::style::dim("Resume this chat:"),
+            crate::style::cyan(format!("aivo chat --resume {id}")),
+        );
+    }
     result
 }
 

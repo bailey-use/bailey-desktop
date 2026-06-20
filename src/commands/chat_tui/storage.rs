@@ -1,28 +1,30 @@
 use super::*;
+use std::collections::HashMap;
 
-pub(super) async fn load_session_snapshots(
-    session_store: &SessionStore,
-    key: &ApiKey,
-    cwd: &str,
-) -> Result<Vec<SessionPreview>> {
-    Ok(session_store
-        .list_chat_sessions(&key.id, &key.base_url, cwd)
-        .await?
-        .into_iter()
-        .map(|entry| SessionPreview::from_index_entry(entry, key))
-        .collect())
-}
-
+/// Every resumable chat session, newest first, across ALL keys and working
+/// dirs. Not cwd-scoped: `aivo chat` runs in an ephemeral per-pid sandbox, so a
+/// cwd filter would hide every prior session — `/resume` is a global history
+/// browser (searchable in the picker). Sessions whose key was removed are
+/// dropped (no key to load them with).
 pub(super) async fn load_resume_snapshots(
     session_store: &SessionStore,
-    cwd: &str,
 ) -> Result<Vec<SessionPreview>> {
-    let keys = session_store.get_keys().await?;
-    let mut sessions = Vec::new();
+    let by_id: HashMap<String, ApiKey> = session_store
+        .get_keys()
+        .await?
+        .into_iter()
+        .map(|key| (key.id.clone(), key))
+        .collect();
 
-    for key in keys {
-        sessions.extend(load_session_snapshots(session_store, &key, cwd).await?);
-    }
+    let mut sessions: Vec<SessionPreview> = session_store
+        .all_chat_sessions()
+        .await?
+        .into_iter()
+        .filter_map(|entry| {
+            let key = by_id.get(&entry.key_id)?;
+            Some(SessionPreview::from_index_entry(entry, key))
+        })
+        .collect();
 
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(sessions)
@@ -107,6 +109,13 @@ pub(super) fn restore_cancelled_submission(
     }
 }
 
+/// Only user/assistant prose makes a readable title/preview. Agent turns also
+/// store `tool_call` (JSON) and `tool_result` (raw output) entries — skip those
+/// so the resume list shows conversation text, not tool noise.
+fn is_conversational_role(role: &str) -> bool {
+    matches!(role, "user" | "assistant")
+}
+
 pub(crate) fn session_title_from_messages(messages: &[ChatMessage], raw_model: &str) -> String {
     let last_user = messages
         .iter()
@@ -121,7 +130,7 @@ pub(crate) fn session_title_from_messages(messages: &[ChatMessage], raw_model: &
     let fallback = messages
         .iter()
         .rev()
-        .find(|message| !message.content.trim().is_empty())
+        .find(|message| is_conversational_role(&message.role) && !message.content.trim().is_empty())
         .map(|message| first_non_empty_line(&message.content));
 
     last_user
@@ -138,6 +147,7 @@ pub(crate) fn session_preview_text_from_messages(
     let snippets = messages
         .iter()
         .rev()
+        .filter(|message| is_conversational_role(&message.role))
         .filter_map(|message| {
             if !message.content.trim().is_empty() {
                 Some(collapse_whitespace(&message.content))

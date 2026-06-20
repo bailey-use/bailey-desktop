@@ -8,9 +8,11 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::process::Command;
 
+use crate::agent::protocol::Decision;
 use crate::services::acp_client::{
     AcpClient, PermissionDecision, PermissionFn, PromptEvent, PromptStream,
 };
@@ -34,33 +36,115 @@ pub fn is_legacy_cursor_login_secret(secret: &str) -> bool {
     secret == LEGACY_CURSOR_LOGIN_SENTINEL
 }
 
-/// Env var controlling Cursor's tool-execution policy for
-/// `session/request_permission`. Allowed by default so the launched tool
-/// (Claude/Codex/etc.) can delegate through Cursor's agent normally; set to
-/// `0`, `false`, `no`, or `reject` to force graceful rejection.
+/// Env var that HARD-OVERRIDES Cursor's tool-execution policy for
+/// `session/request_permission`, for scripted / non-interactive use. Set to `0`,
+/// `false`, `no`, or `reject` to force conversation-only; any other value forces
+/// allow. When UNSET, an interactive chat session follows its live auto-approve
+/// toggle (Shift+Tab) instead — see [`cursor_permission_decision`].
 pub const CURSOR_ALLOW_TOOLS_ENV: &str = "AIVO_CURSOR_ALLOW_TOOLS";
 
-/// Per-session override for cursor-agent's tool-execution policy. The
-/// chat path pins this to [`Reject`] so cursor's built-in
-/// `Read`/`grep`/`execute` tools can't fire during a conversation;
-/// other call sites use [`EnvDefault`] to honor the global env var.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolPolicy {
-    EnvDefault,
-    Reject,
+/// An explicit `AIVO_CURSOR_ALLOW_TOOLS` override, or `None` when unset/blank so
+/// the caller falls back to the live auto-approve toggle.
+fn cursor_allow_tools_env_override() -> Option<PermissionDecision> {
+    let raw = std::env::var(CURSOR_ALLOW_TOOLS_ENV).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("no")
+        || v.eq_ignore_ascii_case("reject")
+    {
+        Some(PermissionDecision::Reject)
+    } else {
+        Some(PermissionDecision::Allow)
+    }
 }
 
-fn cursor_permission_decision(_params: &Value) -> PermissionDecision {
-    match std::env::var(CURSOR_ALLOW_TOOLS_ENV) {
-        Ok(v)
-            if v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-                || v.eq_ignore_ascii_case("reject") =>
-        {
-            PermissionDecision::Reject
-        }
+/// Decide a cursor `session/request_permission`. The env override wins when set;
+/// otherwise the live auto-approve toggle governs — ON lets cursor's tools run
+/// in the real workspace, OFF rejects them. Cursor's tools run out-of-process,
+/// so aivo can't surface its own permission card for them; "off" therefore means
+/// conversation-only, which keeps the displayed safety state honest instead of
+/// silently auto-running tools behind an "off" indicator. `None` (no interactive
+/// toggle, e.g. a one-shot turn) keeps the historical allow-by-default.
+fn cursor_permission_decision(auto_approve: Option<&AtomicBool>) -> PermissionDecision {
+    if let Some(decision) = cursor_allow_tools_env_override() {
+        return decision;
+    }
+    match auto_approve {
+        Some(flag) if !flag.load(Ordering::Relaxed) => PermissionDecision::Reject,
         _ => PermissionDecision::Allow,
+    }
+}
+
+/// What the user is asked to approve for one cursor tool call — built from the
+/// ACP `session/request_permission` params and shown on aivo's permission card.
+pub struct CursorPermissionRequest {
+    /// Tool key for the card heading (see `permission_heading`).
+    pub tool: String,
+    /// Human description of what cursor wants to do.
+    pub preview: String,
+}
+
+/// Interactive front-end hook: ask the user to approve one cursor tool call and
+/// return the decision. Supplied by the chat TUI; `None` falls back to the
+/// toggle/env policy (the loopback routers and one-shot turns pass `None`).
+pub type CursorPermissionPrompt = Arc<
+    dyn Fn(CursorPermissionRequest) -> futures::future::BoxFuture<'static, Decision> + Send + Sync,
+>;
+
+/// Turn an ACP `session/request_permission` `params` object into a card request.
+/// cursor carries the human description in `toolCall.title` (with a `kind` like
+/// `execute`/`edit`); degrade gracefully when a field is missing.
+fn build_cursor_permission_request(params: &Value) -> CursorPermissionRequest {
+    let tool_call = params.get("toolCall").unwrap_or(params);
+    let title = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("title").and_then(Value::as_str))
+        .unwrap_or("a tool")
+        .trim();
+    let kind = tool_call.get("kind").and_then(Value::as_str);
+    let preview = match kind {
+        Some(k) if !k.is_empty() => format!("Cursor wants to run a {k} tool:\n{title}"),
+        _ => format!("Cursor wants to run:\n{title}"),
+    };
+    CursorPermissionRequest {
+        tool: "cursor".to_string(),
+        preview,
+    }
+}
+
+/// Resolve one cursor `session/request_permission`. An `AIVO_CURSOR_ALLOW_TOOLS`
+/// override hard-wins; otherwise auto-approve-on allows silently; otherwise, when
+/// an interactive `prompt` is wired, ask the user (with "always" flipping
+/// `auto` on for the rest of the session); with no prompt, fall back to the
+/// toggle policy (off = conversation-only reject, no flag = allow-by-default).
+async fn resolve_cursor_permission(
+    params: &Value,
+    auto: Option<&AtomicBool>,
+    prompt: Option<&CursorPermissionPrompt>,
+) -> PermissionDecision {
+    if let Some(decision) = cursor_allow_tools_env_override() {
+        return decision;
+    }
+    if auto.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return PermissionDecision::Allow;
+    }
+    match prompt {
+        Some(ask) => match ask(build_cursor_permission_request(params)).await {
+            Decision::Allow => PermissionDecision::Allow,
+            Decision::AlwaysAllow => {
+                if let Some(flag) = auto {
+                    flag.store(true, Ordering::Relaxed);
+                }
+                PermissionDecision::Allow
+            }
+            Decision::Deny => PermissionDecision::Reject,
+        },
+        None => cursor_permission_decision(auto),
     }
 }
 
@@ -716,12 +800,33 @@ pub struct CursorTurnResult {
     pub model: Option<String>,
 }
 
-/// Streaming chunk delivered to callers of [`run_cursor_acp_turn`]. Borrowed
-/// to avoid allocating per delta on hot paths.
+/// Streaming chunk delivered to callers of [`run_cursor_acp_turn`]. Text deltas
+/// are borrowed to avoid allocating per delta on hot paths; tool steps (rare
+/// relative to deltas) carry owned data.
 #[derive(Debug)]
 pub enum CursorChunk<'a> {
     Content(&'a str),
     Reasoning(&'a str),
+    /// cursor-agent invoked a tool. `name`/`args` are normalized into aivo's tool
+    /// vocabulary (`read_file`/`grep`/`run_bash`/…) so the transcript renders them
+    /// like the in-process agent — and coalesces runs of the same kind. `id` is
+    /// cursor's `toolCallId`, used to correlate the later [`CursorChunk::ToolUpdate`]
+    /// that fills in the resolved target/result.
+    ToolCall {
+        id: Option<String>,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// A `tool_call_update` for an earlier [`CursorChunk::ToolCall`] (matched by
+    /// `id`). The initial call event often lacks the real target (path/pattern) —
+    /// it arrives here in `rawInput`/`locations`, alongside a compact `result` and
+    /// the `failed` status. Lets the transcript enrich the call line in place.
+    ToolUpdate {
+        id: String,
+        args: Option<serde_json::Value>,
+        result: Option<String>,
+        failed: bool,
+    },
 }
 
 /// How to resolve a user-facing model name against cursor-agent's encoded
@@ -796,8 +901,9 @@ impl CursorAcpSession {
             requested_model,
             workspace_cwd,
             None,
-            ToolPolicy::EnvDefault,
             ModelPickPreference::Default,
+            None,
+            None,
         )
         .await
     }
@@ -817,23 +923,25 @@ impl CursorAcpSession {
             requested_model,
             workspace_cwd,
             mcp_url,
-            ToolPolicy::EnvDefault,
             ModelPickPreference::Default,
+            None,
+            None,
         )
         .await
     }
 
-    /// Most general open: callers can pin a [`ToolPolicy`] independent of
-    /// the env-var default. `aivo chat` uses [`ToolPolicy::Reject`] so
-    /// cursor-agent's built-in `Read`/`grep`/`execute` tools can't fire
-    /// during a chat turn — chat is a pure conversation surface.
+    /// Most general open: lets callers register an MCP server and pick a model
+    /// preference. Tool execution follows the env-var default permission policy
+    /// (allow by default; set `AIVO_CURSOR_ALLOW_TOOLS=0` for conversation-only —
+    /// see [`CURSOR_ALLOW_TOOLS_ENV`]).
     pub async fn open_with_options(
         key: &ApiKey,
         requested_model: Option<&str>,
         workspace_cwd: &str,
         mcp_url: Option<&str>,
-        tool_policy: ToolPolicy,
         model_pick_preference: ModelPickPreference,
+        auto_approve: Option<Arc<AtomicBool>>,
+        permission_prompt: Option<CursorPermissionPrompt>,
     ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
@@ -842,10 +950,21 @@ impl CursorAcpSession {
         }
         cmd.arg("acp");
 
-        let permission_fn: PermissionFn = match tool_policy {
-            ToolPolicy::Reject => Arc::new(|_| PermissionDecision::Reject),
-            ToolPolicy::EnvDefault => Arc::new(cursor_permission_decision),
-        };
+        // cursor runs its tools out-of-process; each arrives as a
+        // `session/request_permission`. An env override hard-wins; else if
+        // auto-approve is on we allow silently; else when an interactive prompt
+        // is wired we surface aivo's own permission card (allow once / always /
+        // deny) instead of a blanket reject — "always" flips auto-approve on for
+        // the rest of the session. With no prompt (routers, one-shot) we keep the
+        // historical toggle/allow-by-default. The closure holds the shared toggle
+        // flag, so a mid-session Shift+Tab is reflected on the very next request.
+        let permission_fn: PermissionFn = Arc::new(move |params: Value| {
+            let auto = auto_approve.clone();
+            let prompt = permission_prompt.clone();
+            Box::pin(async move {
+                resolve_cursor_permission(&params, auto.as_deref(), prompt.as_ref()).await
+            })
+        });
         let client = Arc::new(AcpClient::spawn_with_permission_policy(cmd, permission_fn).await?);
 
         let init = client
@@ -1004,8 +1123,9 @@ where
         requested_model,
         workspace_cwd,
         None,
-        ToolPolicy::EnvDefault,
         ModelPickPreference::PreferNoThinking,
+        None,
+        None,
     )
     .await?;
     ensure_image_attachments_supported(session.prompt_capabilities(), attachments)?;
@@ -1056,22 +1176,207 @@ where
         return Ok(());
     };
     let kind = update.get("sessionUpdate").and_then(Value::as_str);
-    let text = update
-        .get("content")
-        .and_then(|c| c.get("text"))
-        .and_then(Value::as_str);
-    match (kind, text) {
-        (Some("agent_message_chunk"), Some(t)) => {
-            out.content.push_str(t);
-            on_chunk(CursorChunk::Content(t))?;
+    let text = || {
+        update
+            .get("content")
+            .and_then(|c| c.get("text"))
+            .and_then(Value::as_str)
+    };
+    match kind {
+        Some("agent_message_chunk") => {
+            if let Some(t) = text() {
+                out.content.push_str(t);
+                on_chunk(CursorChunk::Content(t))?;
+            }
         }
-        (Some("agent_thought_chunk"), Some(t)) => {
-            reasoning_buf.push_str(t);
-            on_chunk(CursorChunk::Reasoning(t))?;
+        Some("agent_thought_chunk") => {
+            if let Some(t) = text() {
+                reasoning_buf.push_str(t);
+                on_chunk(CursorChunk::Reasoning(t))?;
+            }
+        }
+        // A tool starting: surface a normalized call card. The resolved target
+        // and result land later in a `tool_call_update` (below), correlated by id.
+        Some("tool_call") => {
+            let (name, args) = normalize_tool_call(update);
+            let id = update
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            on_chunk(CursorChunk::ToolCall { id, name, args })?;
+        }
+        // A tool progressing/finishing: carries the resolved input (real path /
+        // pattern, which the start event usually omits) and the result. Emitted
+        // only when it adds something — an enrichment for the call line.
+        Some("tool_call_update") => {
+            if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                let args = update_target_args(update);
+                let (result, failed) = summarize_tool_outcome(update);
+                if args.is_some() || result.is_some() || failed {
+                    on_chunk(CursorChunk::ToolUpdate {
+                        id: id.to_string(),
+                        args,
+                        result,
+                        failed,
+                    })?;
+                }
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Map an ACP `tool_call` update onto aivo's tool vocabulary so cursor's steps
+/// render (and coalesce) like the in-process agent's. The salient target — file
+/// path, search pattern, or command — comes from `locations`/`rawInput`, falling
+/// back to the human `title`.
+fn normalize_tool_call(update: &Value) -> (String, Value) {
+    let kind = update.get("kind").and_then(Value::as_str).unwrap_or("");
+    let title = update.get("title").and_then(Value::as_str).unwrap_or("");
+    // The path/pattern is left empty when absent rather than falling back to the
+    // generic title ("Read File", "grep") — cursor sends those titles but no real
+    // target (rawInput is empty, no locations), so the title is pure noise in the
+    // call line. Execute is the exception: cursor's execute *title is* the command.
+    let path = location_path(update)
+        .or_else(|| raw_input_str(update, PATH_KEYS))
+        .unwrap_or("");
+    match kind {
+        "read" => ("read_file".into(), serde_json::json!({ "path": path })),
+        "edit" => ("edit_file".into(), serde_json::json!({ "path": path })),
+        "delete" => ("delete_file".into(), serde_json::json!({ "path": path })),
+        "search" => {
+            let pattern = raw_input_str(update, PATTERN_KEYS).unwrap_or("");
+            ("grep".into(), serde_json::json!({ "pattern": pattern }))
+        }
+        "execute" => {
+            let command = raw_input_str(update, COMMAND_KEYS).unwrap_or(title);
+            ("run_bash".into(), serde_json::json!({ "command": command }))
+        }
+        _ => {
+            let name = if title.is_empty() { "tool" } else { title };
+            (name.to_string(), Value::Null)
+        }
+    }
+}
+
+/// cursor's `rawInput` parameter names aren't stable across tools (a read's path
+/// may be `path`, `target_file`, `file_path`, …), so each salient field is keyed
+/// off a candidate list rather than a single name.
+const PATH_KEYS: &[&str] = &[
+    "path",
+    "target_file",
+    "file_path",
+    "relative_workspace_path",
+    "file",
+    "filename",
+];
+const PATTERN_KEYS: &[&str] = &["pattern", "query", "regex", "search"];
+const COMMAND_KEYS: &[&str] = &["command", "cmd"];
+
+/// First string value among `keys` in the event's `rawInput`.
+fn raw_input_str<'a>(update: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    let raw = update.get("rawInput")?;
+    keys.iter()
+        .find_map(|k| raw.get(*k).and_then(Value::as_str))
+}
+
+/// The first `locations[].path` (ACP's standard place for a tool's file target).
+fn location_path(update: &Value) -> Option<&str> {
+    update
+        .get("locations")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|l| l.get("path"))
+        .and_then(Value::as_str)
+}
+
+/// The resolved target from a `tool_call_update` — the real path/pattern/command
+/// the start event lacked — as aivo-vocabulary args, or `None` if it carried no
+/// new input. Keyed generically so the consumer overwrites whichever field its
+/// tool reads.
+fn update_target_args(update: &Value) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    if let Some(p) = location_path(update).or_else(|| raw_input_str(update, PATH_KEYS)) {
+        map.insert("path".into(), Value::String(p.to_string()));
+    }
+    if let Some(p) = raw_input_str(update, PATTERN_KEYS) {
+        map.insert("pattern".into(), Value::String(p.to_string()));
+    }
+    if let Some(c) = raw_input_str(update, COMMAND_KEYS) {
+        map.insert("command".into(), Value::String(c.to_string()));
+    }
+    (!map.is_empty()).then_some(Value::Object(map))
+}
+
+/// A compact, one-line result for a `tool_call_update` plus whether it failed.
+/// cursor reports the outcome in `rawOutput` — a match/result count, the read
+/// content, or an `error` string (with status still `completed`) — so that's
+/// checked first; ACP's standard `content` blocks are the fallback for other
+/// tools/versions.
+fn summarize_tool_outcome(update: &Value) -> (Option<String>, bool) {
+    let mut failed = matches!(
+        update.get("status").and_then(Value::as_str),
+        Some("failed" | "error")
+    );
+    let mut result = None;
+    if let Some(out) = update.get("rawOutput") {
+        if let Some(err) = out.get("error").and_then(Value::as_str) {
+            failed = true;
+            result = Some(compact_result(err));
+        } else if let Some(n) = out.get("totalMatches").and_then(Value::as_u64) {
+            result = Some(format!("{n} match{}", if n == 1 { "" } else { "es" }));
+        } else if let Some(n) = out.get("resultCount").and_then(Value::as_u64) {
+            result = Some(format!("{n} result{}", if n == 1 { "" } else { "s" }));
+        } else if let Some(content) = out.get("content").and_then(Value::as_str) {
+            result = Some(compact_result(content));
+        }
+    }
+    if result.is_none() {
+        let text = collect_content_text(update);
+        if !text.trim().is_empty() {
+            result = Some(compact_result(&text));
+        }
+    }
+    (result, failed)
+}
+
+/// Concatenate the text from ACP `content` blocks (`[{content:{text}}]` or flat
+/// `[{text}]`) — the standard place for tool output, used as a fallback when
+/// cursor's `rawOutput` digest is absent.
+fn collect_content_text(update: &Value) -> String {
+    let mut text = String::new();
+    if let Some(blocks) = update.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            let piece = block
+                .get("content")
+                .and_then(|c| c.get("text"))
+                .and_then(Value::as_str)
+                .or_else(|| block.get("text").and_then(Value::as_str));
+            if let Some(piece) = piece {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(piece);
+            }
+        }
+    }
+    text
+}
+
+/// One-line digest of tool output: the line itself when short, else `N lines`.
+fn compact_result(text: &str) -> String {
+    let lines = text.lines().filter(|l| !l.trim().is_empty()).count();
+    if lines <= 1 {
+        let one = text.trim();
+        if one.chars().count() > 50 {
+            format!("{}…", one.chars().take(50).collect::<String>())
+        } else {
+            one.to_string()
+        }
+    } else {
+        format!("{lines} lines")
+    }
 }
 
 /// Look up the encoded modelId for `requested` against an ACP `models` object
@@ -1300,38 +1605,122 @@ mod tests {
     }
 
     #[test]
-    fn permission_decision_defaults_to_allow_and_can_be_forced_to_reject() {
+    fn permission_decision_env_overrides_then_follows_toggle() {
         // Serialize against other env-var tests in the binary by saving the
         // prior value (if any) and restoring it on exit.
         let prior = std::env::var(CURSOR_ALLOW_TOOLS_ENV).ok();
+        let on = AtomicBool::new(true);
+        let off = AtomicBool::new(false);
         // SAFETY: tests run single-threaded by default for this binary; the
         // restore in the guard below keeps state consistent for any parallel
         // peers that may read this env var afterwards.
         unsafe { std::env::remove_var(CURSOR_ALLOW_TOOLS_ENV) };
+        // Env unset: no toggle => legacy allow-by-default; toggle governs when set.
+        assert_eq!(cursor_permission_decision(None), PermissionDecision::Allow);
         assert_eq!(
-            cursor_permission_decision(&Value::Null),
-            PermissionDecision::Allow
+            cursor_permission_decision(Some(&on)),
+            PermissionDecision::Allow,
+            "auto-approve ON allows cursor tools"
         );
+        assert_eq!(
+            cursor_permission_decision(Some(&off)),
+            PermissionDecision::Reject,
+            "auto-approve OFF rejects cursor tools (honest 'off' state)"
+        );
+        // Env set wins over the toggle, both directions.
         unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "1") };
         assert_eq!(
-            cursor_permission_decision(&Value::Null),
-            PermissionDecision::Allow
-        );
-        unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "true") };
-        assert_eq!(
-            cursor_permission_decision(&Value::Null),
-            PermissionDecision::Allow
-        );
-        unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "no") };
-        assert_eq!(
-            cursor_permission_decision(&Value::Null),
-            PermissionDecision::Reject
+            cursor_permission_decision(Some(&off)),
+            PermissionDecision::Allow,
+            "explicit allow override beats an off toggle"
         );
         unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "reject") };
         assert_eq!(
-            cursor_permission_decision(&Value::Null),
+            cursor_permission_decision(Some(&on)),
+            PermissionDecision::Reject,
+            "explicit reject override beats an on toggle"
+        );
+        unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, "no") };
+        assert_eq!(cursor_permission_decision(None), PermissionDecision::Reject);
+        match prior {
+            Some(v) => unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, v) },
+            None => unsafe { std::env::remove_var(CURSOR_ALLOW_TOOLS_ENV) },
+        }
+    }
+
+    #[test]
+    fn cursor_permission_request_reads_tool_call_title_and_kind() {
+        let req = build_cursor_permission_request(&json!({
+            "toolCall": { "title": "Run `git commit -m hi`", "kind": "execute" }
+        }));
+        assert_eq!(req.tool, "cursor");
+        assert!(req.preview.contains("execute"), "preview: {}", req.preview);
+        assert!(
+            req.preview.contains("git commit"),
+            "preview: {}",
+            req.preview
+        );
+
+        // Missing fields degrade gracefully rather than panicking.
+        let bare = build_cursor_permission_request(&json!({}));
+        assert_eq!(bare.tool, "cursor");
+        assert!(bare.preview.contains("a tool"));
+    }
+
+    #[tokio::test]
+    async fn resolve_cursor_permission_prompts_when_off_and_honors_decision() {
+        let prior = std::env::var(CURSOR_ALLOW_TOOLS_ENV).ok();
+        // SAFETY: this binary's tests run single-threaded; restored below.
+        unsafe { std::env::remove_var(CURSOR_ALLOW_TOOLS_ENV) };
+
+        let allow: CursorPermissionPrompt = Arc::new(|_| Box::pin(async { Decision::Allow }));
+        let deny: CursorPermissionPrompt = Arc::new(|_| Box::pin(async { Decision::Deny }));
+        let off = AtomicBool::new(false);
+
+        assert_eq!(
+            resolve_cursor_permission(&json!({}), Some(&off), Some(&allow)).await,
+            PermissionDecision::Allow,
+            "approved card → allow"
+        );
+        assert_eq!(
+            resolve_cursor_permission(&json!({}), Some(&off), Some(&deny)).await,
+            PermissionDecision::Reject,
+            "denied card → reject"
+        );
+
+        // "Always" allows AND flips auto-approve on for the rest of the session.
+        let always: CursorPermissionPrompt =
+            Arc::new(|_| Box::pin(async { Decision::AlwaysAllow }));
+        let flag = AtomicBool::new(false);
+        assert_eq!(
+            resolve_cursor_permission(&json!({}), Some(&flag), Some(&always)).await,
+            PermissionDecision::Allow
+        );
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "'always' turns auto-approve on"
+        );
+
+        // Auto-approve ON short-circuits without ever invoking the prompt.
+        let called = Arc::new(AtomicBool::new(false));
+        let probe = called.clone();
+        let never: CursorPermissionPrompt = Arc::new(move |_| {
+            probe.store(true, Ordering::Relaxed);
+            Box::pin(async { Decision::Deny })
+        });
+        let on = AtomicBool::new(true);
+        assert_eq!(
+            resolve_cursor_permission(&json!({}), Some(&on), Some(&never)).await,
+            PermissionDecision::Allow
+        );
+        assert!(!called.load(Ordering::Relaxed), "auto-on skips the prompt");
+
+        // No interactive prompt → falls back to the toggle policy (off = reject).
+        assert_eq!(
+            resolve_cursor_permission(&json!({}), Some(&off), None).await,
             PermissionDecision::Reject
         );
+
         match prior {
             Some(v) => unsafe { std::env::set_var(CURSOR_ALLOW_TOOLS_ENV, v) },
             None => unsafe { std::env::remove_var(CURSOR_ALLOW_TOOLS_ENV) },
@@ -1593,6 +1982,8 @@ mod tests {
             match chunk {
                 CursorChunk::Content(t) => chunks.push(("content".into(), t.to_string())),
                 CursorChunk::Reasoning(t) => chunks.push(("reasoning".into(), t.to_string())),
+                CursorChunk::ToolCall { name, .. } => chunks.push(("tool_call".into(), name)),
+                CursorChunk::ToolUpdate { id, .. } => chunks.push(("tool_update".into(), id)),
             }
             Ok(())
         };
@@ -1607,7 +1998,7 @@ mod tests {
             "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Hello"}},
         });
         consume_session_update(&msg, &mut out, &mut reasoning, &mut on_chunk).unwrap();
-        // Unknown update kinds (tool_call, plan, available_commands_update) are dropped.
+        // Unknown update kinds (plan, available_commands_update) are dropped.
         let msg = serde_json::json!({
             "sessionId": "s1",
             "update": {"sessionUpdate": "available_commands_update", "commands": []},
@@ -1623,5 +2014,156 @@ mod tests {
                 ("content".to_string(), "Hello".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn consume_session_update_surfaces_tool_calls() {
+        let mut out = CursorTurnResult::default();
+        let mut reasoning = String::new();
+        let mut chunks: Vec<(String, String)> = Vec::new();
+        let mut on_chunk = |chunk: CursorChunk<'_>| -> Result<()> {
+            match chunk {
+                CursorChunk::Content(t) => chunks.push(("content".into(), t.to_string())),
+                CursorChunk::Reasoning(t) => chunks.push(("reasoning".into(), t.to_string())),
+                CursorChunk::ToolCall { id, name, args } => chunks.push((
+                    "tool_call".into(),
+                    format!("{}|{name}|{args}", id.unwrap_or_default()),
+                )),
+                CursorChunk::ToolUpdate {
+                    id,
+                    args,
+                    result,
+                    failed,
+                } => chunks.push((
+                    "tool_update".into(),
+                    format!(
+                        "{id}|{}|{}|{failed}",
+                        args.map(|a| a.to_string()).unwrap_or_default(),
+                        result.unwrap_or_default(),
+                    ),
+                )),
+            }
+            Ok(())
+        };
+
+        // A read tool. The start event carries cursor's own param name
+        // (`target_file`), not ACP's `path`; normalization still resolves it.
+        let call = serde_json::json!({
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "c1",
+                "title": "Read File",
+                "kind": "read",
+                "status": "pending",
+                "rawInput": {"target_file": "src/main.rs"},
+            },
+        });
+        consume_session_update(&call, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+
+        // The update enriches the call: resolved path (from `locations`) + a
+        // compact result, surfaced as a ToolUpdate keyed by the same id.
+        let done = serde_json::json!({
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "c1",
+                "status": "completed",
+                "locations": [{"path": "src/main.rs"}],
+                "content": [{"type": "content", "content": {"type": "text", "text": "fn main() {}"}}],
+            },
+        });
+        consume_session_update(&done, &mut out, &mut reasoning, &mut on_chunk).unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                (
+                    "tool_call".to_string(),
+                    "c1|read_file|{\"path\":\"src/main.rs\"}".to_string()
+                ),
+                (
+                    "tool_update".to_string(),
+                    "c1|{\"path\":\"src/main.rs\"}|fn main() {}|false".to_string()
+                ),
+            ]
+        );
+        // Tool I/O is not assistant prose — it must not leak into the reply text.
+        assert!(out.content.is_empty());
+    }
+
+    #[test]
+    fn normalize_tool_call_maps_kinds_and_targets() {
+        let search = serde_json::json!({
+            "kind": "search", "title": "Grep", "rawInput": {"pattern": "hover"},
+        });
+        assert_eq!(
+            normalize_tool_call(&search),
+            ("grep".to_string(), serde_json::json!({"pattern": "hover"}))
+        );
+
+        let exec = serde_json::json!({
+            "kind": "execute", "title": "git show ab12",
+        });
+        assert_eq!(
+            normalize_tool_call(&exec),
+            (
+                "run_bash".to_string(),
+                serde_json::json!({"command": "git show ab12"})
+            )
+        );
+
+        // Unknown kind keeps the human title.
+        let other = serde_json::json!({"kind": "fetch", "title": "Fetch URL"});
+        assert_eq!(
+            normalize_tool_call(&other),
+            ("Fetch URL".to_string(), Value::Null)
+        );
+
+        // Real cursor shape: empty rawInput + a generic title → no fake target
+        // (the title is noise). The result comes from the update's `rawOutput`.
+        let real = serde_json::json!({
+            "kind": "read", "title": "Read File", "rawInput": {},
+        });
+        assert_eq!(
+            normalize_tool_call(&real),
+            ("read_file".to_string(), serde_json::json!({"path": ""}))
+        );
+    }
+
+    #[test]
+    fn summarize_tool_outcome_reads_raw_output() {
+        // Verified against real cursor-agent frames: the outcome lives in
+        // `rawOutput` (counts / read content / error), not ACP `content`.
+        let matches = serde_json::json!({
+            "status": "completed", "rawOutput": {"totalMatches": 18, "truncated": false},
+        });
+        assert_eq!(
+            summarize_tool_outcome(&matches),
+            (Some("18 matches".to_string()), false)
+        );
+
+        let results = serde_json::json!({
+            "status": "completed", "rawOutput": {"resultCount": 1},
+        });
+        assert_eq!(
+            summarize_tool_outcome(&results),
+            (Some("1 result".to_string()), false)
+        );
+
+        let read = serde_json::json!({
+            "status": "completed", "rawOutput": {"content": "line one\nline two\nline three"},
+        });
+        assert_eq!(
+            summarize_tool_outcome(&read),
+            (Some("3 lines".to_string()), false)
+        );
+
+        // An error rides in `rawOutput.error` with status still `completed`.
+        let err = serde_json::json!({
+            "status": "completed",
+            "rawOutput": {"error": "Glob pattern \"**/*\" is not allowed."},
+        });
+        let (result, failed) = summarize_tool_outcome(&err);
+        assert!(failed);
+        assert!(result.unwrap().starts_with("Glob pattern"));
     }
 }

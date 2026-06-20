@@ -39,10 +39,98 @@ const REDACTED_QUERY_PARAMS: &[&str] = &["key", "api_key", "token"];
 /// fragments in unrelated text (e.g. docs, error messages) stay readable.
 const MIN_TOKEN_LEN: usize = 20;
 
-/// Scrub `Bearer <token>` (any case) and bare `sk-<token>` from body text
-/// before logging. Operates on raw bytes so it catches keys buried in
-/// escaped or nested content (codex's approved_command_prefixes etc.).
+/// Credential parameter names whose values are masked in logged bodies. OAuth
+/// token / dynamic-client-registration exchanges flow through `send_logged`, and
+/// their raw token values lack the `Bearer `/`sk-` prefixes the byte scan below
+/// keys on — so a token endpoint's request form (`code_verifier=…`,
+/// `client_secret=…`) and response JSON (`"access_token":"…"`) would otherwise
+/// land in the debug log verbatim.
+const SECRET_PARAM_KEYS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "code_verifier",
+    "client_secret",
+];
+
+/// Scrub secrets from a body before logging: first mask the known credential
+/// parameters in both JSON (`"key":"value"`) and form-urlencoded (`key=value`)
+/// shapes, then the generic `Bearer <token>` / `sk-<token>` patterns.
 pub fn redact_body(body: &str) -> String {
+    redact_bearer_tokens(&redact_secret_params(body))
+}
+
+/// Mask the values of `SECRET_PARAM_KEYS` in JSON and form bodies. Fast-paths to
+/// a plain copy when none of the key names appear at all.
+fn redact_secret_params(body: &str) -> String {
+    if !SECRET_PARAM_KEYS.iter().any(|k| body.contains(k)) {
+        return body.to_string();
+    }
+    let mut out = body.to_string();
+    for key in SECRET_PARAM_KEYS {
+        out = redact_json_string_value(&out, key);
+        out = redact_form_value(&out, key);
+    }
+    out
+}
+
+/// Mask the `"<value>"` after every `"key":` (a JSON string value).
+fn redact_json_string_value(body: &str, key: &str) -> String {
+    let needle = format!("\"{key}\"");
+    let mut out = body.to_string();
+    let mut cursor = 0;
+    while let Some(rel) = out[cursor..].find(&needle) {
+        let after = cursor + rel + needle.len();
+        let rest = &out[after..];
+        let Some(colon) = rest.find(':') else { break };
+        let Some(open) = rest[colon..].find('"') else {
+            cursor = after;
+            continue;
+        };
+        let Some(close_rel) = rest[colon + open + 1..].find('"') else {
+            cursor = after;
+            continue;
+        };
+        let start = after + colon + open + 1;
+        let end = start + close_rel;
+        out.replace_range(start..end, REDACTED);
+        cursor = start + REDACTED.len();
+    }
+    out
+}
+
+/// Mask the value after every `key=` (a form-urlencoded value, up to `&` or end),
+/// but only where `key` starts at a parameter boundary (start, `&`, or `?`).
+fn redact_form_value(body: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let mut out = body.to_string();
+    let mut cursor = 0;
+    while let Some(rel) = out[cursor..].find(&needle) {
+        let idx = cursor + rel;
+        let at_boundary = idx == 0 || matches!(out.as_bytes()[idx - 1], b'&' | b'?');
+        if !at_boundary {
+            cursor = idx + needle.len();
+            continue;
+        }
+        let val_start = idx + needle.len();
+        let val_end = out[val_start..]
+            .find('&')
+            .map(|p| val_start + p)
+            .unwrap_or(out.len());
+        if val_end > val_start {
+            out.replace_range(val_start..val_end, REDACTED);
+            cursor = val_start + REDACTED.len();
+        } else {
+            cursor = val_start;
+        }
+    }
+    out
+}
+
+/// Scrub `Bearer <token>` (any case) and bare `sk-<token>` from body text.
+/// Operates on raw bytes so it catches keys buried in escaped or nested content
+/// (codex's approved_command_prefixes etc.).
+fn redact_bearer_tokens(body: &str) -> String {
     if !body
         .as_bytes()
         .windows(7)
@@ -858,6 +946,34 @@ mod tests {
             out.contains("bearer [REDACTED]"),
             "casing should be preserved: {out}"
         );
+    }
+
+    #[test]
+    fn redact_body_masks_oauth_token_response_json() {
+        // A token endpoint's JSON response — the tokens lack a `Bearer `/`sk-`
+        // prefix, so only the new key-based masking catches them.
+        let body = r#"{"access_token":"eyJraWQ.AAAAAAAAAAAAAAAAAAAA","refresh_token":"rt-BBBBBBBBBBBBBBBBBBBB","expires_in":3600,"token_type":"Bearer"}"#;
+        let out = redact_body(body);
+        assert!(!out.contains("eyJraWQ"), "access_token leaked: {out}");
+        assert!(!out.contains("rt-BBBB"), "refresh_token leaked: {out}");
+        assert!(out.contains(r#""access_token":"[REDACTED]""#), "{out}");
+        assert!(out.contains(r#""refresh_token":"[REDACTED]""#), "{out}");
+        // Non-secret fields survive.
+        assert!(out.contains("\"expires_in\":3600"), "{out}");
+    }
+
+    #[test]
+    fn redact_body_masks_oauth_token_request_form() {
+        // The token exchange request body is form-urlencoded — PKCE verifier and
+        // client_secret must not leak (PkcePair docs it as never-logged).
+        let body = "grant_type=authorization_code&code=auth123&code_verifier=VVVVVVVVVVVVVVVVVVVV&client_secret=SSSSSSSSSSSSSSSSSSSS";
+        let out = redact_body(body);
+        assert!(!out.contains("VVVVVVVV"), "code_verifier leaked: {out}");
+        assert!(!out.contains("SSSSSSSS"), "client_secret leaked: {out}");
+        assert!(out.contains("code_verifier=[REDACTED]"), "{out}");
+        assert!(out.contains("client_secret=[REDACTED]"), "{out}");
+        // The grant_type (non-secret) and the bare auth code survive.
+        assert!(out.contains("grant_type=authorization_code"), "{out}");
     }
 
     #[tokio::test]

@@ -783,8 +783,19 @@ pub fn sse_data_payload(line: &str) -> Option<&str> {
 /// as fallback). aivo's release binary is static-musl and musl reads
 /// `/etc/resolv.conf` literally — which Termux doesn't populate — so
 /// without this override every lookup returns `EAI_AGAIN`.
+/// The `User-Agent` aivo advertises on outbound HTTP requests, e.g.
+/// `aivo/0.30.1`. Set as the client default in [`aivo_http_client_builder`], so
+/// requests that don't override it — including the in-process agent's provider
+/// calls, which the loopback serve rebuilds without forwarding the client's own
+/// UA — identify themselves to providers the way `claude-cli/x.y.z` does.
+/// Per-request or per-client agents (web_fetch, `update`, plugin installs) still
+/// take precedence, and the raw proxy path still forwards a tool client's own UA.
+pub fn aivo_user_agent() -> String {
+    format!("aivo/{}", crate::version::VERSION)
+}
+
 pub fn aivo_http_client_builder() -> reqwest::ClientBuilder {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().user_agent(aivo_user_agent());
     if force_ipv4_enabled() {
         builder = builder.local_address(Some(std::net::Ipv4Addr::UNSPECIFIED.into()));
     }
@@ -882,6 +893,51 @@ pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn aivo_user_agent_is_versioned() {
+        let ua = aivo_user_agent();
+        assert!(ua.starts_with("aivo/"), "unexpected UA: {ua}");
+        assert!(
+            ua.ends_with(crate::version::VERSION),
+            "UA should carry the crate version: {ua}"
+        );
+    }
+
+    /// The shared client builder must stamp `User-Agent: aivo/<version>` onto the
+    /// wire, so the agent's provider calls (which the loopback serve rebuilds
+    /// without forwarding the client UA) are attributable to aivo.
+    #[tokio::test]
+    async fn shared_client_sends_aivo_user_agent() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = sock.flush();
+            request
+        });
+
+        // `.no_proxy()` isolates the test from any ambient HTTP(S)_PROXY without
+        // disturbing the user-agent the builder set.
+        let client = aivo_http_client_builder().no_proxy().build().unwrap();
+        let _ = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .unwrap();
+
+        let request = handle.join().unwrap();
+        let ua = header_value(&request, "user-agent").unwrap_or("");
+        assert_eq!(ua, aivo_user_agent(), "request was:\n{request}");
+    }
 
     #[test]
     fn test_request_loopback_authorized_forms() {

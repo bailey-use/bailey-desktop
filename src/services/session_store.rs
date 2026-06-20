@@ -755,6 +755,17 @@ pub struct ChatSessionState {
     /// Raw encrypted blob. Call `decrypt_messages()` to get the actual messages.
     #[serde(deserialize_with = "deserialize_messages_field")]
     pub messages: String,
+    /// Optional encrypted blob of the in-process agent engine's raw OpenAI-format
+    /// conversation (assistant `tool_calls` + `tool` results with ids), for exact
+    /// resume. Absent for non-agent chats and pre-feature sessions; a decrypt/parse
+    /// failure is treated as absent (resume falls back to the lossy text seed).
+    /// Call [`ChatSessionState::decrypt_engine_messages`].
+    #[serde(
+        rename = "engineMessages",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub engine_messages: Option<String>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "createdAt", default)]
@@ -801,6 +812,15 @@ impl ChatSessionState {
         }
         let json = decrypt(&self.messages)?;
         serde_json::from_str(&json).context("Failed to parse stored messages")
+    }
+
+    /// Best-effort decrypt of the persisted agent-engine conversation for exact
+    /// resume. Returns `None` (never an error) when absent or unreadable — a lost
+    /// keyring or a schema mismatch degrades to a lossy text resume, never a brick.
+    pub fn decrypt_engine_messages(&self) -> Option<Vec<serde_json::Value>> {
+        let blob = self.engine_messages.as_ref()?;
+        let json = decrypt(blob).ok()?;
+        serde_json::from_str(&json).ok()
     }
 }
 
@@ -992,6 +1012,17 @@ pub struct StoredConfig {
     /// Prevents auto-recreation until the user explicitly re-adds it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub starter_key_dismissed: bool,
+    /// Skill names the user turned OFF in `/skills`; excluded from the agent's
+    /// system prompt + `skill` tool. Empty = every discovered skill is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_skills: Vec<String>,
+    /// MCP server names the user turned OFF in `/mcp`; skipped at connect time so
+    /// their tools aren't offered. Empty = every configured server is enabled.
+    /// Applies to both user- and project-scoped servers: a repo's `.mcp.json`
+    /// server connects by default like any other (the user owns what's in their
+    /// own project) — disable it here to opt out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_mcp_servers: Vec<String>,
 }
 
 /// Deserialize directory_starts supporting both legacy flat format and new nested format.
@@ -1091,6 +1122,8 @@ impl StoredConfig {
             last_selection: None,
             chat_sessions: HashMap::new(),
             starter_key_dismissed: false,
+            disabled_skills: Vec::new(),
+            disabled_mcp_servers: Vec::new(),
         }
     }
 }
@@ -1585,6 +1618,40 @@ impl SessionStore {
         self.api_keys.ctx.save_raw(&config).await
     }
 
+    /// Skill names the user has turned off in `/skills`.
+    pub async fn get_disabled_skills(&self) -> Result<Vec<String>> {
+        Ok(self.api_keys.ctx.load().await?.disabled_skills)
+    }
+
+    /// Enable or disable one skill by name (idempotent). Disabled skills are kept
+    /// out of the agent's system prompt + `skill` tool.
+    pub async fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        let _lock = self.api_keys.ctx.acquire_config_lock()?;
+        let mut config = self.api_keys.ctx.load().await?;
+        config.disabled_skills.retain(|n| n != name);
+        if !enabled {
+            config.disabled_skills.push(name.to_string());
+        }
+        self.api_keys.ctx.save_raw(&config).await
+    }
+
+    /// MCP server names the user has turned off in `/mcp`.
+    pub async fn get_disabled_mcp_servers(&self) -> Result<Vec<String>> {
+        Ok(self.api_keys.ctx.load().await?.disabled_mcp_servers)
+    }
+
+    /// Enable or disable one MCP server by name (idempotent). Disabled servers are
+    /// skipped at connect time so their tools aren't offered to the agent.
+    pub async fn set_mcp_server_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        let _lock = self.api_keys.ctx.acquire_config_lock()?;
+        let mut config = self.api_keys.ctx.load().await?;
+        config.disabled_mcp_servers.retain(|n| n != name);
+        if !enabled {
+            config.disabled_mcp_servers.push(name.to_string());
+        }
+        self.api_keys.ctx.save_raw(&config).await
+    }
+
     /// Gets all keys and the active key ID without decrypting secrets.
     pub async fn get_keys_and_active_id_info(&self) -> Result<(Vec<ApiKey>, Option<String>)> {
         self.api_keys.get_keys_and_active_id_info().await
@@ -1603,6 +1670,93 @@ impl SessionStore {
     /// Saves the chat model for a specific API key
     pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
         self.api_keys.set_chat_model(key_id, model).await
+    }
+
+    /// The persisted global chat auto-approve toggle (remembered across `aivo
+    /// chat` sessions). Stored in its own small file rather than the encrypted
+    /// keys config, so it never risks the key store. Missing/unreadable → off.
+    pub async fn get_chat_auto_approve(&self) -> bool {
+        let path = self.config_dir().join("chat-prefs.json");
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return false;
+        };
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("autoApprove").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+    }
+
+    /// Persist the global chat auto-approve toggle, preserving any sibling prefs
+    /// (e.g. the project-MCP allow-list). Best-effort; written atomically via a
+    /// temp file + rename so a crash can't truncate it.
+    pub async fn set_chat_auto_approve(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        prefs.insert("autoApprove".into(), serde_json::Value::Bool(on));
+        self.write_chat_prefs(&prefs).await
+    }
+
+    /// chat-prefs.json as a JSON object (empty when absent/unparseable), for a
+    /// read-modify-write that preserves keys other than the one being changed.
+    async fn read_chat_prefs(&self) -> serde_json::Map<String, serde_json::Value> {
+        let path = self.config_dir().join("chat-prefs.json");
+        tokio::fs::read(&path)
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    async fn write_chat_prefs(
+        &self,
+        prefs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let dir = self.config_dir();
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join("chat-prefs.json");
+        let data = serde_json::to_vec_pretty(prefs)?;
+        // chat-prefs holds the project-MCP allow-list and the auto-approve flag —
+        // security-relevant, so write it 0600 (and via a random-suffix temp that
+        // leaves no orphan on a crash), like every other config write. A plain
+        // `tokio::fs::write` would land at the process umask (typically 0644).
+        atomic_write_secure(&path, data).await
+    }
+
+    /// Whether the user granted "always" approval to spawn the project
+    /// `.mcp.json` stdio servers in `dir_key` (a canonical repo path) with the
+    /// exact server set hashed into `digest`. These run arbitrary local commands,
+    /// so they're gated until the user opts in once — and the approval is bound to
+    /// the server content, so a later `.mcp.json` change (e.g. a `git pull` that
+    /// swaps in a different command) no longer matches and re-prompts. Stored in
+    /// chat-prefs.json (non-secret, never the encrypted key store). Missing → false.
+    /// Legacy bare-string entries (dir only, no digest) never match — they expire
+    /// to one re-approval rather than silently honoring a changed config.
+    pub async fn get_project_mcp_approved(&self, dir_key: &str, digest: &str) -> bool {
+        self.read_chat_prefs()
+            .await
+            .get("approvedProjectMcpDirs")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter().any(|d| {
+                    d.get("dir").and_then(|x| x.as_str()) == Some(dir_key)
+                        && d.get("sha256").and_then(|x| x.as_str()) == Some(digest)
+                })
+            })
+    }
+
+    /// Remember an "always" approval for `dir_key`'s project MCP servers, bound to
+    /// `digest`. Replaces any prior approval for the same dir so a re-approval
+    /// after a config change supersedes (rather than accumulates) the old digest.
+    pub async fn set_project_mcp_approved(&self, dir_key: &str, digest: &str) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        let arr = prefs
+            .entry("approvedProjectMcpDirs")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(list) = arr.as_array_mut() {
+            list.retain(|d| d.get("dir").and_then(|x| x.as_str()) != Some(dir_key));
+            list.push(serde_json::json!({ "dir": dir_key, "sha256": digest }));
+        }
+        self.write_chat_prefs(&prefs).await
     }
 
     // ── Last selection (delegated to LastSelectionStore) ───────────────────
@@ -1711,6 +1865,13 @@ impl SessionStore {
         self.sessions.session_ids_on_disk().await
     }
 
+    /// Cumulative tokens stored for a session's index entry (zero if unknown).
+    /// Re-seeds the chat TUI's running total on resume so continued turns keep
+    /// accumulating rather than overwriting the prior total.
+    pub async fn chat_session_tokens(&self, session_id: &str) -> SessionTokens {
+        self.sessions.chat_session_tokens(session_id).await
+    }
+
     pub async fn all_chat_sessions(&self) -> Result<Vec<SessionIndexEntry>> {
         self.sessions.all_chat_sessions().await
     }
@@ -1742,6 +1903,18 @@ impl SessionStore {
                 preview,
                 tokens,
             )
+            .await
+    }
+
+    /// Refresh only the durable agent-engine transcript of an existing chat
+    /// session (for exact resume of the in-process agent). Best-effort.
+    pub async fn save_agent_messages(
+        &self,
+        session_id: &str,
+        engine_messages: &[serde_json::Value],
+    ) -> Result<()> {
+        self.sessions
+            .save_agent_messages(session_id, engine_messages)
             .await
     }
 
@@ -1973,6 +2146,43 @@ mod tests {
         let config = store.load().await.unwrap();
         assert!(config.api_keys.is_empty());
         assert!(config.active_key_id.is_none());
+    }
+
+    /// The per-repo project-MCP allow-list round-trips and shares chat-prefs.json
+    /// with the auto-approve toggle without either write clobbering the other.
+    #[tokio::test]
+    async fn project_mcp_approval_persists_and_coexists_with_auto_approve() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        store.set_chat_auto_approve(true).await.unwrap();
+        assert!(!store.get_project_mcp_approved("/repo/a", "sig1").await);
+
+        store
+            .set_project_mcp_approved("/repo/a", "sig1")
+            .await
+            .unwrap();
+        assert!(store.get_project_mcp_approved("/repo/a", "sig1").await);
+        // A changed .mcp.json (different content digest) no longer matches.
+        assert!(!store.get_project_mcp_approved("/repo/a", "sig2").await);
+        assert!(!store.get_project_mcp_approved("/repo/b", "sig1").await);
+        // Adding the allow-list entry preserved autoApprove.
+        assert!(store.get_chat_auto_approve().await);
+
+        // Flipping auto-approve preserves the allow-list.
+        store.set_chat_auto_approve(false).await.unwrap();
+        assert!(store.get_project_mcp_approved("/repo/a", "sig1").await);
+        assert!(!store.get_chat_auto_approve().await);
+        // Re-approving with a new digest supersedes the old one (one entry per dir).
+        store
+            .set_project_mcp_approved("/repo/a", "sig2")
+            .await
+            .unwrap();
+        assert!(store.get_project_mcp_approved("/repo/a", "sig2").await);
+        assert!(
+            !store.get_project_mcp_approved("/repo/a", "sig1").await,
+            "the superseded digest no longer matches"
+        );
     }
 
     #[tokio::test]
@@ -2244,6 +2454,22 @@ mod tests {
             .await
             .unwrap();
         assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn chat_auto_approve_persists_and_defaults_off() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        // No prefs file yet → defaults to off.
+        assert!(!store.get_chat_auto_approve().await);
+
+        // Round-trips both directions across (re)reads.
+        store.set_chat_auto_approve(true).await.unwrap();
+        assert!(store.get_chat_auto_approve().await);
+        store.set_chat_auto_approve(false).await.unwrap();
+        assert!(!store.get_chat_auto_approve().await);
     }
 
     #[tokio::test]
@@ -2580,6 +2806,46 @@ mod tests {
         let session: ChatSessionState = serde_json::from_str(&session_json).unwrap();
         let decoded = session.decrypt_messages().unwrap();
         assert_eq!(decoded, msgs);
+    }
+
+    /// `decrypt_engine_messages` is best-effort: a corrupt or unreadable engine
+    /// blob (lost keyring, schema mismatch) must degrade to `None` — a lossy text
+    /// resume — never panic or brick the session. A valid blob still round-trips.
+    #[test]
+    fn test_decrypt_engine_messages_degrades_not_bricks() {
+        let make = |engine: Option<&str>| -> ChatSessionState {
+            let mut v = serde_json::json!({
+                "sessionId": "s", "keyId": "k", "baseUrl": "u",
+                "cwd": "/", "model": "m", "messages": "",
+                "updatedAt": "2024-01-01T00:00:00Z"
+            });
+            if let Some(e) = engine {
+                v["engineMessages"] = serde_json::Value::String(e.to_string());
+            }
+            serde_json::from_value(v).unwrap()
+        };
+
+        let absent = make(None);
+        assert!(absent.engine_messages.is_none());
+        assert!(absent.decrypt_engine_messages().is_none());
+
+        assert!(
+            make(Some("not-a-valid-blob"))
+                .decrypt_engine_messages()
+                .is_none(),
+            "a corrupt engine blob must degrade to None, never brick"
+        );
+
+        // A valid blob still round-trips.
+        let payload = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "tool_calls": [{"id": "t1"}]}),
+        ];
+        let blob = encrypt(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(
+            make(Some(&blob)).decrypt_engine_messages().unwrap(),
+            payload
+        );
     }
 
     #[test]

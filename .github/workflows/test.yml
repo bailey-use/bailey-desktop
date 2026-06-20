@@ -21,7 +21,10 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      # CI: fail loud if Landlock is missing on the Linux runner (see tests/sandbox_linux.rs).
       - run: cargo test --features __internal_test_fast_crypto
+        env:
+          AIVO_REQUIRE_LANDLOCK: ${{ matrix.runs-on == 'ubuntu-latest' && '1' || '' }}
 
       - run: cargo clippy -- -D warnings
 

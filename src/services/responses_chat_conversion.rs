@@ -585,7 +585,10 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
                         if let Some(name) = tc["function"]["name"].as_str()
                             && !name.is_empty()
                         {
-                            tool_calls_acc[idx].1.push_str(name);
+                            // Assign, don't append: some providers (e.g. qwen)
+                            // re-send the full name on every delta, which would
+                            // otherwise accumulate into `run_bashrun_bash…`.
+                            tool_calls_acc[idx].1 = name.to_string();
                         }
                         if let Some(args) = tc["function"]["arguments"].as_str() {
                             tool_calls_acc[idx].2.push_str(args);

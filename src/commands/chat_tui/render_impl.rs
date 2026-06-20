@@ -1052,31 +1052,50 @@ impl ChatTuiApp {
         } else {
             ("⇧⇥ auto-approve: off", Style::default().fg(MUTED))
         };
-        // Live `/goal` step indicator at the LEFT of the rule, so an unattended
-        // loop is always visible (not just in a transient notice).
-        let goal_badge = self.goal_mode.as_ref().map(|g| {
+        // Left title on the rule. While recalling input history, show
+        // `History {pos}/{total}` — the newest entry reads as total/total and
+        // counts down as you scroll further back — preceded by two rule dashes
+        // so it reads as a titled divider (matching the recall affordance).
+        // Otherwise, a live `/goal` step indicator pinned to the very left so an
+        // unattended loop is always visible (not just in a transient notice).
+        // The two never coincide in one frame: history recall is a foreground
+        // composer action.
+        let (left_text, left_style, left_lead) = if let Some(index) = self.draft_history_index {
             (
-                format!(" ◎ goal {}/{} ", g.iteration, g.max),
-                Style::default().fg(ACCENT),
+                format!(" History {}/{} ", index + 1, self.draft_history.len()),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                2usize,
             )
-        });
+        } else if let Some(goal) = self.goal_mode.as_ref() {
+            (
+                format!(" ◎ goal {}/{} ", goal.iteration, goal.max),
+                Style::default().fg(ACCENT),
+                0usize,
+            )
+        } else {
+            (String::new(), Style::default(), 0usize)
+        };
         let trailing = 2usize;
         // Badge cell width including one space of padding on each side.
         let badge_w = display_width(badge) + 2;
-        let goal_w = goal_badge
-            .as_ref()
-            .map(|(s, _)| display_width(s))
-            .unwrap_or(0);
-        if width <= goal_w + badge_w + trailing + 2 {
+        let left_w = if left_text.is_empty() {
+            0
+        } else {
+            left_lead + display_width(&left_text)
+        };
+        if width <= left_w + badge_w + trailing + 2 {
             // Too narrow to inset both — keep the safety-critical auto-approve badge.
             return Line::from(Span::styled(badge.to_string(), badge_style));
         }
-        let left = width - goal_w - badge_w - trailing;
-        let mut spans = Vec::with_capacity(4);
-        if let Some((text, style)) = goal_badge {
-            spans.push(Span::styled(text, style));
+        let fill = width - left_w - badge_w - trailing;
+        let mut spans = Vec::with_capacity(5);
+        if !left_text.is_empty() {
+            if left_lead > 0 {
+                spans.push(Span::styled("─".repeat(left_lead), rule_style));
+            }
+            spans.push(Span::styled(left_text, left_style));
         }
-        spans.push(Span::styled("─".repeat(left), rule_style));
+        spans.push(Span::styled("─".repeat(fill), rule_style));
         spans.push(Span::styled(format!(" {badge} "), badge_style));
         spans.push(Span::styled("─".repeat(trailing), rule_style));
         Line::from(spans)

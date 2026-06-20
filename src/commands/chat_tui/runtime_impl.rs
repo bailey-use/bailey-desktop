@@ -1574,6 +1574,12 @@ impl ChatTuiApp {
         // shouldn't stack identical rows. Non-adjacent repeats are kept.
         if self.draft_history.last().map(String::as_str) != Some(input) {
             self.draft_history.push(input.to_string());
+            // Bound the recall list (and its on-disk file) to the most recent
+            // `MAX_DRAFT_HISTORY` entries, dropping the oldest first.
+            let overflow = self.draft_history.len().saturating_sub(MAX_DRAFT_HISTORY);
+            if overflow > 0 {
+                self.draft_history.drain(..overflow);
+            }
         }
         self.draft_history_index = None;
         self.draft_history_stash = None;

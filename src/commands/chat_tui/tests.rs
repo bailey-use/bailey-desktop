@@ -5070,6 +5070,60 @@ fn test_composer_rule_shows_goal_step_indicator() {
     );
 }
 
+/// While recalling input history with up-arrow, the composer rule titles itself
+/// `History pos/total` (newest is total/total, counting down going back) and
+/// drops the title once navigation ends.
+#[tokio::test]
+async fn test_composer_rule_shows_history_position_while_navigating() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_history = (0..100).map(|i| format!("/cmd {i}")).collect();
+
+    // Idle: no history title, just the auto-approve badge.
+    let idle = plain_text_from_spans(&app.composer_rule_line(80).spans);
+    assert!(!idle.contains("History"), "no title when idle: {idle:?}");
+
+    // Up-arrow into the newest entry → `History 100/100`.
+    app.history_prev();
+    let newest = plain_text_from_spans(&app.composer_rule_line(80).spans);
+    assert!(newest.contains("History 100/100"), "newest: {newest:?}");
+    assert!(
+        display_width(&newest) <= 80,
+        "rule fits width: {}",
+        display_width(&newest)
+    );
+
+    // One step further back → `History 99/100`.
+    app.history_prev();
+    let back = plain_text_from_spans(&app.composer_rule_line(80).spans);
+    assert!(back.contains("History 99/100"), "back one: {back:?}");
+
+    // Leaving navigation drops the title again.
+    app.leave_history_navigation();
+    let done = plain_text_from_spans(&app.composer_rule_line(80).spans);
+    assert!(!done.contains("History"), "title gone after exit: {done:?}");
+}
+
+/// The input/draft history is bounded to the most recent `MAX_DRAFT_HISTORY`
+/// entries, dropping the oldest first so the on-disk recall file can't grow
+/// without bound.
+#[tokio::test]
+async fn test_draft_history_capped_at_max() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Record 50 over the cap; each entry is distinct so none dedupe away.
+    for i in 0..(MAX_DRAFT_HISTORY + 50) {
+        app.record_draft_history(&format!("/cmd {i}"));
+    }
+    assert_eq!(app.draft_history.len(), MAX_DRAFT_HISTORY);
+    // The 50 oldest were dropped; the newest is retained.
+    assert_eq!(app.draft_history.first().unwrap(), "/cmd 50");
+    assert_eq!(
+        app.draft_history.last().unwrap(),
+        &format!("/cmd {}", MAX_DRAFT_HISTORY + 49)
+    );
+}
+
 #[tokio::test]
 async fn test_skills_add_routes_source_not_scaffold() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

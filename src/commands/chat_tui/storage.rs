@@ -56,11 +56,18 @@ pub(super) fn load_persisted_draft_history_from_path(path: &Path) -> Vec<String>
         return Vec::new();
     };
 
-    plain
+    let mut entries: Vec<String> = plain
         .lines()
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
-        .collect()
+        .collect();
+    // Keep only the most recent `MAX_DRAFT_HISTORY` entries — a file written
+    // before the cap existed can be arbitrarily long; trim it on load.
+    let overflow = entries.len().saturating_sub(MAX_DRAFT_HISTORY);
+    if overflow > 0 {
+        entries.drain(..overflow);
+    }
+    entries
 }
 
 pub(super) fn save_persisted_draft_history(history: &[String]) -> io::Result<()> {

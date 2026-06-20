@@ -70,6 +70,11 @@ use super::chat_tui_format;
 /// Maximum number of messages to keep in chat history.
 /// When exceeded, the oldest messages are dropped (keeping any system message).
 const MAX_HISTORY_MESSAGES: usize = 50;
+/// Maximum number of entries kept in the composer's input/draft history (the
+/// up-arrow recall list, persisted to `~/.config/aivo/chat_history`). When
+/// exceeded, the oldest entries are dropped — bounding the on-disk file and the
+/// recall depth, the same way Claude Code caps its prompt history.
+const MAX_DRAFT_HISTORY: usize = 100;
 /// Retry budget for transient HTTP failures.
 const MAX_REQUEST_ATTEMPTS: usize = 3;
 

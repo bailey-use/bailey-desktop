@@ -348,17 +348,17 @@ mod tests {
     #[test]
     fn variant_only_listings_resolve_for_plain_id() {
         // poolside/laguna-m.1 is mostly listed as `…:free`; the generator
-        // merges variants into the base id (131,040 = poolside's own figure).
+        // merges variants into the base id (262,144 = poolside's own figure).
         assert_eq!(
             snapshot_limits("poolside/laguna-m.1").unwrap().context,
-            Some(131_040)
+            Some(262_144)
         );
         // Explicit `:free` needles resolve too (colon-strip step).
         assert_eq!(
             snapshot_limits("openrouter/poolside/laguna-m.1:free")
                 .unwrap()
                 .context,
-            Some(131_040)
+            Some(262_144)
         );
     }
 

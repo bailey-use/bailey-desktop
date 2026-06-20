@@ -143,8 +143,11 @@ fn collect_runnable(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both are used only by the `#[cfg(unix)]` executable-bit tests below.
+    #[cfg(unix)]
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     fn put_runnable(path: &Path) {
         std::fs::write(path, b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]

@@ -6558,6 +6558,8 @@ fn test_render_main_local_command_no_clip() {
 
 /// Drive a started `!cmd` to completion: drain runtime events until the run
 /// commits to history (clearing `local_command`).
+// Only the `#[cfg(unix)]` PTY `!cmd` tests above drive this; unused on Windows.
+#[cfg(unix)]
 async fn run_local_command_to_completion(app: &mut ChatTuiApp) {
     for _ in 0..5000 {
         app.handle_runtime_events().await.unwrap();

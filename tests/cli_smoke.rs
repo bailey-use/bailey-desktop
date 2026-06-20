@@ -28,6 +28,8 @@ fn aivo(home: &TempDir) -> Command {
     cmd
 }
 
+// Only the `#[cfg(unix)]` fake-binary tests use this; unused on Windows.
+#[cfg(unix)]
 fn prepend_path(cmd: &mut Command, dir: &std::path::Path) {
     let mut paths = vec![dir.to_path_buf()];
     if let Some(existing) = std::env::var_os("PATH") {

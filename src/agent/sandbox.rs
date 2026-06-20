@@ -115,6 +115,10 @@ pub fn wrap_shell(command: &str, cwd: &Path) -> ShellInvocation {
         return landlock_relaunch(exe.to_string_lossy().into_owned(), cwd, command);
     }
 
+    // `cwd` is consulted only by the macOS/Linux sandbox backends above; on other
+    // targets (Windows) there's no path-confinement, so it's intentionally unused.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = cwd;
     bare_shell(command)
 }
 

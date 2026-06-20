@@ -110,6 +110,10 @@ struct McpTool {
 /// A connected server's transport state, behind the per-server mutex. Both
 /// variants carry the JSON-RPC `next_id`; `request`/`notify` dispatch on the
 /// variant.
+// The variant sizes are close enough on Unix to pass, but cross clippy's
+// threshold on Windows (platform-dependent struct layout); boxing either side
+// would churn every match arm for no real win on a per-server, low-count enum.
+#[allow(clippy::large_enum_variant)]
 enum ServerIo {
     Stdio(StdioIo),
     Http(HttpIo),

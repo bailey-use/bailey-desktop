@@ -54,15 +54,15 @@ struct SnapshotFile {
 static SNAPSHOT: LazyLock<HashMap<String, ModelLimits>> = LazyLock::new(build_snapshot);
 
 fn build_snapshot() -> HashMap<String, ModelLimits> {
-    let mut rows = embedded_rows();
+    let embedded = embedded_rows();
     // Tests skip the overlay so assertions don't depend on the dev's real
     // `~/.config/aivo`.
     if !cfg!(test)
         && let Some(over) = load_override_rows()
     {
-        merge_rows(&mut rows, over); // override wins per id
+        return overlay_override(embedded, over);
     }
-    fold_rows(rows)
+    fold_rows(embedded)
 }
 
 fn embedded_rows() -> std::collections::BTreeMap<String, LimitRow> {
@@ -80,11 +80,18 @@ fn load_override_rows() -> Option<std::collections::BTreeMap<String, LimitRow>> 
     (!parsed.models.is_empty()).then_some(parsed.models)
 }
 
-fn merge_rows(
-    base: &mut std::collections::BTreeMap<String, LimitRow>,
+/// Overlay `over` onto `base` so the override wins per *folded* id. Each source
+/// is folded independently before overlaying: merging raw keys then folding
+/// would route both through `fold_rows`' larger-context tiebreak, letting a
+/// stale embedded entry under a fold-equivalent spelling (`claude-sonnet-4.6`
+/// vs `claude-sonnet-4-6`) beat a fresh — possibly smaller — override value.
+fn overlay_override(
+    base: std::collections::BTreeMap<String, LimitRow>,
     over: std::collections::BTreeMap<String, LimitRow>,
-) {
-    base.extend(over);
+) -> HashMap<String, ModelLimits> {
+    let mut map = fold_rows(base);
+    map.extend(fold_rows(over)); // override wins per folded id
+    map
 }
 
 fn fold_rows(rows: std::collections::BTreeMap<String, LimitRow>) -> HashMap<String, ModelLimits> {
@@ -461,12 +468,36 @@ mod tests {
             "model-c".into(),
             (Some(300), None, String::new(), String::new()),
         );
-        merge_rows(&mut base, over);
-        let folded = fold_rows(base);
+        let folded = overlay_override(base, over);
         assert_eq!(folded["model-a"].context, Some(50));
         assert!(folded["model-a"].reasoning);
         assert_eq!(folded["model-b"].context, Some(200)); // untouched embedded id
         assert_eq!(folded["model-c"].context, Some(300)); // new id from override
+    }
+
+    #[test]
+    fn override_wins_across_dot_dash_spelling_with_smaller_context() {
+        use std::collections::BTreeMap;
+        // The embedded floor lists the model dot-spelled with a *larger* context;
+        // the fresh override lists it dash-spelled with a smaller one. Both fold
+        // to the same id — the override must still win. Regression for the
+        // merge-raw-then-fold path, where `fold_rows`' larger-context tiebreak
+        // kept the stale embedded value and silently dropped the refresh.
+        let mut base: BTreeMap<String, LimitRow> = BTreeMap::new();
+        base.insert(
+            "claude-sonnet-4.6".into(),
+            (Some(1_000_000), Some(64_000), "t".into(), String::new()),
+        );
+        let mut over: BTreeMap<String, LimitRow> = BTreeMap::new();
+        over.insert(
+            "claude-sonnet-4-6".into(),
+            (Some(800_000), Some(32_000), "tr".into(), String::new()),
+        );
+        let folded = overlay_override(base, over);
+        assert_eq!(folded.len(), 1, "dot and dash fold to one id");
+        assert_eq!(folded["claude-sonnet-4-6"].context, Some(800_000));
+        assert_eq!(folded["claude-sonnet-4-6"].output, Some(32_000));
+        assert!(folded["claude-sonnet-4-6"].reasoning);
     }
 
     #[test]

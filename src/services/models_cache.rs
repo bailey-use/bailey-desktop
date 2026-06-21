@@ -120,10 +120,11 @@ impl ModelsCache {
         let entries = self.entries().await;
         let state = entries.read().await;
         let mut ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for key in [base_url.to_string(), full_catalog_key(base_url)] {
             if let Some(entry) = state.get(&key) {
                 for m in &entry.models {
-                    if !ids.contains(m) {
+                    if seen.insert(m.as_str()) {
                         ids.push(m.clone());
                     }
                 }

@@ -282,7 +282,8 @@ impl ChatCommand {
     /// Transforms model names for OpenRouter compatibility
     /// OpenRouter uses dots in version numbers: 4.6 instead of 4-6
     fn transform_model_for_provider(base_url: &str, model: &str) -> String {
-        model_names::transform_model_for_provider(base_url, model)
+        // No catalog needed: the picker already yields a provider-correct name.
+        model_names::transform_model_for_provider(None, base_url, model)
     }
 
     /// Read-only preview for `aivo chat --dry-run`: resolves the key, model,

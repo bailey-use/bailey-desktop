@@ -234,7 +234,9 @@ pub fn convert_responses_to_chat_request(
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
     // Skip transform when using Copilot — model names pass through unchanged
     // If actual_model is set, use that (it was set by environment injector)
+    // No catalog handle on this sync path → host-based transform only.
     let selected_model = select_model_for_provider_attempt(
+        None,
         &config.target_base_url,
         body.get("model").and_then(|v| v.as_str()),
         config.actual_model.as_deref(),

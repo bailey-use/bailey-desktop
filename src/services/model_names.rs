@@ -60,9 +60,55 @@ pub fn transform_model_for_openrouter(model: &str) -> String {
     format!("anthropic/{}", normalize_claude_version(model))
 }
 
-/// Transforms a model name based on the provider's base URL.
-/// Currently, only OpenRouter requires transformation.
-pub fn transform_model_for_provider(base_url: &str, model: &str) -> String {
+/// Lowercase and collapse `.`→`-` so `claude-sonnet-4.6` and `claude-sonnet-4-6`
+/// compare equal, while keeping the full `vendor/…/model` path intact.
+fn normalize_model_id(model: &str) -> String {
+    model.trim().to_ascii_lowercase().replace('.', "-")
+}
+
+/// True when `a` and `b` are the same model modulo a leading `vendor/…` path:
+/// equal, or one is a *slash-boundary* suffix of the other. Matches `glm-5.2`
+/// to `@cf/zai-org/glm-5.2`, but not `qwen/glm-5.2` to `zai-org/glm-5.2` or
+/// `gpt-4` to `gpt-4o`. Inputs must be pre-normalized.
+fn same_model_modulo_prefix(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (longer, shorter) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    !shorter.is_empty()
+        && longer.len() > shorter.len()
+        && longer.ends_with(shorter)
+        && longer.as_bytes()[longer.len() - shorter.len() - 1] == b'/'
+}
+
+/// Resolve `requested` to the exact id the provider advertises in `catalog`
+/// (its `/v1/models` list): exact match, else modulo a `vendor/…` prefix and
+/// dot-vs-dash. `None` when nothing matches. The data-driven alternative to
+/// per-host model-name rules — we send a name the provider actually lists.
+pub fn resolve_model_from_catalog(catalog: &[String], requested: &str) -> Option<String> {
+    if let Some(hit) = catalog.iter().find(|m| m.as_str() == requested) {
+        return Some(hit.clone());
+    }
+    let want = normalize_model_id(requested);
+    catalog
+        .iter()
+        .find(|m| same_model_modulo_prefix(&normalize_model_id(m), &want))
+        .cloned()
+}
+
+/// Resolve a model name to what the provider expects: the exact catalog id when
+/// one matches (so any `vendor/`-slug gateway works with no per-host rule), else
+/// the OpenRouter string transform as a cold-start fallback.
+pub fn transform_model_for_provider(
+    catalog: Option<&[String]>,
+    base_url: &str,
+    model: &str,
+) -> String {
+    if let Some(catalog) = catalog
+        && let Some(hit) = resolve_model_from_catalog(catalog, model)
+    {
+        return hit;
+    }
     if is_openrouter_base(base_url) {
         transform_model_for_openrouter(model)
     } else {
@@ -241,22 +287,32 @@ pub fn select_model_for_protocol(
 }
 
 pub fn select_model_for_provider_attempt(
+    catalog: Option<&[String]>,
     base_url: &str,
     requested_model: Option<&str>,
     explicit_model: Option<&str>,
     target_protocol: ProviderProtocol,
 ) -> String {
+    // An explicit model is the user's deliberate choice — respect it verbatim.
     if let Some(model) = explicit_model.filter(|model| !model.trim().is_empty()) {
         return model.to_string();
     }
 
-    if let Some(model) = requested_model.filter(|model| !model.trim().is_empty())
+    let selected = if let Some(model) = requested_model.filter(|model| !model.trim().is_empty())
         && should_preserve_cross_protocol_model(base_url, model, target_protocol)
     {
-        return model.to_string();
-    }
+        model.to_string()
+    } else {
+        select_model_for_protocol(requested_model, explicit_model, target_protocol)
+    };
 
-    select_model_for_protocol(requested_model, explicit_model, target_protocol)
+    // Snap the tool's default name to the exact catalog id when we have one.
+    if let Some(catalog) = catalog
+        && let Some(hit) = resolve_model_from_catalog(catalog, &selected)
+    {
+        return hit;
+    }
+    selected
 }
 
 /// Normalize protocol for model comparison — ResponsesApi uses the same models as Openai.
@@ -371,14 +427,105 @@ mod tests {
 
     #[test]
     fn test_transform_model_for_provider() {
+        // No catalog: falls back to the OpenRouter string transform.
         assert_eq!(
-            transform_model_for_provider("https://openrouter.ai/api/v1", "claude-sonnet-4-6"),
+            transform_model_for_provider(None, "https://openrouter.ai/api/v1", "claude-sonnet-4-6"),
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(
-            transform_model_for_provider("https://api.example.com/v1", "claude-sonnet-4-6"),
+            transform_model_for_provider(None, "https://api.example.com/v1", "claude-sonnet-4-6"),
             "claude-sonnet-4-6"
         );
+    }
+
+    #[test]
+    fn test_catalog_snaps_default_to_provider_slug() {
+        // Requesty/Vercel/etc advertise `anthropic/claude-sonnet-4.6`. With the
+        // catalog in hand we match the tool's `claude-sonnet-4-6` default to it
+        // — no `is_requesty_base`/`is_vercel_base` host rule required.
+        let catalog = vec![
+            "anthropic/claude-sonnet-4.6".to_string(),
+            "openai/gpt-4o".to_string(),
+        ];
+        assert_eq!(
+            transform_model_for_provider(
+                Some(&catalog),
+                "https://router.requesty.ai/v1",
+                "claude-sonnet-4-6"
+            ),
+            "anthropic/claude-sonnet-4.6"
+        );
+    }
+
+    #[test]
+    fn test_catalog_exact_match_passes_through() {
+        let catalog = vec!["claude-sonnet-4-6".to_string()];
+        assert_eq!(
+            transform_model_for_provider(
+                Some(&catalog),
+                "https://api.example.com/v1",
+                "claude-sonnet-4-6"
+            ),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn test_catalog_miss_falls_back_to_host_transform() {
+        // Model not in the catalog → behave exactly as the no-catalog path.
+        let catalog = vec!["openai/gpt-4o".to_string()];
+        assert_eq!(
+            transform_model_for_provider(
+                Some(&catalog),
+                "https://openrouter.ai/api/v1",
+                "claude-sonnet-4-6"
+            ),
+            "anthropic/claude-sonnet-4.6"
+        );
+    }
+
+    #[test]
+    fn test_resolve_model_from_catalog_no_false_match() {
+        // A different minor version must not match.
+        let catalog = vec!["anthropic/claude-sonnet-4.5".to_string()];
+        assert_eq!(
+            resolve_model_from_catalog(&catalog, "claude-sonnet-4-6"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_multi_segment_id() {
+        // Cloudflare-style `@cf/<org>/<model>` ids carry two slashes.
+        let catalog = vec!["@cf/zai-org/glm-5.2".to_string()];
+        // Exact id passes through.
+        assert_eq!(
+            resolve_model_from_catalog(&catalog, "@cf/zai-org/glm-5.2").as_deref(),
+            Some("@cf/zai-org/glm-5.2")
+        );
+        // A bare or org-qualified request snaps to the full advertised id.
+        assert_eq!(
+            resolve_model_from_catalog(&catalog, "glm-5.2").as_deref(),
+            Some("@cf/zai-org/glm-5.2")
+        );
+        assert_eq!(
+            resolve_model_from_catalog(&catalog, "zai-org/glm-5-2").as_deref(),
+            Some("@cf/zai-org/glm-5.2")
+        );
+    }
+
+    #[test]
+    fn test_resolve_multi_segment_different_org_does_not_match() {
+        // Same model name under a different org is a different model.
+        let catalog = vec!["zai-org/glm-5.2".to_string()];
+        assert_eq!(resolve_model_from_catalog(&catalog, "qwen/glm-5.2"), None);
+    }
+
+    #[test]
+    fn test_resolve_does_not_partial_token_match() {
+        // The slash boundary blocks `gpt-4` matching `gpt-4o`.
+        let catalog = vec!["openai/gpt-4o".to_string()];
+        assert_eq!(resolve_model_from_catalog(&catalog, "gpt-4"), None);
     }
 
     #[test]
@@ -529,6 +676,7 @@ mod tests {
     fn test_select_model_for_provider_attempt_preserves_cross_protocol_gateway_models() {
         assert_eq!(
             select_model_for_provider_attempt(
+                None,
                 "https://api.ai.example-gateway.net/endpoint",
                 Some("claude-sonnet-4.6"),
                 None,
@@ -542,9 +690,44 @@ mod tests {
     fn test_select_model_for_provider_attempt_still_remaps_plain_openai_endpoints() {
         assert_eq!(
             select_model_for_provider_attempt(
+                None,
                 "https://api.openai.com/v1",
                 Some("claude-sonnet-4.6"),
                 None,
+                ProviderProtocol::Openai
+            ),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_provider_attempt_snaps_to_catalog() {
+        // OpenAI-format gateway whose catalog lists the slug form: the tool's
+        // default name snaps to the exact id the gateway advertises.
+        let catalog = vec!["openai/gpt-4o".to_string()];
+        assert_eq!(
+            select_model_for_provider_attempt(
+                Some(&catalog),
+                "https://router.requesty.ai/v1",
+                Some("gpt-4o"),
+                None,
+                ProviderProtocol::Openai
+            ),
+            "openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn test_select_model_for_provider_attempt_explicit_model_not_snapped() {
+        // An explicit user choice is respected verbatim, even if the catalog
+        // lists a differently-spelled equivalent.
+        let catalog = vec!["openai/gpt-4o".to_string()];
+        assert_eq!(
+            select_model_for_provider_attempt(
+                Some(&catalog),
+                "https://router.requesty.ai/v1",
+                None,
+                Some("gpt-4o"),
                 ProviderProtocol::Openai
             ),
             "gpt-4o"

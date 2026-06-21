@@ -71,6 +71,14 @@ impl ModelsCache {
         }
     }
 
+    /// Process-wide shared instance: reads disk at most once and reuses the
+    /// in-memory map. Hot paths (routers resolving model names) should prefer
+    /// this over `new()`, which re-reads the file per instance.
+    pub fn shared() -> &'static ModelsCache {
+        static SHARED: std::sync::OnceLock<ModelsCache> = std::sync::OnceLock::new();
+        SHARED.get_or_init(ModelsCache::new)
+    }
+
     /// Returns the initialised entries map, loading from disk exactly once.
     async fn entries(&self) -> &RwLock<HashMap<String, CacheEntry>> {
         self.entries
@@ -103,6 +111,25 @@ impl ModelsCache {
         let entries = self.entries().await;
         let state = entries.read().await;
         state.get(base_url).and_then(Self::fresh_models)
+    }
+
+    /// Model ids advertised for `base_url`, ignoring the TTL (ids are stable
+    /// once published) and merging both namespaces — the picker key (`base_url`)
+    /// and the `aivo models` key (`{base_url}#all`). `None` if never fetched.
+    pub async fn model_ids(&self, base_url: &str) -> Option<Vec<String>> {
+        let entries = self.entries().await;
+        let state = entries.read().await;
+        let mut ids: Vec<String> = Vec::new();
+        for key in [base_url.to_string(), full_catalog_key(base_url)] {
+            if let Some(entry) = state.get(&key) {
+                for m in &entry.models {
+                    if !ids.contains(m) {
+                        ids.push(m.clone());
+                    }
+                }
+            }
+        }
+        (!ids.is_empty()).then_some(ids)
     }
 
     /// Returns the cached id list and per-model metadata for `base_url` when

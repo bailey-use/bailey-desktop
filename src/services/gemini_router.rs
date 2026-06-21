@@ -257,6 +257,10 @@ async fn forward_to_provider(
     let effective_requires_reasoning =
         config.requires_reasoning_content || learned_requires_reasoning.load(Ordering::Relaxed);
     let mut quirk = QuirkRetryState::new(learned_requires_reasoning, effective_requires_reasoning);
+    // Catalog (when cached) snaps the model name to the exact advertised id.
+    let catalog = crate::services::models_cache::ModelsCache::shared()
+        .model_ids(&config.target_base_url)
+        .await;
     let mut idx = 0;
 
     while idx < candidates.len() {
@@ -265,6 +269,7 @@ async fn forward_to_provider(
         // Select the right model name for this protocol attempt.
         let mut req_body = body_for_attempts.clone();
         let selected_model = select_model_for_provider_attempt(
+            catalog.as_deref(),
             &config.target_base_url,
             req_body.get("model").and_then(|v| v.as_str()),
             None,

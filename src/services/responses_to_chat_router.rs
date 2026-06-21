@@ -1786,7 +1786,9 @@ fn apply_selected_model(
         return;
     }
 
+    // No catalog handle on this sync path → host-based transform only.
     let selected_model = select_model_for_provider_attempt(
+        None,
         &config.target_base_url,
         body.get("model").and_then(|v| v.as_str()),
         config.actual_model.as_deref(),

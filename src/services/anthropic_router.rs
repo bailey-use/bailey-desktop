@@ -258,9 +258,11 @@ async fn forward_request(
     // into the top-level `system` field before patching/forwarding so the
     // request validates regardless of which client produced it.
     hoist_anthropic_system_messages(&mut body);
-    let ctx = RequestContext {
-        upstream_base_url: &config.upstream_base_url,
-    };
+    // Catalog (when cached) lets ModelNamePatch snap to the exact advertised id.
+    let catalog = crate::services::models_cache::ModelsCache::shared()
+        .model_ids(&config.upstream_base_url)
+        .await;
+    let ctx = RequestContext::new(&config.upstream_base_url).with_catalog(catalog.as_deref());
     let pipeline = RouterPipeline::for_openrouter();
     pipeline.patch_json(route.patch_route(), &mut body, &ctx)?;
 
@@ -328,15 +330,15 @@ mod tests {
     fn test_transform_openrouter_adds_prefix_and_normalizes() {
         let url = "https://openrouter.ai/api/v1";
         assert_eq!(
-            transform_model_for_provider(url, "claude-sonnet-4-6"),
+            transform_model_for_provider(None, url, "claude-sonnet-4-6"),
             "anthropic/claude-sonnet-4.6"
         );
         assert_eq!(
-            transform_model_for_provider(url, "claude-opus-4-6"),
+            transform_model_for_provider(None, url, "claude-opus-4-6"),
             "anthropic/claude-opus-4.6"
         );
         assert_eq!(
-            transform_model_for_provider(url, "claude-haiku-4-5"),
+            transform_model_for_provider(None, url, "claude-haiku-4-5"),
             "anthropic/claude-haiku-4.5"
         );
     }
@@ -345,6 +347,7 @@ mod tests {
     fn test_transform_openrouter_date_suffix_preserved() {
         assert_eq!(
             transform_model_for_provider(
+                None,
                 "https://openrouter.ai/api/v1",
                 "claude-haiku-4-5-20251001"
             ),
@@ -356,11 +359,15 @@ mod tests {
     fn test_transform_other_provider_passthrough() {
         // Non-OpenRouter providers: model names pass through unchanged
         assert_eq!(
-            transform_model_for_provider("https://ai-gateway.vercel.sh/v1", "claude-sonnet-4-6"),
+            transform_model_for_provider(
+                None,
+                "https://ai-gateway.vercel.sh/v1",
+                "claude-sonnet-4-6"
+            ),
             "claude-sonnet-4-6"
         );
         assert_eq!(
-            transform_model_for_provider("https://api.example.com/v1", "claude-opus-4-6"),
+            transform_model_for_provider(None, "https://api.example.com/v1", "claude-opus-4-6"),
             "claude-opus-4-6"
         );
     }

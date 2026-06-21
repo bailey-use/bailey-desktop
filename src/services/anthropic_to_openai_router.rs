@@ -531,9 +531,7 @@ async fn try_native_anthropic(
     };
 
     let mut native_body = body.clone();
-    let ctx = RequestContext {
-        upstream_base_url: &config.target_base_url,
-    };
+    let ctx = RequestContext::new(&config.target_base_url);
     CacheControlPatch.patch_json("messages", &mut native_body, &ctx)?;
     ThinkingNormalizationPatch.patch_json("messages", &mut native_body, &ctx)?;
 
@@ -725,13 +723,25 @@ async fn handle_anthropic_to_upstream(
     let mut first_error: FirstError<RouterResponse> = FirstError::seeded(native_anthropic_terminal);
     let mut quirk = QuirkRetryState::new(learned_requires_reasoning, effective_requires_reasoning);
 
+    // Catalog (when cached) snaps the model name to the exact advertised id —
+    // this is what makes Claude work on slug-style gateways (Requesty, Vercel).
+    let catalog = crate::services::models_cache::ModelsCache::shared()
+        .model_ids(&config.target_base_url)
+        .await;
+
     let mut idx = 0;
     while idx < candidates.len() {
         let (protocol, variant) = candidates[idx];
         let attempt = idx;
         let mut req_body = simplified.clone();
         let mut attempt_headers = passthrough_headers.clone();
-        prepare_gateway_model_metadata(&mut req_body, &mut attempt_headers, config, protocol);
+        prepare_gateway_model_metadata(
+            &mut req_body,
+            &mut attempt_headers,
+            config,
+            protocol,
+            catalog.as_deref(),
+        );
 
         // Apply model prefix for OpenAI protocol
         if protocol == ProviderProtocol::Openai
@@ -1103,6 +1113,7 @@ fn prepare_gateway_model_metadata(
     passthrough_headers: &mut HeaderMap,
     config: &AnthropicToOpenAIRouterConfig,
     protocol: ProviderProtocol,
+    catalog: Option<&[String]>,
 ) {
     let requested_model = simplified
         .get("model")
@@ -1110,6 +1121,7 @@ fn prepare_gateway_model_metadata(
         .unwrap_or_default()
         .to_string();
     let selected_model = select_model_for_provider_attempt(
+        catalog,
         &config.target_base_url,
         Some(&requested_model),
         None,
@@ -2212,7 +2224,13 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
 
-        prepare_gateway_model_metadata(&mut body, &mut headers, &config, ProviderProtocol::Openai);
+        prepare_gateway_model_metadata(
+            &mut body,
+            &mut headers,
+            &config,
+            ProviderProtocol::Openai,
+            None,
+        );
 
         assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(
@@ -2236,7 +2254,13 @@ mod tests {
         let mut body = json!({"model": "claude-sonnet-4-6"});
         let mut headers = HeaderMap::new();
 
-        prepare_gateway_model_metadata(&mut body, &mut headers, &config, ProviderProtocol::Openai);
+        prepare_gateway_model_metadata(
+            &mut body,
+            &mut headers,
+            &config,
+            ProviderProtocol::Openai,
+            None,
+        );
 
         assert_eq!(body["model"], "gpt-4o");
         assert!(headers.get("x-provider").is_none());

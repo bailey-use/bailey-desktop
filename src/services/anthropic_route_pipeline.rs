@@ -13,6 +13,23 @@ const ANTHROPIC_CACHE_CONTROL_BREAKPOINT_LIMIT: usize = 4;
 
 pub struct RequestContext<'a> {
     pub upstream_base_url: &'a str,
+    /// Provider's advertised model ids, when known, so `ModelNamePatch` can snap
+    /// to an exact id. `None` falls back to the host-based transform.
+    pub catalog: Option<&'a [String]>,
+}
+
+impl<'a> RequestContext<'a> {
+    pub fn new(upstream_base_url: &'a str) -> Self {
+        Self {
+            upstream_base_url,
+            catalog: None,
+        }
+    }
+
+    pub fn with_catalog(mut self, catalog: Option<&'a [String]>) -> Self {
+        self.catalog = catalog;
+        self
+    }
 }
 
 pub trait RequestPatch: Send + Sync {
@@ -82,6 +99,7 @@ impl RequestPatch for ModelNamePatch {
             && let Some(model_str) = model.as_str()
         {
             *model = Value::String(transform_model_for_provider(
+                ctx.catalog,
                 ctx.upstream_base_url,
                 model_str,
             ));
@@ -367,9 +385,7 @@ mod tests {
     fn test_model_name_patch_openrouter_transform() {
         let patch = ModelNamePatch;
         let mut body = serde_json::json!({"model":"claude-sonnet-4-6"});
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
         patch.patch_json("messages", &mut body, &ctx).unwrap();
         assert_eq!(body["model"], "anthropic/claude-sonnet-4.6");
     }
@@ -378,9 +394,7 @@ mod tests {
     fn test_model_name_patch_non_openrouter_passthrough() {
         let patch = ModelNamePatch;
         let mut body = serde_json::json!({"model":"claude-sonnet-4-6"});
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.example.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.example.com/v1");
         patch.patch_json("messages", &mut body, &ctx).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-6");
     }
@@ -388,9 +402,7 @@ mod tests {
     #[test]
     fn test_anthropic_version_patch_only_messages_routes() {
         let patch = AnthropicVersionPatch;
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
 
         let mut headers = HeaderMap::new();
         patch.patch_headers("messages", &mut headers, &ctx).unwrap();
@@ -410,9 +422,7 @@ mod tests {
             "system": "You are helpful.",
             "messages": [{"role": "user", "content": "Hi"}]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch.patch_json("messages", &mut body, &ctx).unwrap();
 
         let system = body["system"].as_array().unwrap();
@@ -436,9 +446,7 @@ mod tests {
                 {"role": "user", "content": [{"type": "text", "text": "Bye"}]}
             ]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch.patch_json("messages", &mut body, &ctx).unwrap();
 
         // Only last system block gets cache_control
@@ -464,9 +472,7 @@ mod tests {
             "system": [{"type": "text", "text": "Sys", "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": "Hi", "cache_control": {"type": "ephemeral"}}]}]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch.patch_json("messages", &mut body, &ctx).unwrap();
 
         // Should not double-add
@@ -495,9 +501,7 @@ mod tests {
                 ]}
             ]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
 
         let report =
             crate::services::anthropic_chat_request::hoist_anthropic_system_messages(&mut body)
@@ -528,9 +532,7 @@ mod tests {
                 {"role": "user", "content": "Hi"}
             ]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch
             .patch_json("chat/completions", &mut body, &ctx)
             .unwrap();
@@ -571,9 +573,7 @@ mod tests {
     fn test_cache_control_patch_skips_unknown_routes() {
         let patch = CacheControlPatch;
         let mut body = serde_json::json!({"system": "Hello", "messages": []});
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch
             .patch_json("messages/count_tokens", &mut body, &ctx)
             .unwrap();
@@ -590,9 +590,7 @@ mod tests {
                 {"role": "user", "content": "Hi"}
             ]
         });
-        let ctx = RequestContext {
-            upstream_base_url: "https://api.anthropic.com/v1",
-        };
+        let ctx = RequestContext::new("https://api.anthropic.com/v1");
         patch
             .patch_json("chat/completions", &mut body, &ctx)
             .unwrap();
@@ -648,9 +646,7 @@ mod tests {
     #[test]
     fn test_pipeline_applies_all_patches() {
         let pipeline = RouterPipeline::for_openrouter();
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
         let mut body = serde_json::json!({"model":"claude-haiku-4-5"});
         let mut headers = HeaderMap::new();
 
@@ -671,9 +667,7 @@ mod tests {
     // ─── ThinkingNormalizationPatch ───────────────────────────────────────
 
     fn run_thinking_patch(body: &mut Value) {
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
         ThinkingNormalizationPatch
             .patch_json("messages", body, &ctx)
             .unwrap();
@@ -922,9 +916,7 @@ mod tests {
         // thinking patch (running after the rename) must still recognize
         // Opus 4.7 as supporting adaptive.
         let pipeline = RouterPipeline::for_openrouter();
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
         let mut body = json!({
             "model": "claude-opus-4-7",
             "thinking": {"type": "adaptive"}
@@ -938,9 +930,7 @@ mod tests {
     #[test]
     fn full_pipeline_strips_adaptive_on_haiku_4_5_through_openrouter_rename() {
         let pipeline = RouterPipeline::for_openrouter();
-        let ctx = RequestContext {
-            upstream_base_url: "https://openrouter.ai/api/v1",
-        };
+        let ctx = RequestContext::new("https://openrouter.ai/api/v1");
         let mut body = json!({
             "model": "claude-haiku-4-5",
             "thinking": {"type": "adaptive"}

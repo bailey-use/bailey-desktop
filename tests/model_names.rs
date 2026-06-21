@@ -64,7 +64,7 @@ fn transform_model_for_provider_table() {
     ];
     for (base_url, model, expected) in cases {
         assert_eq!(
-            transform_model_for_provider(base_url, model),
+            transform_model_for_provider(None, base_url, model),
             expected,
             "transform_model_for_provider({base_url:?}, {model:?})"
         );

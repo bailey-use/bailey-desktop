@@ -597,13 +597,11 @@ fn status_hint(status: reqwest::StatusCode) -> Option<&'static str> {
     }
 }
 
-/// Convert a `/v1/models` price string to a per-1M display (e.g. "$3").
+/// Convert a `/v1/models` price to a `$`-prefixed, 2-decimal per-1M display.
 ///
-/// Providers report pricing in two unit conventions: per-token (OpenRouter,
-/// Vercel — e.g. "0.000003") and per-million dollars (publicai — e.g. "0.15").
-/// Per-token prices are always tiny (even a $200/1M model is 0.0002/token), so
-/// any value >= 0.001 is already per-million and must NOT be scaled — otherwise
-/// publicai's "0.15" became "$150000".
+/// Providers report either per-token (OpenRouter — "0.000003") or per-million
+/// (publicai — "0.15"). Per-token prices are always tiny, so any value >= 0.001
+/// is already per-million and isn't scaled (else "0.15" became "$150000").
 fn format_price_per_million(raw: &str) -> Option<String> {
     let price: f64 = raw.parse().ok()?;
     if price <= 0.0 {
@@ -614,24 +612,7 @@ fn format_price_per_million(raw: &str) -> Option<String> {
     } else {
         price * 1_000_000.0
     };
-    if per_m >= 1.0 {
-        let rounded = (per_m * 100.0).round() / 100.0;
-        if rounded == rounded.floor() {
-            Some(format!("${}", rounded as u64))
-        } else {
-            let s = format!("{:.2}", rounded);
-            Some(format!(
-                "${}",
-                s.trim_end_matches('0').trim_end_matches('.')
-            ))
-        }
-    } else {
-        let s = format!("{:.4}", per_m);
-        Some(format!(
-            "${}",
-            s.trim_end_matches('0').trim_end_matches('.')
-        ))
-    }
+    Some(format!("${per_m:.2}"))
 }
 
 #[derive(Default)]
@@ -639,7 +620,6 @@ struct ColumnWidths {
     name: usize,
     context: usize,
     max_output: usize,
-    input_price: usize,
 }
 
 impl ColumnWidths {
@@ -653,55 +633,46 @@ impl ColumnWidths {
             if let Some(o) = &m.max_output {
                 w.max_output = w.max_output.max(o.len());
             }
-            if let Some(p) = &m.input_price {
-                w.input_price = w.input_price.max(p.len());
-            }
         }
         w
     }
 }
 
 fn format_model_line(model: &ModelInfo, widths: &ColumnWidths) -> String {
-    let has_info = model.context.is_some()
-        || model.max_output.is_some()
-        || (model.input_price.is_some() && model.output_price.is_some())
-        || model.multiplier.is_some()
-        || model.deprecated;
-    if !has_info {
+    let has_price = model.input_price.is_some() && model.output_price.is_some();
+    let has_meta = model.context.is_some() || model.max_output.is_some() || has_price;
+    if !has_meta && model.multiplier.is_none() && !model.deprecated {
         return model.id.clone();
     }
 
     let mut line = format!("{:<width$}", model.id, width = widths.name);
-    if model.context.is_some() || model.max_output.is_some() {
-        let ctx = model.context.as_deref().unwrap_or("?");
-        let out = model.max_output.as_deref().unwrap_or("?");
-        line.push_str(&format!(
-            "  {}",
-            style::dim(format!(
-                "{:>cw$} ctx \u{00b7} {:>ow$} out",
-                ctx,
-                out,
-                cw = widths.context.max(1),
-                ow = widths.max_output.max(1),
-            ))
-        ));
+    let cw = widths.context.max(1);
+    let ow = widths.max_output.max(1);
+
+    // Compact ctx/out cell, e.g. "128K/16K"; a missing half is "-", a priced row
+    // with no context is "-/-" so the price column still lines up.
+    if has_meta {
+        let ctx = model.context.as_deref().unwrap_or("-");
+        let out = model.max_output.as_deref().unwrap_or("-");
+        let cell = format!("{ctx}/{out}");
+        // Pad to full width only when something follows, to avoid trailing space.
+        let cell = if has_price || model.multiplier.is_some() || model.deprecated {
+            format!("{cell:<width$}", width = cw + 1 + ow)
+        } else {
+            cell
+        };
+        line.push_str(&format!(" {}", style::dim(cell)));
     }
+
+    // Left-aligned "$in/$out" per 1M — right-alignment leaves wide gaps ("$1.2/$6").
     if let (Some(input), Some(output)) = (&model.input_price, &model.output_price) {
-        line.push_str(&format!(
-            "  {}",
-            style::dim(format!(
-                "{:>iw$}/{}",
-                input,
-                output,
-                iw = widths.input_price.max(1),
-            ))
-        ));
+        line.push_str(&format!(" {}", style::dim(format!("{input}/{output}"))));
     }
     if let Some(mult) = model.multiplier {
-        line.push_str(&format!("  {}", style::dim(format_multiplier(mult))));
+        line.push_str(&format!(" {}", style::dim(format_multiplier(mult))));
     }
     if model.deprecated {
-        line.push_str(&format!("  {}", style::dim("deprecated")));
+        line.push_str(&format!(" {}", style::dim("deprecated")));
     }
     line
 }
@@ -1966,23 +1937,29 @@ mod tests {
 
     #[test]
     fn format_price_scales_per_token_values() {
-        // OpenRouter/Vercel report per-token (tiny) values.
+        // OpenRouter/Vercel report per-token (tiny) values; always 2 decimals.
         assert_eq!(
             format_price_per_million("0.0000005").as_deref(),
-            Some("$0.5")
+            Some("$0.50")
         );
-        assert_eq!(format_price_per_million("0.000003").as_deref(), Some("$3"));
+        assert_eq!(
+            format_price_per_million("0.000003").as_deref(),
+            Some("$3.00")
+        );
         // Even the priciest realistic model ($200/1M) stays per-token.
-        assert_eq!(format_price_per_million("0.0002").as_deref(), Some("$200"));
+        assert_eq!(
+            format_price_per_million("0.0002").as_deref(),
+            Some("$200.00")
+        );
     }
 
     #[test]
     fn format_price_keeps_per_million_values() {
         // publicai reports per-million dollars directly — must not be scaled.
         assert_eq!(format_price_per_million("0.15").as_deref(), Some("$0.15"));
-        assert_eq!(format_price_per_million("0.2").as_deref(), Some("$0.2"));
+        assert_eq!(format_price_per_million("0.2").as_deref(), Some("$0.20"));
         assert_eq!(format_price_per_million("2.92").as_deref(), Some("$2.92"));
-        assert_eq!(format_price_per_million("200").as_deref(), Some("$200"));
+        assert_eq!(format_price_per_million("200").as_deref(), Some("$200.00"));
     }
 
     #[test]
@@ -1994,14 +1971,13 @@ mod tests {
 
     #[test]
     fn format_model_line_shows_price_without_context() {
-        // Regression: a model with only pricing (no context/max_output) must
-        // still render its price, not collapse to a bare id — publicai's shape.
+        // A price-only model (no ctx/max_output) still renders its price.
         let mut m = ModelInfo::id_only("allenai/Olmo-3.1-32B-Think".to_string());
         m.input_price = Some("$0.05".to_string());
-        m.output_price = Some("$0.2".to_string());
+        m.output_price = Some("$0.20".to_string());
         let widths = ColumnWidths::from_models(std::slice::from_ref(&m));
         let line = format_model_line(&m, &widths);
-        assert!(line.contains("$0.05/$0.2"), "price missing: {line:?}");
+        assert!(line.contains("$0.05/$0.20"), "price missing: {line:?}");
     }
 
     #[test]
@@ -2009,5 +1985,49 @@ mod tests {
         let m = ModelInfo::id_only("some/model".to_string());
         let widths = ColumnWidths::from_models(std::slice::from_ref(&m));
         assert_eq!(format_model_line(&m, &widths), "some/model");
+    }
+
+    #[test]
+    fn format_model_line_dashes_missing_meta_values() {
+        // A missing context/max-output half renders as "-" in the compact cell.
+        let mut ctx_only = ModelInfo::id_only("m".to_string());
+        ctx_only.context = Some("512".to_string());
+        let widths = ColumnWidths::from_models(std::slice::from_ref(&ctx_only));
+        let line = console::strip_ansi_codes(&format_model_line(&ctx_only, &widths)).into_owned();
+        assert!(line.contains("512/-"), "expected '512/-', got {line:?}");
+
+        // A priced row with no context shows "-/-" so the price column aligns.
+        let mut price_only = ModelInfo::id_only("m".to_string());
+        price_only.input_price = Some("$0.10".to_string());
+        price_only.output_price = Some("$0.20".to_string());
+        let widths = ColumnWidths::from_models(std::slice::from_ref(&price_only));
+        let line = console::strip_ansi_codes(&format_model_line(&price_only, &widths)).into_owned();
+        assert!(line.contains("-/-"), "expected '-/-', got {line:?}");
+        assert!(line.contains("$0.10/$0.20"), "price missing: {line:?}");
+    }
+
+    #[test]
+    fn format_model_line_price_column_aligns_with_and_without_context() {
+        // The price column starts at the same offset with or without a context.
+        let mut with_ctx = ModelInfo::id_only("aaaa".to_string());
+        with_ctx.context = Some("128K".to_string());
+        with_ctx.max_output = Some("8K".to_string());
+        with_ctx.input_price = Some("$0.15".to_string());
+        with_ctx.output_price = Some("$0.20".to_string());
+        let mut no_ctx = ModelInfo::id_only("b".to_string());
+        no_ctx.input_price = Some("$0.05".to_string());
+        no_ctx.output_price = Some("$0.20".to_string());
+
+        let models = [with_ctx, no_ctx];
+        let widths = ColumnWidths::from_models(&models);
+        let l0 = console::strip_ansi_codes(&format_model_line(&models[0], &widths)).into_owned();
+        let l1 = console::strip_ansi_codes(&format_model_line(&models[1], &widths)).into_owned();
+
+        let col = |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
+        assert_eq!(
+            col(&l0, "0.15"),
+            col(&l1, "0.05"),
+            "price columns misaligned:\n{l0:?}\n{l1:?}"
+        );
     }
 }

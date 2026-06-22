@@ -569,6 +569,37 @@ pub(super) fn render_assistant_message(
     }
 }
 
+/// Push an assistant turn as up to two separately-barred blocks so the muted
+/// "Thinking" block carries a different left border (`MUTED`) than the answer
+/// (`content_bar`). `push_block` paints one gutter color per block, so a distinct
+/// thinking bar requires committing the reasoning as its own block.
+pub(super) fn push_assistant_blocks(
+    lines: &mut Vec<StyledLine>,
+    bars: &mut Vec<Option<Color>>,
+    reasoning: Option<&str>,
+    content: &str,
+    width: u16,
+    content_bar: Color,
+) {
+    if let Some(reasoning) = reasoning.filter(|text| !text.trim().is_empty()) {
+        let mut block = Vec::new();
+        render_reasoning_block(&mut block, reasoning);
+        push_block(lines, bars, block, Some(MUTED));
+        if !content.is_empty() {
+            // A barless blank separates the muted thinking gutter from the answer's.
+            lines.push(blank_line());
+            bars.push(None);
+        }
+    }
+
+    if !content.is_empty() {
+        // Reuse the single content renderer (no reasoning — that's its own block).
+        let mut block = Vec::new();
+        render_assistant_message(&mut block, None, content, width);
+        push_block(lines, bars, block, Some(content_bar));
+    }
+}
+
 pub(super) fn render_pending_status(
     lines: &mut Vec<StyledLine>,
     frame_tick: usize,

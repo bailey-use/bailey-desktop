@@ -1,8 +1,8 @@
 //! Client → loopback serve: the `Complete` handler. Streams an OpenAI chat
 //! completion and assembles the assistant message (content + tool_calls). This
 //! is the client's sole provider I/O — serve translates to the real upstream,
-//! so this only ever speaks OpenAI chat. `on_text` fires per content delta for
-//! live rendering.
+//! so this only ever speaks OpenAI chat. `on_delta` fires per content/reasoning
+//! delta for live rendering.
 
 use crate::agent::protocol::{AssistantMessage, ChatRequest, ToolCall};
 use futures::StreamExt;
@@ -12,6 +12,15 @@ use serde_json::{Value, json};
 /// index-keyed accumulator against a bogus huge `index` from upstream.
 const MAX_TOOL_CALLS: usize = 256;
 
+/// A streamed delta handed to the caller's render callback: the visible answer
+/// text, or the model's reasoning/thinking (DeepSeek `reasoning_content`, the
+/// generic `reasoning`, or an Anthropic-style `thinking` field). One callback so
+/// the caller can keep a single "anything streamed yet?" flag.
+pub enum StreamDelta<'a> {
+    Text(&'a str),
+    Reasoning(&'a str),
+}
+
 /// POST `request` to `{base_url}/v1/chat/completions` (the loopback serve),
 /// stream the SSE response, and return the assembled assistant message.
 pub async fn complete(
@@ -20,7 +29,8 @@ pub async fn complete(
     auth_token: Option<&str>,
     request: &ChatRequest,
     // `+ Send` so the chat TUI can run the engine (and this call) on a spawned task.
-    on_text: &mut (dyn FnMut(&str) + Send),
+    // Fires per content/reasoning delta for live rendering.
+    on_delta: &mut (dyn FnMut(StreamDelta) + Send),
 ) -> Result<AssistantMessage, String> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let mut body = json!({
@@ -99,11 +109,23 @@ pub async fn complete(
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
             };
+            // Reasoning/thinking arrives on its own delta fields (no `content`).
+            // Stream it for live rendering but DON'T fold it into `content`: it's
+            // not part of the assistant's reply sent back on the next turn.
+            if let Some(r) = delta
+                .get("reasoning_content")
+                .and_then(|x| x.as_str())
+                .or_else(|| delta.get("reasoning").and_then(|x| x.as_str()))
+                .or_else(|| delta.get("thinking").and_then(|x| x.as_str()))
+                && !r.is_empty()
+            {
+                on_delta(StreamDelta::Reasoning(r));
+            }
             if let Some(c) = delta.get("content").and_then(|x| x.as_str())
                 && !c.is_empty()
             {
                 content.push_str(c);
-                on_text(c);
+                on_delta(StreamDelta::Text(c));
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|x| x.as_array()) {
                 accumulate_tool_calls(tcs, &mut tools);
@@ -234,7 +256,11 @@ data: [DONE]\n\n";
             &format!("http://127.0.0.1:{port}"),
             None,
             &req(),
-            &mut |t| seen.push_str(t),
+            &mut |d| {
+                if let StreamDelta::Text(t) = d {
+                    seen.push_str(t)
+                }
+            },
         )
         .await
         .unwrap();
@@ -333,7 +359,11 @@ data: [DONE]\n\n";
             &format!("http://127.0.0.1:{port}"),
             None,
             &req(),
-            &mut |t| seen.push_str(t),
+            &mut |d| {
+                if let StreamDelta::Text(t) = d {
+                    seen.push_str(t)
+                }
+            },
         )
         .await
         .unwrap();
@@ -406,7 +436,11 @@ data: [DONE]\n\n";
             &format!("http://127.0.0.1:{port}"),
             None,
             &req(),
-            &mut |t| seen.push_str(t),
+            &mut |d| {
+                if let StreamDelta::Text(t) = d {
+                    seen.push_str(t)
+                }
+            },
         )
         .await
         .unwrap();

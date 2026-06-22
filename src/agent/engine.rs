@@ -8,6 +8,8 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
@@ -172,6 +174,10 @@ pub trait AgentUi: Send {
         None
     }
     fn assistant_text(&mut self, delta: &str);
+    /// A streamed reasoning/thinking delta (separate from the visible reply). The
+    /// UI may render it in a muted "Thinking" block; default no-op so non-rendering
+    /// impls (and impls that don't surface thinking) ignore it.
+    fn assistant_reasoning(&mut self, _delta: &str) {}
     /// The agent set or updated its task plan via the `update_plan` tool. The UI
     /// renders this as a checklist card instead of a generic tool step. Default
     /// no-op so non-rendering impls ignore it.
@@ -338,6 +344,31 @@ pub struct AgentEngine {
     /// `checkpoints[u - restored_turn_count]`; `u < restored_turn_count` is
     /// conversation-only (no file revert).
     restored_turn_count: usize,
+    /// `reasoning_effort` to request when thinking is enabled, or `None` when the
+    /// model isn't a reasoning model (sending the field then 400s some providers).
+    /// Resolved once from the model's snapshot capability at construction.
+    reasoning_effort: Option<String>,
+    /// Live "request thinking" toggle, shared with the chat TUI (mirrors its
+    /// `show_thinking` so a mid-session Ctrl+T / `/config` flip takes effect on the
+    /// next step). `None` for non-TUI engines (subagents, tests) → thinking not
+    /// requested. Only consulted when `reasoning_effort` is `Some`.
+    thinking_flag: Option<Arc<AtomicBool>>,
+}
+
+/// The `reasoning_effort` to request for `model`, or `None` for non-reasoning
+/// models (where the field would 400 strict providers). Capability comes from the
+/// model-limits snapshot; the level defaults to `"medium"` and can be overridden
+/// with `AIVO_AGENT_REASONING_EFFORT` (e.g. `low`/`high`).
+fn default_reasoning_effort(model: &str) -> Option<String> {
+    if !crate::services::model_metadata::snapshot_limits(model).is_some_and(|c| c.reasoning) {
+        return None;
+    }
+    Some(
+        std::env::var("AIVO_AGENT_REASONING_EFFORT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "medium".to_string()),
+    )
 }
 
 impl AgentEngine {
@@ -394,7 +425,28 @@ impl AgentEngine {
             checkpoints: Vec::new(),
             checkpoint_store: None,
             restored_turn_count: 0,
+            reasoning_effort: default_reasoning_effort(model),
+            thinking_flag: None,
         }
+    }
+
+    /// Share the chat TUI's live "show thinking" toggle so the engine requests
+    /// reasoning (for reasoning-capable models) only while it's on. Without this
+    /// the engine never asks for thinking (the default for subagents/tests).
+    pub fn set_thinking_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.thinking_flag = Some(flag);
+    }
+
+    /// The `reasoning_effort` to put on this step's request: the model's resolved
+    /// level when it's reasoning-capable AND the shared thinking flag is on, else
+    /// `None`. Read live each step so a mid-turn toggle takes effect.
+    fn reasoning_effort_param(&self) -> Option<&str> {
+        let effort = self.reasoning_effort.as_deref()?;
+        let on = self
+            .thinking_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed));
+        on.then_some(effort)
     }
 
     /// Enable `/rewind` tree-checkpointing for this engine (top-level chat only;
@@ -773,6 +825,14 @@ impl AgentEngine {
 
             let mut extra = Map::new();
             extra.insert("tool_choice".into(), json!("auto"));
+            // Request reasoning for reasoning-capable models while the shared
+            // thinking toggle is on. The loopback serve translates `reasoning_effort`
+            // to each upstream's thinking surface (Anthropic `thinking`, Gemini
+            // `thinkingConfig`, OpenAI passthrough). Skipped for non-reasoning models
+            // so strict providers don't 400.
+            if let Some(effort) = self.reasoning_effort_param() {
+                extra.insert("reasoning_effort".into(), json!(effort));
+            }
             let request = ChatRequest {
                 model: self.model.clone(),
                 messages: self.messages.clone(),
@@ -796,9 +856,14 @@ impl AgentEngine {
                     ctx.serve_base,
                     ctx.auth,
                     &request,
-                    &mut |d| {
+                    &mut |delta| {
+                        // Any streamed output (text OR reasoning) means a retry
+                        // would double-render, so guard the retry on `streamed`.
                         streamed = true;
-                        ui.assistant_text(d);
+                        match delta {
+                            serve_client::StreamDelta::Text(t) => ui.assistant_text(t),
+                            serve_client::StreamDelta::Reasoning(r) => ui.assistant_reasoning(r),
+                        }
                     },
                 )
                 .await;
@@ -2259,6 +2324,55 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert!(!tool_names.contains(&"skill"));
+    }
+
+    #[test]
+    fn default_reasoning_effort_gates_on_model_capability() {
+        // Reasoning-capable models (snapshot `r` flag) get an effort to send…
+        for model in ["o3", "gpt-5", "claude-sonnet-4-5", "gemini-2.5-pro"] {
+            assert_eq!(
+                default_reasoning_effort(model).as_deref(),
+                Some("medium"),
+                "model={model} should request reasoning"
+            );
+        }
+        // …non-reasoning models and unknown ids never send it (would 400 strict providers).
+        for model in [
+            "gpt-4o",
+            "claude-3-5-sonnet",
+            "definitely-not-a-real-model-xyz",
+        ] {
+            assert_eq!(
+                default_reasoning_effort(model),
+                None,
+                "model={model} must not request reasoning"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_param_tracks_capability_and_live_flag() {
+        // Capable model: requested only while the shared flag is on; reads live.
+        let mut engine = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
+        assert_eq!(
+            engine.reasoning_effort_param(),
+            None,
+            "no flag set yet → not requested"
+        );
+        let flag = Arc::new(AtomicBool::new(true));
+        engine.set_thinking_flag(flag.clone());
+        assert_eq!(engine.reasoning_effort_param(), Some("medium"));
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            engine.reasoning_effort_param(),
+            None,
+            "a mid-turn toggle is seen live"
+        );
+
+        // Non-reasoning model: never requested, even with the flag on.
+        let mut plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
+        plain.set_thinking_flag(Arc::new(AtomicBool::new(true)));
+        assert_eq!(plain.reasoning_effort_param(), None);
     }
 
     /// Full loop: first model turn emits a write_file tool call (executed

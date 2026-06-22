@@ -723,6 +723,14 @@ pub struct MessageAttachment {
     pub storage: AttachmentStorage,
 }
 
+/// The persisted `aivo chat` toggles, read together at startup (see
+/// [`SessionStore::get_chat_toggles`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatToggles {
+    pub auto_approve: bool,
+    pub show_thinking: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttachmentStorage {
@@ -1674,18 +1682,22 @@ impl SessionStore {
         self.api_keys.set_chat_model(key_id, model).await
     }
 
+    /// Read a single boolean from chat-prefs.json, falling back to `default` when
+    /// the file or key is missing/unreadable. Shares the read+parse with
+    /// `read_chat_prefs` so each bool getter is one line and they can't drift.
+    async fn get_chat_pref_bool(&self, key: &str, default: bool) -> bool {
+        self.read_chat_prefs()
+            .await
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(default)
+    }
+
     /// The persisted global chat auto-approve toggle (remembered across `aivo
     /// chat` sessions). Stored in its own small file rather than the encrypted
     /// keys config, so it never risks the key store. Missing/unreadable → off.
     pub async fn get_chat_auto_approve(&self) -> bool {
-        let path = self.config_dir().join("chat-prefs.json");
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            return false;
-        };
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("autoApprove").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false)
+        self.get_chat_pref_bool("autoApprove", false).await
     }
 
     /// Persist the global chat auto-approve toggle, preserving any sibling prefs
@@ -1695,6 +1707,39 @@ impl SessionStore {
         let mut prefs = self.read_chat_prefs().await;
         prefs.insert("autoApprove".into(), serde_json::Value::Bool(on));
         self.write_chat_prefs(&prefs).await
+    }
+
+    /// The persisted "show the model's thinking" toggle (remembered across `aivo
+    /// chat` sessions, set in the `/config` overlay). Shares chat-prefs.json with
+    /// the auto-approve flag. Defaults to ON — reasoning is high-signal feedback
+    /// during the silent gaps before tool calls — so a missing/unreadable file
+    /// shows thinking rather than silently hiding it.
+    pub async fn get_chat_show_thinking(&self) -> bool {
+        self.get_chat_pref_bool("showThinking", true).await
+    }
+
+    /// Persist the show-thinking toggle, preserving any sibling prefs. Best-effort,
+    /// written atomically (same path/permissions as the auto-approve flag).
+    pub async fn set_chat_show_thinking(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        prefs.insert("showThinking".into(), serde_json::Value::Bool(on));
+        self.write_chat_prefs(&prefs).await
+    }
+
+    /// Both `aivo chat` toggles in a single read of chat-prefs.json, so startup
+    /// doesn't open+parse the same file twice.
+    pub async fn get_chat_toggles(&self) -> ChatToggles {
+        let prefs = self.read_chat_prefs().await;
+        let bool_or = |key: &str, default: bool| {
+            prefs
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default)
+        };
+        ChatToggles {
+            auto_approve: bool_or("autoApprove", false),
+            show_thinking: bool_or("showThinking", true),
+        }
     }
 
     /// chat-prefs.json as a JSON object (empty when absent/unparseable), for a
@@ -2472,6 +2517,25 @@ mod tests {
         assert!(store.get_chat_auto_approve().await);
         store.set_chat_auto_approve(false).await.unwrap();
         assert!(!store.get_chat_auto_approve().await);
+    }
+
+    #[tokio::test]
+    async fn chat_show_thinking_persists_and_defaults_on() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        let store = SessionStore::with_path(config_path);
+
+        // No prefs file yet → defaults to ON (thinking is high-signal).
+        assert!(store.get_chat_show_thinking().await);
+
+        // Round-trips both directions across (re)reads, and coexists with the
+        // auto-approve flag in the same file.
+        store.set_chat_auto_approve(true).await.unwrap();
+        store.set_chat_show_thinking(false).await.unwrap();
+        assert!(!store.get_chat_show_thinking().await);
+        assert!(store.get_chat_auto_approve().await);
+        store.set_chat_show_thinking(true).await.unwrap();
+        assert!(store.get_chat_show_thinking().await);
     }
 
     #[tokio::test]

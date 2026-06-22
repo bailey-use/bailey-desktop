@@ -88,8 +88,13 @@ impl ChatTuiApp {
             .or(Some((MUTED, "Ready".to_string())));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
-        // Remembered across sessions (the user picked "remember last choice").
-        let auto_approve = params.session_store.get_chat_auto_approve().await;
+        // Remembered across sessions (the user picked "remember last choice");
+        // both toggles come from one read of chat-prefs.json. auto_approve
+        // defaults off (safe); show_thinking defaults on (high-signal).
+        let crate::services::session_store::ChatToggles {
+            auto_approve,
+            show_thinking,
+        } = params.session_store.get_chat_toggles().await;
         // The launch dir keys the recall view; the persisted file stays global.
         let real_cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
@@ -186,6 +191,12 @@ impl ChatTuiApp {
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 auto_approve,
             )),
+            show_thinking,
+            // Set by `refresh_context_window` (called right after construction and
+            // on every model switch); false until the first resolve.
+            model_supports_thinking: false,
+            // Mirrors show_thinking; the engine reads it live to gate reasoning.
+            thinking_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(show_thinking)),
             queued_messages: Vec::new(),
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,

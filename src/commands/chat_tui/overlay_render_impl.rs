@@ -647,6 +647,63 @@ impl ChatTuiApp {
         None
     }
 
+    /// `/config` overlay: a small fixed toggle list of chat preferences, sharing
+    /// the `/skills` and `/mcp` chrome via [`render_toggle_list`] so all three feel
+    /// the same. No filter/add/remove — the top row is a static heading instead of
+    /// a search field.
+    pub(super) fn render_config_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &ConfigOverlay,
+    ) {
+        let on = state
+            .items
+            .iter()
+            .filter(|i| self.config_setting_enabled(i.setting))
+            .count();
+        let input_line = Line::from(Span::styled(
+            "Chat settings — remembered across sessions",
+            Style::default().fg(MUTED),
+        ));
+
+        let inner_width = usize::from(area.width).saturating_sub(6).max(1);
+        let mut rows: Vec<Line> = Vec::new();
+        let mut selected_pos = 0usize;
+        for (pos, item) in state.items.iter().enumerate() {
+            let desc =
+                truncate_for_display_width(item.description, toggle_detail_room(inner_width));
+            if pos == state.selected {
+                selected_pos = rows.len() + 1;
+            }
+            rows.extend(toggle_list_rows(
+                self.config_setting_enabled(item.setting),
+                item.label,
+                &desc,
+                MUTED,
+                pos == state.selected,
+                inner_width,
+            ));
+            if pos + 1 < state.items.len() {
+                rows.push(Line::from(""));
+            }
+        }
+
+        render_toggle_list(
+            frame,
+            area,
+            ToggleListView {
+                title: "Config",
+                badge: count_badge(true, on, state.items.len()),
+                input_line,
+                rows,
+                selected_pos,
+                detail: None,
+                footer: vec![("↑↓", "move"), ("Enter/Space", "toggle"), ("Esc", "close")],
+            },
+        );
+    }
+
     /// One-line detail for the selected `/skills` row: where the skill lives (home
     /// dir abbreviated to `~`) and, for a repo skill, a `project` tag — so the user
     /// knows where to edit it and that `d` won't delete it.
@@ -1228,7 +1285,10 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
 /// shown under it. Any command not listed here is swept into a trailing "More"
 /// group by the renderer, so a newly added command never silently vanishes.
 const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Chat", &["new", "resume", "rewind", "copy", "help", "exit"]),
+    (
+        "Chat",
+        &["new", "resume", "rewind", "copy", "config", "help", "exit"],
+    ),
     ("Model & key", &["model", "key"]),
     ("Context", &["attach", "detach"]),
     (
@@ -1286,6 +1346,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Ctrl+R", "resume a saved chat"),
             ("Ctrl+O", "view last !cmd output in full"),
+            ("Ctrl+T", "toggle thinking"),
             ("Shift+Tab", "toggle agent auto-approve"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),

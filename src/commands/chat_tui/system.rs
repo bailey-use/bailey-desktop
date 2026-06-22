@@ -710,6 +710,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "create-skill" => Ok(SlashCommand::CreateSkill(argument)),
         // `undo` kept as a hidden alias for muscle memory; only `/rewind` is advertised.
         "rewind" | "undo" => Ok(SlashCommand::Rewind),
+        "config" => Ok(SlashCommand::Config),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),

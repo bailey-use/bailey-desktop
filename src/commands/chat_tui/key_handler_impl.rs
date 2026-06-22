@@ -13,6 +13,7 @@ enum OverlayKeyAction {
     RemoveMcpServer(usize),
     AuthorizeMcpServer(usize),
     SignOutMcpServer(usize),
+    ToggleConfigSetting(usize),
 }
 
 impl ChatTuiApp {
@@ -195,6 +196,10 @@ impl ChatTuiApp {
                 self.sign_out_mcp_server(index).await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::ToggleConfigSetting(index) => {
+                self.toggle_config_setting(index).await;
+                Ok(Some(false))
+            }
         }
     }
 
@@ -206,6 +211,25 @@ impl ChatTuiApp {
                 } else if let Overlay::Help { scroll } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::Config(state) => {
+                // A small fixed toggle list: ↑/↓ (or Ctrl+P/N) move, Enter/Space/Tab
+                // flip the row, Esc closes. No filter/add/remove.
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Tab
+                        if !state.items.is_empty() =>
+                    {
+                        return OverlayKeyAction::ToggleConfigSetting(state.selected);
+                    }
+                    _ => {}
                 }
                 OverlayKeyAction::Handled
             }
@@ -463,6 +487,12 @@ impl ChatTuiApp {
         // Claude Code's Shift+Tab permission-mode switch.
         if is_auto_approve_toggle(key) {
             self.set_auto_approve(!self.agent_auto_approve);
+            return Ok(Some(false));
+        }
+
+        // Ctrl+T toggles the live "Thinking" block (the same flag as /config).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
+            self.set_show_thinking(!self.show_thinking).await;
             return Ok(Some(false));
         }
 

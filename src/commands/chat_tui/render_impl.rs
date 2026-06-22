@@ -126,7 +126,21 @@ impl ChatTuiApp {
                     render_user_message(&mut block, shown, &message.attachments);
                 }
                 "assistant" => {
-                    render_assistant_message(&mut block, None, &message.content, text_width)
+                    let reasoning = self
+                        .show_thinking
+                        .then_some(message.reasoning_content.as_deref())
+                        .flatten();
+                    // Commit the muted thinking block and the answer as separate
+                    // blocks (distinct left bars); `block` stays empty so the generic
+                    // push below is a no-op for this message.
+                    push_assistant_blocks(
+                        &mut lines,
+                        &mut bars,
+                        reasoning,
+                        &message.content,
+                        text_width,
+                        role_bar_color("assistant"),
+                    );
                 }
                 "tool_call" => {
                     let (name, args) = decode_tool_call(&message.content);
@@ -213,12 +227,22 @@ impl ChatTuiApp {
         if self.is_transcript_empty() {
             return (lines, bars);
         }
-        if !self.pending_response.is_empty() {
+        // Show the live "Thinking" block while reasoning streams — including the
+        // thinking-only phase before any answer text has arrived (so the user sees
+        // activity during the silent gap). Gated by `show_thinking`.
+        let live_reasoning = (self.show_thinking && !self.pending_reasoning.is_empty())
+            .then_some(self.pending_reasoning.as_str());
+        if live_reasoning.is_some() || !self.pending_response.is_empty() {
             lines.push(blank_line());
             bars.push(None);
-            let mut block = Vec::new();
-            render_assistant_message(&mut block, None, &self.pending_response, text_width);
-            push_block(&mut lines, &mut bars, block, Some(ACCENT));
+            push_assistant_blocks(
+                &mut lines,
+                &mut bars,
+                live_reasoning,
+                &self.pending_response,
+                text_width,
+                ACCENT,
+            );
         }
         // A running `!cmd` streams its output here (not into history) so the
         // memoized history body stays put while lines arrive; it's committed to
@@ -320,6 +344,9 @@ impl ChatTuiApp {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
         self.transcript_revision.hash(&mut hasher);
+        // The committed history renders reasoning only while this is on, so a
+        // toggle must invalidate the memoized body.
+        self.show_thinking.hash(&mut hasher);
         self.history.len().hash(&mut hasher);
         if let Some(first) = self.history.first() {
             first.role.hash(&mut hasher);
@@ -382,11 +409,17 @@ impl ChatTuiApp {
     /// without hashing it. The spinner is deliberately EXCLUDED (it animates every
     /// frame and is wrapped fresh at compose time), so a pure animation tick — the
     /// 60fps redraw that drove the O(reply²) re-parse — hits the cache.
-    fn volatile_tail_fp(&self) -> u64 {
+    pub(super) fn volatile_tail_fp(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.is_transcript_empty().hash(&mut hasher);
         self.pending_response.len().hash(&mut hasher);
+        // The live "Thinking" block lives in this tail and streams independently of
+        // the reply text (it has no typewriter), so its length must key the cache
+        // or it never repaints during the reasoning-only gap. `show_thinking` gates
+        // whether it renders, so a /config toggle mid-turn must invalidate too.
+        self.pending_reasoning.len().hash(&mut hasher);
+        self.show_thinking.hash(&mut hasher);
         match &self.local_command {
             Some(run) => {
                 run.command.hash(&mut hasher);
@@ -589,6 +622,11 @@ impl ChatTuiApp {
                 if let (Some(c), Overlay::Mcp(s)) = (clamped, &mut self.overlay) {
                     s.detail_scroll = c;
                 }
+            }
+            Overlay::Config(config) => {
+                let area = centered_rect(64, 80, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                self.render_config_overlay(frame, area, &config);
             }
             Overlay::None => {}
         }
@@ -1677,19 +1715,20 @@ impl ChatTuiApp {
 
     /// The left-hand key hints, chosen by the current state.
     fn hint_key_spans(&self) -> Vec<Span<'static>> {
-        let pairs: &[(&str, &str)] = if self.pending_mcp_consent.is_some() {
-            &[("y", "run"), ("a", "always"), ("n", "deny")]
+        let pairs: Vec<(&str, &str)> = if self.pending_mcp_consent.is_some() {
+            vec![("y", "run"), ("a", "always"), ("n", "deny")]
         } else if self.agent_permission.is_some() {
-            &[("y", "allow"), ("n", "deny"), ("a", "always")]
+            vec![("y", "allow"), ("n", "deny"), ("a", "always")]
         } else if self.sending {
-            &[("esc", "interrupt"), ("type", "queue next")]
+            vec![("esc", "interrupt"), ("type", "queue next")]
         } else {
-            &[
-                ("/", "commands"),
-                ("↵", "send"),
-                ("↑", "history"),
-                ("^C", "exit"),
-            ]
+            let mut idle = vec![("/", "commands"), ("↑", "history")];
+            // Only advertise the thinking toggle where it can actually do something.
+            if self.model_supports_thinking {
+                idle.push(("^T", "thinking"));
+            }
+            idle.push(("^C", "exit"));
+            idle
         };
         let mut spans = Vec::new();
         for (idx, (keycap, label)) in pairs.iter().enumerate() {

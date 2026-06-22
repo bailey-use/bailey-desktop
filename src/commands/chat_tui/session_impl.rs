@@ -49,14 +49,15 @@ impl ChatTuiApp {
     /// utilization stat. Cheap (in-memory cache) — call after any model/key
     /// change. 0 when the model isn't in the live catalog or snapshot.
     pub(super) async fn refresh_context_window(&mut self) {
-        self.context_window = crate::services::model_metadata::resolve_limits(
+        let limits = crate::services::model_metadata::resolve_limits(
             &self.cache,
             Some(&self.key.base_url),
             &self.model,
         )
-        .await
-        .context
-        .unwrap_or(0);
+        .await;
+        self.context_window = limits.context.unwrap_or(0);
+        // Capability from the model-limits snapshot (unknown model → not advertised).
+        self.model_supports_thinking = limits.caps.is_some_and(|c| c.reasoning);
     }
 
     pub(super) async fn apply_model(&mut self, raw_model: String) -> Result<()> {
@@ -213,6 +214,71 @@ impl ChatTuiApp {
 
     pub(super) fn open_help_overlay(&mut self) {
         self.overlay = Overlay::Help { scroll: 0 };
+    }
+
+    /// `/config`: a small toggle list of chat preferences, seeded from the live
+    /// state. The list is fixed (no filter/add/remove) and each row flips on
+    /// Enter/Space.
+    pub(super) fn open_config_overlay(&mut self) {
+        let items = vec![
+            ConfigToggle {
+                setting: ConfigSetting::ShowThinking,
+                label: "Show thinking",
+                description: "stream the model's reasoning in a muted block (Ctrl+T)",
+            },
+            ConfigToggle {
+                setting: ConfigSetting::AutoApprove,
+                label: "Auto-approve tools",
+                description: "run write/edit/bash without asking (Shift+Tab)",
+            },
+        ];
+        self.overlay = Overlay::Config(ConfigOverlay { items, selected: 0 });
+    }
+
+    /// Whether `setting` is currently on — the single source of truth the `/config`
+    /// renderer reads, so a row's checkbox can never drift from the live flag.
+    pub(super) fn config_setting_enabled(&self, setting: ConfigSetting) -> bool {
+        match setting {
+            ConfigSetting::ShowThinking => self.show_thinking,
+            ConfigSetting::AutoApprove => self.agent_auto_approve,
+        }
+    }
+
+    /// Flip the preference for the `/config` row at `index`, applying it live and
+    /// persisting it (best-effort). The renderer derives each row's state from the
+    /// live flag, so there's no per-row copy to write back.
+    pub(super) async fn toggle_config_setting(&mut self, index: usize) {
+        let Some(setting) = (match &self.overlay {
+            Overlay::Config(state) => state.items.get(index).map(|item| item.setting),
+            _ => None,
+        }) else {
+            return;
+        };
+        match setting {
+            ConfigSetting::ShowThinking => self.set_show_thinking(!self.show_thinking).await,
+            // Reuse the shared setter so the live atomic + toast stay in lockstep.
+            ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
+        }
+    }
+
+    /// Set the show-thinking flag and persist it (best-effort). Both transcript
+    /// fingerprints (history body and volatile tail) key on `show_thinking`, so the
+    /// flip invalidates the memoized render on its own — no revision bump needed.
+    pub(super) async fn set_show_thinking(&mut self, on: bool) {
+        if self.show_thinking == on {
+            return;
+        }
+        self.show_thinking = on;
+        // Keep the engine's live gate in lockstep so a mid-session toggle changes
+        // whether the model is asked to think on the next step, not just the display.
+        self.thinking_flag
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.show_toast(if on {
+            "Thinking shown"
+        } else {
+            "Thinking hidden"
+        });
+        let _ = self.session_store.set_chat_show_thinking(on).await;
     }
 
     /// `ctrl+o`: open the most recent `!cmd`'s full output in a scrollable pager.

@@ -239,16 +239,22 @@ impl ChatTuiApp {
         // Reveal any buffered text before committing so a tool step never lands
         // ahead of prose the typewriter hadn't shown yet.
         self.drain_incoming_buffer();
-        if !self.pending_response.is_empty() {
-            let content = std::mem::take(&mut self.pending_response);
+        let content = std::mem::take(&mut self.pending_response);
+        // Carry this segment's reasoning onto the committed message so it persists
+        // (and survives resume) instead of being discarded at every tool boundary.
+        // A reasoning-only segment (the model thought, then called a tool with no
+        // prose) still commits — an empty-content assistant message renders just
+        // the "Thinking" block, in order, before the tool step.
+        let reasoning_content = (!self.pending_reasoning.is_empty())
+            .then(|| std::mem::take(&mut self.pending_reasoning));
+        if !content.is_empty() || reasoning_content.is_some() {
             self.history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content,
-                reasoning_content: None,
+                reasoning_content,
                 attachments: vec![],
             });
         }
-        self.pending_reasoning.clear();
     }
 
     /// Live context-fill from the agent engine. A measured step total flows
@@ -536,7 +542,10 @@ impl ChatTuiApp {
             // Live provider-measured usage — the footer's context-fill reads this
             // while `sending` so the stat grows during the turn, not just at the end.
             ChatResponseChunk::Usage(usage) => self.live_usage = Some(usage),
-            ChatResponseChunk::Reasoning(_) => {}
+            // Accumulate the model's reasoning unconditionally; `show_thinking`
+            // gates only the *render* (so toggling /config reveals/hides it
+            // instantly). Committed onto the assistant message at turn end.
+            ChatResponseChunk::Reasoning(text) => self.pending_reasoning.push_str(&text),
         }
     }
 
@@ -625,16 +634,17 @@ impl ChatTuiApp {
             _ => "the agent turn ended unexpectedly",
         };
         self.drain_incoming_buffer();
-        if !self.pending_response.is_empty() {
-            let partial = std::mem::take(&mut self.pending_response);
+        let partial = std::mem::take(&mut self.pending_response);
+        let reasoning_content = (!self.pending_reasoning.is_empty())
+            .then(|| std::mem::take(&mut self.pending_reasoning));
+        if !partial.is_empty() || reasoning_content.is_some() {
             self.history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: partial,
-                reasoning_content: None,
+                reasoning_content,
                 attachments: vec![],
             });
         }
-        self.pending_reasoning.clear();
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
         self.request_started_at = None;
@@ -726,12 +736,18 @@ impl ChatTuiApp {
         };
         self.pending_submit = None;
         self.pending_response.clear();
-        self.pending_reasoning.clear();
-        if !content.is_empty() {
+        // Carry the turn's reasoning onto the committed message so it stays in the
+        // transcript (and survives resume) instead of vanishing when the live
+        // `pending_reasoning` clears. Rendered only while `show_thinking` is on. A
+        // reasoning-only turn (thinking, then ended on a tool with no closing prose)
+        // still commits so the thinking isn't lost.
+        let reasoning_content = (!self.pending_reasoning.is_empty())
+            .then(|| std::mem::take(&mut self.pending_reasoning));
+        if !content.is_empty() || reasoning_content.is_some() {
             self.history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content,
-                reasoning_content: None,
+                reasoning_content,
                 attachments: vec![],
             });
         }
@@ -1694,6 +1710,18 @@ impl ChatTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Mcp(_), _) => Ok(Some(false)),
+            (Overlay::Config(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::Config(state) = &mut self.overlay {
+                    if up {
+                        state.select_prev();
+                    } else {
+                        state.select_next();
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::Config(_), _) => Ok(Some(false)),
             (Overlay::Picker(picker), MouseEventKind::ScrollUp) if !picker.loading => {
                 if let Overlay::Picker(picker) = &mut self.overlay {
                     picker.select_prev();

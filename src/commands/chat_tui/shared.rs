@@ -180,6 +180,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: false,
     },
     SlashCommandSpec {
+        name: "config",
+        help_label: "/config",
+        description: "toggle chat settings (thinking, auto-approve)",
+        takes_argument: false,
+    },
+    SlashCommandSpec {
         name: "help",
         help_label: "/help",
         description: "open help",
@@ -495,6 +501,47 @@ impl McpOverlay {
     }
 }
 
+/// One toggleable chat preference, identified so the handler knows which flag to
+/// flip (and where to persist it) without matching on the row's label text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConfigSetting {
+    /// Show the model's streamed reasoning/thinking in a muted block.
+    ShowThinking,
+    /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
+    AutoApprove,
+}
+
+/// One row in the `/config` overlay: a boolean preference with a label and a
+/// one-line description. The current value is read live from the app (see
+/// `config_setting_enabled`), not cached here, so the row can't drift.
+#[derive(Clone, Debug)]
+pub(super) struct ConfigToggle {
+    pub(super) setting: ConfigSetting,
+    pub(super) label: &'static str,
+    pub(super) description: &'static str,
+}
+
+/// The interactive `/config` overlay: a small *fixed* toggle list. Unlike
+/// `/skills` and `/mcp` there's nothing to filter, add, or remove — so it's just
+/// a navigable list whose rows flip on Enter/Space. `selected` indexes `items`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConfigOverlay {
+    pub(super) items: Vec<ConfigToggle>,
+    pub(super) selected: usize,
+}
+
+impl ConfigOverlay {
+    pub(super) fn select_prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1).min(self.items.len() - 1);
+        }
+    }
+}
+
 /// Move `selected` (an index into the full list) one step (`dir` = -1/+1) within
 /// `filtered` (the in-order matching indices), clamped to the filtered ends.
 fn move_within(filtered: &[usize], selected: &mut usize, dir: i32) {
@@ -576,6 +623,8 @@ pub(super) enum Overlay {
     Skills(SkillsOverlay),
     /// `/mcp` — the configured MCP servers with status, toggleable.
     Mcp(McpOverlay),
+    /// `/config` — a small fixed list of chat preferences, toggleable.
+    Config(ConfigOverlay),
     Picker(Box<PickerState>),
 }
 
@@ -1171,6 +1220,8 @@ pub(super) enum SlashCommand {
     /// Open the rewind picker: jump back to an earlier turn, reverting the file
     /// edits made since and restoring that turn's prompt to the composer.
     Rewind,
+    /// Open the `/config` overlay: a toggle list of chat preferences.
+    Config,
     Help,
 }
 
@@ -1531,6 +1582,21 @@ pub(super) struct ChatTuiApp {
     /// cursor-agent ACP session reads it on each out-of-process
     /// `request_permission`. Kept in lockstep with `agent_auto_approve`.
     pub(super) auto_approve_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Show the model's streamed reasoning/thinking in a muted "Thinking" block
+    /// (live, and kept in the transcript afterwards). Toggled in `/config`,
+    /// remembered across sessions. On by default. Reasoning is always captured;
+    /// this only gates whether it's rendered, so toggling it is instant.
+    pub(super) show_thinking: bool,
+    /// Whether the current model is known to support reasoning/thinking (from the
+    /// model-limits snapshot). Cached on each model resolve (see
+    /// `refresh_context_window`); gates the `^T` footer hint so it only advertises
+    /// the toggle where thinking can actually appear. Unknown models → false.
+    pub(super) model_supports_thinking: bool,
+    /// `show_thinking` as a shared atomic the agent engine reads live, so the
+    /// engine only *requests* reasoning (`reasoning_effort`) while thinking is on.
+    /// Kept in lockstep with `show_thinking` (see `set_show_thinking`); handed to
+    /// the engine on build. Mirrors the `auto_approve_flag` pattern.
+    pub(super) thinking_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Messages typed while a turn was in flight, in submit order; each is
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.

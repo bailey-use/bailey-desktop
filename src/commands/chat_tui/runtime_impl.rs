@@ -486,6 +486,9 @@ impl ChatTuiApp {
             // Enable `/rewind` tree-checkpointing (top-level chat only — sub-engines
             // never call this, so they don't pay the git cost).
             engine.enable_rewind_checkpoints(&real_cwd);
+            // Share the live thinking toggle so the engine requests reasoning (on
+            // reasoning-capable models) only while thinking is on.
+            engine.set_thinking_flag(self.thinking_flag.clone());
             // Offer any named specialist sub-agents authored under
             // `.aivo/agents` / `.claude/agents` (project + user). The model
             // delegates to them via the `subagent` tool's `agent` field.
@@ -829,6 +832,10 @@ impl ChatTuiApp {
             }
             SlashCommand::Rewind => {
                 self.open_rewind_picker().await?;
+                Ok(false)
+            }
+            SlashCommand::Config => {
+                self.open_config_overlay();
                 Ok(false)
             }
             SlashCommand::Help => {
@@ -1536,7 +1543,10 @@ impl ChatTuiApp {
         self.queued_messages.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
-        self.pending_reasoning.clear();
+        // Keep the reasoning shown for this partial reply (the user saw it); the
+        // empty-response interrupt above already returned without committing.
+        let reasoning_content = (!self.pending_reasoning.is_empty())
+            .then(|| std::mem::take(&mut self.pending_reasoning));
         self.pending_submit = None;
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
@@ -1546,7 +1556,7 @@ impl ChatTuiApp {
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
             content: partial,
-            reasoning_content: None,
+            reasoning_content,
             attachments: vec![],
         });
         self.context_tokens = estimate_context_tokens(&self.history);
@@ -1762,6 +1772,14 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             .ok();
     }
 
+    fn assistant_reasoning(&mut self, delta: &str) {
+        self.tx
+            .send(RuntimeEvent::Delta(ChatResponseChunk::Reasoning(
+                delta.to_string(),
+            )))
+            .ok();
+    }
+
     fn context_usage(&mut self, tokens: u64, measured: bool) {
         self.tx
             .send(RuntimeEvent::AgentContext { tokens, measured })
@@ -1899,9 +1917,12 @@ async fn drive_cursor_turn(
             }
         }
     }
-    if !reasoning_buf.is_empty() {
-        turn_result.reasoning_content = Some(reasoning_buf);
-    }
+    // `reasoning_buf` is required by `consume_session_update`'s signature, but the
+    // chat TUI doesn't read it: cursor reasoning reaches the UI live via
+    // `CursorChunk::Reasoning` → `pending_reasoning` (committed at turn finish like
+    // every other provider), so there's no `reasoning_content` on `ChatTurnResult`
+    // to populate here.
+    let _ = &reasoning_buf;
 
     Ok(ChatTurnResult {
         content: turn_result.content,

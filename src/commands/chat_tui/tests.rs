@@ -1069,6 +1069,9 @@ fn make_test_app(
         agent_permission: None,
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        show_thinking: true,
+        model_supports_thinking: true,
+        thinking_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         queued_messages: Vec::new(),
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
@@ -1308,9 +1311,50 @@ fn test_build_transcript_shows_pending_status_without_visible_stream() {
 }
 
 #[test]
-fn test_build_transcript_ignores_streaming_reasoning_in_chat() {
+fn test_build_transcript_shows_streaming_reasoning_when_enabled() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
+    app.show_thinking = true;
+    app.sending = true;
+    app.pending_reasoning = "Inspecting the request".to_string();
+    app.pending_response = "Working on it".to_string();
+
+    let transcript = app.build_transcript();
+    let plain = transcript.plain_lines.join("\n");
+
+    assert!(plain.contains("Thinking"));
+    assert!(plain.contains("Inspecting the request"));
+    assert!(plain.contains("Working on it"));
+}
+
+#[test]
+fn test_thinking_shows_before_any_response_text() {
+    // The whole point of the live block: reasoning must render during the
+    // thinking-only gap, BEFORE any answer text has streamed (pending_response
+    // empty). Regression for the cache that only repainted once text arrived.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.show_thinking = true;
+    app.sending = true;
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_reasoning = "Working out the approach".to_string();
+    assert!(app.pending_response.is_empty(), "no answer text yet");
+
+    let plain = app.build_transcript().plain_lines.join("\n");
+    assert!(plain.contains("Thinking"));
+    assert!(plain.contains("Working out the approach"));
+}
+
+#[test]
+fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.show_thinking = false;
     app.sending = true;
     app.pending_reasoning = "Inspecting the request".to_string();
     app.pending_response = "Working on it".to_string();
@@ -1321,6 +1365,174 @@ fn test_build_transcript_ignores_streaming_reasoning_in_chat() {
     assert!(!plain.contains("Thinking"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
+}
+
+#[tokio::test]
+async fn test_config_overlay_toggles_show_thinking() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.show_thinking = true;
+
+    app.open_config_overlay();
+    let Overlay::Config(state) = &app.overlay else {
+        panic!("expected config overlay");
+    };
+    // First row is "Show thinking"; its rendered state reads the live flag.
+    assert_eq!(state.items[0].setting, ConfigSetting::ShowThinking);
+    assert!(app.config_setting_enabled(ConfigSetting::ShowThinking));
+
+    // Toggling it flips the live flag (the renderer derives the checkbox from it).
+    app.toggle_config_setting(0).await;
+    assert!(!app.show_thinking);
+    assert!(!app.config_setting_enabled(ConfigSetting::ShowThinking));
+}
+
+#[test]
+fn test_flush_pending_assistant_keeps_reasoning() {
+    // Regression: the native agent path (flush_pending_assistant, used before each
+    // tool step and at turn end) must carry pending_reasoning onto the committed
+    // message, not drop it.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.pending_response = "the answer".to_string();
+    app.pending_reasoning = "the chain of thought".to_string();
+
+    app.flush_pending_assistant();
+
+    let last = app.history.last().expect("assistant message committed");
+    assert_eq!(last.role, "assistant");
+    assert_eq!(last.content, "the answer");
+    assert_eq!(
+        last.reasoning_content.as_deref(),
+        Some("the chain of thought")
+    );
+    assert!(app.pending_reasoning.is_empty());
+}
+
+#[test]
+fn test_flush_pending_assistant_commits_reasoning_only_segment() {
+    // A reasoning-only segment (model thought, then a tool call with no prose)
+    // still commits, so the thinking isn't lost at the tool boundary.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.pending_reasoning = "thinking before a tool".to_string();
+
+    app.flush_pending_assistant();
+
+    let last = app
+        .history
+        .last()
+        .expect("reasoning-only message committed");
+    assert_eq!(last.role, "assistant");
+    assert!(last.content.is_empty());
+    assert_eq!(
+        last.reasoning_content.as_deref(),
+        Some("thinking before a tool")
+    );
+}
+
+#[test]
+fn test_volatile_tail_fp_tracks_reasoning_and_toggle() {
+    // Regression: the live "Thinking" block lives in the volatile tail, so its
+    // fingerprint must change as reasoning streams and when show_thinking flips —
+    // otherwise the cached tail never repaints during the reasoning-only gap.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.show_thinking = true;
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    let base = app.volatile_tail_fp();
+    app.pending_reasoning.push_str("more thinking");
+    let after_reasoning = app.volatile_tail_fp();
+    assert_ne!(
+        base, after_reasoning,
+        "fp must change as reasoning streams (pending_response stays empty)"
+    );
+
+    app.show_thinking = false;
+    let after_toggle = app.volatile_tail_fp();
+    assert_ne!(
+        after_reasoning, after_toggle,
+        "fp must change when show_thinking flips so a /config toggle repaints"
+    );
+}
+
+#[test]
+fn test_thinking_block_has_distinct_bar_color() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.show_thinking = true;
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "the answer".to_string(),
+        reasoning_content: Some("the reasoning".to_string()),
+        attachments: vec![],
+    });
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+
+    let t = app.build_transcript();
+    let bar_for = |needle: &str| {
+        t.plain_lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .and_then(|i| t.bar_colors[i])
+    };
+    let thinking_bar = bar_for("Thinking");
+    let answer_bar = bar_for("the answer");
+    assert_eq!(
+        thinking_bar,
+        Some(MUTED),
+        "thinking block uses the muted bar"
+    );
+    assert_eq!(answer_bar, Some(ACCENT), "answer uses the accent bar");
+    assert_ne!(thinking_bar, answer_bar);
+}
+
+#[tokio::test]
+async fn test_ctrl_t_toggles_show_thinking() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.show_thinking = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(!app.show_thinking, "Ctrl+T turns thinking off");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    assert!(app.show_thinking, "Ctrl+T turns it back on");
+}
+
+#[test]
+fn test_history_reasoning_renders_only_when_show_thinking() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: "the answer".to_string(),
+        reasoning_content: Some("the private chain of thought".to_string()),
+        attachments: vec![],
+    });
+
+    app.show_thinking = true;
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let shown = app.build_transcript().plain_lines.join("\n");
+    assert!(shown.contains("the private chain of thought"));
+    assert!(shown.contains("the answer"));
+
+    app.show_thinking = false;
+    app.transcript_revision = app.transcript_revision.wrapping_add(1);
+    let hidden = app.build_transcript().plain_lines.join("\n");
+    assert!(!hidden.contains("the private chain of thought"));
+    assert!(hidden.contains("the answer"));
 }
 
 #[test]
@@ -2725,6 +2937,15 @@ fn test_hint_bar_reflects_state() {
     assert!(
         bottom_row(|a| a.queued_messages = vec!["next".to_string()]).contains("queued"),
         "queued indicator"
+    );
+    // The ^T thinking hint only appears for models that support thinking.
+    assert!(
+        bottom_row(|a| a.model_supports_thinking = true).contains("thinking"),
+        "^T hint shown for thinking-capable models"
+    );
+    assert!(
+        !bottom_row(|a| a.model_supports_thinking = false).contains("thinking"),
+        "^T hint hidden for models without thinking support"
     );
 }
 

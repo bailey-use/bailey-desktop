@@ -597,13 +597,23 @@ fn status_hint(status: reqwest::StatusCode) -> Option<&'static str> {
     }
 }
 
-/// Convert a per-token price string (e.g. "0.000003") to per-1M display (e.g. "$3").
-fn format_price_per_million(per_token: &str) -> Option<String> {
-    let price: f64 = per_token.parse().ok()?;
+/// Convert a `/v1/models` price string to a per-1M display (e.g. "$3").
+///
+/// Providers report pricing in two unit conventions: per-token (OpenRouter,
+/// Vercel — e.g. "0.000003") and per-million dollars (publicai — e.g. "0.15").
+/// Per-token prices are always tiny (even a $200/1M model is 0.0002/token), so
+/// any value >= 0.001 is already per-million and must NOT be scaled — otherwise
+/// publicai's "0.15" became "$150000".
+fn format_price_per_million(raw: &str) -> Option<String> {
+    let price: f64 = raw.parse().ok()?;
     if price <= 0.0 {
         return None;
     }
-    let per_m = price * 1_000_000.0;
+    let per_m = if price >= 0.001 {
+        price
+    } else {
+        price * 1_000_000.0
+    };
     if per_m >= 1.0 {
         let rounded = (per_m * 100.0).round() / 100.0;
         if rounded == rounded.floor() {
@@ -654,6 +664,7 @@ impl ColumnWidths {
 fn format_model_line(model: &ModelInfo, widths: &ColumnWidths) -> String {
     let has_info = model.context.is_some()
         || model.max_output.is_some()
+        || (model.input_price.is_some() && model.output_price.is_some())
         || model.multiplier.is_some()
         || model.deprecated;
     if !has_info {
@@ -1951,5 +1962,52 @@ mod tests {
         assert!(!tool_supports_default_model(AIToolType::Gemini, &[]));
         assert!(!tool_supports_default_model(AIToolType::Pi, &[]));
         assert!(!tool_supports_default_model(AIToolType::Opencode, &[]));
+    }
+
+    #[test]
+    fn format_price_scales_per_token_values() {
+        // OpenRouter/Vercel report per-token (tiny) values.
+        assert_eq!(
+            format_price_per_million("0.0000005").as_deref(),
+            Some("$0.5")
+        );
+        assert_eq!(format_price_per_million("0.000003").as_deref(), Some("$3"));
+        // Even the priciest realistic model ($200/1M) stays per-token.
+        assert_eq!(format_price_per_million("0.0002").as_deref(), Some("$200"));
+    }
+
+    #[test]
+    fn format_price_keeps_per_million_values() {
+        // publicai reports per-million dollars directly — must not be scaled.
+        assert_eq!(format_price_per_million("0.15").as_deref(), Some("$0.15"));
+        assert_eq!(format_price_per_million("0.2").as_deref(), Some("$0.2"));
+        assert_eq!(format_price_per_million("2.92").as_deref(), Some("$2.92"));
+        assert_eq!(format_price_per_million("200").as_deref(), Some("$200"));
+    }
+
+    #[test]
+    fn format_price_rejects_zero_and_garbage() {
+        assert_eq!(format_price_per_million("0"), None);
+        assert_eq!(format_price_per_million("-1"), None);
+        assert_eq!(format_price_per_million("free"), None);
+    }
+
+    #[test]
+    fn format_model_line_shows_price_without_context() {
+        // Regression: a model with only pricing (no context/max_output) must
+        // still render its price, not collapse to a bare id — publicai's shape.
+        let mut m = ModelInfo::id_only("allenai/Olmo-3.1-32B-Think".to_string());
+        m.input_price = Some("$0.05".to_string());
+        m.output_price = Some("$0.2".to_string());
+        let widths = ColumnWidths::from_models(std::slice::from_ref(&m));
+        let line = format_model_line(&m, &widths);
+        assert!(line.contains("$0.05/$0.2"), "price missing: {line:?}");
+    }
+
+    #[test]
+    fn format_model_line_bare_id_when_no_info() {
+        let m = ModelInfo::id_only("some/model".to_string());
+        let widths = ColumnWidths::from_models(std::slice::from_ref(&m));
+        assert_eq!(format_model_line(&m, &widths), "some/model");
     }
 }

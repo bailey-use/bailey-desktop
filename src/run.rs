@@ -286,6 +286,7 @@ pub async fn run() -> ! {
                     chat_args.json,
                     chat_args.resume,
                     chat_args.agent,
+                    chat_args.max_context,
                     chat_args.dry_run,
                 )
                 .await

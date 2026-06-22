@@ -67,9 +67,6 @@ mod chat_tui;
 // without `super::`.
 use super::chat_tui_format;
 
-/// Maximum number of messages to keep in chat history.
-/// When exceeded, the oldest messages are dropped (keeping any system message).
-const MAX_HISTORY_MESSAGES: usize = 50;
 /// Max entries in the composer's per-directory recall view (the up-arrow list
 /// for the current launch dir). Recall is cwd-filtered like Claude Code's
 /// `project` history and Grok's per-cwd history.
@@ -298,6 +295,7 @@ impl ChatCommand {
         key_override: Option<ApiKey>,
         one_shot: Option<&str>,
         agent: Option<&str>,
+        max_context: Option<u64>,
     ) -> Result<ExitCode> {
         let hf = model_input.as_deref().is_some_and(|m| {
             huggingface::is_hf_or_local_gguf(m) || huggingface::is_bare_hf_picker_trigger(m)
@@ -392,6 +390,14 @@ impl ChatCommand {
                 "interactive TUI"
             },
         );
+        if let Some(window) = max_context {
+            println!(
+                "{} {} {}",
+                style::bold("Context:"),
+                window,
+                style::dim("(--max-context override, this session)"),
+            );
+        }
         if let Ok(dir) = chat_sandbox_dir() {
             println!(
                 "{} {}",
@@ -418,6 +424,7 @@ impl ChatCommand {
         json: bool,
         resume: Option<String>,
         agent: Option<String>,
+        max_context: Option<String>,
         dry_run: bool,
     ) -> ExitCode {
         match self
@@ -430,6 +437,7 @@ impl ChatCommand {
                 json,
                 resume,
                 agent,
+                max_context,
                 dry_run,
             )
             .await
@@ -453,8 +461,17 @@ impl ChatCommand {
         json: bool,
         resume: Option<String>,
         agent: Option<String>,
+        max_context: Option<String>,
         dry_run: bool,
     ) -> Result<ExitCode> {
+        // Validate `--max-context` up front so a malformed value fails fast.
+        let max_context: Option<u64> = match max_context.as_deref() {
+            Some(s) => Some(parse_context_window_size(s).ok_or_else(|| {
+                anyhow::anyhow!("invalid --max-context '{s}' (use e.g. 200k, 1m, or 128000)")
+            })?),
+            None => None,
+        };
+
         // `--dry-run` previews resolution and exits before any side effect
         // (no HTTP, persistence, model picker, llama-server spawn, or TUI).
         // Placed first so it also skips the over-broad-workspace prompt below.
@@ -466,6 +483,7 @@ impl ChatCommand {
                     key_override,
                     one_shot.as_deref(),
                     agent.as_deref(),
+                    max_context,
                 )
                 .await;
         }
@@ -883,6 +901,7 @@ impl ChatCommand {
             startup_notice,
             initial_resume: resume,
             initial_agent,
+            max_context,
         })
         .await?;
 
@@ -945,6 +964,10 @@ impl ChatCommand {
         print_opt(
             "--json",
             "Print upstream provider's raw JSON response (requires -p; useful for scripting)",
+        );
+        print_opt(
+            "--max-context <size>",
+            "Set the context window for a model aivo doesn't know yet (e.g. 200k, 1m); session-only",
         );
         print_opt(
             "--dry-run",
@@ -2244,26 +2267,26 @@ where
 /// Trims chat history to keep at most `max_messages` messages.
 /// If there's a system message at the start, it's always preserved.
 /// Drops the oldest non-system messages first.
-fn trim_history(history: &mut Vec<ChatMessage>, max_messages: usize) {
-    if history.len() <= max_messages {
-        return;
+/// Parse a `--max-context` size into tokens: a bare integer or a `k`/`m` suffix
+/// (`200k`, `1m`, `128000`), case-insensitive. `None` if unparseable or <= 0.
+fn parse_context_window_size(s: &str) -> Option<u64> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
     }
-
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-
-    if has_system {
-        // Keep the system message + last (max_messages - 1) messages
-        let keep_from = history.len() - (max_messages - 1);
-        let system_msg = history[0].clone();
-        let kept: Vec<ChatMessage> = std::iter::once(system_msg)
-            .chain(history[keep_from..].iter().cloned())
-            .collect();
-        *history = kept;
+    let (num_part, mult) = if let Some(n) = lower.strip_suffix('k') {
+        (n, 1_000f64)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 1_000_000f64)
     } else {
-        // Keep the last max_messages messages
-        let keep_from = history.len() - max_messages;
-        *history = history[keep_from..].to_vec();
+        (lower.as_str(), 1f64)
+    };
+    let num: f64 = num_part.trim().parse().ok()?;
+    if !num.is_finite() || num <= 0.0 {
+        return None;
     }
+    let tokens = (num * mult).round();
+    (tokens >= 1.0).then_some(tokens as u64)
 }
 
 /// Returns true when the error indicates the endpoint doesn't exist,
@@ -2788,6 +2811,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_context_window_size_accepts_suffixes_and_rejects_garbage() {
+        assert_eq!(parse_context_window_size("128000"), Some(128_000));
+        assert_eq!(parse_context_window_size("200k"), Some(200_000));
+        assert_eq!(parse_context_window_size("200K"), Some(200_000));
+        assert_eq!(parse_context_window_size("1m"), Some(1_000_000));
+        assert_eq!(parse_context_window_size("2M"), Some(2_000_000));
+        assert_eq!(parse_context_window_size("1.5m"), Some(1_500_000));
+        assert_eq!(parse_context_window_size("  256k "), Some(256_000));
+        // Rejected: empty, non-numeric, zero/negative, bad suffix.
+        assert_eq!(parse_context_window_size(""), None);
+        assert_eq!(parse_context_window_size("abc"), None);
+        assert_eq!(parse_context_window_size("0"), None);
+        assert_eq!(parse_context_window_size("-5"), None);
+        assert_eq!(parse_context_window_size("10g"), None);
+        assert_eq!(parse_context_window_size("k"), None);
+    }
 
     #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {

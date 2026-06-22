@@ -113,6 +113,10 @@ fn is_retryable_error(err: &str) -> bool {
 const KEEP_RECENT_TOKENS: usize = 20_000;
 /// Tokens held back from the window for the response + tool schemas.
 const COMPACT_RESERVE: usize = 16_000;
+/// Window assumed for compaction when the model's real context window is unknown
+/// (0); without it such models never compact and resend the whole transcript
+/// every turn. A real window, once known, takes precedence.
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 /// A `tool` result longer than this (in chars) is eligible for clearing once it
 /// ages out of the recent window; smaller results aren't worth the churn.
@@ -371,9 +375,10 @@ fn default_reasoning_effort(model: &str) -> Option<String> {
 impl AgentEngine {
     /// Seed an engine with the identity system prompt. `guides` are the names of
     /// project convention files present in cwd — the agent reads them on demand
-    /// (we don't inject their contents). `context_window` (0 = unknown → no
-    /// compaction) honors an env override; `max_steps` is the per-turn tool-step
-    /// budget (0 = no cap — the default for an interactive turn).
+    /// (we don't inject their contents). `context_window` (0 = unknown →
+    /// compaction falls back to [`DEFAULT_CONTEXT_WINDOW`]) honors an env
+    /// override; `max_steps` is the per-turn tool-step budget (0 = no cap — the
+    /// default for an interactive turn).
     pub fn new(
         cwd: &str,
         model: &str,
@@ -472,10 +477,8 @@ impl AgentEngine {
 
     /// Fill in the compaction context window if it was unknown (0) at
     /// construction. A model only known via a background catalog warm resolves
-    /// its window AFTER the engine is built; without this the engine keeps
-    /// window 0 for its whole lifetime and never compacts, so a long
-    /// conversation eventually overflows the upstream. Only fills a missing
-    /// window — never overrides a known one (incl. the test env override).
+    /// its window AFTER the engine is built. Only fills a missing window — never
+    /// overrides a known one (incl. the test env override).
     pub fn set_context_window(&mut self, window: u32) {
         if self.context_window == 0 && window > 0 {
             self.context_window = window;
@@ -572,10 +575,8 @@ impl AgentEngine {
                 continue;
             }
             // The conversation must open with a user turn — Anthropic (via the
-            // serve bridge) rejects an assistant-first sequence. A trimmed
-            // history (trim_history keeps the last N, with no system entry to
-            // anchor it) can start mid-exchange with an assistant turn, so drop
-            // leading assistant turns until the first user.
+            // serve bridge) rejects an assistant-first sequence, so drop leading
+            // assistant turns until the first user.
             if !seen_user {
                 if role != "user" {
                     continue;
@@ -1213,16 +1214,24 @@ Re-run the full command without write confinement?",
         tools::run_bash_unconfined(args, ctx.cwd).await
     }
 
+    /// The window `maybe_compact` budgets against: the real context window, or
+    /// [`DEFAULT_CONTEXT_WINDOW`] when it's unknown (0).
+    fn compaction_window(&self) -> usize {
+        if self.context_window == 0 {
+            DEFAULT_CONTEXT_WINDOW
+        } else {
+            self.context_window as usize
+        }
+    }
+
     /// If the history would overflow the model's context window, summarize the
     /// older messages (via a quiet `complete`) and replace them with the
     /// summary. Cuts only at user-turn boundaries so tool-call/result pairs stay
-    /// intact. No-op when the window is unknown. Returns tokens the summarization
-    /// call consumed (counted toward the turn, but not as a step).
+    /// intact; falls back to [`DEFAULT_CONTEXT_WINDOW`] when the window is unknown
+    /// (0). Returns tokens the summarization call consumed (counted toward the
+    /// turn, but not as a step).
     async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
-        if self.context_window == 0 {
-            return 0;
-        }
-        let budget = (self.context_window as usize).saturating_sub(COMPACT_RESERVE);
+        let budget = self.compaction_window().saturating_sub(COMPACT_RESERVE);
         let total = estimate_tokens(&self.messages);
         if total <= budget {
             return 0;
@@ -3475,6 +3484,25 @@ mod tests {
         );
         engine.set_context_window(0);
         assert_eq!(engine.context_window, 200_000, "a 0 update is a no-op");
+    }
+
+    /// An unknown window (0) compacts at `DEFAULT_CONTEXT_WINDOW`; a known window
+    /// takes precedence.
+    #[test]
+    fn compaction_window_falls_back_to_default_when_unknown() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 0; // unknown, ignoring any env override
+        assert_eq!(
+            engine.compaction_window(),
+            DEFAULT_CONTEXT_WINDOW,
+            "unknown window should compact at the default backstop, not be skipped"
+        );
+        engine.set_context_window(500_000);
+        assert_eq!(
+            engine.compaction_window(),
+            500_000,
+            "a known window takes precedence over the default"
+        );
     }
 
     #[test]

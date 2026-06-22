@@ -237,6 +237,8 @@ pub(crate) struct ChatTuiParams {
     /// `--agent <name>`: the top-level agent profile to start in (validated lazily
     /// on first engine build; an unknown name warns and falls back to default).
     pub initial_agent: Option<String>,
+    /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
+    pub max_context: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1457,6 +1459,9 @@ pub(super) struct ChatTuiApp {
     /// Active model's context window (tokens), 0 = unknown. Cached on model/key
     /// change for the footer utilization stat; see `refresh_context_window`.
     pub(super) context_window: u64,
+    /// `--max-context` manual override (tokens); wins over the resolved window in
+    /// `refresh_context_window` and the engine build. Session-only.
+    pub(super) context_window_override: Option<u64>,
     /// `context_tokens` is a chars/4 estimate of the visible transcript, not a
     /// provider-measured count (cursor ACP and agents-without-usage). The footer
     /// marks these with `~` since the model's real context is larger.

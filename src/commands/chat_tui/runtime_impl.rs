@@ -289,7 +289,6 @@ impl ChatTuiApp {
             reasoning_content: None,
             attachments: attachments.clone(),
         });
-        trim_history(&mut self.history, MAX_HISTORY_MESSAGES);
         // A new turn rebuilds the transcript rows and snaps to the bottom, so any
         // prior selection would point at the wrong content — drop it.
         self.clear_transcript_selection();
@@ -460,6 +459,19 @@ impl ChatTuiApp {
             .as_ref()
             .is_none_or(|s| s.key_id != self.key.id || s.model != self.model);
         if need_new {
+            // Snapshot the outgoing engine's transcript before replacing it, so a
+            // model switch rebuilds from the exact prior messages (ids intact), not
+            // the lossy display seed. Empty after /new or key switch (they clear
+            // agent_engine); skipped when a resume payload is pending (it wins).
+            let prior_engine_messages: Option<Vec<serde_json::Value>> =
+                if self.pending_agent_messages.is_some() {
+                    None
+                } else if let Some(prev) = self.agent_engine.as_ref() {
+                    let msgs = prev.engine.lock().await.export_conversation();
+                    (!msgs.is_empty()).then_some(msgs)
+                } else {
+                    None
+                };
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
             let guides =
                 crate::agent::engine::discover_project_guides(std::path::Path::new(&real_cwd));
@@ -469,14 +481,18 @@ impl ChatTuiApp {
                 let disabled: std::collections::HashSet<String> = disabled.into_iter().collect();
                 skills.retain(|s| !disabled.contains(&s.name));
             }
-            let context_window = crate::services::model_metadata::resolve_limits(
-                &self.cache,
-                Some(&self.key.base_url),
-                &self.model,
-            )
-            .await
-            .context
-            .unwrap_or(0)
+            // A `--max-context` override wins; otherwise resolve from catalog/snapshot.
+            let context_window = match self.context_window_override {
+                Some(w) => w,
+                None => crate::services::model_metadata::resolve_limits(
+                    &self.cache,
+                    Some(&self.key.base_url),
+                    &self.model,
+                )
+                .await
+                .context
+                .unwrap_or(0),
+            }
             .min(u32::MAX as u64) as u32;
             let mut engine = AgentEngine::new(
                 &real_cwd,
@@ -524,13 +540,13 @@ impl ChatTuiApp {
                     self.active_agent = None;
                 }
             }
-            // Carry prior conversation into the new engine. A resumed session
-            // restores its DURABLE transcript verbatim (exact tool_calls + results
-            // with ids); otherwise (model/key switch, old/non-agent sessions) fall
-            // back to the lossy text seed of the display history (tool steps folded
-            // into compact notes, since their call ids are gone). Either way the
-            // just-pushed current user turn is excluded — run_turn re-adds it.
+            // Carry prior conversation in, best fidelity first: a resumed session's
+            // durable transcript, else the outgoing engine's messages on a model
+            // switch (both verbatim), else the lossy text seed of display history.
+            // The just-pushed user turn is excluded — run_turn re-adds it.
             if let Some(conversation) = self.pending_agent_messages.take() {
+                engine.restore_conversation(conversation);
+            } else if let Some(conversation) = prior_engine_messages {
                 engine.restore_conversation(conversation);
             } else {
                 let prior = self.history.len().saturating_sub(1);

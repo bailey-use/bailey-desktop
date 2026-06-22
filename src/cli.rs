@@ -780,6 +780,12 @@ pub struct ChatArgs {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     pub debug: Option<String>,
 
+    /// Manually set this model's context window for the session (e.g. 200k,
+    /// 128000, 1m). Use for new models aivo doesn't know the window for yet —
+    /// it drives compaction and the context-usage stat. Not persisted.
+    #[arg(long, value_name = "SIZE")]
+    pub max_context: Option<String>,
+
     /// Print the resolved key, model, endpoint, and agent without connecting
     #[arg(long)]
     pub dry_run: bool,

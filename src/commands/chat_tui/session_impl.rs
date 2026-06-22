@@ -55,7 +55,8 @@ impl ChatTuiApp {
             &self.model,
         )
         .await;
-        self.context_window = limits.context.unwrap_or(0);
+        // A `--max-context` override wins over the resolved window.
+        self.context_window = self.context_window_override.or(limits.context).unwrap_or(0);
         // Capability from the model-limits snapshot (unknown model → not advertised).
         self.model_supports_thinking = limits.caps.is_some_and(|c| c.reasoning);
     }

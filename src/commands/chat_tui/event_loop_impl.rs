@@ -219,7 +219,6 @@ impl ChatTuiApp {
             reasoning_content: None,
             attachments: vec![],
         });
-        trim_history(&mut self.history, MAX_HISTORY_MESSAGES);
 
         self.last_local_output = Some(LocalCommandOutput {
             command,

@@ -140,6 +140,7 @@ impl ChatTuiApp {
             context_tokens: 0,
             session_tokens: crate::services::session_store::SessionTokens::default(),
             context_window: 0,
+            context_window_override: params.max_context,
             context_is_estimate: true,
             follow_output: true,
             transcript_revision: 0,

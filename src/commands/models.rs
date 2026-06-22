@@ -52,6 +52,10 @@ pub(crate) struct ModelInfo {
     /// Marked deprecated by models.dev; display-only, never cached.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
+    /// Reasoning-effort levels advertised by `/v1/models`; drives `/effort` for
+    /// catalog-only models (e.g. `aivo/starter`) the snapshot lacks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
 }
 
 impl ModelInfo {
@@ -66,6 +70,7 @@ impl ModelInfo {
             output_price: None,
             multiplier: None,
             deprecated: false,
+            reasoning_efforts: Vec::new(),
         }
     }
 }
@@ -93,6 +98,7 @@ impl OpenAIModel {
         let max_output = max_output_tokens.map(format_token_count);
         let (input_price, output_price) = self.find_pricing();
         let multiplier = self.find_multiplier();
+        let reasoning_efforts = self.find_reasoning_efforts();
         ModelInfo {
             id: self.id,
             context,
@@ -103,7 +109,24 @@ impl OpenAIModel {
             output_price,
             multiplier,
             deprecated: false,
+            reasoning_efforts,
         }
+    }
+
+    /// Levels from a `reasoning_efforts` string array (exact key), lowercased;
+    /// empty when absent or not a string array.
+    fn find_reasoning_efforts(&self) -> Vec<String> {
+        self.extra
+            .get("reasoning_efforts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Search for a Copilot-style billing multiplier (`billing.multiplier`).
@@ -746,12 +769,14 @@ fn build_metadata_map(models: &[ModelInfo]) -> HashMap<String, ModelMetadata> {
                 input_price: m.input_price.clone(),
                 output_price: m.output_price.clone(),
                 multiplier: m.multiplier,
+                reasoning_efforts: m.reasoning_efforts.clone(),
             };
             let any = meta.context_window.is_some()
                 || meta.max_output.is_some()
                 || meta.input_price.is_some()
                 || meta.output_price.is_some()
-                || meta.multiplier.is_some();
+                || meta.multiplier.is_some()
+                || !meta.reasoning_efforts.is_empty();
             any.then(|| (m.id.clone(), meta))
         })
         .collect()
@@ -794,6 +819,7 @@ fn models_from_cache(ids: Vec<String>, metadata: HashMap<String, ModelMetadata>)
                 output_price: m.output_price,
                 multiplier: m.multiplier,
                 deprecated: false,
+                reasoning_efforts: m.reasoning_efforts,
             }
         })
         .collect()
@@ -1041,6 +1067,7 @@ async fn fetch_models_detailed_filtered(
                         output_price: None,
                         multiplier: None,
                         deprecated: false,
+                        reasoning_efforts: Vec::new(),
                         id,
                     }
                 })
@@ -1843,6 +1870,7 @@ mod tests {
                 input_price: Some("$3".to_string()),
                 output_price: Some("$15".to_string()),
                 multiplier: None,
+                reasoning_efforts: Vec::new(),
             },
         );
         metadata.insert(
@@ -1890,6 +1918,7 @@ mod tests {
                 output_price: Some("$2".to_string()),
                 multiplier: None,
                 deprecated: false,
+                reasoning_efforts: Vec::new(),
             },
             ModelInfo::id_only("bare".to_string()),
         ];

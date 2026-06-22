@@ -2853,6 +2853,7 @@ mod tests {
                 context: Some(128_000),
                 output: Some(8_000),
                 caps: None,
+                reasoning_efforts: Vec::new(),
             },
         );
         // Raw catalog id carries the `aivo/` prefix the config id strips.
@@ -2862,6 +2863,7 @@ mod tests {
                 context: Some(1_000_000),
                 output: Some(384_000),
                 caps: None,
+                reasoning_efforts: Vec::new(),
             },
         );
         // Context-only must not emit a half-filled limit.
@@ -2871,6 +2873,7 @@ mod tests {
                 context: Some(64_000),
                 output: None,
                 caps: None,
+                reasoning_efforts: Vec::new(),
             },
         );
         let discovered = vec![
@@ -3432,6 +3435,7 @@ mod tests {
                 context: Some(1_000_000),
                 output: Some(384_000),
                 caps: None,
+                reasoning_efforts: Vec::new(),
             },
         );
         let env = injector.for_pi(&key, Some("aivo/starter"), &catalog, &limits);

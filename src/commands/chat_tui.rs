@@ -196,8 +196,9 @@ impl ChatTuiApp {
             // Set by `refresh_context_window` (called right after construction and
             // on every model switch); false until the first resolve.
             model_supports_thinking: false,
-            // Mirrors show_thinking; the engine reads it live to gate reasoning.
-            thinking_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(show_thinking)),
+            // Loaded per-model by `refresh_context_window` (called right after).
+            reasoning_effort: None,
+            model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
@@ -232,22 +233,12 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     if app.context_window == 0 {
         let cache = app.cache.clone();
         let key = app.key.clone();
-        let model = app.model.clone();
         let client = app.client.clone();
         let tx = app.tx.clone();
         tokio::spawn(async move {
             crate::commands::models::warm_full_catalog_metadata(&client, &key, &cache).await;
-            let window = crate::services::model_metadata::resolve_limits(
-                &cache,
-                Some(&key.base_url),
-                &model,
-            )
-            .await
-            .context
-            .unwrap_or(0);
-            if window > 0 {
-                let _ = tx.send(RuntimeEvent::ContextWindowResolved(window));
-            }
+            // Re-resolve the full limits (window + efforts), not just the window.
+            let _ = tx.send(RuntimeEvent::CatalogWarmed);
         });
     }
     // `--resume`: open the session picker (empty arg) or jump straight to a

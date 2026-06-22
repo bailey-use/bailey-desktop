@@ -1726,6 +1726,43 @@ impl SessionStore {
         self.write_chat_prefs(&prefs).await
     }
 
+    /// The persisted `/effort` reasoning level for `model` (remembered across
+    /// `aivo chat` sessions). Effort levels are model-specific, so they're stored
+    /// per-model under `reasoningEffort: {<model>: <level>}` in chat-prefs.json.
+    /// `None` when unset — the engine then uses the model default. The caller
+    /// still re-validates against the model's current level list.
+    pub async fn get_chat_reasoning_effort(&self, model: &str) -> Option<String> {
+        self.read_chat_prefs()
+            .await
+            .get("reasoningEffort")
+            .and_then(|v| v.get(model))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Persist `model`'s `/effort` level (or clear it with `None`), preserving
+    /// other models' levels and sibling prefs. Best-effort, written atomically.
+    pub async fn set_chat_reasoning_effort(&self, model: &str, level: Option<&str>) -> Result<()> {
+        let mut prefs = self.read_chat_prefs().await;
+        let entry = prefs
+            .entry("reasoningEffort")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        // Replace a legacy non-object value (the earlier global string form).
+        if !entry.is_object() {
+            *entry = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let map = entry.as_object_mut().expect("just ensured object");
+        match level {
+            Some(l) => {
+                map.insert(model.to_string(), serde_json::Value::String(l.into()));
+            }
+            None => {
+                map.remove(model);
+            }
+        }
+        self.write_chat_prefs(&prefs).await
+    }
+
     /// Both `aivo chat` toggles in a single read of chat-prefs.json, so startup
     /// doesn't open+parse the same file twice.
     pub async fn get_chat_toggles(&self) -> ChatToggles {

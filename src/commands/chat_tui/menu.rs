@@ -271,6 +271,7 @@ pub(super) fn picker_kind_noun(kind: &PickerKind) -> &'static str {
         PickerKind::Model { .. } => "models",
         PickerKind::Session => "chats",
         PickerKind::Rewind => "turns",
+        PickerKind::Effort => "levels",
     }
 }
 
@@ -280,6 +281,7 @@ pub(super) fn picker_search_placeholder(kind: &PickerKind) -> &'static str {
         PickerKind::Model { .. } => "filter model names",
         PickerKind::Session => "filter saved chats",
         PickerKind::Rewind => "filter turns",
+        PickerKind::Effort => "filter levels",
     }
 }
 

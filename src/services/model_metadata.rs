@@ -36,6 +36,9 @@ pub struct ResolvedLimits {
     pub context: Option<u64>,
     pub output: Option<u64>,
     pub caps: Option<&'static ModelLimits>,
+    /// Reasoning-effort levels (live catalog, else snapshot). Owned, not on
+    /// `caps`, since the live source isn't `'static`.
+    pub reasoning_efforts: Vec<String>,
 }
 
 /// Row: `[context, output, flags, efforts]` — see `sync_model_limits.py` and
@@ -240,6 +243,7 @@ fn hf_local_limits_for(
         context: Some(info.context),
         output: None,
         caps: Some(caps),
+        reasoning_efforts: Vec::new(),
     })
 }
 
@@ -273,6 +277,13 @@ pub async fn resolve_limits(
             .as_ref()
             .and_then(|m| m.max_output_tokens)
             .or_else(|| snap.and_then(|s| s.output)),
+        // Live catalog wins when it advertises levels; else the snapshot's.
+        reasoning_efforts: live
+            .as_ref()
+            .map(|m| m.reasoning_efforts.clone())
+            .filter(|v| !v.is_empty())
+            .or_else(|| snap.map(|s| s.reasoning_efforts.clone()))
+            .unwrap_or_default(),
         caps: snap,
     }
 }
@@ -608,6 +619,32 @@ mod tests {
         // Cache has no output → snapshot fills the gap (per-field merge).
         assert_eq!(resolved.output, Some(64_000));
         assert!(resolved.caps.unwrap().tool_call);
+    }
+
+    #[tokio::test]
+    async fn reasoning_efforts_come_from_live_catalog_for_unknown_model() {
+        let dir = TempDir::new().unwrap();
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "aivo/starter".to_string(),
+            ModelMetadata {
+                context_window: Some(1_000_000),
+                reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
+                ..Default::default()
+            },
+        );
+        cache
+            .set_with_metadata(
+                &full_catalog_key("https://api.getaivo.dev"),
+                vec!["aivo/starter".to_string()],
+                metadata,
+            )
+            .await;
+        // The snapshot has no `aivo/starter`; the levels come from the catalog.
+        let resolved =
+            resolve_limits(&cache, Some("https://api.getaivo.dev"), "aivo/starter").await;
+        assert_eq!(resolved.reasoning_efforts, vec!["low", "medium", "high"]);
     }
 
     #[tokio::test]

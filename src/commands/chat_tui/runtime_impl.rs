@@ -508,7 +508,6 @@ impl ChatTuiApp {
             engine.enable_rewind_checkpoints(&real_cwd);
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
-            engine.set_thinking_flag(self.thinking_flag.clone());
             // Offer any named specialist sub-agents authored under
             // `.aivo/agents` / `.claude/agents` (project + user). The model
             // delegates to them via the `subagent` tool's `agent` field.
@@ -623,6 +622,10 @@ impl ChatTuiApp {
         // so the engine can fill a still-missing window and start compacting,
         // instead of letting a long conversation overflow uncompacted.
         let context_window = self.context_window.min(u32::MAX as u64) as u32;
+        // Effective reasoning effort, carried in per turn like the window so a
+        // mid-session change applies next turn without locking the engine. `None`
+        // leaves the engine's own model default in place.
+        let reasoning_effort = self.effective_reasoning_effort();
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -636,6 +639,9 @@ impl ChatTuiApp {
             let mut ui = ChatAgentUi { tx };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
+            if let Some(effort) = reasoning_effort {
+                engine.set_reasoning_effort(effort);
+            }
             // run_turn ends by calling ui.footer → AgentFinished commits the turn.
             engine.run_turn(&ctx, &mut ui, input).await;
         }));
@@ -840,6 +846,10 @@ impl ChatTuiApp {
             }
             SlashCommand::Goal(arg) => {
                 self.run_goal_command(arg).await;
+                Ok(false)
+            }
+            SlashCommand::Effort(arg) => {
+                self.run_effort_command(arg).await;
                 Ok(false)
             }
             SlashCommand::CreateSkill(arg) => {

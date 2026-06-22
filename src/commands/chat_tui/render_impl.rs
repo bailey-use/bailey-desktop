@@ -1750,8 +1750,19 @@ impl ChatTuiApp {
     /// when a narrow terminal squeezes this bar.
     fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
+        // Reasoning effort (shown for models with levels) — the same effective
+        // level the engine sends, so they can't disagree. Separate from display.
+        if let Some(level) = self.effective_reasoning_effort() {
+            spans.push(Span::styled(
+                format!("effort: {level}"),
+                Style::default().fg(TOOL),
+            ));
+        }
         let queued = self.queued_messages.len();
         if queued > 0 {
+            if !spans.is_empty() {
+                spans.push(Span::styled("   ".to_string(), Style::default().fg(FAINT)));
+            }
             spans.push(Span::styled(
                 format!("● {queued} queued"),
                 Style::default().fg(ACCENT),

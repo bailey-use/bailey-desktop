@@ -29,6 +29,9 @@ pub struct ModelMetadata {
     pub output_price: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplier: Option<f64>,
+    /// Reasoning-effort levels advertised by `/v1/models` (e.g. for `aivo/starter`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

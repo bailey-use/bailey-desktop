@@ -57,8 +57,105 @@ impl ChatTuiApp {
         .await;
         // A `--max-context` override wins over the resolved window.
         self.context_window = self.context_window_override.or(limits.context).unwrap_or(0);
-        // Capability from the model-limits snapshot (unknown model → not advertised).
-        self.model_supports_thinking = limits.caps.is_some_and(|c| c.reasoning);
+        // Valid `/effort` levels: live catalog (e.g. aivo/starter) or snapshot.
+        self.model_reasoning_efforts = limits.reasoning_efforts.clone();
+        // Reasoning-capable per the snapshot, or implied by advertised levels.
+        self.model_supports_thinking =
+            limits.caps.is_some_and(|c| c.reasoning) || !self.model_reasoning_efforts.is_empty();
+        // This model's remembered effort, dropped if no longer a valid level.
+        self.reasoning_effort = match self
+            .session_store
+            .get_chat_reasoning_effort(&self.model)
+            .await
+        {
+            Some(level) if self.model_reasoning_efforts.contains(&level) => Some(level),
+            _ => None,
+        };
+    }
+
+    /// `/effort [level]`: bare opens a picker of the model's reasoning levels,
+    /// `<level>` sets it directly. No-op (with a notice) for models that expose
+    /// no levels.
+    pub(super) async fn run_effort_command(&mut self, arg: Option<String>) {
+        if self.model_reasoning_efforts.is_empty() {
+            self.notice = Some((
+                MUTED,
+                format!("{} has no reasoning-effort levels", self.model),
+            ));
+            return;
+        }
+        match arg.map(|s| s.trim().to_ascii_lowercase()) {
+            Some(level) if self.model_reasoning_efforts.contains(&level) => {
+                self.apply_reasoning_effort(level).await;
+            }
+            Some(level) => {
+                self.notice = Some((
+                    ERROR,
+                    format!(
+                        "unknown effort '{level}' (choose: {})",
+                        self.model_reasoning_efforts.join(", ")
+                    ),
+                ));
+            }
+            None => self.open_effort_picker(),
+        }
+    }
+
+    fn open_effort_picker(&mut self) {
+        let current = self.reasoning_effort.clone();
+        let items: Vec<PickerEntry> = self
+            .model_reasoning_efforts
+            .iter()
+            .map(|level| PickerEntry {
+                label: if current.as_deref() == Some(level) {
+                    format!("{level}  (current)")
+                } else {
+                    level.clone()
+                },
+                search_text: level.clone(),
+                value: PickerValue::Effort(level.clone()),
+            })
+            .collect();
+        let selected = current
+            .as_deref()
+            .and_then(|c| self.model_reasoning_efforts.iter().position(|l| l == c))
+            .unwrap_or(0);
+        let mut state =
+            PickerState::ready("Reasoning effort", String::new(), items, PickerKind::Effort);
+        state.selected = selected;
+        self.overlay = Overlay::Picker(Box::new(state));
+    }
+
+    /// Set the reasoning effort: remember it (per-model) and persist it. The
+    /// engine picks it up at the start of the next turn (carried in like the
+    /// context window), so we never lock the engine here — that would block the
+    /// event loop on an in-flight turn's guard. Independent of show-thinking.
+    pub(super) async fn apply_reasoning_effort(&mut self, level: String) {
+        self.reasoning_effort = Some(level.clone());
+        let _ = self
+            .session_store
+            .set_chat_reasoning_effort(&self.model, Some(&level))
+            .await;
+        self.notice = Some((MUTED, format!("reasoning effort: {level}")));
+    }
+
+    /// The effort the engine will request: the user's `/effort` choice, else —
+    /// for a model with levels — the default (env or `medium`) if valid, else the
+    /// first level; `None` when the model has no levels. Keeps the footer badge in
+    /// step with what's sent and lets catalog-only models reason by default.
+    pub(super) fn effective_reasoning_effort(&self) -> Option<String> {
+        if let Some(level) = &self.reasoning_effort {
+            return Some(level.clone());
+        }
+        if self.model_reasoning_efforts.is_empty() {
+            return None;
+        }
+        let default = crate::agent::engine::default_reasoning_effort_level();
+        if self.model_reasoning_efforts.contains(&default) {
+            Some(default)
+        } else {
+            self.model_reasoning_efforts.first().cloned()
+        }
     }
 
     pub(super) async fn apply_model(&mut self, raw_model: String) -> Result<()> {
@@ -270,10 +367,6 @@ impl ChatTuiApp {
             return;
         }
         self.show_thinking = on;
-        // Keep the engine's live gate in lockstep so a mid-session toggle changes
-        // whether the model is asked to think on the next step, not just the display.
-        self.thinking_flag
-            .store(on, std::sync::atomic::Ordering::Relaxed);
         self.show_toast(if on {
             "Thinking shown"
         } else {
@@ -1222,6 +1315,9 @@ impl ChatTuiApp {
                 },
             ) => {
                 self.rewind_to_turn(history_index, ordinal).await?;
+            }
+            (PickerKind::Effort, PickerValue::Effort(level)) => {
+                self.apply_reasoning_effort(level).await;
             }
             _ => {}
         }

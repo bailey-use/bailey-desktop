@@ -26,8 +26,8 @@ impl ChatTuiApp {
             RuntimeEvent::ModelsLoaded(result) => {
                 self.apply_loaded_models(result).await?;
             }
-            RuntimeEvent::ContextWindowResolved(window) => {
-                self.context_window = window;
+            RuntimeEvent::CatalogWarmed => {
+                self.refresh_context_window().await;
             }
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;

@@ -1072,7 +1072,8 @@ fn make_test_app(
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         show_thinking: true,
         model_supports_thinking: true,
-        thinking_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        reasoning_effort: None,
+        model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
@@ -1366,6 +1367,49 @@ fn test_build_transcript_hides_streaming_reasoning_when_disabled() {
     assert!(!plain.contains("Thinking"));
     assert!(!plain.contains("Inspecting the request"));
     assert!(plain.contains("Working on it"));
+}
+
+#[tokio::test]
+async fn effort_command_sets_level_independent_of_thinking_and_validates() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_reasoning_efforts = vec!["low".into(), "medium".into(), "high".into()];
+    app.show_thinking = false;
+    app.reasoning_effort = None;
+
+    // `/effort high` sets it (case-insensitive) WITHOUT touching the separate
+    // show-thinking display toggle.
+    app.run_effort_command(Some("HIGH".into())).await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+    assert!(
+        !app.show_thinking,
+        "setting effort must not flip show-thinking"
+    );
+
+    // An unknown level errors and leaves the choice unchanged.
+    app.run_effort_command(Some("bogus".into())).await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+    assert!(matches!(app.notice, Some((ERROR, _))));
+
+    // Bare `/effort` opens the picker of the model's levels.
+    app.run_effort_command(None).await;
+    assert!(
+        matches!(&app.overlay, Overlay::Picker(p) if matches!(p.kind, PickerKind::Effort)),
+        "bare /effort opens the effort picker"
+    );
+}
+
+#[tokio::test]
+async fn effort_command_noop_when_model_has_no_levels() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model_reasoning_efforts.clear();
+    app.run_effort_command(None).await;
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "no picker without levels"
+    );
+    assert!(matches!(app.notice, Some((MUTED, _))));
 }
 
 #[tokio::test]

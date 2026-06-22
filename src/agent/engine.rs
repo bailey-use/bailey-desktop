@@ -8,8 +8,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
@@ -345,31 +343,30 @@ pub struct AgentEngine {
     /// `/rewind` checkpointing is enabled for this engine (top-level chat only —
     /// sub-engines don't checkpoint). See [`crate::agent::checkpoint`].
     checkpoint_store: Option<crate::agent::checkpoint::CheckpointStore>,
-    /// `reasoning_effort` to request when thinking is enabled, or `None` when the
-    /// model isn't a reasoning model (sending the field then 400s some providers).
-    /// Resolved once from the model's snapshot capability at construction.
+    /// `reasoning_effort` to request for a reasoning-capable model, or `None`
+    /// otherwise (sending the field then 400s some providers). Defaults from the
+    /// model's snapshot capability at construction; changed live by `/effort`.
     reasoning_effort: Option<String>,
-    /// Live "request thinking" toggle, shared with the chat TUI (mirrors its
-    /// `show_thinking` so a mid-session Ctrl+T / `/config` flip takes effect on the
-    /// next step). `None` for non-TUI engines (subagents, tests) → thinking not
-    /// requested. Only consulted when `reasoning_effort` is `Some`.
-    thinking_flag: Option<Arc<AtomicBool>>,
+}
+
+/// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
+/// set, else `"medium"`. Whether it's actually requested depends on model
+/// capability — see [`default_reasoning_effort`]. Exposed so the chat footer can
+/// show the same level the engine will send when the user hasn't picked one.
+pub fn default_reasoning_effort_level() -> String {
+    std::env::var("AIVO_AGENT_REASONING_EFFORT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "medium".to_string())
 }
 
 /// The `reasoning_effort` to request for `model`, or `None` for non-reasoning
 /// models (where the field would 400 strict providers). Capability comes from the
-/// model-limits snapshot; the level defaults to `"medium"` and can be overridden
-/// with `AIVO_AGENT_REASONING_EFFORT` (e.g. `low`/`high`).
+/// model-limits snapshot; the level is [`default_reasoning_effort_level`].
 fn default_reasoning_effort(model: &str) -> Option<String> {
-    if !crate::services::model_metadata::snapshot_limits(model).is_some_and(|c| c.reasoning) {
-        return None;
-    }
-    Some(
-        std::env::var("AIVO_AGENT_REASONING_EFFORT")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "medium".to_string()),
-    )
+    crate::services::model_metadata::snapshot_limits(model)
+        .is_some_and(|c| c.reasoning)
+        .then(default_reasoning_effort_level)
 }
 
 impl AgentEngine {
@@ -427,27 +424,21 @@ impl AgentEngine {
             checkpoints: Vec::new(),
             checkpoint_store: None,
             reasoning_effort: default_reasoning_effort(model),
-            thinking_flag: None,
         }
     }
 
-    /// Share the chat TUI's live "show thinking" toggle so the engine requests
-    /// reasoning (for reasoning-capable models) only while it's on. Without this
-    /// the engine never asks for thinking (the default for subagents/tests).
-    pub fn set_thinking_flag(&mut self, flag: Arc<AtomicBool>) {
-        self.thinking_flag = Some(flag);
+    /// Set the `reasoning_effort` level (the `/effort` command). Only meaningful
+    /// for reasoning-capable models.
+    pub fn set_reasoning_effort(&mut self, effort: String) {
+        self.reasoning_effort = Some(effort);
     }
 
     /// The `reasoning_effort` to put on this step's request: the model's resolved
-    /// level when it's reasoning-capable AND the shared thinking flag is on, else
-    /// `None`. Read live each step so a mid-turn toggle takes effect.
+    /// level for a reasoning-capable model, else `None`. Independent of whether
+    /// the chat displays the reasoning (the show-thinking toggle) — effort
+    /// controls how much the model thinks, not whether it's shown.
     fn reasoning_effort_param(&self) -> Option<&str> {
-        let effort = self.reasoning_effort.as_deref()?;
-        let on = self
-            .thinking_flag
-            .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed));
-        on.then_some(effort)
+        self.reasoning_effort.as_deref()
     }
 
     /// Enable `/rewind` tree-checkpointing for this engine (top-level chat only;
@@ -828,11 +819,12 @@ impl AgentEngine {
 
             let mut extra = Map::new();
             extra.insert("tool_choice".into(), json!("auto"));
-            // Request reasoning for reasoning-capable models while the shared
-            // thinking toggle is on. The loopback serve translates `reasoning_effort`
-            // to each upstream's thinking surface (Anthropic `thinking`, Gemini
-            // `thinkingConfig`, OpenAI passthrough). Skipped for non-reasoning models
-            // so strict providers don't 400.
+            // Request reasoning for reasoning-capable models at the resolved
+            // effort. The loopback serve translates `reasoning_effort` to each
+            // upstream's thinking surface (Anthropic `thinking`, Gemini
+            // `thinkingConfig`, OpenAI passthrough). Skipped for non-reasoning
+            // models so strict providers don't 400. Whether the chat *shows* the
+            // reasoning is a separate concern (the show-thinking display toggle).
             if let Some(effort) = self.reasoning_effort_param() {
                 extra.insert("reasoning_effort".into(), json!(effort));
             }
@@ -1664,6 +1656,16 @@ Re-run the full command without write confinement?",
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
+        // Carry the parent's reasoning effort into delegated work, but only when
+        // it's a valid level for the sub's model (they may differ) — otherwise
+        // keep the sub model's own default rather than risk sending a level the
+        // model rejects.
+        if let Some(effort) = &self.reasoning_effort
+            && crate::services::model_metadata::snapshot_limits(model)
+                .is_some_and(|c| c.reasoning_efforts.iter().any(|l| l == effort))
+        {
+            sub.set_reasoning_effort(effort.clone());
+        }
         // Share the parent's external tools (MCP) so a sub-agent can use them too,
         // reusing the same already-connected servers.
         if let Some(ext) = &self.external {
@@ -2420,27 +2422,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_param_tracks_capability_and_live_flag() {
-        // Capable model: requested only while the shared flag is on; reads live.
+    fn reasoning_effort_param_tracks_capability_not_display() {
+        // Reasoning-capable model: the level is always requested (independent of
+        // whether the chat shows thinking); `/effort` changes it.
         let mut engine = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
-        assert_eq!(
-            engine.reasoning_effort_param(),
-            None,
-            "no flag set yet → not requested"
-        );
-        let flag = Arc::new(AtomicBool::new(true));
-        engine.set_thinking_flag(flag.clone());
         assert_eq!(engine.reasoning_effort_param(), Some("medium"));
-        flag.store(false, Ordering::Relaxed);
-        assert_eq!(
-            engine.reasoning_effort_param(),
-            None,
-            "a mid-turn toggle is seen live"
-        );
+        engine.set_reasoning_effort("high".into());
+        assert_eq!(engine.reasoning_effort_param(), Some("high"));
 
-        // Non-reasoning model: never requested, even with the flag on.
-        let mut plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
-        plain.set_thinking_flag(Arc::new(AtomicBool::new(true)));
+        // Non-reasoning model: never requested (would 400 strict providers).
+        let plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
         assert_eq!(plain.reasoning_effort_param(), None);
     }
 

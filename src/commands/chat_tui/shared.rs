@@ -186,6 +186,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: false,
     },
     SlashCommandSpec {
+        name: "effort",
+        help_label: "/effort [level]",
+        description: "set reasoning effort (bare opens a picker)",
+        takes_argument: true,
+    },
+    SlashCommandSpec {
         name: "help",
         help_label: "/help",
         description: "open help",
@@ -648,6 +654,8 @@ pub(super) enum PickerValue {
         history_index: usize,
         ordinal: Option<usize>,
     },
+    /// A `/effort` reasoning level (e.g. `low`/`high`).
+    Effort(String),
 }
 
 /// A model option ready for the picker: stable id and display label.
@@ -687,6 +695,7 @@ pub(super) enum PickerKind {
     Key,
     Session,
     Rewind,
+    Effort,
 }
 
 #[derive(Clone)]
@@ -1205,6 +1214,9 @@ pub(super) enum SlashCommand {
     /// Goal mode: `<objective>` works autonomously until done; bare shows status,
     /// `stop` ends it.
     Goal(Option<String>),
+    /// Reasoning effort: bare opens a picker of the model's levels, `<level>`
+    /// sets it directly.
+    Effort(Option<String>),
     /// Built-in `create-skill` command: starts the guided create/improve-a-skill
     /// workflow. The optional argument is the initial intent (what the skill
     /// should do); bare just opens the workflow.
@@ -1248,9 +1260,9 @@ pub(super) enum RuntimeEvent {
         format: ChatFormat,
     },
     ModelsLoaded(std::result::Result<Vec<ModelChoice>, String>),
-    /// A background catalog warm resolved the active model's context window
-    /// (tokens) — update the footer utilization stat. Only sent when > 0.
-    ContextWindowResolved(u64),
+    /// The background catalog warm finished — re-resolve the active model's
+    /// limits (window + `/effort` levels) so catalog-advertised efforts surface.
+    CatalogWarmed,
     ResumeLoaded {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
@@ -1595,11 +1607,12 @@ pub(super) struct ChatTuiApp {
     /// `refresh_context_window`); gates the `^T` footer hint so it only advertises
     /// the toggle where thinking can actually appear. Unknown models → false.
     pub(super) model_supports_thinking: bool,
-    /// `show_thinking` as a shared atomic the agent engine reads live, so the
-    /// engine only *requests* reasoning (`reasoning_effort`) while thinking is on.
-    /// Kept in lockstep with `show_thinking` (see `set_show_thinking`); handed to
-    /// the engine on build. Mirrors the `auto_approve_flag` pattern.
-    pub(super) thinking_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `/effort` reasoning level chosen by the user (None = model default);
+    /// applied to the engine on build/change and persisted in chat-prefs.
+    pub(super) reasoning_effort: Option<String>,
+    /// Valid effort levels for the active model (from `caps.reasoning_efforts`),
+    /// refreshed on model/key change. Empty = the model exposes none.
+    pub(super) model_reasoning_efforts: Vec<String>,
     /// Messages typed while a turn was in flight, in submit order; each is
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.

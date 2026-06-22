@@ -1287,7 +1287,9 @@ fn footer_hints(hints: &[(&str, &str)]) -> Line<'static> {
 const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Chat",
-        &["new", "resume", "rewind", "copy", "config", "help", "exit"],
+        &[
+            "new", "resume", "rewind", "copy", "config", "effort", "help", "exit",
+        ],
     ),
     ("Model & key", &["model", "key"]),
     ("Context", &["attach", "detach"]),

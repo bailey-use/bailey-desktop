@@ -242,7 +242,11 @@ impl ChatTuiApp {
         self.dispatch_user_message(content, Some(typed)).await
     }
 
-    async fn dispatch_user_message(&mut self, input: String, record: Option<String>) -> Result<()> {
+    pub(super) async fn dispatch_user_message(
+        &mut self,
+        input: String,
+        record: Option<String>,
+    ) -> Result<()> {
         let attachments = materialize_attachments(&self.draft_attachments).await?;
         if self.key.is_cursor_acp()
             && let Some(session) = self.cursor_acp_session.as_ref()
@@ -1370,7 +1374,11 @@ impl ChatTuiApp {
                     max: goal_max_iterations(),
                 });
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
-                if let Err(e) = self.send_user_message(first).await {
+                // The model receives the expanded preamble, but draft history must
+                // record only the typed `/goal <objective>` (done by `submit_draft`),
+                // not this machine text — so send with `record: None`. Mirrors how
+                // `send_skill_message` keeps the re-runnable `/name args` recallable.
+                if let Err(e) = self.dispatch_user_message(first, None).await {
                     self.goal_mode = None;
                     self.notice = Some((ERROR, e.to_string()));
                     return;
@@ -1425,7 +1433,10 @@ impl ChatTuiApp {
             ));
             return Ok(());
         }
-        self.send_user_message(GOAL_CONTINUE.to_string()).await
+        // Auto-continuation: the model gets the self-check prompt, but it must not
+        // leak into ↑/↓ recall — record nothing (see `run_goal_command`).
+        self.dispatch_user_message(GOAL_CONTINUE.to_string(), None)
+            .await
     }
 
     pub(super) fn start_new_chat(&mut self) {

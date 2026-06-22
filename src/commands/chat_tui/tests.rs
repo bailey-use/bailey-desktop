@@ -5409,6 +5409,29 @@ async fn test_goal_command_status_stop_and_guards() {
     assert!(app.notice.as_ref().unwrap().1.contains("native agent"));
 }
 
+/// Goal mode sends machine text to the model but must not leak it into ↑/↓
+/// recall — `record: None` records nothing; only the typed `/goal <obj>` does.
+#[tokio::test]
+async fn test_goal_machine_text_never_enters_draft_history() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Non-agent key keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "copilot".to_string();
+
+    app.dispatch_user_message("[Goal mode] preamble".to_string(), None)
+        .await
+        .unwrap();
+    assert!(app.draft_history.is_empty());
+
+    app.dispatch_user_message(
+        "[Goal mode] preamble".to_string(),
+        Some("/goal x".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.draft_history, vec!["/goal x".to_string()]);
+}
+
 /// The goal loop ends on the completion marker and at the iteration cap (both
 /// terminal — neither sends another turn). Exercises `signals_goal_complete`.
 #[tokio::test]

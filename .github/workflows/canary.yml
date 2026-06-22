@@ -20,7 +20,9 @@ name: Canary
 
 on:
   schedule:
-    - cron: '23 6 * * *'
+    # Every 3 days at 06:23 UTC (day-of-month step; resets each month, so the
+    # boundary gap can be 1–3 days). GitHub cron has no true N-day interval.
+    - cron: '23 6 */3 * *'
   workflow_dispatch:
 
 concurrency:

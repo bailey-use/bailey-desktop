@@ -262,6 +262,10 @@ impl TurnCtx<'_> {
 /// `tree` is `None` when git is unavailable or the guard skipped it (conversation
 /// only). `msg_index` stays valid across compaction via `rebase_checkpoints`.
 ///
+/// `prompt` is the opening user text, stored verbatim so the picker can match it
+/// to a display row — `messages[msg_index]` is later mutated in place (merge on
+/// resend, summary fold on compaction) and would stop matching.
+///
 /// `changed` is the paths the turn modified (recorded at turn end); a rewind
 /// reverts only the union of these across rewound turns, leaving the user's
 /// independent edits alone. `None` until recorded — an interrupted turn is
@@ -269,6 +273,7 @@ impl TurnCtx<'_> {
 #[derive(Clone)]
 struct Checkpoint {
     msg_index: usize,
+    prompt: String,
     tree: Option<String>,
     changed: Option<Vec<std::path::PathBuf>>,
 }
@@ -790,6 +795,8 @@ impl AgentEngine {
             };
             self.checkpoints.push(Checkpoint {
                 msg_index: turn_start,
+                // Before `push_text_turn` may merge a resend in (see `Checkpoint`).
+                prompt: user_text.clone(),
                 tree,
                 changed: None,
             });
@@ -1474,16 +1481,7 @@ Re-run the full command without write confinement?",
     pub fn rewind_targets(&self) -> Vec<(String, bool)> {
         self.checkpoints
             .iter()
-            .map(|c| {
-                let prompt = self
-                    .messages
-                    .get(c.msg_index)
-                    .and_then(|m| m.get("content"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                (prompt, c.tree.is_some())
-            })
+            .map(|c| (c.prompt.clone(), c.tree.is_some()))
             .collect()
     }
 
@@ -4420,6 +4418,7 @@ mod tests {
         // [system]; then two turns each adding a user + assistant message.
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
+            prompt: "a".into(),
             tree: None,
             changed: None,
         });
@@ -4431,6 +4430,7 @@ mod tests {
             .push(json!({"role": "assistant", "content": "b"}));
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
+            prompt: "c".into(),
             tree: None,
             changed: None,
         });
@@ -4464,6 +4464,7 @@ mod tests {
         // A live turn (user "c") with a tree snapshot, then one (user "e") without.
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
+            prompt: "c".into(),
             tree: Some("abc".into()),
             changed: None,
         });
@@ -4475,6 +4476,7 @@ mod tests {
             .push(json!({"role": "assistant", "content": "d"}));
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
+            prompt: "e".into(),
             tree: None,
             changed: None,
         });
@@ -4499,6 +4501,7 @@ mod tests {
         for (u, a) in [("u0", "a0"), ("u1", "a1"), ("u2", "a2")] {
             engine.checkpoints.push(Checkpoint {
                 msg_index: engine.messages.len(),
+                prompt: u.into(),
                 tree: None,
                 changed: None,
             });
@@ -4529,6 +4532,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3]
         );
+        // Verbatim "u1", not the folded "S\n\nu1" at messages[1].
+        assert_eq!(engine.rewind_targets()[0].0, "u1");
         assert_eq!(engine.rewind_targets()[1].0, "u2");
 
         // Rewinding to the last turn truncates at the correct (rebased) index.
@@ -4536,6 +4541,30 @@ mod tests {
         assert_eq!(engine.messages.len(), 3);
         assert_eq!(role(engine.messages.last().unwrap()), "assistant");
         assert_eq!(engine.messages[2]["content"], "a1");
+    }
+
+    #[tokio::test]
+    async fn rewind_target_survives_interrupted_turn_merge() {
+        // A resend after an interrupt merges into the trailing `user` message
+        // ("first\n\nsecond"); the stored prompt must stay "first" so the turn
+        // keeps file revert instead of dropping to conversation-only.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = rewind_engine(dir.path());
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "first".into(),
+            tree: Some("abc".into()),
+            changed: None,
+        });
+        engine.push_text_turn("user", "first".into());
+        engine.push_text_turn("user", "second".into());
+        assert_eq!(
+            engine.messages.last().unwrap()["content"],
+            "first\n\nsecond"
+        );
+
+        let targets = engine.rewind_targets();
+        assert_eq!(targets, vec![("first".to_string(), true)]);
     }
 
     #[tokio::test]
@@ -4554,6 +4583,7 @@ mod tests {
         };
         engine.checkpoints.push(Checkpoint {
             msg_index: engine.messages.len(),
+            prompt: "go".into(),
             tree,
             changed: None,
         });

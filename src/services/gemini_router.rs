@@ -218,8 +218,28 @@ async fn handle_request(
                 }
             }
         }
+        None if is_interactions_path(&path) => {
+            // 501 + JSON error envelope (not a bare 404) so a client that migrated to
+            // the unsupported Interactions API gets a parseable, honest reason.
+            let body = serde_json::json!({
+                "error": {
+                    "code": 501,
+                    "message": "aivo's gemini loopback bridges the stateless generateContent API only; \
+                                Google's Interactions API (previous_interaction_id/background) is not supported yet",
+                    "status": "UNIMPLEMENTED",
+                }
+            })
+            .to_string();
+            Ok(http_utils::http_response(501, CONTENT_TYPE_JSON, &body))
+        }
         None => Ok(http_utils::http_error_response(404, "not found")),
     }
+}
+
+/// Detects Google's stateful Interactions API endpoints (REST `/v1beta/interactions...`).
+fn is_interactions_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.split('/').any(|seg| seg == "interactions")
 }
 
 /// Wraps plaintext/HTML error bodies in a Google-native error envelope so
@@ -1205,6 +1225,18 @@ mod tests {
         assert_eq!(parse_gemini_path("/v1/chat/completions"), None);
         assert_eq!(parse_gemini_path("/health"), None);
         assert_eq!(parse_gemini_path(""), None);
+    }
+
+    #[test]
+    fn test_is_interactions_path() {
+        assert!(is_interactions_path("/v1beta/interactions"));
+        assert!(is_interactions_path("/v1beta/interactions/abc123"));
+        assert!(is_interactions_path("/v1beta/interactions?store=false"));
+        // generateContent and unrelated paths must not be misclassified
+        assert!(!is_interactions_path(
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        ));
+        assert!(!is_interactions_path("/v1/chat/completions"));
     }
 
     #[test]

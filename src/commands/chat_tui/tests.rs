@@ -1080,7 +1080,8 @@ fn make_test_app(
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
         local_command: None,
-        last_local_output: None,
+        local_outputs: std::collections::HashMap::new(),
+        expanded_output: std::collections::HashSet::new(),
         expanded_thinking: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
@@ -2774,75 +2775,63 @@ fn streaming_reply_cache_invalidates_on_change() {
     }
 }
 
-/// The `!cmd` output pager windows a large capture: it draws only the visible
-/// slice (with a correct range/total footer) and clamps over-scroll to the last
-/// page, instead of materializing the whole buffer into `Line`s every keystroke.
+/// Clicking a folded `!cmd` block's `▸ +N more lines` expander reveals the full
+/// output inline (the in-process successor to the ctrl+o pager); clicking the
+/// `▾ collapse` toggle folds it back to the preview. Drives the real render +
+/// hitbox + click-mapping path end to end.
 #[test]
-fn output_pager_windows_large_capture() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
-
+fn output_block_expands_inline_on_click() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    let stdout: String = (0..1000).map(|i| format!("L{i:04}\n")).collect();
-    app.last_local_output = Some(LocalCommandOutput {
-        command: "seq 1000".to_string(),
-        stdout,
-        stderr: String::new(),
-        exit_code: 0,
-        truncated: false,
-        interrupted: false,
-    });
+    // 250 lines: past the 40-line fold preview, so the block renders an expander.
+    let full: String = (1..=250).map(|i| format!("L{i:04}\n")).collect();
+    app.record_local_output("seq 250".to_string(), full, String::new(), 0, false, false);
+    let idx = app.history.len() - 1;
 
-    let render = |app: &ChatTuiApp, scroll: u16| -> (String, u16) {
-        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        let mut clamped = 0u16;
-        terminal
-            .draw(|frame| {
-                clamped = app.render_output_overlay(frame, Rect::new(0, 0, 60, 20), scroll);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let screen: String = (0..20)
-            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        (screen, clamped)
+    // The transcript rows the click handler resolves against — built exactly as the
+    // real render does (wrap the body, then seed the hitbox).
+    let refresh = |app: &mut ChatTuiApp| -> Vec<String> {
+        let body = app.build_transcript_history_body(80);
+        let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
+        app.transcript_hitbox = Some(TranscriptHitbox {
+            area: Rect::new(0, 0, 80, 40),
+            first_row: 0,
+            rows: wrapped.rows.clone(),
+        });
+        wrapped.rows
     };
 
-    // 60x20 minus margin(v1,h2) ⇒ inner height 18 ⇒ body_h 17.
-    let (screen, clamped) = render(&app, 50);
-    assert_eq!(clamped, 50);
-    assert!(
-        screen.contains("L0050"),
-        "window starts at the scroll offset:\n{screen}"
-    );
-    assert!(
-        screen.contains("L0066"),
-        "window ends at scroll+body_h-1:\n{screen}"
-    );
-    assert!(
-        !screen.contains("L0049"),
-        "the line above the window isn't drawn"
-    );
-    assert!(
-        !screen.contains("L0067"),
-        "the line below the window isn't drawn"
-    );
-    assert!(
-        screen.contains("51–67/1000"),
-        "footer shows the true range/total:\n{screen}"
-    );
+    // Folded: the preview stops at the cap, the tail (L0250) is hidden behind a
+    // clickable expander.
+    let rows = refresh(&mut app);
+    assert!(rows.iter().any(|r| r.contains("+210 more lines")));
+    assert!(rows.iter().all(|r| !r.contains("L0250")));
+    let marker_row = rows
+        .iter()
+        .position(|r| is_output_expander(r))
+        .expect("folded block renders an expander row");
 
-    // Over-scroll clamps to the last full page (total - body_h = 983).
-    let (screen, clamped) = render(&app, 60_000);
-    assert_eq!(clamped, 983, "over-scroll clamps to the last page");
+    // Clicking the expander row toggles this block into `expanded_output`.
+    assert!(app.toggle_output_at_row(marker_row));
+    assert!(app.expanded_output.contains(&idx));
+
+    // Expanded: the full tail is shown in place, over a `▾ collapse` toggle.
+    let rows = refresh(&mut app);
     assert!(
-        screen.contains("L0999"),
-        "the final line is visible:\n{screen}"
+        rows.iter().any(|r| r.contains("L0250")),
+        "expanded block reveals the elided tail:\n{}",
+        rows.join("\n")
     );
-    assert!(screen.contains("984–1000/1000"), "footer at end:\n{screen}");
+    let collapse_row = rows
+        .iter()
+        .position(|r| r.trim_start().starts_with(OUTPUT_EXPANDED_PREFIX))
+        .expect("expanded block renders a collapse toggle");
+
+    // Clicking the collapse toggle folds it back.
+    assert!(app.toggle_output_at_row(collapse_row));
+    assert!(!app.expanded_output.contains(&idx));
+    let rows = refresh(&mut app);
+    assert!(rows.iter().all(|r| !r.contains("L0250")));
 }
 
 #[test]
@@ -4375,7 +4364,7 @@ async fn test_open_overlay_left_drag_selects_overlay_text() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     // An open overlay covers the transcript: a left drag selects the overlay text.
-    app.overlay = Overlay::Output { scroll: 0 };
+    app.overlay = Overlay::Help { scroll: 0 };
     app.transcript_hitbox = Some(TranscriptHitbox {
         area: Rect::new(0, 0, 40, 10),
         first_row: 0,
@@ -7014,7 +7003,7 @@ async fn test_local_command_caps_huge_output() {
     // A run we killed at the cap must NOT render a scary `[exited -1]` — the
     // "truncated" note explains the stop; the SIGKILL status is ours, not `yes`'s.
     let mut block = Vec::new();
-    render_local_command(&mut block, &step.content);
+    render_local_command(&mut block, &step.content, OutputView::Collapsed);
     let rendered: String = block
         .iter()
         .map(|l| l.plain.as_str())
@@ -7031,7 +7020,7 @@ async fn test_local_command_caps_huge_output() {
 }
 
 #[tokio::test]
-async fn test_local_command_full_output_kept_for_pager() {
+async fn test_local_command_full_output_kept_for_inline_expand() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
@@ -7040,6 +7029,7 @@ async fn test_local_command_full_output_kept_for_pager() {
     let total =
         app.record_local_output("seq 250".to_string(), full, String::new(), 0, false, false);
     assert_eq!(total, 250);
+    let idx = app.history.len() - 1;
 
     // The committed transcript entry keeps only a bounded preview…
     let step = app.history.last().expect("history entry");
@@ -7052,12 +7042,9 @@ async fn test_local_command_full_output_kept_for_pager() {
     // …but records the TRUE total, so the transcript's "+N more" stays honest.
     assert_eq!(decoded["total_lines"].as_u64(), Some(250));
 
-    // The full output is retained in memory for the ctrl+o pager (all 250 lines),
-    // never persisted into history.
-    let kept = app
-        .last_local_output
-        .as_ref()
-        .expect("full output retained");
+    // The full output is retained in memory keyed by the entry's history index (the
+    // source an expanded block renders from), never persisted into history.
+    let kept = app.local_outputs.get(&idx).expect("full output retained");
     assert_eq!(kept.stdout.lines().count(), 250);
 }
 
@@ -7075,7 +7062,7 @@ fn test_render_local_command_marker_counts_total_lines() {
     })
     .to_string();
     let mut block = Vec::new();
-    render_local_command(&mut block, &content);
+    render_local_command(&mut block, &content, OutputView::Collapsed);
     let rendered: String = block
         .iter()
         .map(|l| l.plain.as_str())
@@ -7086,54 +7073,6 @@ fn test_render_local_command_marker_counts_total_lines() {
         rendered.contains("+41240 more lines"),
         "marker should count the true total:\n{rendered}"
     );
-}
-
-#[tokio::test]
-async fn test_ctrl_o_pager_reveals_elided_tail() {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    let full: String = (1..=250).map(|i| format!("{i}\n")).collect();
-    app.record_local_output("seq 250".to_string(), full, String::new(), 0, false, false);
-
-    // ctrl+o opens the scrollable pager at the top.
-    app.open_output_overlay();
-    assert!(matches!(app.overlay, Overlay::Output { scroll: 0 }));
-
-    // Scroll to the bottom and render: the pager surfaces line 250 — far past the
-    // 40-line transcript cap — proving the elided tail is now viewable.
-    if let Overlay::Output { scroll } = &mut app.overlay {
-        *scroll = u16::MAX;
-    }
-    let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
-    terminal
-        .draw(|frame| {
-            app.render(frame);
-        })
-        .unwrap();
-    let buf = terminal.backend().buffer().clone();
-    let mut screen = String::new();
-    for y in 0..40 {
-        for x in 0..80 {
-            screen.push_str(buf[(x, y)].symbol());
-        }
-    }
-    assert!(
-        screen.contains("250"),
-        "pager should reveal the elided tail (line 250):\n{screen}"
-    );
-}
-
-#[test]
-fn test_open_output_overlay_without_output_is_noop() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut app = make_test_app(tx, rx);
-    app.open_output_overlay();
-    // No command has run, so the overlay stays closed and a hint is shown instead.
-    assert!(matches!(app.overlay, Overlay::None));
-    assert!(app.notice.is_some());
 }
 
 #[test]
@@ -9170,4 +9109,56 @@ async fn test_preflight_refuses_image_on_known_text_only_model() {
     assert_eq!(app.draft_attachments.len(), 1, "attachment retained");
     assert!(app.history.is_empty(), "no user turn was pushed");
     assert!(!app.sending, "no turn started");
+}
+
+/// A `find .`-sized capture (way past the inline cap) expands to at most
+/// `MAX_EXPANDED_OUTPUT_LINES` rendered lines — bounding the O(lines) re-wrap so the
+/// UI can't freeze — and notes the remainder instead of rendering it.
+#[tokio::test]
+async fn output_expand_caps_huge_capture_and_notes_remainder() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // 10_000 lines captured this session (held in memory, but bounded by the cap).
+    let full: String = (1..=10_000).map(|i| format!("L{i:05}\n")).collect();
+    app.record_local_output("find .".to_string(), full, String::new(), 0, false, false);
+    let idx = app.history.len() - 1;
+
+    // Memory retention is bounded by the inline cap, not the full 10k capture.
+    let kept = app.local_outputs.get(&idx).expect("output retained");
+    assert!(
+        kept.stdout.lines().count() <= MAX_EXPANDED_OUTPUT_LINES,
+        "retained {} lines, expected ≤ {MAX_EXPANDED_OUTPUT_LINES}",
+        kept.stdout.lines().count()
+    );
+
+    app.expanded_output.insert(idx);
+    let mut block = Vec::new();
+    render_local_command(
+        &mut block,
+        &app.history[idx].content,
+        OutputView::Expanded {
+            full: app.local_outputs.get(&idx),
+        },
+    );
+    // The `! command` header + at most the cap of output rows + the overflow note +
+    // the `▾ collapse` toggle — never 10k rows.
+    let output_rows = block.iter().filter(|l| l.plain.starts_with("  L")).count();
+    assert_eq!(output_rows, MAX_EXPANDED_OUTPUT_LINES);
+    let rendered: String = block
+        .iter()
+        .map(|l| l.plain.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains(&format!(
+            "+{} more lines",
+            10_000 - MAX_EXPANDED_OUTPUT_LINES
+        )),
+        "overflow note counts the un-rendered remainder:\n{rendered}"
+    );
+    assert!(rendered.contains("too long to show inline"));
+    assert!(
+        !rendered.contains("L10000"),
+        "the tail is not rendered inline"
+    );
 }

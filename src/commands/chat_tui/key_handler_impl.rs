@@ -233,19 +233,6 @@ impl ChatTuiApp {
                 }
                 OverlayKeyAction::Handled
             }
-            Overlay::Output { .. } => {
-                // The full `!cmd` output pager: Esc/Enter (or ctrl+o again) close;
-                // everything else scrolls the body.
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                if matches!(key.code, KeyCode::Esc | KeyCode::Enter)
-                    || (ctrl && matches!(key.code, KeyCode::Char('o')))
-                {
-                    self.overlay = Overlay::None;
-                } else if let Overlay::Output { scroll } = &mut self.overlay {
-                    apply_detail_scroll(scroll, key, ctrl);
-                }
-                OverlayKeyAction::Handled
-            }
             Overlay::Skills(state) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 // Detail drill-in: scroll through the body; Esc/Enter/Tab back out.
@@ -553,10 +540,6 @@ impl ChatTuiApp {
                     && self.loading_resume.is_none() =>
             {
                 self.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
-                true
-            }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_output_overlay();
                 true
             }
             _ => false,

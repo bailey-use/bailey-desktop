@@ -174,22 +174,21 @@ impl ChatTuiApp {
             truncated,
             false,
         );
-        if truncated || total > MAX_OUTPUT_LINES {
+        if truncated {
             self.notice = Some((
                 MUTED,
-                format!("Output elided — ctrl+o to view all {total} lines"),
+                format!("Output truncated at the capture cap ({total} lines)"),
             ));
         }
         self.persist_history().await?;
         Ok(())
     }
 
-    /// Stash a finished/interrupted `!cmd` run's FULL output in `last_local_output`
-    /// (the source the ctrl+o pager reads) and push a BOUNDED preview to history as
-    /// a `local_command` entry (the shape `render_local_command` reads), so the
-    /// persisted session stays small while the whole output stays viewable for the
-    /// session. The true line count rides along as `total_lines` so the transcript's
-    /// "+N more" marker counts everything, not just the preview. Returns that total.
+    /// Stash a finished/interrupted `!cmd` run's full output in `local_outputs` keyed
+    /// by history index, and push a bounded preview to history as a `local_command`
+    /// entry, so the persisted session stays small while the output stays viewable.
+    /// The true line count rides along as `total_lines` so "+N more" stays honest.
+    /// Returns that total.
     pub(super) fn record_local_output(
         &mut self,
         command: String,
@@ -221,14 +220,18 @@ impl ChatTuiApp {
             attachments: vec![],
         });
 
-        self.last_local_output = Some(LocalCommandOutput {
-            command,
-            stdout,
-            stderr,
-            exit_code,
-            truncated,
-            interrupted,
-        });
+        // Retain only what an expander can show (bounded by `MAX_EXPANDED_OUTPUT_LINES`)
+        // — and only when there's more than the fold preview already reveals.
+        if total > MAX_OUTPUT_LINES {
+            let idx = self.history.len() - 1;
+            self.local_outputs.insert(
+                idx,
+                LocalCommandOutput {
+                    stdout: first_lines(&stdout, MAX_EXPANDED_OUTPUT_LINES),
+                    stderr: first_lines(&stderr, MAX_EXPANDED_OUTPUT_LINES),
+                },
+            );
+        }
         self.follow_output = true;
         total
     }
@@ -1300,10 +1303,12 @@ impl ChatTuiApp {
                         self.end_drag();
                         self.copy_selection_to_clipboard();
                     }
-                    // A single click on a `▸`/`▾ thinking` header toggles that
-                    // block's inline expansion. Anything else starts a drag-select.
+                    // A single click on a `▸`/`▾` fold marker (thinking header or
+                    // `!cmd` output expander) toggles that block's inline expansion.
+                    // Anything else starts a drag-select.
                     1 if matches!(surface, SelectionSurface::Transcript)
-                        && self.toggle_thinking_at_row(point.row) => {}
+                        && (self.toggle_thinking_at_row(point.row)
+                            || self.toggle_output_at_row(point.row)) => {}
                     _ => self.begin_drag(surface, point),
                 }
             }
@@ -1700,6 +1705,52 @@ impl ChatTuiApp {
             .collect()
     }
 
+    /// History indices of `local_command` entries that render an output expander, in
+    /// display order — i.e. runs whose output exceeds `MAX_OUTPUT_LINES` (shorter
+    /// runs show in full with no marker). The Nth expander row maps to the Nth entry
+    /// (folded and expanded blocks alike render exactly one marker). A still-running
+    /// command's preview is absent: it has no history index and a plain, non-clickable
+    /// marker.
+    fn expandable_output_indices(&self) -> Vec<usize> {
+        self.history
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "local_command")
+            .filter(|(_, m)| local_command_total_lines(&m.content) > MAX_OUTPUT_LINES)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// If transcript `row` is a `▸ +N more lines` / `▾ collapse` output marker, toggle
+    /// that `local_command` block's inline expansion and return `true`. Mirrors
+    /// [`Self::toggle_thinking_at_row`]: counts marker rows from the top for the
+    /// block's ordinal, then maps it to a history index via
+    /// [`Self::expandable_output_indices`]. A click on a live run's marker (ordinal
+    /// past the committed blocks) is ignored.
+    pub(super) fn toggle_output_at_row(&mut self, row: usize) -> bool {
+        let ordinal = {
+            let Some(hitbox) = self.transcript_hitbox.as_ref() else {
+                return false;
+            };
+            if !hitbox.rows.get(row).is_some_and(|r| is_output_expander(r)) {
+                return false;
+            }
+            hitbox.rows[..=row]
+                .iter()
+                .filter(|r| is_output_expander(r))
+                .count()
+        };
+        let Some(&idx) = self.expandable_output_indices().get(ordinal - 1) else {
+            return false;
+        };
+        if !self.expanded_output.insert(idx) {
+            self.expanded_output.remove(&idx);
+        }
+        // The memoized body keys on `transcript_revision`; bump so the flip repaints.
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        true
+    }
+
     /// If transcript `row` is a `▸`/`▾ thinking` header, toggle that block's inline
     /// expansion and return `true`. Counts header rows from the top to get the
     /// block's ordinal, then maps it to a committed message via
@@ -1750,8 +1801,8 @@ impl ChatTuiApp {
 
     async fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> Result<Option<bool>> {
         // A left press/drag/release over a non-picker overlay falls through to the
-        // screen selection, so the Ctrl+O pager / help / skills / mcp bodies are
-        // selectable; wheel + picker clicks stay handled below.
+        // screen selection, so the help / skills / mcp bodies are selectable; wheel +
+        // picker clicks stay handled below.
         if matches!(
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left)
@@ -1770,14 +1821,6 @@ impl ChatTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Help { .. }, _) => Ok(Some(false)),
-            (Overlay::Output { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
-                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                if let Overlay::Output { scroll } = &mut self.overlay {
-                    *scroll = wheel_scroll(*scroll, up);
-                }
-                Ok(Some(false))
-            }
-            (Overlay::Output { .. }, _) => Ok(Some(false)),
             // The /skills and /mcp toggle lists scroll on the wheel the same way
             // they do on ↑/↓: a drill-in scrolls its body, otherwise the wheel
             // moves the selection (the list follows it), and add-input ignores it.

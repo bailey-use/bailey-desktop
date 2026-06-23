@@ -399,106 +399,6 @@ impl ChatTuiApp {
         render_detail_lines(frame, inner, lines, scroll, "Esc close")
     }
 
-    /// `ctrl+o` overlay: the full, un-elided output of the most recent `!cmd` run
-    /// in a scrollable pager (the transcript keeps only the first
-    /// `MAX_OUTPUT_LINES`; the full text lives in `last_local_output`). Shares the
-    /// `/help` drill-in chrome and scroll model. Returns the clamped scroll offset
-    /// so the caller can write it back.
-    pub(super) fn render_output_overlay(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        scroll: u16,
-    ) -> u16 {
-        frame.render_widget(Clear, area);
-
-        let title_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT));
-
-        // A /new between opening and rendering can clear the output; draw an empty
-        // framed box so Esc still closes it cleanly rather than panicking.
-        let Some(output) = self.last_local_output.as_ref() else {
-            frame.render_widget(shell.title(Span::styled("Output", title_style)), area);
-            return 0;
-        };
-
-        let out_lines = output.stdout.lines().count() + output.stderr.lines().count();
-        let cmd_preview: String = if output.command.chars().count() > 56 {
-            output
-                .command
-                .chars()
-                .take(55)
-                .chain(std::iter::once('…'))
-                .collect()
-        } else {
-            output.command.clone()
-        };
-        let title = format!(" ! {cmd_preview}  ·  {out_lines} lines ");
-        frame.render_widget(shell.title(Span::styled(title, title_style)), area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
-
-        // Body: stdout faint, stderr in the warning hue. The capture can run to
-        // tens of thousands of lines, so WINDOW it — materialize only the visible
-        // slice into `Line`s rather than building (and handing a non-virtualizing
-        // Paragraph) the whole buffer on every scroll keystroke. Lines are not
-        // wrapped, so a very long line clips at the right edge rather than reflowing.
-        let body_h = usize::from(inner.height.saturating_sub(1));
-        // Trailing status line (0 or 1), mirroring `render_local_command`'s vocab.
-        let status: Option<(String, Color)> = if output.interrupted {
-            Some(("[interrupted]".to_string(), ERROR))
-        } else if output.truncated {
-            Some((format!("[output truncated at {out_lines} lines]"), FAINT))
-        } else if output.exit_code != 0 {
-            Some((format!("[exited {}]", output.exit_code), ERROR))
-        } else {
-            None
-        };
-        // Logical sequence: stdout (FAINT) ++ stderr (WARNING) — or a single
-        // "(no output)" placeholder when both are empty — then the status line.
-        let placeholder = out_lines == 0;
-        let total = if placeholder { 1 } else { out_lines } + usize::from(status.is_some());
-        let max_scroll = total.saturating_sub(body_h) as u16;
-        let scroll = scroll.min(max_scroll);
-        let start = usize::from(scroll);
-        let end = start.saturating_add(body_h);
-
-        let mut lines: Vec<Line> = Vec::new();
-        if placeholder {
-            if start == 0 && end > 0 {
-                lines.push(Line::from(Span::styled(
-                    "(no output)",
-                    Style::default().fg(FAINT),
-                )));
-            }
-        } else {
-            // `skip`/`take` walk the line boundaries (a cheap byte scan, no
-            // allocation) and build `Line`s only for the visible window.
-            let body = output
-                .stdout
-                .lines()
-                .map(|l| (l, FAINT))
-                .chain(output.stderr.lines().map(|l| (l, WARNING)));
-            for (l, color) in body.skip(start).take(body_h) {
-                lines.push(Line::from(Span::styled(l, Style::default().fg(color))));
-            }
-        }
-        if let Some((text, color)) = status {
-            let status_idx = if placeholder { 1 } else { out_lines };
-            if status_idx >= start && status_idx < end {
-                lines.push(Line::from(Span::styled(text, Style::default().fg(color))));
-            }
-        }
-
-        render_paged_lines(frame, inner, lines, scroll, total, "Esc close")
-    }
-
     /// `/skills` overlay: a toggle list of the agent skills discovered for the
     /// working dir. A `[✓]`/`[ ]` checkbox shows each skill's enabled state, with
     /// the name on its own line and the (truncated) description below it; Tab
@@ -1340,6 +1240,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("Mouse drag", "select + copy (auto-scrolls at edges)"),
             ("Double/triple-click", "select word / line"),
+            ("Click ▸ / ▾", "expand a folded thinking / !cmd block"),
             ("⌥ / Shift + drag", "native select (any text on screen)"),
         ],
     ),
@@ -1347,7 +1248,6 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         "Session",
         &[
             ("Ctrl+R", "resume a saved chat"),
-            ("Ctrl+O", "view last !cmd output in full"),
             ("Shift+Tab", "toggle agent auto-approve"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),
@@ -1419,67 +1319,6 @@ fn render_detail_lines(
     }
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        Rect {
-            height: area.height.saturating_sub(1),
-            ..area
-        },
-    );
-    scroll
-}
-
-/// Like [`render_detail_lines`] but for an ALREADY-windowed body: `visible` holds
-/// only the rows for the current `scroll`, and `total` is the full logical line
-/// count (drives the footer + scroll clamp). The body is drawn at scroll 0 since
-/// it's pre-sliced, so the caller never materializes — nor hands a non-
-/// virtualizing `Paragraph` — more than a screenful of `Line`s. Used by the
-/// `!cmd` output pager, whose capture can be tens of thousands of lines. Returns
-/// the clamped scroll so the caller can persist it (identical clamping to
-/// `render_detail_lines`).
-fn render_paged_lines(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    visible: Vec<Line>,
-    scroll: u16,
-    total: usize,
-    esc_label: &str,
-) -> u16 {
-    if area.height == 0 {
-        return 0;
-    }
-    let body_h = usize::from(area.height.saturating_sub(1));
-    let max_scroll = (total.saturating_sub(body_h)) as u16;
-    let scroll = scroll.min(max_scroll);
-
-    let footer_line = if max_scroll == 0 {
-        Line::from(Span::styled(
-            esc_label.to_string(),
-            Style::default().fg(MUTED),
-        ))
-    } else {
-        let first = usize::from(scroll) + 1;
-        let last = (usize::from(scroll) + body_h).min(total);
-        Line::from(vec![
-            Span::styled(esc_label.to_string(), Style::default().fg(MUTED)),
-            Span::styled("   ↑↓ scroll   ", Style::default().fg(FAINT)),
-            Span::styled(
-                format!("{first}–{last}/{total}"),
-                Style::default().fg(MUTED),
-            ),
-        ])
-    };
-    frame.render_widget(
-        Paragraph::new(footer_line),
-        Rect {
-            y: area.y + area.height - 1,
-            height: 1,
-            ..area
-        },
-    );
-    if body_h == 0 {
-        return scroll;
-    }
-    frame.render_widget(
-        Paragraph::new(Text::from(visible)),
         Rect {
             height: area.height.saturating_sub(1),
             ..area

@@ -386,20 +386,6 @@ impl ChatTuiApp {
         let _ = self.session_store.set_chat_thinking_enabled(on).await;
     }
 
-    /// `ctrl+o`: open the most recent `!cmd`'s full output in a scrollable pager.
-    /// Opens at the top (standard pager behavior; End jumps to the bottom). A
-    /// no-op-with-notice when no command has run yet this session.
-    pub(super) fn open_output_overlay(&mut self) {
-        if self.last_local_output.is_some() {
-            self.overlay = Overlay::Output { scroll: 0 };
-        } else {
-            self.notice = Some((
-                MUTED,
-                "No command output yet — run one with !cmd".to_string(),
-            ));
-        }
-    }
-
     /// `/skills`: discover the agent skills available for the working dir and show
     /// them in a toggle overlay, seeded with each skill's persisted enabled state.
     /// Discovery is on-demand (cheap dir reads) so the list reflects skills added
@@ -1519,6 +1505,8 @@ impl ChatTuiApp {
             .await;
         self.history = session.messages;
         self.expanded_thinking.clear();
+        self.expanded_output.clear();
+        self.local_outputs.clear();
         self.reasoning_durations.clear();
         // Restore the exact agent transcript (tool calls + results with ids) into
         // the next engine build instead of the lossy text seed. `None` for

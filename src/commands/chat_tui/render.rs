@@ -959,12 +959,15 @@ fn join_targets(targets: &[String], max: usize) -> String {
 /// more than this so that count is accurate for moderate output.
 pub(super) const MAX_OUTPUT_LINES: usize = 40;
 
-/// How many output lines a finished `!cmd` persists into its `local_command`
-/// history entry (and thus the on-disk session). Only the first `MAX_OUTPUT_LINES`
-/// ever render, so a small preview keeps the session file from ballooning on a
-/// floody command; the true line count rides along as `total_lines` so the
-/// "+N more" marker stays honest, and the full output (for `ctrl+o`) lives in
-/// `last_local_output`, not here.
+/// Ceiling on what an inline-expanded block renders (and what `local_outputs` keeps
+/// for it). Bounds the O(lines) whole-body re-wrap, which runs on every history
+/// change — an unbounded 50k-line expand would re-freeze the UI each turn.
+pub(super) const MAX_EXPANDED_OUTPUT_LINES: usize = 2_000;
+
+/// How many output lines a finished `!cmd` persists into its `local_command` history
+/// entry (and the on-disk session) — a bounded preview that caps session size and is
+/// what an expanded block falls back to after a resume. The true count rides along as
+/// `total_lines`; the full in-session output lives in `local_outputs`.
 pub(super) const MAX_PERSISTED_OUTPUT_LINES: usize = 200;
 
 /// The first `n` lines of `s`, rejoined with `\n` (no trailing newline). Used to
@@ -973,22 +976,77 @@ pub(super) fn first_lines(s: &str, n: usize) -> String {
     s.lines().take(n).collect::<Vec<_>>().join("\n")
 }
 
+/// Leading marker of a folded `!cmd` output (`▸ +N more lines`).
+pub(super) const OUTPUT_COLLAPSED_PREFIX: &str = "▸ +";
+/// Leading marker of an expanded `!cmd` output (`▾ collapse`).
+pub(super) const OUTPUT_EXPANDED_PREFIX: &str = "▾ collapse";
+
+/// Whether a rendered transcript row is a clickable `!cmd` output expander — the
+/// folded `▸ +N more lines` or the expanded `▾ collapse` toggle. The click handler
+/// maps it back to its `local_command` block; ordinary output rows are indented
+/// with their own text, so they don't match these arrow-led markers.
+pub(super) fn is_output_expander(row: &str) -> bool {
+    let row = row.trim_start();
+    row.starts_with(OUTPUT_COLLAPSED_PREFIX) || row.starts_with(OUTPUT_EXPANDED_PREFIX)
+}
+
+/// The true output line count a `local_command` entry carries (its persisted
+/// `total_lines`, or the counted preview as a fallback). Only runs whose total
+/// exceeds `MAX_OUTPUT_LINES` render an expander, so this keys the click handler's
+/// ordinal → history-index mapping.
+pub(super) fn local_command_total_lines(content: &str) -> usize {
+    let decoded =
+        serde_json::from_str::<serde_json::Value>(content).unwrap_or(serde_json::Value::Null);
+    decoded
+        .get("total_lines")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| {
+            let pick = |k: &str| {
+                decoded
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0)
+            };
+            pick("stdout") + pick("stderr")
+        })
+}
+
+/// How an existing `!cmd` block should render its output.
+pub(super) enum OutputView<'a> {
+    /// A still-running command — preview only, with a plain (non-clickable)
+    /// `… (+N more lines)` marker, since it isn't committed yet.
+    Live,
+    /// A committed command folded to its `MAX_OUTPUT_LINES` preview + a clickable
+    /// `▸ +N more lines` expander.
+    Collapsed,
+    /// A committed command expanded in place: the retained in-memory output when
+    /// it's still held (`full`, up to `MAX_EXPANDED_OUTPUT_LINES`), else the
+    /// persisted ≤200-line preview, + a `▾ collapse` toggle.
+    Expanded {
+        full: Option<&'a LocalCommandOutput>,
+    },
+}
+
 /// Render a `!cmd` local shell run: a `! command` header over its output (stdout
-/// faint, stderr in the warning hue), with the line COUNT capped so a noisy
-/// command can't flood the transcript. Each shown line is rendered in full — the
-/// transcript word-wraps long lines onto extra rows (grok's pager shows command
-/// output wrapped and scrollable, never per-line truncated), so nothing is clipped
-/// at the pane edge. Stored as a `local_command` entry whose `content` is JSON
-/// `{"command", "stdout", "stderr", "exit_code"}` (plus optional
+/// faint, stderr in the warning hue). A folded block shows only the first
+/// `MAX_OUTPUT_LINES` over a clickable `▸ +N more lines` expander; clicking it
+/// expands the block to its full output in place. Each shown line is rendered in
+/// full — the transcript word-wraps long lines onto extra rows, so nothing is
+/// clipped at the pane edge. Stored as a `local_command` entry whose `content` is
+/// JSON `{"command", "stdout", "stderr", "exit_code"}` (plus optional
 /// `running`/`truncated`/`interrupted` flags).
-pub(super) fn render_local_command(lines: &mut Vec<StyledLine>, content: &str) {
+pub(super) fn render_local_command(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    view: OutputView<'_>,
+) {
     let decoded =
         serde_json::from_str::<serde_json::Value>(content).unwrap_or(serde_json::Value::Null);
     let pick = |k: &str| decoded.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let flag = |k: &str| decoded.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let command = pick("command");
-    let stdout = pick("stdout");
-    let stderr = pick("stderr");
     let exit_code = decoded
         .get("exit_code")
         .and_then(|v| v.as_i64())
@@ -1007,22 +1065,32 @@ pub(super) fn render_local_command(lines: &mut Vec<StyledLine>, content: &str) {
         Span::styled(command.to_string(), Style::default().fg(TEXT)),
     ]));
 
-    // A committed run stores only a bounded preview of its output but carries the
-    // true line count in `total_lines`, so "+N more" reflects everything the
-    // command produced (viewable in full via ctrl+o), not just the persisted slice.
-    // A live run has no `total_lines` yet — count its (full) streamed output.
+    // A committed run stores only a bounded preview but carries the true line count
+    // in `total_lines`, so "+N more" reflects everything the command produced. A
+    // live run has no `total_lines` yet — count its (full) streamed preview.
     let total = decoded
         .get("total_lines")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or_else(|| stdout.lines().count() + stderr.lines().count());
+        .unwrap_or_else(|| local_command_total_lines(content));
+    // Expanded blocks render the FULL in-memory output when it's still held; folded
+    // and live blocks (and a resumed block whose memory is gone) render the persisted
+    // preview, capped at `MAX_OUTPUT_LINES` while folded.
+    let (stdout, stderr) = match &view {
+        OutputView::Expanded { full: Some(o) } => (o.stdout.as_str(), o.stderr.as_str()),
+        _ => (pick("stdout"), pick("stderr")),
+    };
+    let cap = match view {
+        OutputView::Expanded { .. } => MAX_EXPANDED_OUTPUT_LINES,
+        _ => MAX_OUTPUT_LINES,
+    };
     let mut shown = 0usize;
     for (text, color) in stdout
         .lines()
         .map(|l| (l, FAINT))
         .chain(stderr.lines().map(|l| (l, WARNING)))
     {
-        if shown >= MAX_OUTPUT_LINES {
+        if shown >= cap {
             break;
         }
         lines.push(line_with_plain(vec![Span::styled(
@@ -1031,17 +1099,58 @@ pub(super) fn render_local_command(lines: &mut Vec<StyledLine>, content: &str) {
         )]));
         shown += 1;
     }
-    if total > shown {
-        let suffix = if truncated { ", truncated" } else { "" };
+    let mut faint = |text: String| {
         lines.push(line_with_plain(vec![Span::styled(
-            format!("  … (+{} more lines{suffix})", total - shown),
+            text,
             Style::default().fg(FAINT),
         )]));
-    } else if truncated {
-        lines.push(line_with_plain(vec![Span::styled(
-            "  … (output truncated)".to_string(),
-            Style::default().fg(FAINT),
-        )]));
+    };
+    match view {
+        OutputView::Live => {
+            if total > shown {
+                let suffix = if truncated { ", truncated" } else { "" };
+                faint(format!("  … (+{} more lines{suffix})", total - shown));
+            } else if truncated {
+                faint("  … (output truncated)".to_string());
+            }
+        }
+        OutputView::Collapsed => {
+            if total > shown {
+                // Clickable expander (the `▸ thinking` fold affordance). A truncated
+                // capture still notes the cut, since expand shows only what we held.
+                let suffix = if truncated { ", truncated" } else { "" };
+                lines.push(line_with_plain(vec![Span::styled(
+                    format!(
+                        "  {OUTPUT_COLLAPSED_PREFIX}{} more lines{suffix}",
+                        total - shown
+                    ),
+                    Style::default().fg(MUTED),
+                )]));
+            } else if truncated {
+                faint("  … (output truncated)".to_string());
+            }
+        }
+        OutputView::Expanded { .. } => {
+            // Why anything is still hidden, then the collapse toggle. The inline cap
+            // dominates; capture-cap / resume loss only show once we rendered all we held.
+            if total > shown && shown >= MAX_EXPANDED_OUTPUT_LINES {
+                faint(format!(
+                    "  … (+{} more lines — too long to show inline; re-run with `> file` for all)",
+                    total - shown
+                ));
+            } else if truncated {
+                faint("  … (output truncated at the capture cap)".to_string());
+            } else if total > shown {
+                faint(format!(
+                    "  … (+{} lines not retained after resume)",
+                    total - shown
+                ));
+            }
+            lines.push(line_with_plain(vec![Span::styled(
+                format!("  {OUTPUT_EXPANDED_PREFIX}"),
+                Style::default().fg(MUTED),
+            )]));
+        }
     }
     if running {
         lines.push(line_with_plain(vec![Span::styled(

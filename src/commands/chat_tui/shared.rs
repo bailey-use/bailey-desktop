@@ -620,13 +620,6 @@ pub(super) enum Overlay {
     Help {
         scroll: u16,
     },
-    /// `ctrl+o` — the full, un-elided output of the most recent `!cmd` run in a
-    /// scrollable pager (the transcript shows only the first `MAX_OUTPUT_LINES`).
-    /// `scroll` is the body's vertical offset, clamped by the renderer. The output
-    /// itself lives on `last_local_output`, so the variant stays a cheap `Copy`.
-    Output {
-        scroll: u16,
-    },
     /// `/skills` — the agent skills discovered for the working dir, toggleable.
     Skills(SkillsOverlay),
     /// `/mcp` — the configured MCP servers with status, toggleable.
@@ -1055,18 +1048,16 @@ pub(super) struct LocalCommandRun {
     pub(super) stderr: String,
 }
 
-/// The full captured output of the most recent finished/interrupted `!cmd` run,
-/// kept in memory only (never persisted) so the `ctrl+o` pager overlay can show
-/// everything even though the transcript and the on-disk session keep just a
-/// bounded preview. Replaced by each new run and cleared on `/new`.
+/// The full captured stdout/stderr of a finished/interrupted `!cmd` run, kept in
+/// memory only (never persisted) so an inline-expanded block can show everything
+/// even though the transcript and the on-disk session keep just a bounded preview.
+/// Held in `local_outputs` keyed by history index; cleared on `/new` and resume.
+/// The command line and exit status aren't stored here — an expanded block reads
+/// those from its persisted `local_command` entry, which survives a resume.
 #[derive(Clone)]
 pub(super) struct LocalCommandOutput {
-    pub(super) command: String,
     pub(super) stdout: String,
     pub(super) stderr: String,
-    pub(super) exit_code: i64,
-    pub(super) truncated: bool,
-    pub(super) interrupted: bool,
 }
 
 #[allow(dead_code)]
@@ -1631,9 +1622,16 @@ pub(super) struct ChatTuiApp {
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.
     pub(super) local_command: Option<LocalCommandRun>,
-    /// Full output of the most recent finished `!cmd`, for the `ctrl+o` pager.
-    /// In-memory only (not persisted); see [`LocalCommandOutput`].
-    pub(super) last_local_output: Option<LocalCommandOutput>,
+    /// FULL output of each finished `!cmd`, keyed by the history index of its
+    /// `local_command` entry — the source an expanded block renders from (the
+    /// transcript and on-disk session keep only a bounded preview). In-memory only,
+    /// so after a resume an old block expands to just its persisted preview. Cleared
+    /// alongside `expanded_thinking` when history is replaced.
+    pub(super) local_outputs: std::collections::HashMap<usize, LocalCommandOutput>,
+    /// History indices of `local_command` entries the user expanded inline (full
+    /// output shown in place of the folded preview). In-memory only; cleared with
+    /// `expanded_thinking`. A toggle bumps `transcript_revision` so the flip repaints.
+    pub(super) expanded_output: std::collections::HashSet<usize>,
     /// History indices of assistant turns the user expanded inline (full reasoning
     /// shown in place of the folded summary). In-memory only; cleared when history
     /// is replaced (new chat, resume, rewind). A toggle bumps `transcript_revision`,

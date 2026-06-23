@@ -201,7 +201,18 @@ impl ChatTuiApp {
                         .map(|m| decode_tool_call(&m.content).0);
                     render_tool_result(&mut block, &message.content, cwd, tool.as_deref());
                 }
-                "local_command" => render_local_command(&mut block, &message.content),
+                "local_command" => {
+                    // Expanded renders the in-memory output (persisted preview after a
+                    // resume) in place; folded shows the preview + clickable expander.
+                    let view = if self.expanded_output.contains(&idx) {
+                        OutputView::Expanded {
+                            full: self.local_outputs.get(&idx),
+                        }
+                    } else {
+                        OutputView::Collapsed
+                    };
+                    render_local_command(&mut block, &message.content, view);
+                }
                 "plan" => render_plan(&mut block, &message.content),
                 other => render_system_message(&mut block, other, &message.content, text_width),
             }
@@ -275,7 +286,7 @@ impl ChatTuiApp {
                 "running": true,
             })
             .to_string();
-            render_local_command(&mut block, &content);
+            render_local_command(&mut block, &content, OutputView::Live);
             push_block(&mut lines, &mut bars, block, Some(TOOL));
         }
         if let Some((color, text)) = notice_display(self.notice.as_ref()) {
@@ -607,14 +618,6 @@ impl ChatTuiApp {
                 self.screen_region = Some(overlay_content_rect(area));
                 let clamped = self.render_help_overlay(frame, area, scroll);
                 if let Overlay::Help { scroll } = &mut self.overlay {
-                    *scroll = clamped;
-                }
-            }
-            Overlay::Output { scroll } => {
-                let area = centered_rect(84, 88, body);
-                self.screen_region = Some(overlay_content_rect(area));
-                let clamped = self.render_output_overlay(frame, area, scroll);
-                if let Overlay::Output { scroll } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }

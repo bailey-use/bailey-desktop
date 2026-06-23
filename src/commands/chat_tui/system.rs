@@ -103,8 +103,8 @@ if let data = pasteboard.data(forType: .png) {
 /// Hard safety ceiling on what a `!cmd` local run captures, so a runaway flood
 /// like `yes` can't grow memory without bound. The transcript still shows only
 /// the first `MAX_OUTPUT_LINES` (in `render`); everything captured beyond that is
-/// kept in memory for the `ctrl+o` full-output pager (see `last_local_output`),
-/// so a big-but-finite command like `find .` is captured whole and scrollable.
+/// kept in memory (see `local_outputs`) so expanding the block in place shows a
+/// big-but-finite command like `find .` whole.
 /// Only output past this ceiling is dropped — the child is killed and the run
 /// marked `truncated`. Generous enough that ordinary floody commands complete;
 /// the 120s timeout bounds the time dimension.

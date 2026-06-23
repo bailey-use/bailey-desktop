@@ -1166,6 +1166,8 @@ impl ChatTuiApp {
         // Indices shift on truncation — drop inline-expand state and durations so
         // they can't point at the wrong block.
         self.expanded_thinking.clear();
+        self.expanded_output.clear();
+        self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.draft = removed.content;
         self.cursor = self.draft.len();
@@ -1257,15 +1259,8 @@ impl ChatTuiApp {
         // task alone); the reader then hits EOF and the worker winds down.
         let _ = run.killer.kill();
         run.task.abort();
-        let total = self.record_local_output(run.command, run.stdout, run.stderr, -1, false, true);
-        self.notice = Some((
-            MUTED,
-            if total > MAX_OUTPUT_LINES {
-                format!("Command interrupted — ctrl+o to view all {total} lines")
-            } else {
-                "Command interrupted".to_string()
-            },
-        ));
+        self.record_local_output(run.command, run.stdout, run.stderr, -1, false, true);
+        self.notice = Some((MUTED, "Command interrupted".to_string()));
         self.persist_history().await?;
         Ok(())
     }
@@ -1532,10 +1527,11 @@ impl ChatTuiApp {
         self.overlay = Overlay::None;
         self.history.clear();
         self.expanded_thinking.clear();
+        self.expanded_output.clear();
+        self.local_outputs.clear();
         self.reasoning_durations.clear();
         self.reasoning_started_at = None;
         self.reasoning_elapsed_ms = None;
-        self.last_local_output = None;
         self.clear_transcript_selection();
         self.reset_composer();
         self.pending_response.clear();

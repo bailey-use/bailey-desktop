@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.31.4
+
+The thinking display is redesigned around a folded summary you click to expand,
+and chat gains named agent profiles with a `/agent` picker plus an `/effort`
+control for reasoning depth.
+
+- feat(chat): redesign thinking display — folded summary, click to expand, true disable (eabcd12)
+- feat(chat): polish the thinking block — past-tense title, hanging indent, dim gutter (065e96b)
+- feat(chat): scope agent profiles to `~/.config/aivo/agents` + add `/agent` picker (7ad732f)
+- feat(chat): add `/effort` reasoning-effort control (8edf8b6)
+- feat(chat): fold `!cmd` output inline, click to expand, drop ctrl+o modal (44afd09)
+- feat(chat): add a clickable jump-to-bottom pill to the transcript (e4a8a01)
+- feat(chat): handle image inputs gracefully on non-vision models (18948b9)
+- feat(chat): remember the agent path's negotiated protocol across turns (6b7c0f3)
+- feat(chat): re-harvest stale catalog on launch so server-side edits propagate (881fc4e)
+- feat(chat): accept `--1m`/`--2m` shorthands for `--max-context` (781cc64)
+- feat(chat): extend `--max-context` to run tools and plugins (be409a0)
+- feat(agent): tighten the action-bias system prompt wording (a413010)
+- feat(data): add Sakana AI and 14 more providers (942ea8c)
+- fix(chat): persist `/skills` + `/mcp` toggles in chat-prefs.json, not config.json (6c420be)
+- fix(chat): keep `/rewind` file revert across resend merges and compaction (5abbc82)
+- fix(chat): don't retry structured 400s on the Responses API (171a385)
+- fix(chat): compact unknown-window models and stop dropping transcript (1296f01)
+- perf(chat): repaint promptly on input and cache max-scroll for hot scrolling (20cbfb7)
+- docs(run): describe the tool picker accurately in help (c0e73b4)
+- ci(canary): run every 3 days instead of daily (f391ffd)
+
 ## v0.31.3
 
 `/rewind` is now reliable and surgical: it reverts only the files the agent

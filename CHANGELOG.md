@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.31.5
+
+`/rewind` no longer stalls when chat is launched from your home directory, and
+the Gemini bridge answers the unsupported Interactions API with a clean 501
+instead of a confusing failure.
+
+- feat(gemini): return 501 UNIMPLEMENTED for Interactions API paths (02147ce)
+- fix(chat): stop `/rewind` checkpoint from walking the whole tree in `~` (52f3dc9)
+
 ## v0.31.4
 
 The thinking display is redesigned around a folded summary you click to expand,

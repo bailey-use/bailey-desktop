@@ -13,6 +13,7 @@ use crate::commands::keys::{
 };
 use crate::commands::truncate_url_for_display;
 use crate::errors::ExitCode;
+use crate::services::account_store;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
 use crate::services::session_store::SessionStore;
 use crate::services::system_env;
@@ -51,6 +52,40 @@ impl InfoCommand {
             style::cyan("aivo info"),
             style::dim(format!("v{}", version::VERSION)),
         );
+        println!();
+
+        // Account (logged-in user). With --ping, verify against the server and
+        // reconcile the local cache; otherwise show the cached value offline.
+        if check {
+            use crate::commands::login::{AccountSync, sync_account_status};
+            match sync_account_status().await {
+                AccountSync::Linked(a) => {
+                    println!("{} {}", style::bold("Account:"), a.display())
+                }
+                AccountSync::Unverified(Some(a)) => println!(
+                    "{} {} {}",
+                    style::bold("Account:"),
+                    a.display(),
+                    style::dim("(unverified — couldn't verify with the server)")
+                ),
+                AccountSync::Unlinked { .. } | AccountSync::Unverified(None) => println!(
+                    "{} {}",
+                    style::bold("Account:"),
+                    style::dim("not logged in (run `aivo login`)")
+                ),
+            }
+        } else {
+            match account_store::load() {
+                Some(account) => {
+                    println!("{} {}", style::bold("Account:"), account.display())
+                }
+                None => println!(
+                    "{} {}",
+                    style::bold("Account:"),
+                    style::dim("not logged in (run `aivo login`)")
+                ),
+            }
+        }
         println!();
 
         let keys = self.session_store.get_keys().await?;
@@ -240,6 +275,24 @@ impl InfoCommand {
             })
         });
 
+        // With --ping, verify + reconcile against the server (mirrors the text
+        // path); otherwise report the cached account offline.
+        let account = if check {
+            crate::commands::login::sync_account_status()
+                .await
+                .into_account()
+        } else {
+            account_store::load()
+        };
+        let account_json = account.map(|a| {
+            json!({
+                "user_id": a.user_id,
+                "email": a.email,
+                "name": a.name,
+                "linked_at": a.linked_at,
+            })
+        });
+
         let mut payload = json!({
             "version": version::VERSION,
             "cwd": cwd,
@@ -247,6 +300,7 @@ impl InfoCommand {
                 "path": config_path.display().to_string(),
                 "exists": config_exists,
             },
+            "account": account_json,
             "keys": keys_json,
             "tools": tools_json,
             "selection": selection_json,

@@ -47,6 +47,13 @@ pub enum Commands {
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
     Keys(KeysArgs),
 
+    /// Sign in to your aivo account and link this device
+    Login(LoginArgs),
+
+    /// Sign out on this device (clears the local account record)
+    #[command(hide = true)]
+    Logout(LogoutArgs),
+
     /// List available models from the active provider
     Models(ModelsArgs),
 
@@ -82,6 +89,23 @@ pub enum Commands {
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
+}
+
+/// Arguments for `aivo login`.
+#[derive(Args, Debug, Clone)]
+pub struct LoginArgs {
+    /// Label for this device in your account's device list
+    /// (default: "aivo <version> on <hostname>").
+    #[arg(long, value_name = "LABEL", value_parser = non_empty())]
+    pub label: Option<String>,
+}
+
+/// Arguments for `aivo logout`.
+#[derive(Args, Debug, Clone)]
+pub struct LogoutArgs {
+    /// Skip the confirmation prompt
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 /// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).

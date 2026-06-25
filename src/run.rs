@@ -14,9 +14,9 @@ use crate::cli_args::{
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LogsCommand, ModelsCommand,
-    PluginsCommand, RunCommand, ServeCommand, ServeParams, ShareCommand, StartCommand,
-    StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LoginCommand, LogoutCommand,
+    LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand, ServeParams,
+    ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -176,6 +176,8 @@ pub async fn run() -> ! {
         match cmd {
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
+            Commands::Login(_) => LoginCommand::print_help(),
+            Commands::Logout(_) => LogoutCommand::print_help(),
             Commands::Chat(_) => ChatCommand::print_help(),
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
@@ -225,6 +227,16 @@ pub async fn run() -> ! {
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
+        }
+
+        Commands::Login(login_args) => {
+            let command = LoginCommand::new(session_store);
+            command.execute(login_args).await
+        }
+
+        Commands::Logout(logout_args) => {
+            let command = LogoutCommand::new();
+            command.execute(logout_args).await
         }
 
         Commands::Chat(mut chat_args) => {
@@ -847,6 +859,7 @@ fn print_help() {
     };
     print_cmd("run", "Launch an AI tool, or open the tool picker");
     print_cmd("keys", "Manage API keys");
+    print_cmd("login", "Sign in and link this device to your aivo account");
     print_cmd("chat", "Start the interactive chat TUI");
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");

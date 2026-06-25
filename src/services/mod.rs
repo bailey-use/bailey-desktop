@@ -8,6 +8,7 @@
 //!   new `base_url.contains(...)` branch.
 //! - Provider glue, optional features (share), utilities.
 
+pub mod account_store;
 pub mod acp_client;
 pub mod ai_launcher;
 pub mod ansi;
@@ -35,6 +36,7 @@ pub mod copilot_router;
 pub mod cursor_acp;
 pub mod cursor_bridge;
 pub mod cursor_home_shadow;
+pub mod device_auth;
 pub mod device_fingerprint;
 #[cfg(target_env = "musl")]
 pub mod dns_resolver;

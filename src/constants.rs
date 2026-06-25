@@ -19,6 +19,12 @@ pub const AIVO_STARTER_MODEL: &str = "aivo/starter";
 pub const AIVO_STARTER_KEY_NAME: &str = "aivo";
 pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 
+/// Base URL of the aivo web app (account sign-in + device-link approval).
+/// `aivo login` hits its `/api/device/*` endpoints and opens its `/device`
+/// page. Distinct from the API gateway (`AIVO_STARTER_REAL_URL`). Overridable
+/// via the `AIVO_WEBSITE_BASE_URL` env var for testing against `wrangler pages dev`.
+pub const AIVO_WEBSITE_BASE_URL: &str = "https://getaivo.dev";
+
 /// Vestigial HMAC key — superseded by Ed25519. Kept until the gateway drops HMAC verification.
 #[allow(dead_code)]
 pub const AIVO_STARTER_SIGNING_KEY: &str =
@@ -47,6 +53,8 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "alias",
     "info",
     "ls",
+    "login",
+    "logout",
     "logs",
     "stats",
     "update",

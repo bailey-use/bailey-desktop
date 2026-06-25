@@ -14,6 +14,7 @@ use crate::services::context_ingest::{self, IngestOptions};
 use crate::services::id_compact::compact_id;
 use crate::services::log_store::{LogEntry, LogQuery, RunMeta};
 use crate::services::project_id::Thread;
+use crate::services::session_store::SessionIndexEntry;
 use crate::services::system_env;
 use crate::style;
 use unicode_width::UnicodeWidthChar;
@@ -1290,7 +1291,7 @@ async fn fetch_logs_rows(
                 by: Some("run".to_string()),
                 model: args.model.clone(),
                 key_query: args.key.clone(),
-                cwd: cwd_filter,
+                cwd: cwd_filter.clone(),
                 since: normalize_time_filter(args.since.as_deref()),
                 until: normalize_time_filter(args.until.as_deref()),
                 errors_only: args.errors,
@@ -1309,7 +1310,155 @@ async fn fetch_logs_rows(
     // Then collapse chat events by session_id so the session list shows one
     // row per chat conversation instead of one per turn.
     let entries = collapse_run_events(entries, args.limit.saturating_mul(3));
-    Ok(collapse_chat_sessions(entries))
+    let mut entries = collapse_chat_sessions(entries);
+
+    // Sessions whose every turn was cancelled/interrupted never log a `chat_turn`
+    // row; pull them off disk so the listing matches `aivo chat --resume`.
+    if plan.includes_chat() && !args.errors {
+        let logged: HashSet<String> = entries
+            .iter()
+            .filter(|e| e.source == "chat")
+            .filter_map(|e| e.session_id.clone())
+            .collect();
+        let extra = fetch_unlogged_chat_rows(store, args, cwd_filter.as_deref(), &logged).await;
+        if !extra.is_empty() {
+            entries.extend(extra);
+            entries.sort_by(|a, b| b.ts_utc.cmp(&a.ts_utc));
+            entries.truncate(query_limit);
+        }
+    }
+    Ok(entries)
+}
+
+/// `[chat]` rows for on-disk sessions absent from `logged_ids`, filtered to
+/// match logged-row semantics (cwd/model/key/search/since-until).
+async fn fetch_unlogged_chat_rows(
+    store: &SessionStore,
+    args: &LogsArgs,
+    cwd_filter: Option<&str>,
+    logged_ids: &HashSet<String>,
+) -> Vec<LogEntry> {
+    let entries = match store.all_chat_sessions().await {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    // key_id → display name for `--key <name>`/search parity with logged rows.
+    let key_names: HashMap<String, String> = store
+        .get_keys()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|k| (k.id.clone(), k.display_name().to_string()))
+        .collect();
+    entries
+        .into_iter()
+        .filter(|e| !logged_ids.contains(&e.session_id))
+        .filter(|e| {
+            chat_index_passes_filters(
+                e,
+                args,
+                cwd_filter,
+                key_names.get(&e.key_id).map(String::as_str),
+            )
+        })
+        .map(|e| {
+            let key_name = key_names.get(&e.key_id).cloned();
+            synthesize_chat_log_entry(e, key_name)
+        })
+        .collect()
+}
+
+/// Project a `SessionIndexEntry` onto a `source="chat"` `LogEntry` so it renders
+/// and merges like a logged chat turn (id = session UUID; cumulative tokens).
+fn synthesize_chat_log_entry(e: SessionIndexEntry, key_name: Option<String>) -> LogEntry {
+    LogEntry {
+        id: e.session_id.clone(),
+        ts_utc: e.updated_at,
+        source: "chat".to_string(),
+        kind: "chat_session".to_string(),
+        key_id: Some(e.key_id),
+        key_name,
+        base_url: Some(e.base_url),
+        tool: Some("chat".to_string()),
+        model: Some(e.model),
+        cwd: Some(e.cwd),
+        session_id: Some(e.session_id),
+        input_tokens: Some(e.prompt_tokens as i64),
+        output_tokens: Some(e.completion_tokens as i64),
+        cache_read_input_tokens: Some(e.cache_read_tokens as i64),
+        cache_creation_input_tokens: Some(e.cache_write_tokens as i64),
+        title: Some(e.title),
+        body_text: Some(e.preview),
+        ..Default::default()
+    }
+}
+
+/// Rust mirror of the logs.db chat-row filters; `cwd_filter` is pre-canonicalized.
+fn chat_index_passes_filters(
+    e: &SessionIndexEntry,
+    args: &LogsArgs,
+    cwd_filter: Option<&str>,
+    key_name: Option<&str>,
+) -> bool {
+    if let Some(needle) = cwd_filter
+        && !cwd_is_under(&canonicalize_for_match(&e.cwd), needle)
+    {
+        return false;
+    }
+    if let Some(model) = args.model.as_deref() {
+        let needle = model.to_ascii_lowercase();
+        let hay = format!(
+            "{} {}",
+            e.model.to_ascii_lowercase(),
+            e.billed_model
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        );
+        if !hay.contains(&needle) {
+            return false;
+        }
+    }
+    if let Some(key) = args.key.as_deref() {
+        let needle = key.to_ascii_lowercase();
+        let hay = format!(
+            "{} {}",
+            e.key_id.to_ascii_lowercase(),
+            key_name.unwrap_or_default().to_ascii_lowercase()
+        );
+        if !hay.contains(&needle) {
+            return false;
+        }
+    }
+    if let Some(search) = args.search.as_deref() {
+        let needle = search.to_ascii_lowercase();
+        let hay = format!(
+            "{} {} {} {} {} {}",
+            e.title.to_ascii_lowercase(),
+            e.preview.to_ascii_lowercase(),
+            e.model.to_ascii_lowercase(),
+            e.key_id.to_ascii_lowercase(),
+            key_name.unwrap_or_default().to_ascii_lowercase(),
+            e.cwd.to_ascii_lowercase(),
+        );
+        if !hay.contains(&needle) {
+            return false;
+        }
+    }
+    if let Ok(updated) = DateTime::parse_from_rfc3339(&e.updated_at) {
+        let updated = updated.with_timezone(&Utc);
+        if let Some(since) = args.since.as_deref().and_then(parse_loose_time)
+            && updated < since
+        {
+            return false;
+        }
+        if let Some(until) = args.until.as_deref().and_then(parse_loose_time)
+            && updated > until
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Collapse same-session chat events down to one row per `session_id`,
@@ -1599,6 +1748,12 @@ impl SourcePlan {
     }
     fn include_native(&self) -> bool {
         self.native
+    }
+    /// Chat rows in scope: the default view (`Some("chat")`) or a strict-logs
+    /// audit opened to every source (`None`). Run/serve/cli/plugin plans exclude
+    /// chat. Gates whether on-disk-only sessions get synthesized in.
+    fn includes_chat(&self) -> bool {
+        self.logs && matches!(self.logs_by.as_deref(), None | Some("chat"))
     }
 }
 
@@ -2050,6 +2205,100 @@ mod tests {
             debug_local_only: false,
             force: false,
         }
+    }
+
+    fn chat_entry(session_id: &str, cwd: &str, model: &str, key_id: &str) -> SessionIndexEntry {
+        SessionIndexEntry {
+            session_id: session_id.to_string(),
+            key_id: key_id.to_string(),
+            base_url: "https://api.example.com".to_string(),
+            cwd: cwd.to_string(),
+            model: model.to_string(),
+            billed_model: None,
+            updated_at: "2026-06-25T07:36:49+00:00".to_string(),
+            created_at: "2026-06-25T07:36:06+00:00".to_string(),
+            title: "investigate cancel bug".to_string(),
+            preview: "Let me examine the agent engine".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 3057,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn synthesized_chat_row_renders_like_a_logged_one() {
+        let entry = chat_entry("a3476c91-uuid", "/repo", "fugu", "cpg");
+        let row = synthesize_chat_log_entry(entry, Some("sakana".to_string()));
+        assert_eq!(row.source, "chat");
+        // display_id keys on the session UUID, not the row id.
+        assert_eq!(display_id(&row), "a3476c91-uuid");
+        assert_eq!(log_bracket_label(&row), "chat");
+        assert_eq!(format_token_summary(&row), "(0\u{2192}3057 tokens)");
+        assert!(log_row_detail(&row).starts_with("investigate cancel bug"));
+    }
+
+    #[test]
+    fn chat_index_filters_match_logged_chat_semantics() {
+        let entry = chat_entry("sid", "/repo/aivo", "fugu", "cpg");
+        let key_name = Some("sakana");
+
+        assert!(chat_index_passes_filters(
+            &entry,
+            &base_args(),
+            None,
+            key_name
+        ));
+
+        // cwd scoping: parent matches, sibling-prefix does not.
+        assert!(chat_index_passes_filters(
+            &entry,
+            &base_args(),
+            Some("/repo/aivo"),
+            key_name
+        ));
+        assert!(!chat_index_passes_filters(
+            &entry,
+            &base_args(),
+            Some("/repo/other"),
+            key_name
+        ));
+
+        let mut args = base_args();
+        args.model = Some("FUG".to_string());
+        assert!(chat_index_passes_filters(&entry, &args, None, key_name));
+        args.model = Some("gpt".to_string());
+        assert!(!chat_index_passes_filters(&entry, &args, None, key_name));
+
+        let mut args = base_args();
+        args.key = Some("sakana".to_string()); // by display name, not id
+        assert!(chat_index_passes_filters(&entry, &args, None, key_name));
+
+        let mut args = base_args();
+        args.search = Some("cancel".to_string());
+        assert!(chat_index_passes_filters(&entry, &args, None, key_name));
+        args.search = Some("nomatch".to_string());
+        assert!(!chat_index_passes_filters(&entry, &args, None, key_name));
+
+        // updated_at is 2026-06-25.
+        let mut args = base_args();
+        args.since = Some("2026-06-24".to_string());
+        assert!(chat_index_passes_filters(&entry, &args, None, key_name));
+        args.since = Some("2026-06-26".to_string());
+        assert!(!chat_index_passes_filters(&entry, &args, None, key_name));
+    }
+
+    #[test]
+    fn source_plan_includes_chat_only_for_chat_scoped_plans() {
+        assert!(SourcePlan::from_args(&base_args()).includes_chat());
+        assert!(SourcePlan::from_args(&logs_args_by(Some("chat"))).includes_chat());
+        // Strict-logs (audit) reopens logs.db to every source, chat included.
+        let mut args = base_args();
+        args.model = Some("fugu".to_string());
+        assert!(SourcePlan::from_args(&args).includes_chat());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("run"))).includes_chat());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("serve"))).includes_chat());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("claude"))).includes_chat());
     }
 
     #[test]

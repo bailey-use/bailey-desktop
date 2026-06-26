@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.32.1
+
+Polish for the new `aivo login` flow: the device-link screen is redesigned, the
+code is checked the moment you submit it, and pressing Enter is now optional. The
+chat exit hint loses a stray blank line above it.
+
+- fix(login): redesign device-link screen; stop Enter echo duplicating spinner (904f4a1)
+- fix(login): poll immediately, make Enter optional (821d831)
+- fix(chat): drop blank line above the exit resume hint (d9eb5e5)
+- test(agent): make /rewind probe-timeout test deterministic (3b8e14c)
+
 ## v0.32.0
 
 `aivo login`/`logout` link this device to your account, and sharing now requires

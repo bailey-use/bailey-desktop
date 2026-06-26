@@ -47,10 +47,14 @@ pub enum Commands {
     /// Manage API keys (use <id|name>, rm <id|name>, add, cat, edit)
     Keys(KeysArgs),
 
-    /// Sign in to your aivo account and link this device
+    /// Manage your aivo account (info, usage, login, logout)
+    Account(AccountArgs),
+
+    /// Alias for `aivo account login` (kept for backward compatibility)
+    #[command(hide = true)]
     Login(LoginArgs),
 
-    /// Sign out on this device (clears the local account record)
+    /// Alias for `aivo account logout` (kept for backward compatibility)
     #[command(hide = true)]
     Logout(LogoutArgs),
 
@@ -106,6 +110,56 @@ pub struct LogoutArgs {
     /// Skip the confirmation prompt
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+/// Arguments for `aivo account`. No subcommand → defaults to `info`.
+#[derive(Args, Debug, Clone)]
+pub struct AccountArgs {
+    #[command(subcommand)]
+    pub command: Option<AccountSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AccountSubcommand {
+    /// Sign in and link this device to your aivo account
+    Login(LoginArgs),
+
+    /// Sign out on this device (unlinks it from your account)
+    Logout(LogoutArgs),
+
+    /// Show account identity, plan, and linked-device count
+    #[command(alias = "status")]
+    Info(AccountInfoArgs),
+
+    /// Show usage: requests/tokens, daily caps, and per-model breakdown
+    Usage(AccountUsageArgs),
+
+    /// Open your account dashboard in the browser
+    Open(AccountOpenArgs),
+}
+
+/// Arguments for `aivo account open`.
+#[derive(Args, Debug, Clone)]
+pub struct AccountOpenArgs {
+    /// Print the dashboard URL instead of opening a browser
+    #[arg(long)]
+    pub print: bool,
+}
+
+/// Arguments for `aivo account info`.
+#[derive(Args, Debug, Clone)]
+pub struct AccountInfoArgs {
+    /// Output account info as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `aivo account usage`.
+#[derive(Args, Debug, Clone)]
+pub struct AccountUsageArgs {
+    /// Output usage as JSON (verbatim gateway shape)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).
@@ -1462,5 +1516,101 @@ mod tests {
         } else {
             panic!("Expected Chat command");
         }
+    }
+
+    #[test]
+    fn test_account_bare_has_no_subcommand() {
+        let cli = Cli::try_parse_from(["aivo", "account"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            assert!(a.command.is_none());
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_info_json() {
+        let cli = Cli::try_parse_from(["aivo", "account", "info", "--json"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            assert!(matches!(
+                a.command,
+                Some(AccountSubcommand::Info(AccountInfoArgs { json: true }))
+            ));
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_info_status_alias() {
+        let cli = Cli::try_parse_from(["aivo", "account", "status"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            assert!(matches!(a.command, Some(AccountSubcommand::Info(_))));
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_usage_json() {
+        let cli = Cli::try_parse_from(["aivo", "account", "usage", "--json"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            assert!(matches!(
+                a.command,
+                Some(AccountSubcommand::Usage(AccountUsageArgs { json: true }))
+            ));
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_open_print_flag() {
+        let cli = Cli::try_parse_from(["aivo", "account", "open", "--print"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            assert!(matches!(
+                a.command,
+                Some(AccountSubcommand::Open(AccountOpenArgs { print: true }))
+            ));
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_login_passes_label() {
+        let cli = Cli::try_parse_from(["aivo", "account", "login", "--label", "work"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            match a.command {
+                Some(AccountSubcommand::Login(login)) => {
+                    assert_eq!(login.label.as_deref(), Some("work"));
+                }
+                _ => panic!("Expected Account login subcommand"),
+            }
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_account_logout_yes() {
+        let cli = Cli::try_parse_from(["aivo", "account", "logout", "-y"]).unwrap();
+        if let Some(Commands::Account(a)) = cli.command {
+            match a.command {
+                Some(AccountSubcommand::Logout(logout)) => assert!(logout.yes),
+                _ => panic!("Expected Account logout subcommand"),
+            }
+        } else {
+            panic!("Expected Account command");
+        }
+    }
+
+    #[test]
+    fn test_top_level_login_logout_still_parse() {
+        // Backward-compat aliases must keep working alongside `aivo account`.
+        let cli = Cli::try_parse_from(["aivo", "login"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Login(_))));
+        let cli = Cli::try_parse_from(["aivo", "logout", "-y"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Logout(_))));
     }
 }

@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::constants::{AIVO_WEBSITE_BASE_URL, CONTENT_TYPE_JSON};
 use crate::errors::{CLIError, ErrorCategory};
@@ -25,7 +25,7 @@ use crate::services::http_utils::aivo_http_client_builder;
 /// Resolved web base URL: `AIVO_WEBSITE_BASE_URL` env override (for testing
 /// against `wrangler pages dev`) else the compiled-in constant, trailing slash
 /// trimmed.
-fn website_base_url() -> String {
+pub fn website_base_url() -> String {
     std::env::var("AIVO_WEBSITE_BASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -79,6 +79,79 @@ struct LinkedBody {
 #[derive(Deserialize)]
 struct ErrorBody {
     error: Option<String>,
+}
+
+/// Per-window rate caps for the linked account. A `None` field means "no cap".
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct UsageLimits {
+    #[serde(default)]
+    pub rpm: Option<u64>,
+    #[serde(default)]
+    pub rpd: Option<u64>,
+    #[serde(default)]
+    pub tpd: Option<u64>,
+}
+
+/// One row of the per-model usage breakdown (current 24h window).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UsageModelRow {
+    pub model: String,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub tokens: u64,
+}
+
+/// Usage + entitlements for the linked account (gateway `/internal/usage`).
+/// Every field is defaulted so gateway-shape drift degrades gracefully.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct UsageSummary {
+    #[serde(default)]
+    pub plan: Option<String>,
+    #[serde(default)]
+    pub billing_mode: Option<String>,
+    #[serde(default)]
+    pub is_pro: bool,
+    #[serde(default)]
+    pub subscription: Option<serde_json::Value>,
+    #[serde(default)]
+    pub limits: UsageLimits,
+    #[serde(default)]
+    pub rpm: u64,
+    #[serde(default)]
+    pub rpd: u64,
+    #[serde(default)]
+    pub tpd: u64,
+    #[serde(default)]
+    pub requests_total: u64,
+    #[serde(default)]
+    pub tokens_total: u64,
+    #[serde(default)]
+    pub linked_devices: u64,
+    #[serde(default)]
+    pub by_model: Vec<UsageModelRow>,
+    #[serde(default)]
+    pub window_resets_at: Option<String>,
+}
+
+/// Body of `/api/device/usage`: a `linked` discriminator over a `UsageSummary`.
+#[derive(Deserialize)]
+struct UsageBody {
+    #[serde(default)]
+    linked: bool,
+    #[serde(flatten)]
+    usage: UsageSummary,
+}
+
+/// Result of `/api/device/usage` — parallels [`DeviceStatus`].
+pub enum AccountUsage {
+    /// Linked: usage + caps for the account. Boxed to keep the enum small.
+    Linked(Box<UsageSummary>),
+    /// Server says this device isn't linked.
+    Unlinked,
+    /// Couldn't determine (network/transport/unexpected) — caller must NOT
+    /// treat this as unlinked.
+    Unknown,
 }
 
 /// Pulls a non-empty `error` field out of a JSON error body, if present.
@@ -193,6 +266,26 @@ pub async fn fetch_device_status() -> DeviceStatus {
         }) => DeviceStatus::Linked(user),
         Ok(LinkedBody { linked: false, .. }) => DeviceStatus::Unlinked,
         _ => DeviceStatus::Unknown,
+    }
+}
+
+/// Fetches usage + entitlements for this device's account (`/api/device/usage`).
+/// Device-authed; empty body. Never errors — ambiguity collapses to `Unknown`.
+pub async fn fetch_account_usage() -> AccountUsage {
+    let url = format!("{}/api/device/usage", website_base_url());
+    let req = http_client().post(&url).header("Accept", CONTENT_TYPE_JSON);
+    let resp = match with_starter_headers(req).send_logged().await {
+        Ok(r) => r,
+        Err(_) => return AccountUsage::Unknown,
+    };
+    if !resp.status().is_success() {
+        return AccountUsage::Unknown;
+    }
+    let text = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<UsageBody>(&text) {
+        Ok(b) if b.linked => AccountUsage::Linked(Box::new(b.usage)),
+        Ok(_) => AccountUsage::Unlinked,
+        Err(_) => AccountUsage::Unknown,
     }
 }
 
@@ -364,6 +457,50 @@ mod tests {
         let body: LinkedBody = serde_json::from_str(r#"{"linked":false}"#).unwrap();
         assert!(!body.linked);
         assert!(body.user.is_none());
+    }
+
+    #[test]
+    fn usage_body_full_payload_parses() {
+        let json = r#"{
+            "linked":true,"plan":"aivo-pro","billing_mode":"subscription","is_pro":true,
+            "subscription":{"status":"active","current_period_end":"2026-07-26T00:00:00Z"},
+            "limits":{"rpm":30,"rpd":1000,"tpd":100000},
+            "rpd":120,"tpd":45000,"rpm":3,
+            "requests_total":8490,"tokens_total":2100000,"linked_devices":2,
+            "by_model":[{"model":"claude","tokens":1500000,"requests":4200}],
+            "window_resets_at":"2026-06-27T14:32:00Z"
+        }"#;
+        let body: UsageBody = serde_json::from_str(json).unwrap();
+        assert!(body.linked);
+        let u = body.usage;
+        assert_eq!(u.plan.as_deref(), Some("aivo-pro"));
+        assert!(u.is_pro);
+        assert_eq!(u.limits.rpd, Some(1000));
+        assert_eq!(u.rpd, 120);
+        assert_eq!(u.tokens_total, 2_100_000);
+        assert_eq!(u.linked_devices, 2);
+        assert_eq!(u.by_model.len(), 1);
+        assert_eq!(u.by_model[0].model, "claude");
+        assert_eq!(u.window_resets_at.as_deref(), Some("2026-06-27T14:32:00Z"));
+    }
+
+    #[test]
+    fn usage_body_minimal_applies_defaults() {
+        let body: UsageBody = serde_json::from_str(r#"{"linked":true}"#).unwrap();
+        assert!(body.linked);
+        let u = body.usage;
+        assert!(u.plan.is_none());
+        assert!(!u.is_pro);
+        assert_eq!(u.rpd, 0);
+        assert_eq!(u.limits.rpm, None);
+        assert!(u.by_model.is_empty());
+        assert!(u.window_resets_at.is_none());
+    }
+
+    #[test]
+    fn usage_body_unlinked_parses() {
+        let body: UsageBody = serde_json::from_str(r#"{"linked":false}"#).unwrap();
+        assert!(!body.linked);
     }
 
     #[test]

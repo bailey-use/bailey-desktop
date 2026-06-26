@@ -125,30 +125,37 @@ pub fn spinner_frame(index: usize) -> &'static str {
     BRAILLE_SPINNER_FRAMES[index % BRAILLE_SPINNER_FRAMES.len()]
 }
 
-/// Renders a horizontal bar using block-element glyphs with eighth-block resolution.
-/// `value` is drawn proportionally to `max_value`, up to `width` full-block characters.
-/// Non-zero values render at least the thinnest partial-block glyph.
-pub fn bar(value: u64, max_value: u64, width: usize) -> String {
-    if max_value == 0 || value == 0 || width == 0 {
-        return String::new();
-    }
-    let eighths = ((value as f64 / max_value as f64) * (width * 8) as f64).round() as usize;
-    let eighths = eighths.min(width * 8);
-    let full = eighths / 8;
-    let frac = eighths % 8;
-    let mut s = "\u{2588}".repeat(full);
-    if let Some(ch) = [
-        "", "\u{258f}", "\u{258e}", "\u{258d}", "\u{258c}", "\u{258b}", "\u{258a}", "\u{2589}",
-    ][frac]
-        .chars()
-        .next()
-    {
-        s.push(ch);
-    }
-    if s.is_empty() {
-        s.push('\u{258f}');
-    }
-    s
+/// Section header: a dim rule sized to `text`, then `text` in bold.
+pub fn print_header(text: &str) {
+    println!("{}", dim("─".repeat(console::measure_text_width(text))));
+    println!("{}", bold(text));
+}
+
+/// Shared bar/gauge width for `aivo stats` and `aivo account usage`.
+pub const METER_WIDTH: usize = 14;
+
+/// Fixed-`width` line meter: `value`/`max_value` as a cyan `━` rule, the rest a
+/// muted `─` rail. Only a full ratio fills every cell; any partial keeps ≥1 rail
+/// cell (99% never reads full) and any non-zero keeps ≥1 fill cell (so a tiny
+/// value stays visible rather than vanishing).
+pub fn meter(value: u64, max_value: u64, width: usize) -> String {
+    let frac = if max_value == 0 {
+        0.0
+    } else {
+        (value as f64 / max_value as f64).clamp(0.0, 1.0)
+    };
+    let filled = if frac >= 1.0 {
+        width
+    } else if frac > 0.0 {
+        // `min().max()` (not `clamp`) so a width of 1 can't panic on min > max.
+        ((frac * width as f64).round() as usize)
+            .min(width.saturating_sub(1))
+            .max(1)
+    } else {
+        0
+    };
+    let empty = width - filled;
+    format!("{}{}", cyan("━".repeat(filled)), gray("─".repeat(empty)))
 }
 
 /// Starts a braille spinner on stderr. Returns the flag and join handle.
@@ -262,33 +269,48 @@ mod tests {
         assert!(!empty_bullet_symbol().is_empty());
     }
 
-    #[test]
-    fn bar_renders_full_width_at_max() {
-        assert_eq!(bar(100, 100, 20), "\u{2588}".repeat(20));
+    /// Counts (filled `━`, rail `─`) cells, ignoring any surrounding styling.
+    fn cells(s: &str) -> (usize, usize) {
+        (
+            s.chars().filter(|c| *c == '━').count(),
+            s.chars().filter(|c| *c == '─').count(),
+        )
     }
 
     #[test]
-    fn bar_renders_half_width_at_half() {
-        assert_eq!(bar(50, 100, 20), "\u{2588}".repeat(10));
+    fn meter_full_only_at_max() {
+        assert_eq!(cells(&meter(100, 100, 20)), (20, 0));
     }
 
     #[test]
-    fn bar_returns_empty_for_zero_inputs() {
-        assert_eq!(bar(0, 100, 20), "");
-        assert_eq!(bar(10, 0, 20), "");
-        assert_eq!(bar(10, 100, 0), "");
+    fn meter_empty_at_zero_value() {
+        assert_eq!(cells(&meter(0, 100, 20)), (0, 20));
     }
 
     #[test]
-    fn bar_shows_minimum_partial_block_for_tiny_values() {
-        let b = bar(1, 1000, 20);
-        assert!(!b.is_empty());
+    fn meter_below_max_always_leaves_a_rail_cell() {
+        // 99% must never render as full — it keeps ≥1 rail cell.
+        assert_eq!(cells(&meter(99, 100, 20)), (19, 1));
+        // Even 99.9% (rounds to 20) is held to width-1.
+        assert_eq!(cells(&meter(999, 1000, 20)), (19, 1));
     }
 
     #[test]
-    fn bar_never_exceeds_requested_width_under_rounding() {
-        // Float rounding could otherwise push eighths above width * 8.
-        let b = bar(u64::MAX, u64::MAX, 32);
-        assert_eq!(b.chars().count(), 32);
+    fn meter_tiny_nonzero_shows_one_tick() {
+        // Any non-zero value keeps ≥1 fill cell so it stays visible.
+        assert_eq!(cells(&meter(1, 1_000_000, 20)), (1, 19));
+    }
+
+    #[test]
+    fn meter_no_max_is_all_rail() {
+        assert_eq!(cells(&meter(50, 0, 20)), (0, 20));
+    }
+
+    #[test]
+    fn meter_width_is_total_cells() {
+        for value in [0u64, 1, 37, 99, 100] {
+            let (f, e) = cells(&meter(value, 100, 20));
+            assert_eq!(f + e, 20, "value={value} must fill exactly the width");
+        }
     }
 }

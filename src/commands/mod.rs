@@ -64,6 +64,7 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
+pub mod account;
 pub mod alias;
 pub mod chat;
 pub(crate) mod chat_request_builder;
@@ -84,6 +85,7 @@ pub mod start;
 pub mod stats;
 pub mod update;
 
+pub use account::AccountCommand;
 pub use alias::AliasCommand;
 pub use chat::ChatCommand;
 pub use info::InfoCommand;

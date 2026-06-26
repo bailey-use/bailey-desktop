@@ -44,6 +44,8 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     // Top-level subcommands
     "run",
     "keys",
+    "account",
+    "usage",
     "chat",
     "image",
     "video",

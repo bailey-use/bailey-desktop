@@ -8,15 +8,15 @@ use std::process;
 use clap::{Command, CommandFactory, Parser};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{ChatArgs, Cli, Commands};
+use crate::cli::{AccountSubcommand, ChatArgs, Cli, Commands};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LoginCommand, LogoutCommand,
-    LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand, ServeParams,
-    ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AccountCommand, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LoginCommand,
+    LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
+    ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -176,6 +176,16 @@ pub async fn run() -> ! {
         match cmd {
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
+            Commands::Account(a) => {
+                let sub = a.command.as_ref().map(|c| match c {
+                    AccountSubcommand::Login(_) => "login",
+                    AccountSubcommand::Logout(_) => "logout",
+                    AccountSubcommand::Info(_) => "info",
+                    AccountSubcommand::Usage(_) => "usage",
+                    AccountSubcommand::Open(_) => "open",
+                });
+                AccountCommand::print_help(sub)
+            }
             Commands::Login(_) => LoginCommand::print_help(),
             Commands::Logout(_) => LogoutCommand::print_help(),
             Commands::Chat(_) => ChatCommand::print_help(),
@@ -227,6 +237,11 @@ pub async fn run() -> ! {
         Commands::Keys(keys_args) => {
             let command = KeysCommand::new(session_store);
             command.execute(keys_args).await
+        }
+
+        Commands::Account(account_args) => {
+            let command = AccountCommand::new(session_store);
+            command.execute(account_args).await
         }
 
         Commands::Login(login_args) => {
@@ -859,7 +874,10 @@ fn print_help() {
     };
     print_cmd("run", "Launch an AI tool, or open the tool picker");
     print_cmd("keys", "Manage API keys");
-    print_cmd("login", "Sign in and link this device to your aivo account");
+    print_cmd(
+        "account",
+        "Manage your account (info, usage, login, logout)",
+    );
     print_cmd("chat", "Start the interactive chat TUI");
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");

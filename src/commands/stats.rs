@@ -371,11 +371,7 @@ impl StatsCommand {
         parts.push(format!("{} sessions", colorize_unit(&fmt(total_sessions))));
         parts.push(format!("{} models", colorize_unit(&fmt(total_models))));
         let header = parts.join(" · ");
-        println!(
-            "{}",
-            style::dim("─".repeat(console::measure_text_width(&header)))
-        );
-        println!("{}", style::bold(header));
+        style::print_header(&header);
 
         if !tool_tokens.is_empty() {
             println!();
@@ -438,13 +434,7 @@ impl StatsCommand {
                 };
                 match (show_tool_bar, tok) {
                     (true, Some(v)) => {
-                        println!(
-                            "{} {} {} {}",
-                            style::cyan(&pn),
-                            ps,
-                            pt,
-                            style::cyan(bar(*v, max_tok)),
-                        );
+                        println!("{} {} {} {}", style::cyan(&pn), ps, pt, bar(*v, max_tok),);
                     }
                     _ => println!("{} {} {}", style::cyan(&pn), ps, pt),
                 }
@@ -1254,11 +1244,7 @@ fn print_tool_view(view: &ToolView, count_label: &str, fmt: fn(u64) -> String, a
     parts.push(format!("{} models", colorize_unit(&fmt(model_count))));
 
     let header = parts.join(" · ");
-    println!(
-        "{}",
-        style::dim("─".repeat(console::measure_text_width(&header)))
-    );
-    println!("{}", style::bold(header));
+    style::print_header(&header);
 
     render_model_table(&view.models, fmt, args);
 }
@@ -1279,11 +1265,7 @@ fn print_launch_view(
         colorize_unit(&fmt(launches)),
         colorize_unit(&fmt(rows.len() as u64)),
     );
-    println!(
-        "{}",
-        style::dim("─".repeat(console::measure_text_width(&header)))
-    );
-    println!("{}", style::bold(header));
+    style::print_header(&header);
     println!();
     println!(
         "{}",
@@ -1339,7 +1321,7 @@ fn print_launch_view(
         let pn = style::cyan(format!("{:<name_w$}", name));
         let pc = colorize_unit(&format!("{:>cnt_w$}", fmt(*count)));
         if show_bar {
-            println!("{} {} {}", pn, pc, style::cyan(bar(*count, max_count)));
+            println!("{} {} {}", pn, pc, bar(*count, max_count));
         } else {
             println!("{} {}", pn, pc);
         }
@@ -1481,18 +1463,13 @@ fn render_default_model_table(
                     style::cyan(&pn),
                     pc,
                     pt,
-                    style::cyan(bar(m.tokens(), max_tok)),
+                    bar(m.tokens(), max_tok),
                 );
             } else {
                 println!("{} {} {}", style::cyan(&pn), pc, pt);
             }
         } else if show_bar {
-            println!(
-                "{} {} {}",
-                style::cyan(&pn),
-                pt,
-                style::cyan(bar(m.tokens(), max_tok)),
-            );
+            println!("{} {} {}", style::cyan(&pn), pt, bar(m.tokens(), max_tok),);
         } else {
             println!("{} {}", style::cyan(&pn), pt);
         }
@@ -1563,7 +1540,7 @@ fn render_detailed_model_table(
                 po,
                 pc,
                 ptot,
-                style::cyan(bar(m.total(), max_total)),
+                bar(m.total(), max_total),
             );
         } else {
             println!("{} {} {} {} {}", style::cyan(&pn), pi, po, pc, ptot);
@@ -1744,10 +1721,9 @@ fn resolve_since(arg: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Ut
     }
 }
 
-const BAR_MAX: usize = 20;
-
+/// Shared line meter, same as `aivo account usage`. Already styled — don't re-wrap.
 fn bar(value: u64, max_value: u64) -> String {
-    style::bar(value, max_value, BAR_MAX)
+    style::meter(value, max_value, style::METER_WIDTH)
 }
 
 fn format_number(n: u64) -> String {
@@ -1765,7 +1741,7 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-fn format_human(n: u64) -> String {
+pub(crate) fn format_human(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
@@ -1803,7 +1779,7 @@ fn format_human(n: u64) -> String {
 
 /// Colorize the unit suffix (K/M/B/T) in an already-padded string.
 /// Applied at display time so width calculations use plain text.
-fn colorize_unit(s: &str) -> String {
+pub(crate) fn colorize_unit(s: &str) -> String {
     use console::style as csty;
     for (ch, styler) in [
         ('T', csty("T").bold().magenta().to_string()),
@@ -1875,19 +1851,31 @@ mod tests {
         assert_eq!(format_human(15_000_000_000_000), "15T");
     }
 
-    #[test]
-    fn bar_proportional() {
-        assert_eq!(bar(100, 100), "████████████████████");
-        assert_eq!(bar(50, 100), "██████████");
-        assert_eq!(bar(0, 100), "");
-        assert_eq!(bar(0, 0), "");
+    fn meter_cells(s: &str) -> (usize, usize) {
+        (
+            s.chars().filter(|c| *c == '━').count(),
+            s.chars().filter(|c| *c == '─').count(),
+        )
     }
 
     #[test]
-    fn bar_small_value_shows_sliver() {
-        let b = bar(1, 1000);
-        assert!(!b.is_empty());
-        assert!(b.len() <= 4);
+    fn bar_is_shared_meter_at_meter_width() {
+        let w = crate::style::METER_WIDTH;
+        // `bar` delegates to the shared line meter at the shared width.
+        assert_eq!(meter_cells(&bar(100, 100)), (w, 0)); // full
+        assert_eq!(meter_cells(&bar(0, 100)), (0, w)); // empty rail
+        let (f, e) = meter_cells(&bar(50, 100)); // half shows both fill and rail
+        assert_eq!(f + e, w);
+        assert!(f > 0 && e > 0);
+    }
+
+    #[test]
+    fn bar_tiny_value_shows_one_tick() {
+        // Any non-zero value keeps ≥1 fill cell so it stays visible.
+        assert_eq!(
+            meter_cells(&bar(1, 1000)),
+            (1, crate::style::METER_WIDTH - 1)
+        );
     }
 
     #[test]

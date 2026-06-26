@@ -103,15 +103,17 @@ aivo keys import https://example.com/bak.keys   # or from a URL
 aivo keys export ~/bak.keys --password-stdin <<< "my secret password"
 ```
 
-## login
+## account
 
-Link this device to your [getaivo.dev](https://getaivo.dev) account so `aivo/starter`
-uses your plan and credits instead of the free tier.
+Link this device to your [getaivo.dev](https://getaivo.dev) account to unlock higher
+`aivo/starter` limits, then check your plan and usage.
 
 ```bash
-aivo login                                   # approve a short code in the browser
-aivo login --label "work laptop"             # name this device in your account
-aivo logout                                  # unlink this device (confirms; -y to skip)
+aivo account login/logout
+aivo account usage                           # requests/tokens, daily caps, per-model
+aivo account usage --json                    # machine-readable usage
+aivo account login --label "work laptop"     # name this device in your account
+aivo account open                            # open your dashboard in the browser
 ```
 
 ## models

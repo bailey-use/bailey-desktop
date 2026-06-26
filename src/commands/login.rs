@@ -68,9 +68,9 @@ impl LoginCommand {
 
         let device = device_auth::start_device_auth(Some(&label)).await?;
 
-        // Show the bare URL (clean for hand-typing); Enter opens the
-        // code-prefilled one. Polling below starts regardless, so Enter is a
-        // convenience (e.g. approve on a phone), never a gate.
+        // Show the code-prefilled URL so visiting or scanning it needs no
+        // typing; it's also what Enter opens. Polling below starts regardless,
+        // so Enter is a convenience (e.g. approve on a phone), never a gate.
         let bare_url = device.verification_uri.clone();
         let open_url = device
             .verification_uri_complete
@@ -94,10 +94,10 @@ impl LoginCommand {
             println!(
                 "  Press {} to open your browser, or visit {}",
                 style::keycap(" Enter "),
-                style::blue(&bare_url)
+                style::blue(&open_url)
             );
         } else {
-            println!("  Visit {} to confirm.", style::blue(&bare_url));
+            println!("  Visit {} to confirm.", style::blue(&open_url));
         }
         println!();
 

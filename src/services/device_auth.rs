@@ -325,7 +325,7 @@ mod tests {
         let json = r#"{
             "device_code":"dc","user_code":"WDJB-MJHT","device_fingerprint":"fp",
             "verification_uri":"https://getaivo.dev/device",
-            "verification_uri_complete":"https://getaivo.dev/device?user_code=WDJB-MJHT",
+            "verification_uri_complete":"https://getaivo.dev/device?c=WDJB-MJHT",
             "expires_in":600,"interval":5
         }"#;
         let r: DeviceCodeResponse = serde_json::from_str(json).unwrap();
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(r.user_code, "WDJB-MJHT");
         assert_eq!(
             r.verification_uri_complete.as_deref(),
-            Some("https://getaivo.dev/device?user_code=WDJB-MJHT")
+            Some("https://getaivo.dev/device?c=WDJB-MJHT")
         );
         assert_eq!(r.expires_in, 600);
         assert_eq!(r.interval, 5);

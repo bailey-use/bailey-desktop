@@ -332,6 +332,11 @@ impl CheckpointStore {
     /// either trips. Counts tracked (`-c`) and untracked (`-o`) files, so a tracked
     /// file that balloons later still trips it.
     async fn exceeds_cap(&self, git_dir: &Path) -> bool {
+        // A non-positive budget can't enumerate anything before elapsing, so the
+        // tree is "too slow" by definition — skip the git spawn and the timer race.
+        if self.probe_budget.is_zero() {
+            return true;
+        }
         let mut cmd = self.git(git_dir);
         cmd.args(["ls-files", "-c", "-o", "--exclude-standard", "-z"])
             .stdout(Stdio::piped())
@@ -712,10 +717,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         write(cwd, "a.rs", "x");
-        // A zero budget is already elapsed, so the probe times out the instant the
-        // scan pends on its first pipe read → snapshot skipped, file-revert NOT
-        // latched off. (A 1ns budget races: tokio rounds it to the ~ms timer tick,
-        // which a one-file `git ls-files` can beat on a fast machine — flaky on CI.)
+        // A zero budget short-circuits exceeds_cap → snapshot skipped, file-revert
+        // NOT latched off. (Earlier this raced a real `git ls-files` against a
+        // sub-ms timer and flaked on CI; the zero-budget guard is deterministic.)
         let mut store = CheckpointStore::new(cwd);
         store.probe_budget = Duration::ZERO;
         if !store.git_available().await {

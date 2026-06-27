@@ -8,16 +8,17 @@ use crate::services::session_store::{AttachmentStorage, MessageAttachment};
 
 use super::chat::ChatMessage;
 
-/// Minimum `reasoning_effort` accepted by the given OpenAI-family model, or
-/// `None` for non-reasoning models that would 400 on the field. gpt-5+ and
-/// codex-* take `"none"` (in chat without tools); o-series accepts only
-/// low/medium/high so we pin to `"low"`. Anthropic and Gemini have separate
-/// disable mechanisms — see [`apply_chat_no_thinking_google`].
+/// Lowest `reasoning_effort` accepted by the given OpenAI-family model, or `None`
+/// for non-reasoning models that would 400 on the field. gpt-5/codex pin to
+/// `"minimal"`: `"none"` is only valid on gpt-5.1+ and 400s on gpt-5.0 and
+/// gateways ("Reasoning is mandatory … cannot be disabled"), so `"minimal"` is the
+/// safe floor everywhere (matching the agent path's `thinking_request`). o-series
+/// accepts only low/medium/high → `"low"`. Anthropic/Gemini disable separately.
 fn openai_chat_no_thinking_value(model: &str) -> Option<&'static str> {
     let lower = model.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
     if name.starts_with("gpt-5") || name.contains("codex") {
-        Some("none")
+        Some("minimal")
     } else if name.starts_with("o1") || name.starts_with("o3") || name.starts_with("o4") {
         Some("low")
     } else {
@@ -411,20 +412,23 @@ mod tests {
     use crate::services::session_store::AttachmentStorage;
 
     #[test]
-    fn test_openai_chat_disable_gpt5_uses_none() {
-        let body = build_openai_chat_request(
-            "gpt-5.4",
-            &[ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-                reasoning_content: None,
-                attachments: vec![],
-            }],
-            false,
-            None,
-        )
-        .unwrap();
-        assert_eq!(body["reasoning_effort"], "none");
+    fn test_openai_chat_disable_gpt5_uses_minimal() {
+        // "none" 400s on gpt-5.0 and gateways; "minimal" is the safe floor.
+        for model in ["gpt-5", "gpt-5-mini", "gpt-5.4", "gpt-5-codex"] {
+            let body = build_openai_chat_request(
+                model,
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                    reasoning_content: None,
+                    attachments: vec![],
+                }],
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(body["reasoning_effort"], "minimal", "model={model}");
+        }
     }
 
     #[test]
@@ -481,7 +485,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(gpt5["reasoning"]["effort"], "none");
+        assert_eq!(gpt5["reasoning"]["effort"], "minimal");
 
         let gpt4o = build_responses_request(
             "gpt-4o",

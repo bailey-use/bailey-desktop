@@ -173,6 +173,53 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// The built-in tool specs tailored to `model`: GPT-5/Codex-family models get
+/// `apply_patch` in place of `edit_file`/`multi_edit` (never both — they'd mix
+/// edit formats), since they're post-trained to emit the V4A patch grammar.
+pub fn tool_specs_for(model: &str) -> Vec<ToolSpec> {
+    let mut specs = tool_specs();
+    if uses_apply_patch(model) {
+        specs.retain(|s| s.name != "edit_file" && s.name != "multi_edit");
+        specs.push(apply_patch_spec());
+    }
+    specs
+}
+
+/// Models that emit OpenAI's V4A `apply_patch` grammar fluently (and produce
+/// malformed exact-string edits otherwise). Mirrors the family gate in engine's
+/// `thinking_request`; the provider prefix (`openai/…`) is stripped first.
+pub fn uses_apply_patch(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    name.contains("codex") || name.starts_with("gpt-5") || name.starts_with("gpt-4.1")
+}
+
+fn apply_patch_spec() -> ToolSpec {
+    spec(
+        "apply_patch",
+        "Create, edit, rename, or delete files with a V4A patch (pass the whole patch as `input`). \
+Format:\n\
+*** Begin Patch\n\
+*** Update File: path/to/file\n\
+@@ optional_anchor_line\n\
+ unchanged context line\n\
+-removed line\n\
++added line\n\
+*** Add File: path/to/new\n\
++every line of the new file, each prefixed with +\n\
+*** Delete File: path/to/old\n\
+*** End Patch\n\
+Update hunks use NO line numbers: include a few unchanged context lines (each prefixed with a single space) around every change so the hunk can be located, and prefix removed lines with `-` and added lines with `+`. Add `*** Move to: path` on the line after an `*** Update File:` header to rename. One patch may touch several files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "input": {"type": "string", "description": "The full V4A patch, from '*** Begin Patch' to '*** End Patch'."}
+            },
+            "required": ["input"]
+        }),
+    )
+}
+
 fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -183,7 +230,10 @@ fn spec(name: &str, description: &str, parameters: Value) -> ToolSpec {
 
 /// Side-effecting tools the client must permission-gate before `execute`.
 pub fn is_mutating(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "multi_edit" | "run_bash")
+    matches!(
+        name,
+        "write_file" | "edit_file" | "multi_edit" | "apply_patch" | "run_bash"
+    )
 }
 
 /// Built-in tools that only read (filesystem or network) and share no mutable
@@ -222,6 +272,16 @@ pub fn is_dangerous(name: &str, args: &Value, cwd: &Path) -> bool {
             .get("path")
             .and_then(|p| p.as_str())
             .map(|p| path_escapes_cwd(p, cwd))
+            .unwrap_or(false),
+        // A patch may touch many files; gate it if *any* target leaves the cwd.
+        "apply_patch" => args
+            .get("input")
+            .and_then(|p| p.as_str())
+            .map(|p| {
+                crate::agent::apply_patch::target_paths(p)
+                    .iter()
+                    .any(|t| path_escapes_cwd(t, cwd))
+            })
             .unwrap_or(false),
         _ => false,
     }
@@ -563,6 +623,14 @@ pub fn preview(name: &str, args: &Value) -> Option<String> {
             let plural = if n == 1 { "edit" } else { "edits" };
             Some(format!("{path}  ({n} {plural})"))
         }
+        "apply_patch" => {
+            let paths = crate::agent::apply_patch::target_paths(args.get("input")?.as_str()?);
+            if paths.is_empty() {
+                Some("apply_patch".to_string())
+            } else {
+                Some(format!("patch: {}", paths.join(", ")))
+            }
+        }
         "run_bash" => Some(args.get("command")?.as_str()?.to_string()),
         _ => None,
     }
@@ -579,6 +647,7 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         "write_file" => write_file(args, cwd),
         "edit_file" => edit_file(args, cwd),
         "multi_edit" => multi_edit(args, cwd),
+        "apply_patch" => crate::agent::apply_patch::apply(arg_str(args, "input")?, cwd),
         "web_fetch" => web_fetch(args).await,
         "run_bash" => run_bash(args, cwd).await,
         other => Err(format!(
@@ -603,7 +672,7 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     args.get(key).and_then(|v| v.as_u64())
 }
 
-fn resolve(cwd: &Path, p: &str) -> PathBuf {
+pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
     let pb = Path::new(p);
     if pb.is_absolute() {
         pb.to_path_buf()
@@ -1008,7 +1077,7 @@ fn to_crlf(s: &str) -> String {
 /// rename over the target. A crash or error mid-write leaves the original file
 /// intact rather than a truncated/partial one. The temp shares the target's
 /// parent directory so the rename stays on one filesystem (and is atomic).
-fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write(full: &Path, content: &str) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = full.parent().filter(|p| !p.as_os_str().is_empty());
@@ -2008,6 +2077,42 @@ mod tests {
             "run_bash",
         ] {
             assert!(names.iter().any(|x| x == n), "missing {n}");
+        }
+    }
+
+    #[test]
+    fn apply_patch_routing_by_model() {
+        // GPT-5/Codex-family models get apply_patch in place of the string editors.
+        for m in ["gpt-5", "openai/gpt-5-codex", "codex-mini", "gpt-4.1-mini"] {
+            assert!(uses_apply_patch(m), "{m} should use apply_patch");
+            let names: Vec<String> = tool_specs_for(m).into_iter().map(|s| s.name).collect();
+            assert!(
+                names.iter().any(|n| n == "apply_patch"),
+                "{m} missing apply_patch"
+            );
+            assert!(
+                !names.iter().any(|n| n == "edit_file"),
+                "{m} kept edit_file"
+            );
+            assert!(
+                !names.iter().any(|n| n == "multi_edit"),
+                "{m} kept multi_edit"
+            );
+        }
+        // Everyone else keeps the string editors and never sees apply_patch.
+        for m in [
+            "claude-sonnet-4-6",
+            "gpt-4o",
+            "anthropic/claude-opus-4-8",
+            "gemini-2.5-pro",
+        ] {
+            assert!(!uses_apply_patch(m), "{m} should not use apply_patch");
+            let names: Vec<String> = tool_specs_for(m).into_iter().map(|s| s.name).collect();
+            assert!(names.iter().any(|n| n == "edit_file"));
+            assert!(
+                !names.iter().any(|n| n == "apply_patch"),
+                "{m} got apply_patch"
+            );
         }
     }
 

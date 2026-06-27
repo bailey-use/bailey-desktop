@@ -416,7 +416,7 @@ impl AgentEngine {
             .and_then(|s| s.parse().ok())
             .unwrap_or(context_window);
         let max_steps = resolve_max_steps(max_steps);
-        let mut specs = tools::tool_specs();
+        let mut specs = tools::tool_specs_for(model);
         if !skills.is_empty() {
             specs.push(skills::skill_tool_spec(skills));
         }
@@ -601,11 +601,17 @@ impl AgentEngine {
             sys["content"] = json!(format!("{cur}\n\n## Your role: {}\n{}", sa.name, sa.body));
         }
         if let Some(allowed) = sa.resolved_tools() {
+            // On a gpt-5/codex engine the string editors are swapped for
+            // `apply_patch`, so an authored `Edit`/`MultiEdit` scope grants it.
+            let editor_allowed = allowed.contains(&"edit_file") || allowed.contains(&"multi_edit");
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
                 // `update_plan`/`take_note` have no side effects outside the engine,
                 // so a scoped specialist keeps planning + note-taking regardless.
-                name == "update_plan" || name == "take_note" || allowed.contains(&name)
+                name == "update_plan"
+                    || name == "take_note"
+                    || allowed.contains(&name)
+                    || (name == "apply_patch" && editor_allowed)
             });
         }
     }
@@ -1546,22 +1552,30 @@ Re-run the full command without write confinement?",
     }
 
     fn record_touched_file(&mut self, name: &str, args: &Value) {
-        if !matches!(
-            name,
-            "read_file" | "write_file" | "edit_file" | "multi_edit"
-        ) {
-            return;
-        }
-        let Some(path) = args.get("path").and_then(|v| v.as_str()).map(str::trim) else {
-            return;
+        // `apply_patch` carries many paths in its V4A body; the rest carry one.
+        let paths: Vec<String> = match name {
+            "read_file" | "write_file" | "edit_file" | "multi_edit" => args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|p| vec![p.to_string()])
+                .unwrap_or_default(),
+            "apply_patch" => args
+                .get("input")
+                .and_then(|v| v.as_str())
+                .map(crate::agent::apply_patch::target_paths)
+                .unwrap_or_default(),
+            _ => return,
         };
-        if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
-            return;
+        for path in paths {
+            let path = path.trim();
+            if path.is_empty() || self.touched_files.iter().any(|p| p == path) {
+                continue;
+            }
+            if self.touched_files.len() >= MAX_TOUCHED_FILES {
+                self.touched_files.remove(0);
+            }
+            self.touched_files.push(path.to_string());
         }
-        if self.touched_files.len() >= MAX_TOUCHED_FILES {
-            self.touched_files.remove(0);
-        }
-        self.touched_files.push(path.to_string());
     }
 
     // --- /rewind: tree checkpoints ---
@@ -2218,6 +2232,11 @@ fn permission_key(name: &str, args: &Value) -> String {
     match name {
         "run_bash" => format!("run_bash\u{0}{}", arg("command")),
         "write_file" | "edit_file" | "multi_edit" => format!("{name}\u{0}{}", arg("path")),
+        // Scope to the exact set of files the patch touches, not all patches.
+        "apply_patch" => format!(
+            "apply_patch\u{0}{}",
+            crate::agent::apply_patch::target_paths(arg("input")).join("\u{1}")
+        ),
         _ => name.to_string(),
     }
 }
@@ -4527,6 +4546,27 @@ mod tests {
         assert!(after.contains(&"grep".to_string()));
         assert!(after.contains(&"update_plan".to_string()));
         assert!(!after.contains(&"write_file".to_string()));
+        assert!(!after.contains(&"run_bash".to_string()));
+    }
+
+    /// On a gpt-5/codex engine (string editors swapped for `apply_patch`), an
+    /// authored `Edit` scope still grants the edit tool the model actually has.
+    #[test]
+    fn apply_profile_edit_scope_grants_apply_patch_on_gpt5() {
+        let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
+        e.drop_subagent_tool();
+        assert!(tool_names(&e).contains(&"apply_patch".to_string()));
+        e.apply_profile(&subagent(
+            "editor",
+            None,
+            Some(vec!["read_file", "edit_file"]),
+        ));
+        let after = tool_names(&e);
+        assert!(
+            after.contains(&"apply_patch".to_string()),
+            "lost editor on gpt-5"
+        );
+        assert!(after.contains(&"read_file".to_string()));
         assert!(!after.contains(&"run_bash".to_string()));
     }
 

@@ -4,6 +4,7 @@
 //! locally, and renders through an `AgentUi` (the chat TUI). `protocol` holds
 //! the shared data types; `serve_client` is the streaming provider call.
 
+pub mod apply_patch;
 pub mod checkpoint;
 pub mod engine;
 pub mod mcp;

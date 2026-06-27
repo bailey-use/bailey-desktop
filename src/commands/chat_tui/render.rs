@@ -1520,6 +1520,10 @@ fn group_diff<'a>(ops: &[(DiffTag, &'a str)], context: usize) -> Vec<DiffRow<'a>
 /// large rewrite can't flood the transcript. Renders nothing for tools that carry
 /// no textual diff (cursor edits with empty args, write_file, etc.).
 fn render_edit_diff(lines: &mut Vec<StyledLine>, name: &str, args: &serde_json::Value) {
+    if name == "apply_patch" {
+        render_patch_diff(lines, args);
+        return;
+    }
     const MAX_DIFF_LINES: usize = 14;
     const CONTEXT: usize = 3;
     let pick = |v: &serde_json::Value, k: &str| {
@@ -1596,6 +1600,80 @@ fn render_edit_diff(lines: &mut Vec<StyledLine>, name: &str, args: &serde_json::
     if rows.len() > MAX_DIFF_LINES {
         lines.push(line_with_plain(vec![Span::styled(
             format!("    … (+{} more)", rows.len() - MAX_DIFF_LINES),
+            Style::default().fg(FAINT),
+        )]));
+    }
+}
+
+/// Render an `apply_patch` (V4A) tool call as a per-file diff: a faint filename
+/// header (carrying any rename arrow / `(new)`/`(deleted)` tag) over the same
+/// grouped line-level diff used for `edit_file`, so a multi-file patch reviews
+/// like an ordinary edit.
+fn render_patch_diff(lines: &mut Vec<StyledLine>, args: &serde_json::Value) {
+    const MAX_LINES: usize = 22;
+    const CONTEXT: usize = 3;
+    let Some(input) = args.get("input").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let blocks = crate::agent::apply_patch::diff_blocks(input);
+    if blocks.is_empty() {
+        return;
+    }
+
+    enum Item<'a> {
+        Header(&'a str),
+        Row(DiffRow<'a>),
+    }
+    let mut items: Vec<Item> = Vec::new();
+    let mut last: Option<&str> = None;
+    for block in &blocks {
+        if last != Some(block.path.as_str()) {
+            items.push(Item::Header(&block.path));
+            last = Some(&block.path);
+        }
+        let ops = diff_lines(&block.old, &block.new);
+        for row in group_diff(&ops, CONTEXT) {
+            items.push(Item::Row(row));
+        }
+    }
+
+    let change_line = |sign: char, text: &str, bg, fg, sign_fg| {
+        line_with_plain(vec![
+            Span::styled(
+                format!(" {sign} "),
+                Style::default()
+                    .fg(sign_fg)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text.to_string(), Style::default().fg(fg).bg(bg)),
+        ])
+    };
+    for item in items.iter().take(MAX_LINES) {
+        lines.push(match item {
+            Item::Header(path) => line_with_plain(vec![Span::styled(
+                format!("  {path}"),
+                Style::default().fg(TOOL),
+            )]),
+            Item::Row(DiffRow::Context(text)) => line_with_plain(vec![Span::styled(
+                format!("   {text}"),
+                Style::default().fg(MUTED),
+            )]),
+            Item::Row(DiffRow::Del(text)) => {
+                change_line('-', text, DIFF_DEL_BG, DIFF_DEL_FG, DIFF_DEL_SIGN)
+            }
+            Item::Row(DiffRow::Ins(text)) => {
+                change_line('+', text, DIFF_ADD_BG, DIFF_ADD_FG, DIFF_ADD_SIGN)
+            }
+            Item::Row(DiffRow::Gap) => line_with_plain(vec![Span::styled(
+                "   ⋯".to_string(),
+                Style::default().fg(FAINT),
+            )]),
+        });
+    }
+    if items.len() > MAX_LINES {
+        lines.push(line_with_plain(vec![Span::styled(
+            format!("    … (+{} more)", items.len() - MAX_LINES),
             Style::default().fg(FAINT),
         )]));
     }

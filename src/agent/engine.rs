@@ -1042,6 +1042,8 @@ impl AgentEngine {
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
+                // Silent convergence reads as success ("Done" with no answer); say so.
+                ui.notify("the model returned an empty response — no answer produced");
                 converged = true;
                 break;
             }

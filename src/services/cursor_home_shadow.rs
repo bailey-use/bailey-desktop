@@ -107,19 +107,6 @@ impl CursorShadow {
         self.root.join(cursor_subdir_name())
     }
 
-    pub fn auth_file_path(&self) -> PathBuf {
-        self.cursor_dir().join("auth.json")
-    }
-
-    /// True when `auth.json` exists and is non-empty. Authoritative
-    /// authentication state lives in `cursor-agent status`; this is just a
-    /// cheap "has the user ever logged in here?" gate for UI hints.
-    pub fn has_credential_file(&self) -> bool {
-        std::fs::metadata(self.auth_file_path())
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-    }
-
     /// Env vars to inject when spawning cursor-agent for this account.
     /// Returned as a `Vec` so callers can `cmd.env(name, value)` over it
     /// regardless of whether they hold a `Command` or a `HashMap`.

@@ -589,23 +589,10 @@ impl McpClient {
         .await
     }
 
-    /// Like `connect`, but skip servers the user turned off in `/mcp`.
-    pub async fn connect_enabled(cwd: &Path, disabled: &HashSet<String>) -> McpClient {
-        Self::connect_inner(
-            user_config_path().as_deref(),
-            cwd,
-            disabled,
-            MCP_HANDSHAKE_TIMEOUT,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// Like `connect_enabled`, but invokes `progress` with each server's outcome
-    /// the moment that server's handshake resolves (servers connect concurrently),
-    /// so a UI can flip each row to its real status instead of showing every
-    /// server "connecting…" until the slowest one finishes.
+    /// Like `connect`, but skips servers disabled in `/mcp` and invokes `progress`
+    /// with each server's outcome the moment its handshake resolves (servers connect
+    /// concurrently), so a UI can flip each row to its real status instead of
+    /// showing every server "connecting…" until the slowest one finishes.
     pub async fn connect_enabled_with_progress(
         cwd: &Path,
         disabled: &HashSet<String>,
@@ -2236,8 +2223,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `connect_enabled` skips a disabled server entirely: it isn't spawned, so it
-    /// yields neither tools nor a connect error, while the enabled one still does.
+    /// A disabled server is skipped entirely: it isn't spawned, so it yields
+    /// neither tools nor a connect error, while the enabled one still does.
     #[tokio::test]
     async fn connect_enabled_skips_disabled_servers() {
         let dir = std::env::temp_dir().join(format!("aivo-mcp-disabled-{}", std::process::id()));

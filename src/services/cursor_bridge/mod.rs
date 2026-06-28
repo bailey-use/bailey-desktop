@@ -83,12 +83,6 @@ pub struct CursorModelRouter {
 /// per session, so paired turns (main + subagent) need separate slots.
 pub(crate) const MAX_POOL_SESSIONS: usize = 3;
 
-/// Default prewarm when the caller doesn't override. Two sessions covers
-/// Claude Code's paired main+subagent burst; tools without that pattern
-/// override this via `CursorRouterConfig::prewarm_count` to avoid spawning
-/// a second cursor-agent that the tool would never use.
-pub const DEFAULT_POOL_PREWARM: usize = 2;
-
 /// One lazily-opened ACP session. Held inside `Arc<Mutex<...>>` so HTTP
 /// handlers can take an owned lock for the full turn duration; the outer pool
 /// just tracks the slot Arcs.

@@ -25,11 +25,6 @@ pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 /// via the `AIVO_WEBSITE_BASE_URL` env var for testing against `wrangler pages dev`.
 pub const AIVO_WEBSITE_BASE_URL: &str = "https://getaivo.dev";
 
-/// Vestigial HMAC key — superseded by Ed25519. Kept until the gateway drops HMAC verification.
-#[allow(dead_code)]
-pub const AIVO_STARTER_SIGNING_KEY: &str =
-    "39de0d498e4c6fe7f28f7ccc9956e8e34978188a7d2e122fe3c512fe22863f35";
-
 /// AI tool names recognized as positional arguments to `aivo run` and as the
 /// first token of a Bundle alias's launch line (e.g. `aivo alias quick claude
 /// --key work`). Also doubles as the top-level shortcut list (`aivo claude

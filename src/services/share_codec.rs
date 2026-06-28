@@ -29,8 +29,6 @@ pub const FRAME_REJECT: u8 = 0xFF;
 
 pub const METHOD_GET: u8 = 0;
 pub const METHOD_HEAD: u8 = 1;
-#[allow(dead_code)]
-pub const METHOD_POST: u8 = 2;
 
 pub const FLAG_LAST: u8 = 0x01;
 

@@ -56,10 +56,6 @@ pub const MAX_BRIDGE_SESSIONS: usize = 3;
 /// router opens come back to this server on a unique `/sess/<id>/` path.
 pub struct McpBridge {
     state: Arc<BridgeState>,
-    /// Handle to the background `serve` task. Held so [`Self::is_healthy`]
-    /// can detect when the accept loop has died (FD exhaustion, panic) and
-    /// callers can refuse to start a bridged turn against a dead listener.
-    server_handle: tokio::task::JoinHandle<()>,
 }
 
 struct BridgeState {
@@ -198,25 +194,12 @@ impl McpBridge {
             session_permits: Arc::new(Semaphore::new(MAX_BRIDGE_SESSIONS)),
         });
         let server_state = state.clone();
-        let server_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = serve(listener, server_state).await {
                 eprintln!("aivo: cursor_bridge::mcp server stopped: {e:#}");
             }
         });
-        Ok(Arc::new(Self {
-            state,
-            server_handle,
-        }))
-    }
-
-    /// True when the background `serve` task is still running. The cursor
-    /// router checks this before starting a bridged turn — once the accept
-    /// loop dies (FD exhaustion, listener bind lost), every subsequent
-    /// `session/new` would hang cursor-agent on a port no one is listening
-    /// on. Surfacing the failure as a 500 instead of a 60-second timeout is
-    /// cheap and avoids confusing debug logs.
-    pub fn is_healthy(&self) -> bool {
-        !self.server_handle.is_finished()
+        Ok(Arc::new(Self { state }))
     }
 
     pub fn port(&self) -> u16 {
@@ -228,7 +211,6 @@ impl McpBridge {
     /// that never touch the bridge (model listing, OPTIONS preflight, etc.).
     #[cfg(test)]
     pub fn for_tests() -> Arc<Self> {
-        let server_handle = tokio::spawn(async {});
         Arc::new(Self {
             state: Arc::new(BridgeState {
                 port: 0,
@@ -236,7 +218,6 @@ impl McpBridge {
                 parked: Mutex::new(HashMap::new()),
                 session_permits: Arc::new(Semaphore::new(MAX_BRIDGE_SESSIONS)),
             }),
-            server_handle,
         })
     }
 
@@ -434,14 +415,6 @@ impl McpBridge {
 }
 
 impl BridgeSession {
-    /// Replace the cached tool catalog. Currently invoked at session open;
-    /// no support yet for mid-session tool changes (would require
-    /// `notifications/tools/list_changed` over MCP SSE, which cursor-agent
-    /// did not subscribe to during the Phase 0 probe).
-    pub async fn set_tools(&mut self, tools: Vec<Value>) {
-        self.tools = tools;
-    }
-
     /// Install the channel the MCP HTTP handler should push events onto for
     /// this turn. Returns a receiver the router drains inside its SSE loop.
     /// Caller is responsible for clearing the channel with
@@ -454,10 +427,6 @@ impl BridgeSession {
 
     pub fn detach_event_sink(&mut self) {
         self.event_tx = None;
-    }
-
-    pub fn has_parked_call(&self) -> bool {
-        self.parked.is_some()
     }
 
     /// Move the freshly-opened ACP session + its first prompt's stream into

@@ -1833,12 +1833,6 @@ impl SessionStore {
         self.write_chat_prefs(&prefs).await
     }
 
-    /// "use aivo's hosted web_search" toggle (`/config`). Defaults OFF (opt-in) —
-    /// enabling routes searches through aivo's gateway and uses the daily quota.
-    pub async fn get_chat_web_search_enabled(&self) -> bool {
-        self.get_chat_pref_bool("useWebSearch", false).await
-    }
-
     /// Persist the web_search toggle, preserving sibling prefs (atomic write).
     pub async fn set_chat_web_search_enabled(&self, on: bool) -> Result<()> {
         let mut prefs = self.read_chat_prefs().await;
@@ -1986,7 +1980,6 @@ impl SessionStore {
         self.last_sel.set(key, tool, model).await
     }
 
-    #[allow(dead_code)]
     pub async fn clear_last_selection(&self) -> Result<()> {
         self.last_sel.clear().await
     }
@@ -1995,11 +1988,6 @@ impl SessionStore {
 
     pub async fn load_stats(&self) -> Result<UsageStats> {
         self.stats.load().await
-    }
-
-    #[allow(dead_code)]
-    pub async fn clear_stats(&self) -> Result<()> {
-        self.stats.clear().await
     }
 
     pub async fn remove_key_stats(&self, key_id: &str) -> Result<()> {

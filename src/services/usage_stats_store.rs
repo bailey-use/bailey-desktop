@@ -185,12 +185,6 @@ impl UsageStatsStore {
         stats.remove_key(key_id);
         self.stats_ctx.save(&stats).await
     }
-
-    #[allow(dead_code)]
-    pub(crate) async fn clear(&self) -> Result<()> {
-        let _lock = self.stats_ctx.acquire_lock()?;
-        self.stats_ctx.save(&UsageStats::default()).await
-    }
 }
 
 #[cfg(test)]
@@ -253,19 +247,6 @@ mod tests {
         assert_eq!(model.prompt_tokens, 300);
         assert_eq!(model.completion_tokens, 150);
         assert_eq!(model.cache_read_input_tokens, 80);
-    }
-
-    #[tokio::test]
-    async fn clear_resets_stats() {
-        let dir = TempDir::new().unwrap();
-        let store = test_store(&dir);
-        store
-            .record_selection("key1", "claude", None)
-            .await
-            .unwrap();
-        assert!(!store.load().await.unwrap().is_empty());
-        store.clear().await.unwrap();
-        assert!(store.load().await.unwrap().is_empty());
     }
 
     #[tokio::test]

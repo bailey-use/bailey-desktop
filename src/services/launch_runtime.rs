@@ -386,16 +386,6 @@ async fn persist_refreshed_if_needed(
     }
 }
 
-/// Convenience for the crash-path: delegates to `tokens_changed` via the
-/// read-back value. Exposed so tests don't need to touch disk.
-#[allow(dead_code)]
-pub(crate) fn detect_token_rotation(
-    original: &CodexOAuthCredential,
-    disk: &crate::services::codex_home_shadow::AuthDotJson,
-) -> bool {
-    tokens_changed(original, disk)
-}
-
 /// Heuristic for "the refresh server told us our refresh token is bad" vs
 /// "transient failure". 4xx from the token endpoint (`invalid_grant`,
 /// `invalid_request_error`) is recoverable via an interactive re-login;

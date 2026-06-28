@@ -8,13 +8,22 @@ use crate::services::session_store::{AttachmentStorage, MessageAttachment};
 
 use super::chat::ChatMessage;
 
-/// Lowest `reasoning_effort` accepted by the given OpenAI-family model, or `None`
-/// for non-reasoning models that would 400 on the field. gpt-5/codex pin to
-/// `"minimal"`: `"none"` is only valid on gpt-5.1+ and 400s on gpt-5.0 and
-/// gateways ("Reasoning is mandatory … cannot be disabled"), so `"minimal"` is the
-/// safe floor everywhere (matching the agent path's `thinking_request`). o-series
-/// accepts only low/medium/high → `"low"`. Anthropic/Gemini disable separately.
+/// Lowest `reasoning_effort` to send when thinking is off, or `None` for a
+/// non-reasoning model that 400s on the field. Catalog-first: the gpt-5 family
+/// diverged (5.0 → `minimal`, 5.1+/5.4 → `none`, codex → `low`), so a name guess
+/// 400s; the snapshot resolves it, name heuristics cover snapshot-absent models.
 fn openai_chat_no_thinking_value(model: &str) -> Option<&'static str> {
+    if let Some(limits) = crate::services::model_metadata::snapshot_limits(model) {
+        for level in ["none", "minimal", "low"] {
+            if limits.reasoning_efforts.iter().any(|e| e.as_str() == level) {
+                return Some(level);
+            }
+        }
+        // Reasoning-capable but no off level (e.g. gpt-5-pro) → omit, don't 400.
+        if !limits.reasoning_efforts.is_empty() {
+            return None;
+        }
+    }
     let lower = model.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
     if name.starts_with("gpt-5") || name.contains("codex") {
@@ -412,9 +421,15 @@ mod tests {
     use crate::services::session_store::AttachmentStorage;
 
     #[test]
-    fn test_openai_chat_disable_gpt5_uses_minimal() {
-        // "none" 400s on gpt-5.0 and gateways; "minimal" is the safe floor.
-        for model in ["gpt-5", "gpt-5-mini", "gpt-5.4", "gpt-5-codex"] {
+    fn test_openai_chat_disable_uses_catalog_off_level() {
+        // gpt-5 family diverged: 5.0 → minimal, 5.1+/5.4 → none, codex → low.
+        for (model, expected) in [
+            ("gpt-5", "minimal"),
+            ("gpt-5-mini", "minimal"),
+            ("gpt-5.2", "none"),
+            ("gpt-5.4", "none"),
+            ("gpt-5-codex", "low"),
+        ] {
             let body = build_openai_chat_request(
                 model,
                 &[ChatMessage {
@@ -427,7 +442,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_eq!(body["reasoning_effort"], "minimal", "model={model}");
+            assert_eq!(body["reasoning_effort"], expected, "model={model}");
         }
     }
 
@@ -485,7 +500,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(gpt5["reasoning"]["effort"], "minimal");
+        assert_eq!(gpt5["reasoning"]["effort"], "none"); // gpt-5.4 dropped minimal
 
         let gpt4o = build_responses_request(
             "gpt-4o",

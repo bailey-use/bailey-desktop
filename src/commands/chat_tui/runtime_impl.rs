@@ -62,12 +62,13 @@ pub(super) fn expand_skill_invocation(
     args: Option<&str>,
 ) -> String {
     let args = args.unwrap_or("").trim();
-    if skill.body.contains("$ARGUMENTS") {
-        return skill.body.replace("$ARGUMENTS", args);
+    let body = skill.instructions();
+    if body.contains("$ARGUMENTS") {
+        return body.replace("$ARGUMENTS", args);
     }
     let mut out = format!(
         "Use the \"{}\" skill. Follow these instructions:\n\n{}",
-        skill.name, skill.body
+        skill.name, body
     );
     if !args.is_empty() {
         out.push_str(&format!("\n\nInput: {args}"));

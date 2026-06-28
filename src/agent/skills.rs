@@ -6,21 +6,35 @@
 //! ecosystem shares (agentskills.io; Gemini CLI and Vercel's `skills` CLI
 //! populate it), AND Claude Code's `.claude/skills` (project + user) — so an
 //! existing library of `~/.claude/skills/*/SKILL.md` works in `aivo chat`
-//! unchanged. Only the
-//! names + (first-sentence) descriptions go in the system prompt; the `skill`
-//! tool loads a body on demand (progressive disclosure), and the model reads
-//! bundled files in the dir via its file tools.
+//! unchanged. Only the names + (first-sentence) descriptions go in the system
+//! prompt; the `skill` tool loads a body on demand (progressive disclosure), and
+//! the model reads bundled files in the dir via its file tools.
 
 use crate::agent::protocol::ToolSpec;
 use serde_json::json;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// Inline body for the dir-less builtin and test fixtures; empty for discovered
+    /// skills, which read `dir/SKILL.md` lazily via [`Skill::instructions`].
     pub body: String,
     pub dir: PathBuf,
+}
+
+impl Skill {
+    /// Instruction body: inline `body` if present, else read `dir/SKILL.md` on
+    /// demand — never read at discovery.
+    pub fn instructions(&self) -> Cow<'_, str> {
+        if !self.body.is_empty() {
+            return Cow::Borrowed(&self.body);
+        }
+        let text = std::fs::read_to_string(self.dir.join("SKILL.md")).unwrap_or_default();
+        Cow::Owned(split_frontmatter(&text).1.trim().to_string())
+    }
 }
 
 /// Discover skills, project dir before user dir (so a repo can shadow a personal
@@ -586,25 +600,49 @@ fn read_root(root: &Path) -> Vec<Skill> {
     dirs.iter().filter_map(|dir| load_skill(dir)).collect()
 }
 
-/// Load one skill folder; `None` if it has no readable `SKILL.md`.
+/// Load one skill folder; `None` if it has no readable `SKILL.md`. Reads only the
+/// frontmatter head — the body loads lazily ([`Skill::instructions`]).
 fn load_skill(dir: &Path) -> Option<Skill> {
-    let text = std::fs::read_to_string(dir.join("SKILL.md")).ok()?;
     let dir_name = dir.file_name()?.to_string_lossy().into_owned();
-    let (front, body) = split_frontmatter(&text);
+    let path = dir.join("SKILL.md");
+    let front = read_frontmatter_block(&path);
     let name = front
-        .as_ref()
+        .as_deref()
         .and_then(|f| field(f, "name"))
         .unwrap_or(dir_name);
-    let description = front
-        .as_ref()
-        .and_then(|f| field(f, "description"))
-        .unwrap_or_else(|| first_non_empty_line(body));
+    let description = match front.as_deref().and_then(|f| field(f, "description")) {
+        Some(d) => d,
+        // No frontmatter description: fall back to the first body line (one full
+        // read, this skill only); unreadable `SKILL.md` → skip.
+        None => first_non_empty_line(split_frontmatter(&std::fs::read_to_string(&path).ok()?).1),
+    };
     Some(Skill {
         name,
         description,
-        body: body.trim().to_string(),
+        body: String::new(),
         dir: dir.to_path_buf(),
     })
+}
+
+/// The leading `---`…`---` frontmatter (fences excluded), without reading the body.
+/// `None` if unreadable, not opening with `---`, or unterminated. Matches
+/// [`split_frontmatter`]'s strict line match.
+fn read_frontmatter_block(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let mut lines = std::io::BufReader::new(std::fs::File::open(path).ok()?).lines();
+    if lines.next()?.ok()? != "---" {
+        return None;
+    }
+    let mut block = String::new();
+    for line in lines {
+        let line = line.ok()?;
+        if line == "---" {
+            return Some(block);
+        }
+        block.push_str(&line);
+        block.push('\n');
+    }
+    None
 }
 
 /// Split a leading `---`…`---` YAML block from the body. Returns `(frontmatter,
@@ -772,7 +810,7 @@ pub fn load_skill_result(skills: &[Skill], name: &str) -> Result<String, String>
             "Skill: {}\nFolder: {}\n\n{}",
             skill.name,
             skill.dir.display(),
-            skill.body
+            skill.instructions()
         )),
         None => {
             let available: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
@@ -821,7 +859,8 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "pdf-filler");
         assert_eq!(skills[0].description, "Fill PDF forms");
-        assert_eq!(skills[0].body, "Step 1. Do the thing.");
+        assert!(skills[0].body.is_empty()); // not read at discovery
+        assert_eq!(skills[0].instructions(), "Step 1. Do the thing."); // lazy from disk
     }
 
     #[test]
@@ -840,7 +879,7 @@ mod tests {
             s.description,
             "MANUAL TRIGGER ONLY: invoke only when the user types it. Study a repo."
         );
-        assert_eq!(s.body, "Do the study.");
+        assert_eq!(s.instructions(), "Do the study.");
 
         // A literal `|` description keeps its line breaks; a following key still
         // parses (the block ends when indentation returns to the key level).
@@ -995,7 +1034,10 @@ mod tests {
         let skills = discover_from_roots(std::slice::from_ref(&root));
         let skill = skills.iter().find(|s| s.name == "changelog").unwrap();
         assert_eq!(skill.description, "Summarize the git log");
-        assert!(!skill.body.is_empty(), "template body should not be empty");
+        assert!(
+            !skill.instructions().is_empty(),
+            "template body should not be empty"
+        );
 
         // A second scaffold of the same name refuses rather than clobbering.
         assert!(

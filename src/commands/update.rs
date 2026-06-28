@@ -21,11 +21,9 @@ const MODELS_DEV_API: &str = "https://models.dev/api.json";
 /// Download ceiling (the file is ~2 MB today); bounds memory if the host misbehaves.
 const MODELS_DEV_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Ed25519 public key (the base64 line of `aivo.pub`) that every self-update
-/// download is verified against. The matching secret key lives only in CI
-/// secrets and signs each release artifact into a detached `.minisig`. This is
-/// the trust anchor: a compromised download host can't forge an update without
-/// it. Authenticity check; the SHA-256 stays as a corruption check.
+/// Trust anchor for self-update: every download is verified against this Ed25519
+/// key, whose secret lives only in CI and signs each release. Authenticity check
+/// — SHA-256 only guards against corruption.
 const MINISIGN_PUBKEY: &str = "RWTXF3LNcIUx6667XJo3zslNJQPdcNqMagE/Qp7AQUZTQ2BoghNzgwd7";
 
 pub struct UpdateCommand {
@@ -36,7 +34,6 @@ pub struct UpdateCommand {
 }
 
 impl UpdateCommand {
-    /// Shows usage information for the update command
     pub fn print_help() {
         println!("{} aivo update [OPTIONS]", style::bold("Usage:"));
         println!();
@@ -77,7 +74,6 @@ impl UpdateCommand {
         println!("  {}", style::dim("aivo update --sync-model-data"));
     }
 
-    /// Creates a new UpdateCommand instance
     pub fn new() -> Result<Self> {
         let client = crate::services::http_utils::aivo_http_client_builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -133,7 +129,6 @@ impl UpdateCommand {
     }
 
     async fn execute_internal(&self, force: bool) -> Result<ExitCode> {
-        // Check for package-manager-managed installations
         if !force {
             let install_path = get_install_path()?;
             if let Some(manager) = detect_managed_install(&install_path) {
@@ -345,7 +340,6 @@ impl UpdateCommand {
             .context("Failed to read response body")
     }
 
-    /// Downloads and installs the update
     async fn install_update(
         &self,
         download_url: &str,
@@ -396,7 +390,6 @@ impl UpdateCommand {
             style::green("verified")
         );
 
-        // Make executable (Unix only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -418,9 +411,7 @@ impl UpdateCommand {
             );
         }
 
-        // Replace with the new binary
         if let Err(e) = tokio::fs::rename(&tmp_path, &exec_path).await {
-            // Restore backup if the replace failed
             if has_backup {
                 tokio::fs::rename(&backup_path, &exec_path).await.ok();
             }
@@ -545,9 +536,7 @@ impl UpdateCommand {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    /// Compares two semantic version strings.
-    /// Strips pre-release suffixes (e.g. -rc1, -beta.1) before comparing.
-    /// A pre-release version is considered older than its release counterpart.
+    /// Compares semver strings; a pre-release (`-rc1`) sorts older than its release.
     fn is_newer_version(&self, latest: &str, current: &str) -> bool {
         let parse_version = |version: &str| -> (Vec<u32>, bool) {
             let cleaned = version.trim_start_matches('v');
@@ -589,7 +578,6 @@ impl UpdateCommand {
         false
     }
 
-    /// Handles errors
     fn handle_error(&self, error: anyhow::Error) {
         eprintln!("{} {:#}", style::red("Error:"), error);
         eprintln!();
@@ -627,7 +615,6 @@ impl UpdateCommand {
         }
     }
 
-    /// Delegates update to Homebrew
     fn update_via_homebrew(&self) -> ExitCode {
         println!("{} Updating via Homebrew...", style::arrow_symbol());
 
@@ -712,7 +699,6 @@ fn parse_checksum_text(text: &str, binary_name: &str) -> Option<String> {
     fallback_hash
 }
 
-/// Gets the expected binary asset name for the current platform/arch
 fn get_binary_name() -> Result<String> {
     let platform = env::consts::OS;
     let arch = env::consts::ARCH;
@@ -873,13 +859,11 @@ fn normalize_install_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Detected package manager type
 enum PackageManager {
     Homebrew,
     Cargo,
 }
 
-/// Information about a detected package manager
 struct ManagedInstall {
     kind: PackageManager,
     name: &'static str,
@@ -1070,17 +1054,11 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
     fn test_prerelease_version() {
         let cmd = UpdateCommand::new().unwrap();
 
-        // Release is newer than same-version pre-release
         assert!(cmd.is_newer_version("2.0.0", "2.0.0-rc1"));
         assert!(cmd.is_newer_version("2.0.0", "2.0.0-beta.1"));
-
-        // Pre-release is not newer than its release
         assert!(!cmd.is_newer_version("2.0.0-rc1", "2.0.0"));
-
-        // Same pre-release versions are not newer
         assert!(!cmd.is_newer_version("2.0.0-rc1", "2.0.0-rc1"));
-
-        // Higher version is still newer regardless of pre-release
+        // Higher version wins regardless of pre-release.
         assert!(cmd.is_newer_version("2.1.0-rc1", "2.0.0"));
         assert!(cmd.is_newer_version("2.1.0", "2.0.0-rc1"));
     }

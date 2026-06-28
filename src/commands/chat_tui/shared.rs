@@ -1686,6 +1686,9 @@ pub(super) struct ChatTuiApp {
     /// Snapshot vision support, cached on each model resolve. `Some(false)` =
     /// text-only (image sends refused pre-flight); `None` = unknown (let through).
     pub(super) model_image_input: Option<bool>,
+    /// Parsed Cursor effort tier for the footer badge (`None` for non-cursor or
+    /// bare ids); set in `refresh_context_window`.
+    pub(super) cursor_effort_label: Option<String>,
     /// `/effort` reasoning level chosen by the user (None = model default);
     /// applied to the engine on build/change and persisted in chat-prefs.
     pub(super) reasoning_effort: Option<String>,

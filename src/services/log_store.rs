@@ -620,22 +620,10 @@ fn build_list_query(query: &LogQuery, include_run_phase_fields: bool) -> (String
         params.push(SqlValue::Text(term));
     }
     if let Some(cwd) = normalize_text_filter(query.cwd.clone()) {
-        // "this directory or its descendants" — equality first, then a
-        // `cwd/%` prefix. A bare substring match would falsely include
-        // sibling dirs that share a path prefix (e.g. filter `/foo/bar`
-        // also matching `/foo/bar-other`).
-        //
-        // Cross-platform normalization:
-        //   - trailing separators (`/` or `\`) stripped on both sides
-        //   - the filter's backslashes pre-flipped to `/` in Rust
-        //   - the stored cwd's backslashes flipped to `/` on the SQL side
-        //     via `replace(..., '\', '/')` so a row written as
-        //     `C:\Users\yc` matches a filter typed as `C:/Users/yc`
-        // The `lower()` on both sides keeps comparisons case-insensitive
-        // (`normalize_text_filter` already lowercased the filter, but the
-        // column might still hold mixed case on Windows or from older
-        // writes). Index loss from the function wrapping is acceptable —
-        // we already filter by `ts_utc desc` first.
+        // Match the dir or its descendants via `= ?` / `like ?/%`; a substring
+        // match would catch sibling prefixes (`/foo/bar` vs `/foo/bar-other`).
+        // Normalize separators to `/` and lower-case both sides so Windows
+        // backslash/case variants compare equal.
         let cwd: String = cwd
             .trim_end_matches(['/', '\\'])
             .chars()

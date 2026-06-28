@@ -2318,68 +2318,62 @@ mod tests {
 
     #[test]
     fn cwd_is_under_handles_prefix_collisions() {
-        // Exact match.
         assert!(cwd_is_under("/foo/bar", "/foo/bar"));
-        // Subdirectory.
         assert!(cwd_is_under("/foo/bar/sub", "/foo/bar"));
         assert!(cwd_is_under("/foo/bar/sub/deep", "/foo/bar"));
-        // Trailing slash tolerance.
         assert!(cwd_is_under("/foo/bar/", "/foo/bar"));
         assert!(cwd_is_under("/foo/bar", "/foo/bar/"));
-        // Sibling that shares a prefix — must NOT match. This is the
-        // regression that the old `String::contains` matcher missed.
+        // Sibling/mid-string prefixes must NOT match (regression vs the old
+        // `String::contains` matcher).
         assert!(!cwd_is_under("/foo/bar-other", "/foo/bar"));
         assert!(!cwd_is_under("/foo/barother", "/foo/bar"));
-        // Path fragment occurring mid-string — must NOT match.
         assert!(!cwd_is_under("/elsewhere/foo/bar/x", "/foo/bar"));
-        // Unrelated path.
         assert!(!cwd_is_under("/other", "/foo/bar"));
     }
 
     #[test]
     fn cwd_is_under_handles_windows_paths() {
-        // Backslash separators on both sides — exact and subdir.
-        assert!(cwd_is_under(r"C:\Users\yc\project", r"C:\Users\yc\project"));
         assert!(cwd_is_under(
-            r"C:\Users\yc\project\src",
-            r"C:\Users\yc\project"
-        ));
-        // Mixed separators: filter forward-slashed, stored back-slashed.
-        // Real Windows runs can produce both depending on where the cwd
-        // string was captured.
-        assert!(cwd_is_under(
-            r"C:\Users\yc\project\src",
-            "C:/Users/yc/project"
+            r"C:\Users\alice\project",
+            r"C:\Users\alice\project"
         ));
         assert!(cwd_is_under(
-            "C:/Users/yc/project/src",
-            r"C:\Users\yc\project"
+            r"C:\Users\alice\project\src",
+            r"C:\Users\alice\project"
         ));
-        // Trailing separator (either kind) tolerated.
+        // Mixed separators: real Windows runs produce both.
         assert!(cwd_is_under(
-            r"C:\Users\yc\project\",
-            r"C:\Users\yc\project"
+            r"C:\Users\alice\project\src",
+            "C:/Users/alice/project"
         ));
         assert!(cwd_is_under(
-            r"C:\Users\yc\project",
-            r"C:\Users\yc\project\"
+            "C:/Users/alice/project/src",
+            r"C:\Users\alice\project"
         ));
-        // Sibling that shares a prefix — must NOT match.
+        assert!(cwd_is_under(
+            r"C:\Users\alice\project\",
+            r"C:\Users\alice\project"
+        ));
+        assert!(cwd_is_under(
+            r"C:\Users\alice\project",
+            r"C:\Users\alice\project\"
+        ));
         assert!(!cwd_is_under(
-            r"C:\Users\yc\project-other",
-            r"C:\Users\yc\project"
+            r"C:\Users\alice\project-other",
+            r"C:\Users\alice\project"
         ));
     }
 
     #[cfg(windows)]
     #[test]
     fn cwd_is_under_case_insensitive_on_windows() {
-        // Windows filesystems are case-insensitive by default; `\foo` and
-        // `\FOO` should match.
-        assert!(cwd_is_under(r"C:\USERS\YC\Project", r"c:\users\yc\project"));
         assert!(cwd_is_under(
-            r"c:\users\yc\project\Src",
-            r"C:\Users\yc\project"
+            r"C:\USERS\ALICE\Project",
+            r"c:\users\alice\project"
+        ));
+        assert!(cwd_is_under(
+            r"c:\users\alice\project\Src",
+            r"C:\Users\alice\project"
         ));
     }
 

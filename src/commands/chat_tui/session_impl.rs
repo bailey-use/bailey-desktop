@@ -57,6 +57,17 @@ impl ChatTuiApp {
         .await;
         // A `--max-context` override wins over the resolved window.
         self.context_window = self.context_window_override.or(limits.context).unwrap_or(0);
+        // Cursor bakes the effort tier into bare ids; resolve the window from the
+        // underlying model + surface the tier. Unknown → footer token-count.
+        self.cursor_effort_label = if self.key.is_cursor_acp() {
+            let parts = crate::services::cursor_acp::parse_cursor_model(&self.model);
+            if self.context_window_override.is_none() {
+                self.context_window = parts.context_window().unwrap_or(0);
+            }
+            parts.effort_label()
+        } else {
+            None
+        };
         // Valid `/effort` levels: live catalog (e.g. aivo/starter) or snapshot.
         self.model_reasoning_efforts = limits.reasoning_efforts.clone();
         // Reasoning-capable per the snapshot, or implied by advertised levels.
@@ -80,10 +91,16 @@ impl ChatTuiApp {
     /// no levels.
     pub(super) async fn run_effort_command(&mut self, arg: Option<String>) {
         if self.model_reasoning_efforts.is_empty() {
-            self.notice = Some((
-                MUTED,
-                format!("{} has no reasoning-effort levels", self.model),
-            ));
+            // Cursor has no effort param — the tier is part of the model id.
+            let msg = if self.key.is_cursor_acp() {
+                format!(
+                    "{} bakes effort into the name — use /model to pick a tier (…-high, …-max)",
+                    self.model
+                )
+            } else {
+                format!("{} has no reasoning-effort levels", self.model)
+            };
+            self.notice = Some((MUTED, msg));
             return;
         }
         match arg.map(|s| s.trim().to_ascii_lowercase()) {

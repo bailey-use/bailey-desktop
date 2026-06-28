@@ -617,6 +617,112 @@ fn is_plausible_model_id(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':' | b'@'))
 }
 
+/// Reasoning tiers Cursor bakes into model-id suffixes (`none` = off); it ships
+/// one id per tier rather than a `reasoning_effort` param.
+const CURSOR_EFFORT_TIERS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+
+/// A Cursor model id split into underlying model + baked-in effort/mode:
+/// `<base>[-thinking]-<tier>[-fast]` (thinking on either side of the tier).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorModelParts {
+    pub base: String,
+    pub tier: Option<&'static str>,
+    pub thinking: bool,
+    pub fast: bool,
+}
+
+impl CursorModelParts {
+    /// Footer label like `max · thinking · fast`; `None` if no effort/mode hint.
+    pub fn effort_label(&self) -> Option<String> {
+        let label = [
+            self.tier,
+            self.thinking.then_some("thinking"),
+            self.fast.then_some("fast"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        (!label.is_empty()).then_some(label)
+    }
+
+    /// The underlying model's context window (`None` if unknown): Cursor-native
+    /// ids, then snapshot, then the reordered version-first Claude spelling.
+    pub fn context_window(&self) -> Option<u64> {
+        use crate::services::model_metadata::snapshot_limits;
+        // First, so a coincidental snapshot id (a bare `auto` row) can't shadow it.
+        if let Some(ctx) = cursor_native_context_window(&self.base) {
+            return Some(ctx);
+        }
+        if let Some(ctx) = snapshot_limits(&self.base).and_then(|l| l.context) {
+            return Some(ctx);
+        }
+        reorder_claude_version_first(&self.base)
+            .and_then(|alt| snapshot_limits(&alt).and_then(|l| l.context))
+    }
+}
+
+/// Windows for Cursor's own ids, absent from models.dev. Exact-match (not
+/// prefix) so an unseen future id stays unknown rather than wrongly numbered.
+fn cursor_native_context_window(base: &str) -> Option<u64> {
+    match base {
+        "composer-2.5" => Some(200_000),
+        "auto" => Some(2_000_000),
+        _ => None,
+    }
+}
+
+/// Decompose a Cursor model id. Strips at most one each of `-fast`/tier/
+/// `-thinking` so a family ending in a tier word (`gpt-5.1-codex-max`) survives.
+pub fn parse_cursor_model(id: &str) -> CursorModelParts {
+    let mut s = id;
+    let mut fast = false;
+    if let Some(prefix) = s.strip_suffix("-fast") {
+        s = prefix;
+        fast = true;
+    }
+    let mut tier = None;
+    let mut thinking = false;
+    // Two passes cover `-thinking-<tier>` and `-<tier>-thinking`; each token once.
+    for _ in 0..2 {
+        if tier.is_none()
+            && let Some((prefix, matched)) = CURSOR_EFFORT_TIERS.iter().find_map(|&t| {
+                s.strip_suffix(t)
+                    .and_then(|p| p.strip_suffix('-'))
+                    .map(|p| (p, t))
+            })
+        {
+            s = prefix;
+            tier = Some(matched);
+            continue;
+        }
+        if !thinking && let Some(prefix) = s.strip_suffix("-thinking") {
+            s = prefix;
+            thinking = true;
+            continue;
+        }
+        break;
+    }
+    CursorModelParts {
+        base: s.to_string(),
+        tier,
+        thinking,
+        fast,
+    }
+}
+
+/// Swap Cursor's version-first `claude-4.6-opus` to the snapshot's
+/// `claude-opus-4.6`; `None` if not shaped that way.
+fn reorder_claude_version_first(base: &str) -> Option<String> {
+    let rest = base.strip_prefix("claude-")?;
+    for family in ["opus", "sonnet", "haiku"] {
+        if let Some(version) = rest.strip_suffix(family).and_then(|p| p.strip_suffix('-')) {
+            return Some(format!("claude-{family}-{version}"));
+        }
+    }
+    None
+}
+
 fn parse_cursor_status_authenticated(output: &str) -> Option<bool> {
     let value: Value = serde_json::from_str(output.trim()).ok()?;
     status_value_authenticated(&value)
@@ -1446,6 +1552,94 @@ fn pick_prefer_no_thinking(list: &[Value], requested: &str) -> Option<String> {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn parse_cursor_model_decomposes_effort_suffixes() {
+        let p = parse_cursor_model("claude-opus-4-8-high");
+        assert_eq!(p.base, "claude-opus-4-8");
+        assert_eq!(p.tier, Some("high"));
+        assert!(!p.thinking && !p.fast);
+
+        let p = parse_cursor_model("claude-opus-4-8-max-fast");
+        assert_eq!(p.base, "claude-opus-4-8");
+        assert_eq!(p.tier, Some("max"));
+        assert!(p.fast && !p.thinking);
+
+        // thinking on either side of the tier resolves the same.
+        for id in [
+            "claude-opus-4-8-thinking-high-fast",
+            "claude-4.5-opus-high-thinking",
+        ] {
+            let p = parse_cursor_model(id);
+            assert_eq!(p.tier, Some("high"), "{id}");
+            assert!(p.thinking, "{id}");
+        }
+
+        // `-xhigh` not mis-stripped to `-high` (the `-` boundary guards it).
+        assert_eq!(
+            parse_cursor_model("claude-opus-4-8-xhigh").tier,
+            Some("xhigh")
+        );
+
+        // A family ending in a tier word keeps its name (one tier stripped).
+        let p = parse_cursor_model("gpt-5.1-codex-max-high");
+        assert_eq!(p.base, "gpt-5.1-codex-max");
+        assert_eq!(p.tier, Some("high"));
+
+        for id in ["auto", "claude-4.5-sonnet"] {
+            let p = parse_cursor_model(id);
+            assert_eq!(p.base, id);
+            assert_eq!(p.tier, None);
+            assert_eq!(p.effort_label(), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn cursor_effort_label_joins_tier_and_modes() {
+        let p = parse_cursor_model("claude-opus-4-8-thinking-max-fast");
+        assert_eq!(p.effort_label().as_deref(), Some("max · thinking · fast"));
+        assert_eq!(
+            parse_cursor_model("claude-4-sonnet-thinking")
+                .effort_label()
+                .as_deref(),
+            Some("thinking")
+        );
+    }
+
+    #[test]
+    fn cursor_model_context_window_recovers_underlying_window() {
+        assert_eq!(
+            parse_cursor_model("claude-opus-4-8-max").context_window(),
+            Some(1_000_000)
+        );
+        // Version-first spelling resolves via the reorder fallback.
+        assert_eq!(
+            parse_cursor_model("claude-4.6-opus-high-thinking").context_window(),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            parse_cursor_model("claude-4-sonnet").context_window(),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            parse_cursor_model("claude-4.5-opus-high").context_window(),
+            Some(200_000)
+        );
+        // Cursor-native, absent from models.dev (`-fast` strips to the same base).
+        assert_eq!(
+            parse_cursor_model("composer-2.5").context_window(),
+            Some(200_000)
+        );
+        assert_eq!(
+            parse_cursor_model("composer-2.5-fast").context_window(),
+            Some(200_000)
+        );
+        assert_eq!(parse_cursor_model("auto").context_window(), Some(2_000_000));
+        assert_eq!(
+            parse_cursor_model("zzz-unknown-model-9").context_window(),
+            None
+        );
+    }
 
     fn key(secret: &str) -> ApiKey {
         ApiKey {

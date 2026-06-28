@@ -1965,10 +1965,14 @@ impl ChatTuiApp {
     /// when a narrow terminal squeezes this bar.
     fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        // Reasoning effort — the same effective level the engine sends, so they
-        // can't disagree. Shown only when thinking is on for a thinking-capable
-        // model; hidden when thinking is off (the engine isn't reasoning then).
-        if self.thinking_enabled
+        // Effort: Cursor's tier comes from the model id; otherwise the effective
+        // level the engine sends (only while thinking is on, so they can't disagree).
+        if let Some(label) = self.cursor_effort_label.as_deref() {
+            spans.push(Span::styled(
+                format!("effort: {label}"),
+                Style::default().fg(TOOL),
+            ));
+        } else if self.thinking_enabled
             && self.model_supports_thinking
             && let Some(level) = self.effective_reasoning_effort()
         {

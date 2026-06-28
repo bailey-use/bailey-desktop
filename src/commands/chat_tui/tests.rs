@@ -1084,6 +1084,7 @@ fn make_test_app(
         web_search_enabled: true,
         model_supports_thinking: true,
         model_image_input: None,
+        cursor_effort_label: None,
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
@@ -3521,6 +3522,36 @@ fn test_display_cwd_shows_real_dir_for_cursor_keys() {
     assert_eq!(app.display_cwd(), "/home/me/project");
 }
 
+#[tokio::test]
+async fn test_cursor_model_refresh_sets_window_and_effort_badge() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key = ApiKey::new_with_protocol(
+        "cursor".to_string(),
+        String::new(),
+        "cursor".to_string(),
+        None,
+        String::new(),
+    );
+
+    // Claude tier → underlying-model window + tier badge.
+    app.model = "claude-opus-4-8-max".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 1_000_000);
+    assert_eq!(app.cursor_effort_label.as_deref(), Some("max"));
+
+    // Cursor-native windows (not in models.dev): composer 200k, auto 2M.
+    app.model = "composer-2.5".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 200_000);
+    assert_eq!(app.cursor_effort_label, None);
+
+    app.model = "auto".to_string();
+    app.refresh_context_window().await;
+    assert_eq!(app.context_window, 2_000_000);
+    assert_eq!(app.cursor_effort_label, None);
+}
+
 #[test]
 fn test_agent_events_build_display_history() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -3560,36 +3591,34 @@ fn test_agent_events_build_display_history() {
 fn test_native_tool_paths_render_relative_to_cwd() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.real_cwd = "/Users/yc/project/work/llm-server".to_string();
+    app.real_cwd = "/Users/alice/proj".to_string();
 
-    // A path under the cwd renders relative — the absolute prefix is noise the
-    // footer already shows, and it pushed the distinguishing basename off-screen.
+    // Paths under cwd render relative (the absolute prefix is footer noise).
     app.apply_agent_tool_call(
         None,
         "read_file".to_string(),
-        serde_json::json!({"path": "/Users/yc/project/work/llm-server/apps/web/src/routes/chat/+page.svelte"}),
+        serde_json::json!({"path": "/Users/alice/proj/src/ui/views/panel.rs"}),
     );
     app.apply_agent_tool_result("128 lines".to_string());
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(
-        plain.contains("read_file(apps/web/src/routes/chat/+page.svelte)"),
+        plain.contains("read_file(src/ui/views/panel.rs)"),
         "{plain}"
     );
     assert!(
-        !plain.contains("/Users/yc/project"),
+        !plain.contains("/Users/alice/proj"),
         "absolute path leaked: {plain}"
     );
 
-    // A relative path too long to fit is left-truncated on a segment boundary so
-    // the basename survives (vs. the old tail-truncation that cut it off).
+    // Over-long paths left-truncate on a segment boundary to keep the basename.
     app.apply_agent_tool_call(
         None,
         "read_file".to_string(),
-        serde_json::json!({"path": "/Users/yc/project/work/llm-server/apps/web/src/routes/dashboard/settings/billing/invoices/detail/+page.svelte"}),
+        serde_json::json!({"path": "/Users/alice/proj/src/module/feature/component/section/detail/view/inner/widget.rs"}),
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("…/"), "expected left-truncation: {plain}");
-    assert!(plain.contains("+page.svelte"), "basename lost: {plain}");
+    assert!(plain.contains("widget.rs"), "basename lost: {plain}");
 }
 
 #[test]
@@ -3678,15 +3707,18 @@ fn test_adjacent_search_tools_merge_into_one_group() {
 fn test_run_bash_label_strips_redundant_cd_prefix() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    app.real_cwd = "/Users/yc/project/work/aivo".to_string();
+    app.real_cwd = "/Users/alice/project/work/aivo".to_string();
     app.apply_agent_tool_call(
         None,
         "run_bash".to_string(),
-        serde_json::json!({"command": "cd /Users/yc/project/work/aivo && git show f391ffd"}),
+        serde_json::json!({"command": "cd /Users/alice/project/work/aivo && git show f391ffd"}),
     );
     let plain = app.build_transcript().plain_lines.join("\n");
     assert!(plain.contains("run_bash(git show f391ffd)"), "{plain}");
-    assert!(!plain.contains("cd /Users/yc/project/work/aivo"), "{plain}");
+    assert!(
+        !plain.contains("cd /Users/alice/project/work/aivo"),
+        "{plain}"
+    );
 }
 
 #[test]

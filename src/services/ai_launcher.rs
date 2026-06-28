@@ -27,7 +27,8 @@ use crate::services::native_session_probe::SessionProbe;
 use crate::services::ollama;
 use crate::services::path_search::{collect_path_dirs, collect_path_dirs_from, find_in_dirs};
 use crate::services::provider_profile::{
-    is_copilot_base, is_direct_openai_base, is_ollama_base, provider_profile_for_base_url,
+    is_aivo_starter_base, is_copilot_base, is_direct_openai_base, is_ollama_base,
+    provider_profile_for_base_url,
 };
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::route_cache::PersistedRoute;
@@ -1027,8 +1028,10 @@ impl AILauncher {
     /// shows on a genuine miss.
     async fn fetch_pi_models(&self, key: &ApiKey) -> Vec<String> {
         let cache_key = crate::commands::models::full_catalog_cache_key_for_key(key);
-        if let Some(cached) = self.cache.get(&cache_key).await {
-            return cached;
+        if let Some((ids, metadata)) = self.cache.get_with_metadata(&cache_key).await
+            && starter_catalog_window_cached(key, &metadata)
+        {
+            return ids;
         }
         let client = crate::services::http_utils::router_http_client();
         let (spinning, spinner_handle) = crate::style::start_spinner(Some(" Fetching models..."));
@@ -1184,6 +1187,20 @@ struct ResolvedLaunchContext {
     /// `build_runtime_args`. `None` on preview and for OAuth/ollama/copilot keys.
     codex_app_models: Option<Vec<String>>,
     tool_config: ToolConfig,
+}
+
+/// The snapshot can't know `aivo/starter`, so a starter catalog cached without
+/// its window must re-fetch from `/v1/models` or Pi drops to 128k. Scoped to
+/// starter so id-only providers don't re-fetch every launch.
+fn starter_catalog_window_cached(
+    key: &ApiKey,
+    metadata: &HashMap<String, crate::services::models_cache::ModelMetadata>,
+) -> bool {
+    !is_aivo_starter_base(&key.base_url)
+        || metadata
+            .get(crate::constants::AIVO_STARTER_MODEL)
+            .and_then(|m| m.context_window)
+            .is_some()
 }
 
 /// Drops slugs containing control bytes (NUL, newline, CR, tab) that a buggy

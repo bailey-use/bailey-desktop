@@ -2094,6 +2094,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             .ok();
     }
 
+    fn discard_streamed_segment(&mut self) {
+        self.tx.send(RuntimeEvent::AgentDiscardSegment).ok();
+    }
+
     fn context_usage(&mut self, tokens: u64, measured: bool) {
         self.tx
             .send(RuntimeEvent::AgentContext { tokens, measured })

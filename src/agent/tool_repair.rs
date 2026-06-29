@@ -22,13 +22,20 @@ pub(crate) fn prefix_fingerprint(system: &Value, tools: &[Value]) -> (u64, u64) 
 
 const LEAKED_TOOL_TAGS: &[&str] = &["tool_calls", "tool_call", "function_calls", "invoke"];
 
-/// Stripped content if `content` leaks a tool call as plain-text markup, else `None`.
+/// Stripped content if `content` is a tool call rendered as plain-text markup, else
+/// `None`. Flagged only when the markup *dominates* the message, so prose that merely
+/// quotes `<tool_calls>`-style markup as an inline example survives untouched.
 pub(crate) fn strip_if_leaked(content: &str) -> Option<String> {
     if !content.contains('<') {
         return None;
     }
     let cleaned = strip_leaked_tool_calls(content);
-    (cleaned != content).then_some(cleaned)
+    if cleaned == content {
+        return None;
+    }
+    let removed = content.len().saturating_sub(cleaned.len());
+    let remaining = cleaned.trim().len();
+    (remaining == 0 || removed >= remaining).then_some(cleaned)
 }
 
 /// Strip balanced tool-call markup (nested goes as a unit; unbalanced is kept).
@@ -150,6 +157,16 @@ mod tests {
     fn keeps_prose_and_unbalanced_tail_after_a_balanced_block() {
         let s = "<tool_calls>a</tool_calls>b<tool_calls>c";
         assert_eq!(strip_leaked_tool_calls(s), "b<tool_calls>c");
+    }
+
+    #[test]
+    fn keeps_an_inline_markup_example_inside_a_larger_explanation() {
+        let answer = "When a weak model emits a tool call as text it looks like \
+            <tool_calls>{\"name\":\"read_file\"}</tool_calls> and nothing runs.";
+        assert!(strip_if_leaked(answer).is_none());
+        // A markup-dominated message (brief lead-in + the call) is still a leak.
+        let leak = "Let me read it. <tool_calls>{\"name\":\"read_file\"}</tool_calls>";
+        assert_eq!(strip_if_leaked(leak).as_deref(), Some("Let me read it. "));
     }
 
     #[test]

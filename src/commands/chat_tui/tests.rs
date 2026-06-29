@@ -8250,6 +8250,40 @@ async fn test_interrupt_inflight_request_keeps_partial_response() {
     );
 }
 
+/// A leaked tool-call streamed as text must not persist in the scrollback — the
+/// engine emits `AgentDiscardSegment` so only the retry's clean answer commits.
+#[tokio::test]
+async fn test_discard_segment_drops_leaked_markup_from_scrollback() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "<tool_calls>{\"name\":\"read_file\"}</tool_calls>".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    // Engine strips + retries → tells the UI to drop the leaked segment.
+    app.tx.send(RuntimeEvent::AgentDiscardSegment).unwrap();
+    app.handle_runtime_events().await.unwrap();
+    assert!(app.pending_response.is_empty(), "typed reply cleared");
+    assert!(app.incoming_buffer.is_empty(), "buffered reply cleared");
+    // The retry's real answer streams in fresh.
+    app.tx
+        .send(RuntimeEvent::Delta(ChatResponseChunk::Content(
+            "done".to_string(),
+        )))
+        .unwrap();
+    app.handle_runtime_events().await.unwrap();
+    app.flush_pending_assistant();
+    let last = app.history.last().expect("a committed assistant segment");
+    assert_eq!(last.content, "done");
+    assert!(
+        !last.content.contains("<tool_calls>"),
+        "leaked markup must never reach the scrollback: {:?}",
+        last.content
+    );
+}
+
 /// Interrupting an output-less request must not prepend the cancelled text onto
 /// a freshly typed message.
 #[tokio::test]

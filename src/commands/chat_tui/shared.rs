@@ -1318,6 +1318,9 @@ pub(super) enum RuntimeEvent {
     AgentToolResult {
         content: String,
     },
+    /// The agent's just-streamed output was a tool call written as text: drop the
+    /// uncommitted segment so the markup never reaches the scrollback.
+    AgentDiscardSegment,
     /// A background MCP connect finished. Carries the client (possibly empty) and
     /// the generation it started under; the event loop caches it and rebuilds the
     /// engine if it brought tools, but drops a result from a stale generation.

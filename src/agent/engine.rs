@@ -200,6 +200,9 @@ pub trait AgentUi: Send {
     /// UI may render it in a muted "Thinking" block; default no-op so non-rendering
     /// impls (and impls that don't surface thinking) ignore it.
     fn assistant_reasoning(&mut self, _delta: &str) {}
+    /// Drop the just-streamed assistant text for the in-flight segment — the engine
+    /// found it was a tool call written as text (stripped + retried). Default no-op.
+    fn discard_streamed_segment(&mut self) {}
     /// The agent set or updated its task plan via the `update_plan` tool. The UI
     /// renders this as a checklist card instead of a generic tool step. Default
     /// no-op so non-rendering impls ignore it.
@@ -1124,6 +1127,8 @@ impl AgentEngine {
                     .and_then(tool_repair::strip_if_leaked)
             {
                 leaked_nudges += 1;
+                // Drop the markup that already streamed so it never persists.
+                ui.discard_streamed_segment();
                 // Assistant turn before the nudge keeps roles alternating: a user
                 // nudge right after `tool` results 400s the Anthropic bridge.
                 let recorded = if cleaned.trim().is_empty() {
@@ -2080,6 +2085,9 @@ impl AgentUi for SubagentUi<'_> {
     fn assistant_text(&mut self, delta: &str) {
         self.cur_text.push_str(delta);
     }
+    fn discard_streamed_segment(&mut self) {
+        self.cur_text.clear();
+    }
     fn tool_start(&mut self, _name: &str, _args: &Value) {}
     fn tool_result(&mut self, _name: &str, _result: &Result<String, String>) {}
     fn notify(&mut self, text: &str) {
@@ -2541,10 +2549,16 @@ mod tests {
         ask_tools: Vec<String>,
         /// Each `turn_tokens` report, in order.
         turn_token_reports: Vec<u64>,
+        /// How many times the engine discarded a streamed segment (leaked call).
+        discards: usize,
     }
     impl AgentUi for CapturingUi {
         fn assistant_text(&mut self, t: &str) {
             self.text.push_str(t);
+        }
+        fn discard_streamed_segment(&mut self) {
+            self.discards += 1;
+            self.text.clear();
         }
         fn plan_updated(&mut self, items: &[PlanItem]) {
             self.plans.push(items.len());
@@ -2950,6 +2964,11 @@ mod tests {
         let last = engine.messages.last().unwrap();
         assert_eq!(last["role"], "assistant");
         assert_eq!(last["content"], "done");
+        assert_eq!(
+            ui.discards, 1,
+            "engine must drop the leaked streamed segment"
+        );
+        assert_eq!(ui.text, "done");
     }
 
     /// Regression: a leak after a tool step must not produce a user-after-tool 400.

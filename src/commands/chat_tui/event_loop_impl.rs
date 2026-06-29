@@ -57,6 +57,7 @@ impl ChatTuiApp {
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
+            RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
                 // server set; only the current generation's result is applied.
@@ -245,6 +246,14 @@ impl ChatTuiApp {
         }
         self.follow_output = true;
         total
+    }
+
+    /// Drop the in-flight segment's streamed text (typed + buffered) before it
+    /// commits; the engine flagged it as a tool call written as text. Reasoning is
+    /// left to commit with the retry's segment.
+    pub(super) fn discard_streamed_segment(&mut self) {
+        self.incoming_buffer.clear();
+        self.pending_response.clear();
     }
 
     /// Commit any streamed assistant text into a history entry. Called before a

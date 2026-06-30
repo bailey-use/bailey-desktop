@@ -139,6 +139,11 @@ pub async fn run() -> ! {
     services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
     let raw_args: Vec<String> = std::env::args().collect();
 
+    // Detached background update checker; handle before clap/service init.
+    if raw_args.get(1).map(String::as_str) == Some("__update-check") {
+        services::update_check::run_check_and_exit().await;
+    }
+
     // Initialize services. Bundle aliases need to be loaded *before* CLI
     // parsing because `aivo <bundle>` and `aivo run <bundle>` are expanded by
     // `rewrite_cli_args` ahead of clap.
@@ -226,6 +231,12 @@ pub async fn run() -> ! {
             process::exit(0);
         }
     };
+
+    // Skip the background check + notice when the user is already updating.
+    let is_update_cmd = matches!(command, Commands::Update(_));
+    if !is_update_cmd {
+        services::update_check::maybe_spawn_background_check();
+    }
 
     // Route to command handler
     let exit_code = match command {
@@ -836,6 +847,11 @@ pub async fn run() -> ! {
     services::ollama::stop_if_we_started();
     // Stop llama-server if aivo auto-started it for a HuggingFace run.
     services::huggingface::stop_if_we_started();
+
+    // Nudge after the command (TUI screen restored) if a newer release is cached.
+    if !is_update_cmd {
+        services::update_check::maybe_print_notice(crate::version::VERSION);
+    }
 
     process::exit(exit_code.code());
 }

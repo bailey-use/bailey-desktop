@@ -536,46 +536,8 @@ impl UpdateCommand {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    /// Compares semver strings; a pre-release (`-rc1`) sorts older than its release.
     fn is_newer_version(&self, latest: &str, current: &str) -> bool {
-        let parse_version = |version: &str| -> (Vec<u32>, bool) {
-            let cleaned = version.trim_start_matches('v');
-            // Split off pre-release suffix at the first hyphen
-            let (version_str, has_prerelease) = match cleaned.split_once('-') {
-                Some((v, _)) => (v, true),
-                None => (cleaned, false),
-            };
-            let parts = version_str
-                .split('.')
-                .filter_map(|part| part.parse::<u32>().ok())
-                .collect();
-            (parts, has_prerelease)
-        };
-
-        let (latest_parts, latest_pre) = parse_version(latest);
-        let (current_parts, current_pre) = parse_version(current);
-
-        let max_len = latest_parts.len().max(current_parts.len());
-
-        for i in 0..max_len {
-            let latest_part = latest_parts.get(i).copied().unwrap_or(0);
-            let current_part = current_parts.get(i).copied().unwrap_or(0);
-
-            if latest_part > current_part {
-                return true;
-            }
-            if latest_part < current_part {
-                return false;
-            }
-        }
-
-        // Same numeric version: release is newer than pre-release
-        // e.g. "2.0.0" is newer than "2.0.0-rc1"
-        if current_pre && !latest_pre {
-            return true;
-        }
-
-        false
+        crate::services::update_check::is_newer_version(latest, current)
     }
 
     fn handle_error(&self, error: anyhow::Error) {
@@ -909,6 +871,15 @@ fn detect_managed_install(install_path: &Path) -> Option<ManagedInstall> {
     }
 
     None
+}
+
+/// Upgrade command for the current install: `brew`/`cargo` when detected, else `aivo update`.
+pub(crate) fn upgrade_command_for_current_install() -> &'static str {
+    get_install_path()
+        .ok()
+        .and_then(|p| detect_managed_install(&p))
+        .map(|m| m.upgrade_command)
+        .unwrap_or("aivo update")
 }
 
 /// The clean npm launcher shim (`bin/aivo.js`), embedded at build time so the

@@ -901,6 +901,18 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
 }
 
 pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
+    // Expand `~` to $HOME — the tools advertise it and run_bash's shell expands it;
+    // else `list_dir ~/.ssh` ENOENTs on `cwd/~/.ssh` and the model reads it as sandboxed.
+    if (p == "~" || p.starts_with("~/") || (cfg!(windows) && p.starts_with("~\\")))
+        && let Some(home) = crate::services::system_env::home_dir()
+    {
+        let rest = p[1..].trim_start_matches(['/', '\\']);
+        return if rest.is_empty() {
+            home
+        } else {
+            home.join(rest)
+        };
+    }
     let pb = Path::new(p);
     if pb.is_absolute() {
         pb.to_path_buf()
@@ -2009,6 +2021,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn resolve_expands_leading_tilde() {
+        let Some(home) = crate::services::system_env::home_dir() else {
+            return; // no HOME in this environment
+        };
+        let cwd = Path::new("/tmp/work/aivo");
+        assert_eq!(resolve(cwd, "~"), home);
+        assert_eq!(resolve(cwd, "~/.ssh"), home.join(".ssh"));
+        assert_eq!(resolve(cwd, "~/a/b"), home.join("a/b"));
+        #[cfg(windows)]
+        assert_eq!(resolve(cwd, "~\\docs"), home.join("docs"));
+        // `~` only triggers as the first segment; `foo/~` stays literal under cwd.
+        assert_eq!(resolve(cwd, "src"), cwd.join("src"));
+        assert_eq!(resolve(cwd, "foo/~"), cwd.join("foo/~"));
+        // Absolute path returned unchanged; root form is OS-specific.
+        #[cfg(unix)]
+        assert_eq!(resolve(cwd, "/etc/hosts"), PathBuf::from("/etc/hosts"));
+        #[cfg(windows)]
+        assert_eq!(resolve(cwd, "C:\\Windows"), PathBuf::from("C:\\Windows"));
     }
 
     #[test]

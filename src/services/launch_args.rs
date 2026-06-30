@@ -1422,7 +1422,9 @@ mod tests {
             "gemini-3-flash-preview".to_string(),
             "kimi-k2.6".to_string(),
             "step-3.5-flash-2603".to_string(),
-            "glm-4.7".to_string(),
+            // Absent from the catalog → no published efforts, exercises the
+            // fallback robustly (a real slug re-breaks when models.dev adds efforts).
+            "nonexistent-fallback-model".to_string(),
         ];
         let mut limits = HashMap::new();
         for slug in &slugs {
@@ -1451,7 +1453,7 @@ mod tests {
         // Publishes low,high — no medium, so the default falls to the last.
         assert_eq!(levels(2), ["low", "high"]);
         assert_eq!(parsed["models"][2]["default_reasoning_level"], "high");
-        // Publishes nothing → unchanged hardcoded fallback.
+        // Publishes nothing → hardcoded low,medium,high fallback.
         assert_eq!(levels(3), ["low", "medium", "high"]);
         assert_eq!(parsed["models"][3]["default_reasoning_level"], "medium");
     }

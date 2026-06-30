@@ -10,6 +10,7 @@ use crate::commands::login::{AccountSync, sync_account_status};
 use crate::commands::stats::{colorize_unit, format_human};
 use crate::commands::{LoginCommand, LogoutCommand, trim_to_one_line};
 use crate::errors::ExitCode;
+use crate::services::account_store;
 use crate::services::device_auth::{self, AccountUsage, UsageSummary};
 use crate::services::session_store::SessionStore;
 use crate::style;
@@ -76,6 +77,9 @@ impl AccountCommand {
                 tokio::join!(sync_account_status(), device_auth::fetch_account_usage())
             })
             .await;
+            if let AccountUsage::Linked(s) = &usage {
+                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+            }
             return info_json(sync, usage);
         }
 
@@ -100,7 +104,10 @@ impl AccountCommand {
         }
 
         match spin(" Loading usage…", device_auth::fetch_account_usage()).await {
-            AccountUsage::Linked(s) => print_plan_block(&s),
+            AccountUsage::Linked(s) => {
+                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                print_plan_block(&s);
+            }
             AccountUsage::Unlinked | AccountUsage::Unknown => println!(
                 "{} {}",
                 style::bold("Plan:"),
@@ -127,17 +134,21 @@ impl AccountCommand {
                 );
                 ExitCode::Success
             }
-            AccountUsage::Linked(s) if as_json => match serde_json::to_string_pretty(&*s) {
-                Ok(out) => {
-                    println!("{out}");
-                    ExitCode::Success
+            AccountUsage::Linked(s) if as_json => {
+                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
+                match serde_json::to_string_pretty(&*s) {
+                    Ok(out) => {
+                        println!("{out}");
+                        ExitCode::Success
+                    }
+                    Err(e) => {
+                        eprintln!("{} {e}", style::red("Error:"));
+                        ExitCode::UserError
+                    }
                 }
-                Err(e) => {
-                    eprintln!("{} {e}", style::red("Error:"));
-                    ExitCode::UserError
-                }
-            },
+            }
             AccountUsage::Linked(s) => {
+                account_store::cache_plan_from(s.plan.as_deref(), s.is_pro).await;
                 print_usage(&s);
                 ExitCode::Success
             }

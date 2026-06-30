@@ -64,6 +64,27 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
+/// Provider-cell label for the first-party aivo key: the canonical cached plan
+/// (`aivo-pro`, …), or the free-tier sentinel when starter/not logged in.
+/// Returns `(label, is_paid)` so callers pad first, then colour — green when
+/// paid, dim otherwise.
+pub(crate) fn starter_provider_label(cached_plan: Option<&str>) -> (String, bool) {
+    match cached_plan {
+        Some(p) if !p.is_empty() => (p.to_string(), true),
+        _ => (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false),
+    }
+}
+
+/// Colours a first-party key cell by plan — green when paid, dim otherwise — so
+/// the key name and its plan label share one colour.
+pub(crate) fn paint_plan_cell(paid: bool, text: &str) -> String {
+    if paid {
+        crate::style::green(text)
+    } else {
+        crate::style::dim(text)
+    }
+}
+
 pub mod account;
 pub mod alias;
 pub mod chat;
@@ -164,7 +185,27 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_url_for_display;
+    use super::{starter_provider_label, truncate_url_for_display};
+
+    #[test]
+    fn starter_provider_label_falls_back_to_sentinel() {
+        assert_eq!(
+            starter_provider_label(None),
+            (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
+        );
+        assert_eq!(
+            starter_provider_label(Some("")),
+            (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
+        );
+    }
+
+    #[test]
+    fn starter_provider_label_uses_plan_when_paid() {
+        assert_eq!(
+            starter_provider_label(Some("aivo-pro")),
+            ("aivo-pro".to_string(), true)
+        );
+    }
 
     #[test]
     fn truncate_url_for_display_preserves_short_urls() {

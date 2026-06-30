@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use crate::cli::KeysArgs;
 use crate::commands::keys_ui;
-use crate::commands::truncate_url_for_display;
+use crate::commands::{paint_plan_cell, starter_provider_label, truncate_url_for_display};
 use crate::tui::{FuzzyOutcome, FuzzySelect};
 
 use crate::errors::ExitCode;
+use crate::services::account_store;
 use crate::services::models_cache::ModelsCache;
 use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -1139,11 +1140,19 @@ impl KeysCommand {
     async fn list_keys(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
+        let cached_plan = account_store::load().and_then(|a| a.plan);
+        let plan_json = serde_json::to_value(&cached_plan).unwrap_or(Value::Null);
 
         if json {
             let payload: Vec<Value> = keys
                 .iter()
-                .map(|k| key_metadata_json(k, selected_key_id.as_deref()))
+                .map(|k| {
+                    let mut obj = key_metadata_json(k, selected_key_id.as_deref());
+                    if is_aivo_starter_base(&k.base_url) {
+                        obj["plan"] = plan_json.clone();
+                    }
+                    obj
+                })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&payload)?);
             return Ok(ExitCode::Success);
@@ -1165,18 +1174,23 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            let is_starter = is_aivo_starter_base(&key.base_url);
-            let name_col = if is_starter {
-                style::magenta(&name_padded)
-            } else {
-                name_padded
+            // First-party key: name shares the plan label's colour (green when paid).
+            let starter = is_aivo_starter_base(&key.base_url)
+                .then(|| starter_provider_label(cached_plan.as_deref()));
+            let name_col = match &starter {
+                Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                None => name_padded,
+            };
+            let url_col = match &starter {
+                Some((label, paid)) => paint_plan_cell(*paid, label),
+                None => style::dim(truncate_url_for_display(&key.base_url, 50)),
             };
             println!(
                 "{} {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
                 name_col,
-                style::dim(truncate_url_for_display(&key.base_url, 50))
+                url_col
             );
         }
 
@@ -1187,6 +1201,8 @@ impl KeysCommand {
     async fn list_keys_with_ping(&self, json: bool) -> Result<ExitCode> {
         let keys = self.session_store.get_keys().await?;
         let selected_key_id = self.selected_key_id().await;
+        let cached_plan = account_store::load().and_then(|a| a.plan);
+        let plan_json = serde_json::to_value(&cached_plan).unwrap_or(Value::Null);
 
         if json {
             let mut ping_by_id: HashMap<String, Value> = HashMap::new();
@@ -1206,6 +1222,9 @@ impl KeysCommand {
                     let mut obj = key_metadata_json(k, selected_key_id.as_deref());
                     if let Some(p) = ping_by_id.remove(&k.id) {
                         obj["ping"] = p;
+                    }
+                    if is_aivo_starter_base(&k.base_url) {
+                        obj["plan"] = plan_json.clone();
                     }
                     obj
                 })
@@ -1231,11 +1250,12 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
-            let is_starter = is_aivo_starter_base(&key.base_url);
-            let name_col = if is_starter {
-                style::magenta(&name_padded)
-            } else {
-                name_padded
+            // First-party key: name shares the plan label's colour (green when paid).
+            let starter = is_aivo_starter_base(&key.base_url)
+                .then(|| starter_provider_label(cached_plan.as_deref()));
+            let name_col = match &starter {
+                Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                None => name_padded,
             };
 
             let ping_status = if SessionStore::decrypt_key_secret(&mut key).is_ok() {
@@ -1255,14 +1275,23 @@ impl KeysCommand {
                 format!("{} {}", style::red("✗"), style::red("decrypt failed"))
             };
 
-            let url_display = truncate_url_for_display(&key.base_url, url_display_width);
-            let url_padded = format!("{:<width$}", url_display, width = url_display_width);
+            let url_col = match &starter {
+                Some((label, paid)) => {
+                    let padded = format!("{:<width$}", label, width = url_display_width);
+                    paint_plan_cell(*paid, &padded)
+                }
+                None => {
+                    let url_display = truncate_url_for_display(&key.base_url, url_display_width);
+                    let url_padded = format!("{:<width$}", url_display, width = url_display_width);
+                    style::dim(&url_padded)
+                }
+            };
             println!(
                 "{} {}  {}  {}  {}",
                 active_indicator,
                 style::cyan(&id_padded),
                 name_col,
-                style::dim(&url_padded),
+                url_col,
                 ping_status
             );
         }

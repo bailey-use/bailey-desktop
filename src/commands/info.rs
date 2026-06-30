@@ -11,10 +11,11 @@ use std::collections::HashMap;
 use crate::commands::keys::{
     PingResult, PingStatus, key_metadata_json, ping_keys_streaming, ping_result_json,
 };
-use crate::commands::truncate_url_for_display;
+use crate::commands::{paint_plan_cell, starter_provider_label, truncate_url_for_display};
 use crate::errors::ExitCode;
 use crate::services::account_store;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
+use crate::services::provider_profile::is_aivo_starter_base;
 use crate::services::session_store::SessionStore;
 use crate::services::system_env;
 use crate::style;
@@ -123,6 +124,7 @@ impl InfoCommand {
                 })
                 .await;
             } else {
+                let cached_plan = account_store::load().and_then(|a| a.plan);
                 for key in &keys {
                     let is_selected = selected_key_id == Some(key.id.as_str());
                     let marker = if is_selected {
@@ -130,13 +132,25 @@ impl InfoCommand {
                     } else {
                         style::empty_bullet_symbol()
                     };
+                    let name_padded =
+                        format!("{:width$}", key.display_name(), width = max_name_len);
+                    // First-party key: name shares the plan label's colour (green when paid).
+                    let starter = is_aivo_starter_base(&key.base_url)
+                        .then(|| starter_provider_label(cached_plan.as_deref()));
+                    let name_col = match &starter {
+                        Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                        None => name_padded,
+                    };
+                    let url_col = match &starter {
+                        Some((label, paid)) => paint_plan_cell(*paid, label),
+                        None => style::dim(truncate_url_for_display(&key.base_url, 50)),
+                    };
                     println!(
-                        "  {} {}  {:width$}  {}",
+                        "  {} {}  {}  {}",
                         marker,
                         style::cyan(key.short_id()),
-                        key.display_name(),
-                        style::dim(truncate_url_for_display(&key.base_url, 50)),
-                        width = max_name_len
+                        name_col,
+                        url_col,
                     );
                 }
             }

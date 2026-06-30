@@ -134,12 +134,22 @@ impl LoginCommand {
             }
         };
 
-        // Record the account locally for display (no secret stored).
+        // Record the account locally for display (no secret stored). The device
+        // is linked now, so fetch the plan and cache it too — `aivo keys`/`aivo
+        // info` then reflect it without a network call. A failed fetch just
+        // leaves the plan unknown (starter); `aivo account` refreshes it later.
+        let plan = match device_auth::fetch_account_usage().await {
+            device_auth::AccountUsage::Linked(s) => {
+                account_store::canonical_plan(s.plan.as_deref(), s.is_pro)
+            }
+            _ => None,
+        };
         let account = account_store::Account {
             user_id: user.id,
             email: user.email,
             name: user.name,
             linked_at: chrono::Utc::now().to_rfc3339(),
+            plan,
         };
         account_store::save(&account).await?;
 
@@ -230,6 +240,8 @@ pub(crate) async fn sync_account_status() -> AccountSync {
                 email: user.email,
                 name: user.name,
                 linked_at,
+                // Preserve the cached plan — this status sync doesn't fetch it.
+                plan: local.as_ref().and_then(|a| a.plan.clone()),
             };
             if local.as_ref() != Some(&account) {
                 let _ = account_store::save(&account).await;

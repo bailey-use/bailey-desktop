@@ -892,13 +892,12 @@ fn print_help() {
     println!("{}", style::bold("Shortcuts:"));
     let shortcuts: &[(&str, &str, &str)] = &[
         ("use", "keys use", "aivo keys use --help"),
-        ("ping", "keys ping", "aivo keys ping --help"),
         ("share", "logs share", "aivo logs share --help"),
         ("hf:/url", "chat <ref>", "open chat with a local HF model"),
         (
             "<tool>",
             "run <tool>",
-            "claude / codex / codex-app / gemini / opencode / pi",
+            "claude/codex/gemini/opencode/pi/grok",
         ),
     ];
     let expansion_width = shortcuts.iter().map(|(_, e, _)| e.len()).max().unwrap_or(0);

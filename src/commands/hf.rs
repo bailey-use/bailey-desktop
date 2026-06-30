@@ -142,7 +142,7 @@ fn list_summary() -> Result<ExitCode> {
         let quant_summary = quant_summary(r);
         let age = format_modified_ago(r.modified);
         println!(
-            "  {:<repo_w$}  {:<10}  {:>9}  used {}",
+            "{:<repo_w$}  {:<10}  {:>9}  used {}",
             r.repo,
             quant_summary,
             format_size(r.total_bytes),
@@ -190,7 +190,7 @@ fn list_verbose() -> Result<ExitCode> {
         let age = format_modified_ago(m.modified);
         if any_non_main {
             println!(
-                "  {:<repo_w$}  {:<file_w$}  {:<8}  @{:<8}  {:>9}  used {}",
+                "{:<repo_w$}  {:<file_w$}  {:<8}  @{:<8}  {:>9}  used {}",
                 m.repo,
                 m.filename,
                 quant,
@@ -202,7 +202,7 @@ fn list_verbose() -> Result<ExitCode> {
             );
         } else {
             println!(
-                "  {:<repo_w$}  {:<file_w$}  {:<8}  {:>9}  used {}",
+                "{:<repo_w$}  {:<file_w$}  {:<8}  {:>9}  used {}",
                 m.repo,
                 m.filename,
                 quant,
@@ -219,7 +219,7 @@ fn list_verbose() -> Result<ExitCode> {
 
 fn print_total_footer(repo_count: usize, total: u64) {
     println!(
-        "  {}",
+        "{}",
         style::dim(format!(
             "{} model{}, {} total — {}",
             repo_count,

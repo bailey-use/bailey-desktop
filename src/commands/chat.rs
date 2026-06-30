@@ -634,24 +634,14 @@ impl ChatCommand {
             }
         };
 
-        // Preserve the existing tool in last_selection so `aivo run` (no tool)
-        // still recalls the last *launchable* tool, not "chat". Skipped for
-        // HF — the synthetic key is ephemeral and shouldn't be remembered.
+        // chat is a first-class coding agent like the native tools, so it
+        // records itself as the last tool (the native launch does the same in
+        // run.rs). A later bare `aivo run` then recalls "chat". Skipped for HF —
+        // its synthetic key is ephemeral and shouldn't be remembered.
         if !hf_active {
-            let existing_tool = self
-                .session_store
-                .get_last_selection()
-                .await
-                .ok()
-                .flatten()
-                .map(|s| s.tool);
             let _ = self
                 .session_store
-                .set_last_selection(
-                    &key,
-                    existing_tool.as_deref().unwrap_or("chat"),
-                    Some(&raw_model),
-                )
+                .set_last_selection(&key, "chat", Some(&raw_model))
                 .await;
         }
 

@@ -1,10 +1,7 @@
-//! aivo's native agent engine — in-process. Holds the conversation, composes
-//! OpenAI chat requests, calls the model through the loopback serve (the sole
-//! network egress), executes tools (permission-gated), compacts on overflow,
-//! and converges. This replaces the former closed `aivo-agent-core` brain + the
-//! stdio protocol: the loop and all I/O now live here, behind an `AgentUi` for
-//! rendering/permission so the same engine drives the terminal, `--json`, and
-//! (later) the chat TUI.
+//! aivo's native in-process agent engine. Holds the conversation, composes
+//! OpenAI chat requests, calls the model through the loopback serve (sole network
+//! egress), executes tools (permission-gated), compacts on overflow, converges.
+//! Rendering/permission go through `AgentUi` (terminal, `--json`, chat TUI).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,14 +19,11 @@ use crate::agent::{serve_client, tool_repair, tools};
 use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
 
-/// Sanity ceiling for a *finite* step budget, so a caller can't accidentally
-/// ask for billions of steps.
+/// Sanity ceiling for a finite step budget.
 const MAX_STEPS_CEILING: usize = 10_000;
 
-/// Resolves the per-turn step budget from the [`AgentEngine::new`] argument:
-/// `0` means **no cap** (the default for an interactive turn — the repeat-limit
-/// and esc-interrupt are the real safeties), any positive value is taken as-is,
-/// sanity-capped at [`MAX_STEPS_CEILING`].
+/// Per-turn step budget: `0` = no cap (interactive default; repeat-limit and
+/// esc-interrupt are the real safeties), else the value capped at [`MAX_STEPS_CEILING`].
 fn resolve_max_steps(max_steps: u32) -> usize {
     if max_steps == 0 {
         usize::MAX
@@ -37,8 +31,7 @@ fn resolve_max_steps(max_steps: u32) -> usize {
         (max_steps as usize).min(MAX_STEPS_CEILING)
     }
 }
-/// Stop a turn when the model emits the identical tool-call batch this many
-/// times in a row — a weak-model loop that would otherwise burn the step budget.
+/// Stop a turn after this many identical consecutive tool-call batches (weak-model loop).
 const REPEAT_LIMIT: usize = 3;
 /// Per-turn cap on plain-text-markup nudges; after this the turn converges.
 const MAX_LEAKED_NUDGES: usize = 2;
@@ -46,14 +39,12 @@ const LEAKED_TOOL_CALL_NUDGE: &str = "Your last reply wrote tool calls as plain 
 /// Stands in for an all-markup assistant turn (non-empty, keeps alternation).
 const LEAKED_TOOL_CALL_PLACEHOLDER: &str =
     "(I wrote a tool call as text by mistake; reissuing it properly.)";
-/// Auto-retry budget for transient LLM/network failures (matches pi's default).
+/// Auto-retry budget for transient LLM/network failures.
 const MAX_RETRIES: usize = 3;
-/// Step cap for a `subagent` run — bounded below the top-level budget so a
-/// delegated subtask can't run away.
+/// Step cap for a `subagent` run — below the top-level budget so a delegated subtask can't run away.
 const SUBAGENT_MAX_STEPS: u32 = 20;
 
-/// Exponential backoff before retry attempt `n` (1-based). Base is overridable
-/// for tests via `AIVO_AGENT_RETRY_BASE_MS`.
+/// Exponential backoff before retry attempt `n` (1-based); base overridable via `AIVO_AGENT_RETRY_BASE_MS`.
 fn retry_delay(attempt: usize) -> std::time::Duration {
     let base = std::env::var("AIVO_AGENT_RETRY_BASE_MS")
         .ok()
@@ -63,18 +54,13 @@ fn retry_delay(attempt: usize) -> std::time::Duration {
 }
 
 /// Whether an LLM/serve error is worth retrying: transient rate-limit / overload
-/// / 5xx / network blips. Context-overflow is NOT retryable (compaction handles
-/// it); auth (401/403) and bad-request (400) aren't either.
+/// / 5xx / network. Overflow (compaction handles it), auth, and bad-request aren't.
 fn is_retryable_error(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    // Overflow is handled by compaction/recovery, not by retrying the same request.
     if is_context_overflow_error(err) {
         return false;
     }
-    // Auth / bad-request are terminal — surface them now, don't burn retries (and
-    // delay the error) just because the provider's message happens to contain a
-    // retryable word like "connection" or "timeout". Checked before the retryable
-    // patterns. (Phrases, not bare status codes — "400" would match "5400ms".)
+    // Terminal errors first, so a retryable word ("connection"/"timeout") in the message can't override them. Phrases not bare codes — "400" would match "5400ms".
     const TERMINAL: &[&str] = &[
         "unauthorized",
         "forbidden",
@@ -112,8 +98,8 @@ fn is_retryable_error(err: &str) -> bool {
     PATTERNS.iter().any(|p| e.contains(p))
 }
 
-/// Whether an error is the provider rejecting the request as over the model's input
-/// limit — recoverable by compaction+retry. Wordings vary, hence the phrase list.
+/// Provider rejecting the request as over the model's input limit — recoverable by
+/// compaction+retry. Wordings vary, hence the phrase list.
 fn is_context_overflow_error(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     const PHRASES: &[&str] = &[
@@ -174,37 +160,33 @@ fn keep_recent_tokens() -> usize {
 }
 /// Tokens held back from the window for the response + tool schemas.
 const COMPACT_RESERVE: usize = 16_000;
-/// Window assumed for compaction when the model's real context window is unknown
-/// (0); without it such models never compact and resend the whole transcript
-/// every turn. A real window, once known, takes precedence.
+/// Compaction window assumed when the model's real one is unknown (0); without it
+/// such models never compact and resend the whole transcript. A real window wins.
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
 /// Ceiling on the calibration multiplier — clamps a stray measurement.
 const MAX_CALIBRATION: f64 = 2.5;
 /// Below this estimate the measured/estimate ratio is too noisy to calibrate from.
 const CALIBRATION_MIN_SAMPLE: usize = 2_000;
-/// Clamped measured/estimate ratio: floor 1.0 (estimate never trusted to overshoot),
-/// ceiling [`MAX_CALIBRATION`]. `.max(1)` keeps the division safe.
+/// Measured/estimate ratio clamped to [1.0, [`MAX_CALIBRATION`]]; `.max(1)` keeps the division safe.
 fn calibration_ratio(measured: u64, estimate: usize) -> f64 {
     (measured as f64 / estimate.max(1) as f64).clamp(1.0, MAX_CALIBRATION)
 }
 /// Cap on force-compact-and-retry attempts per step after an input-overflow rejection.
 const MAX_FORCED_COMPACTIONS: usize = 3;
 
-/// A `tool` result longer than this (in chars) is eligible for clearing once it
-/// ages out of the recent window; smaller results aren't worth the churn.
+/// A `tool` result longer than this (chars) is eligible for clearing once it ages
+/// out of the recent window; smaller results aren't worth the churn.
 const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
-/// Stub left in place of a cleared tool result. Short enough to fall below
-/// [`TOOL_RESULT_CLEAR_MIN`] so clearing is idempotent, and the message (with its
-/// `tool_call_id`) stays so the assistant↔tool pairing every provider requires
-/// is intact — only the now-stale bytes go.
+/// Stub for a cleared tool result. Below [`TOOL_RESULT_CLEAR_MIN`] so clearing is
+/// idempotent; the message + `tool_call_id` stay so assistant↔tool pairing holds.
 const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
 
-/// Ack when a sandbox-blocked `run_bash` is approved to re-run unconfined; the
-/// chat TUI clears it on the next agent output so it isn't pinned all turn.
+/// Ack when a sandbox-blocked `run_bash` is approved to re-run unconfined; cleared
+/// on the next agent output so it isn't pinned all turn.
 pub const SANDBOX_ESCALATION_NOTICE: &str = "re-running outside the workspace sandbox (approved)";
 
-/// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1` (off keeps it out of the TUI).
+/// One-line diagnostic to stderr, gated by `AIVO_DEBUG=1`.
 fn agent_debug(msg: &str) {
     if matches!(std::env::var("AIVO_DEBUG").as_deref(), Ok("1")) {
         eprintln!("aivo[agent]: {msg}");
@@ -218,10 +200,8 @@ context. Write a concise but complete summary under these exact headings:\n\
 Preserve specifics: file paths, function/identifier names, exact values, commands run. Drop \
 chit-chat. Output only the summary.";
 
-/// Carry-forward variant: instead of re-summarizing a blob that already contains
-/// a prior summary (lossy drift over repeated compactions), the model is given
-/// the CURRENT running summary plus only the NEW events, and asked to update the
-/// summary in place — preserving still-relevant facts verbatim.
+/// Carry-forward variant: feeds the current running summary + only the NEW events
+/// and asks for an in-place update, avoiding lossy drift from re-summarizing a blob.
 const SUMMARY_UPDATE_SYSTEM_PROMPT: &str = "You are MAINTAINING a running summary of an ongoing \
 coding-agent session. Below is the CURRENT summary, then the NEW events since it was written. \
 Produce the UPDATED summary under these exact headings:\n\
@@ -231,63 +211,47 @@ Preserve every still-relevant fact from the current summary verbatim (file paths
 function/identifier names, exact values, commands run); merge in the new events; drop a fact \
 only when the new events explicitly supersede it. Output only the updated summary.";
 
-/// Hard ceiling (chars/4 tokens) on the pinned working-set block folded into a
-/// compaction. The plan is kept whole; the touched-files list is trimmed
-/// (oldest first) until the block fits, so pinning can't reintroduce overflow.
+/// Ceiling (chars/4 tokens) on the pinned working-set block folded into a compaction;
+/// plan kept whole, touched-files trimmed oldest-first so pinning can't re-overflow.
 const PINNED_MAX_TOKENS: usize = 2_000;
 /// Cap on the tracked touched-files list (most-recent kept).
 const MAX_TOUCHED_FILES: usize = 40;
-/// Cap on the agent's durable scratchpad (most-recent kept). Bounds memory; the
-/// pinned-block budget bounds how much rides into a compaction.
+/// Cap on the agent's durable scratchpad (most-recent kept).
 const MAX_NOTES: usize = 50;
 
 /// Side-effects the engine delegates: rendering and the permission prompt.
-/// `ask_permission` is only called for mutating tools that aren't pre-approved;
-/// a non-TTY impl must fail closed (Deny). `Send` so the chat TUI can drive the
-/// engine on a spawned task.
+/// `ask_permission` fires only for mutating tools that aren't pre-approved; a
+/// non-TTY impl must fail closed (Deny). `Send` so the chat TUI can drive it on a task.
 pub trait AgentUi: Send {
-    /// Called once before each LLM turn (before any text) — for a "thinking…"
-    /// indicator. Default no-op so non-rendering impls can ignore it.
+    /// Before each LLM turn (before any text) — for a "thinking…" indicator. Default no-op.
     fn turn_start(&mut self) {}
-    /// Live context-window fill for the in-flight turn, so a UI can move its
-    /// usage stat mid-turn instead of waiting for `footer`. `measured` is true
-    /// when `tokens` is a provider-reported step total (exact); false when it is
-    /// a chars/4 estimate of the request the engine is about to send (system
-    /// prompt + tool schemas + conversation), emitted before usage is known.
-    /// Default no-op.
+    /// Live context-window fill for the in-flight turn. `measured` true = a
+    /// provider-reported step total (exact); false = a chars/4 estimate of the
+    /// about-to-send request, emitted before usage is known. Default no-op.
     fn context_usage(&mut self, _tokens: u64, _measured: bool) {}
-    /// The turn's cumulative generated (output) tokens so far, summed across
-    /// steps — for a live per-turn counter. Default no-op.
+    /// Turn's cumulative output tokens so far (live per-turn counter). Default no-op.
     fn turn_tokens(&mut self, _output: u64) {}
-    /// Prompt the user for the next turn (REPL). `None` ends the session (EOF /
-    /// `/exit`). Default `None` → one-shot only (used by tests/non-interactive).
+    /// Prompt for the next REPL turn. `None` ends the session (EOF / `/exit`);
+    /// default `None` → one-shot only.
     fn read_user_input(&mut self) -> Option<String> {
         None
     }
     fn assistant_text(&mut self, delta: &str);
-    /// A streamed reasoning/thinking delta (separate from the visible reply). The
-    /// UI may render it in a muted "Thinking" block; default no-op so non-rendering
-    /// impls (and impls that don't surface thinking) ignore it.
+    /// A streamed reasoning/thinking delta (separate from the visible reply). Default no-op.
     fn assistant_reasoning(&mut self, _delta: &str) {}
-    /// Drop the just-streamed assistant text for the in-flight segment — the engine
-    /// found it was a tool call written as text (stripped + retried). Default no-op.
+    /// Drop the just-streamed segment — it was a tool call written as text (stripped + retried). Default no-op.
     fn discard_streamed_segment(&mut self) {}
-    /// The agent set or updated its task plan via the `update_plan` tool. The UI
-    /// renders this as a checklist card instead of a generic tool step. Default
-    /// no-op so non-rendering impls ignore it.
+    /// The agent set/updated its plan via `update_plan`; rendered as a checklist card. Default no-op.
     fn plan_updated(&mut self, _items: &[PlanItem]) {}
     fn tool_start(&mut self, name: &str, args: &Value);
     fn tool_result(&mut self, name: &str, result: &Result<String, String>);
     fn notify(&mut self, text: &str);
-    /// Like [`notify`](Self::notify) but for a genuine error, so a UI can use an
-    /// error hue. Default delegates to `notify`.
+    /// Like [`notify`](Self::notify) but for a genuine error (error hue). Default delegates to `notify`.
     fn notify_error(&mut self, text: &str) {
         self.notify(text);
     }
-    /// End-of-turn line: an optional summary plus this turn's stats.
-    /// `tokens` is the cumulative work across all steps (prompt re-counted each
-    /// step); `context_tokens` is the *last* step's prompt+completion — the real
-    /// context-window fill after the turn (0 when no usage was reported).
+    /// End-of-turn line: optional summary + stats. `tokens` = cumulative work (prompt
+    /// re-counted each step); `context_tokens` = last step's prompt+completion (real fill, 0 if no usage).
     fn footer(
         &mut self,
         summary: Option<&str>,
@@ -296,9 +260,8 @@ pub trait AgentUi: Send {
         context_tokens: u64,
         elapsed_secs: u64,
     );
-    /// Decide whether a mutating tool may run. Async so a TUI can await a
-    /// permission card via the event loop; the terminal impl resolves it
-    /// synchronously inside the returned future. Must fail closed off a TTY.
+    /// Decide whether a mutating tool may run. Async so a TUI can await a permission
+    /// card; the terminal impl resolves synchronously. Must fail closed off a TTY.
     fn ask_permission<'a>(
         &'a mut self,
         tool: &'a str,
@@ -306,30 +269,25 @@ pub trait AgentUi: Send {
     ) -> BoxFuture<'a, Decision>;
 }
 
-/// A source of extra tools beyond the built-ins — currently MCP servers (see
-/// `agent::mcp`). The engine offers `specs()` alongside its own tool schemas and
-/// routes any call it `handles()` to `call()`. Kept abstract so the engine stays
-/// free of process/transport knowledge. `Send + Sync` so it rides on the spawned
-/// engine task and can be shared.
+/// Extra tools beyond the built-ins — currently MCP servers. The engine advertises
+/// `specs()` and routes any call it `handles()` to `call()`. Abstract to keep the
+/// engine free of process/transport knowledge; `Send + Sync` so it can be shared.
 pub trait ExternalTools: Send + Sync {
     /// OpenAI tool schemas to advertise (already `mcp__server__tool`-named).
     fn specs(&self) -> Vec<Value>;
-    /// Whether this source owns `name` (so the engine routes it here, not to the
-    /// built-in executor).
+    /// Whether this source owns `name` (routed here, not to the built-in executor).
     fn handles(&self, name: &str) -> bool;
-    /// Whether a call to `name` should be permission-gated (e.g. an MCP server the
-    /// user marked untrusted). Default `false` — configured sources are trusted.
+    /// Whether a call to `name` is permission-gated (e.g. an untrusted MCP server).
+    /// Default `false` — configured sources are trusted.
     fn requires_approval(&self, _name: &str) -> bool {
         false
     }
-    /// Execute one tool call. The result string is fed back to the model as the
-    /// tool result (Err is rendered as an error but still continues the loop).
+    /// Execute one tool call; the result string is fed back as the tool result (Err continues the loop).
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>>;
 }
 
-/// Per-turn I/O the engine needs: the loopback serve to reach the provider and
-/// the working directory tools execute against. (Model, history, and limits are
-/// owned by the engine itself.)
+/// Per-turn I/O: the loopback serve to reach the provider and the working dir tools
+/// run against. (Model, history, limits are owned by the engine.)
 pub struct TurnCtx<'a> {
     pub client: &'a reqwest::Client,
     pub serve_base: &'a str,
@@ -344,8 +302,7 @@ pub struct TurnCtx<'a> {
 }
 
 impl TurnCtx<'_> {
-    /// True when mutating tools should run without a prompt — the static `-y`
-    /// flag, or the live chat toggle checked fresh on each call.
+    /// True when mutating tools run without a prompt — the `-y` flag or the live chat toggle.
     pub fn auto_approve_enabled(&self) -> bool {
         self.yes
             || self
@@ -354,19 +311,12 @@ impl TurnCtx<'_> {
     }
 }
 
-/// A `/rewind` turn boundary: the `messages` index of the turn's opening user
-/// message (truncation point) plus the working-tree snapshot taken at turn start.
-/// `tree` is `None` when git is unavailable or the guard skipped it (conversation
-/// only). `msg_index` stays valid across compaction via `rebase_checkpoints`.
-///
-/// `prompt` is the opening user text, stored verbatim so the picker can match it
-/// to a display row — `messages[msg_index]` is later mutated in place (merge on
-/// resend, summary fold on compaction) and would stop matching.
-///
-/// `changed` is the paths the turn modified (recorded at turn end); a rewind
-/// reverts only the union of these across rewound turns, leaving the user's
-/// independent edits alone. `None` until recorded — an interrupted turn is
-/// finalized lazily by [`AgentEngine::rewind_to`].
+/// A `/rewind` turn boundary. `msg_index` = the turn's opening user message
+/// (truncation point), kept valid across compaction via `rebase_checkpoints`.
+/// `tree` = working-tree snapshot at turn start (`None` = conversation-only).
+/// `prompt` = opening user text stored verbatim (the picker matches on it, since
+/// `messages[msg_index]` gets mutated in place). `changed` = paths the turn modified
+/// (a rewind reverts only their union); `None` until recorded / for interrupted turns.
 #[derive(Clone)]
 struct Checkpoint {
     msg_index: usize,
@@ -375,7 +325,7 @@ struct Checkpoint {
     changed: Option<Vec<std::path::PathBuf>>,
 }
 
-/// The result of applying a [`AgentEngine::rewind_to`] — counts for the notice.
+/// Result of a [`AgentEngine::rewind_to`] — counts for the notice.
 #[derive(Default)]
 pub struct RewindOutcome {
     /// Files rewritten/recreated to match the snapshot.
@@ -387,87 +337,65 @@ pub struct RewindOutcome {
 }
 
 /// The agent's brain: system prompt + conversation + decision/convergence logic.
-/// Zero rendering and zero direct provider knowledge — those flow through
-/// `TurnCtx`/`AgentUi`.
+/// No rendering or direct provider knowledge — those flow through `TurnCtx`/`AgentUi`.
 pub struct AgentEngine {
     model: String,
     tools_openai: Vec<Value>,
     messages: Vec<Value>,
     context_window: u32,
     /// Multiplier (>= 1.0) correcting the chars/4 [`estimate_tokens`] undershoot toward
-    /// the real tokenizer, learned from measured usage; compaction budgets against
-    /// `estimate * calibration`. Starts at 1.0 until the first measurement.
+    /// the real tokenizer, learned from measured usage; starts at 1.0.
     token_calibration: f64,
     max_steps: usize,
-    /// Actions the user approved for the rest of the session ("always"), keyed by
-    /// [`permission_key`] — scoped to the specific command/path, not the whole
-    /// tool, so approving one risky action doesn't whitelist every future one.
+    /// "Always"-approved actions, keyed by [`permission_key`] — scoped to the
+    /// command/path, not the tool, so one approval doesn't whitelist every future call.
     always: HashSet<String>,
     /// Discovered SKILL.md skills, loaded on demand via the `skill` tool.
     skills: Vec<Skill>,
-    /// Named specialist sub-agents discovered from `~/.config/aivo/agents`
-    /// (top-level engine only — sub-engines drop the `subagent` tool). The
-    /// `subagent` tool's `agent` field selects one; `run_subagent` applies its
-    /// model + instructions + tool scope. Empty when none are authored.
+    /// Named specialist sub-agents (top-level engine only). The `subagent` tool's
+    /// `agent` field selects one; `run_subagent` applies its model/instructions/scope.
     subagents: Vec<Subagent>,
-    /// Kept so the `subagent` tool can build a fresh sub-engine with the same
-    /// identity (date + project guides).
+    /// Kept so `subagent` can build a sub-engine with the same identity (date + guides).
     date: String,
     guides: Vec<String>,
     /// Extra tools beyond the built-ins (MCP servers), if any are configured.
     external: Option<std::sync::Arc<dyn ExternalTools>>,
-    /// Body of the last applied compaction summary (without the
-    /// "[Summary of earlier conversation]" prefix). Fed back to the summarizer on
-    /// the next compaction so earlier facts carry forward faithfully instead of
-    /// being re-lossily re-compressed.
+    /// Body of the last compaction summary (no prefix). Fed back to the summarizer
+    /// next compaction so facts carry forward instead of being re-compressed lossily.
     last_summary: Option<String>,
-    /// Latest plan from the most recent `update_plan` call. Pinned into every
-    /// compaction fold so the task plan survives verbatim.
+    /// Latest `update_plan` plan. Pinned into every compaction fold, verbatim.
     plan: Vec<PlanItem>,
-    /// Files the agent has read/written/edited this session (insertion order,
-    /// deduped, capped). Maintained incrementally so the list isn't lost when the
-    /// turns that touched them are summarized away; pinned into every compaction.
+    /// Files touched this session (insertion order, deduped, capped). Maintained
+    /// incrementally so it survives summarization; pinned into every compaction.
     touched_files: Vec<String>,
-    /// The agent's durable scratchpad: notes it appends via `take_note` during a
-    /// long task. Pinned verbatim into every compaction and rebuilt from the log
-    /// on resume, so they outlive the turns and summaries — the agentic-memory
-    /// pattern for long-horizon work. Capped at [`MAX_NOTES`] (oldest dropped).
+    /// Durable scratchpad: `take_note` entries. Pinned verbatim into compaction and
+    /// rebuilt from the log on resume, so they outlive turns/summaries. Capped at [`MAX_NOTES`].
     notes: Vec<String>,
-    /// Provider-measured token split for the LAST run turn (prompt / completion /
-    /// cache), summed across all of the turn's steps. The chat TUI drains this
-    /// after each turn (`take_turn_usage`) to record real per-session tokens in
-    /// the chat index, so `aivo stats --since` can attribute chat usage. Reset at
-    /// the start of every turn.
+    /// Provider-measured token split (prompt/completion/cache) for the LAST turn,
+    /// summed across steps. The chat TUI drains it (`take_turn_usage`) for `aivo stats`. Reset per turn.
     turn_usage: SessionTokens,
-    /// `/rewind` support: one checkpoint per live `run_turn`, in order. The chat
-    /// TUI maps its display turns onto these by matching prompt text from the
-    /// newest backward (see [`AgentEngine::rewind_targets`]) — robust to history
-    /// trimming, compaction, and rebuilds, which a positional index isn't.
-    /// In-memory (the shadow tree objects live in `checkpoint_store`).
+    /// `/rewind`: one checkpoint per `run_turn`, in order. The chat TUI maps display
+    /// turns by matching prompt text newest-backward (robust to trim/compaction/rebuild,
+    /// which a positional index isn't). In-memory; tree objects live in `checkpoint_store`.
     checkpoints: Vec<Checkpoint>,
-    /// Tree-level file snapshot/restore via a shadow git store. `None` until
-    /// `/rewind` checkpointing is enabled for this engine (top-level chat only —
-    /// sub-engines don't checkpoint). See [`crate::agent::checkpoint`].
+    /// Tree-level snapshot/restore via a shadow git store. `None` until `/rewind` is
+    /// enabled (top-level chat only). See [`crate::agent::checkpoint`].
     checkpoint_store: Option<crate::agent::checkpoint::CheckpointStore>,
-    /// `reasoning_effort` to request for a reasoning-capable model, or `None`
-    /// otherwise (sending the field then 400s some providers). Defaults from the
-    /// model's snapshot capability at construction; changed live by `/effort`.
+    /// `reasoning_effort` for a reasoning-capable model, else `None` (the field 400s
+    /// some providers). Defaults from the snapshot; changed live by `/effort`.
     reasoning_effort: Option<String>,
-    /// Catalog-advertised effort levels, set per turn by the chat layer; used to
-    /// pick a provider-valid "off" effort. Empty when unknown. See `thinking_request`.
+    /// Catalog-advertised effort levels (set per turn); used to pick a valid "off". See `thinking_request`.
     reasoning_efforts: Vec<String>,
-    /// Whether the model is asked to think this turn. Off makes
-    /// [`Self::thinking_request`] emit a disable signal instead of the level.
-    /// Set per turn from the chat `/config` toggle.
+    /// Whether the model is asked to think this turn. Off makes [`Self::thinking_request`]
+    /// emit a disable signal. Set per turn from the `/config` toggle.
     thinking_enabled: bool,
     /// `/config` toggle for aivo's hosted web_search (the local tool); native search untouched.
     use_web_search_enabled: bool,
-    /// Whether this model can reason at all (from the model-limits snapshot).
-    /// Cached at construction (the engine is rebuilt on model switch) so the
-    /// disable path doesn't send an effort field to a model that would 400 on it.
+    /// Whether this model can reason at all (snapshot). Cached at construction so the
+    /// disable path doesn't send an effort field that would 400.
     reasoning_capable: bool,
-    /// Plan mode: mutating tools (writes, edits, `run_bash`, subagent) are refused
-    /// so a `/plan` investigation can't modify the workspace. See `restrict_read_only`.
+    /// Plan mode: mutating tools refused so a `/plan` investigation can't modify the
+    /// workspace. See `restrict_read_only`.
     read_only: bool,
     /// First-party branding (aivo-starter): present as aivo, not the upstream model.
     first_party: bool,
@@ -475,10 +403,8 @@ pub struct AgentEngine {
     prefix_fp: Option<(u64, u64)>,
 }
 
-/// The reasoning-effort level to default to: `AIVO_AGENT_REASONING_EFFORT` if
-/// set, else `"medium"`. Whether it's actually requested depends on model
-/// capability — see [`default_reasoning_effort`]. Exposed so the chat footer can
-/// show the same level the engine will send when the user hasn't picked one.
+/// Default reasoning-effort level: `AIVO_AGENT_REASONING_EFFORT` or `"medium"`.
+/// Whether it's requested depends on model capability (see [`default_reasoning_effort`]).
 pub fn default_reasoning_effort_level() -> String {
     std::env::var("AIVO_AGENT_REASONING_EFFORT")
         .ok()
@@ -486,9 +412,8 @@ pub fn default_reasoning_effort_level() -> String {
         .unwrap_or_else(|| "medium".to_string())
 }
 
-/// The `reasoning_effort` to request for `model`, or `None` for non-reasoning
-/// models (where the field would 400 strict providers). Capability comes from the
-/// model-limits snapshot; the level is [`default_reasoning_effort_level`].
+/// `reasoning_effort` for `model`, or `None` for non-reasoning models (the field
+/// would 400 strict providers). Capability from the snapshot; level from [`default_reasoning_effort_level`].
 fn default_reasoning_effort(model: &str) -> Option<String> {
     crate::services::model_metadata::snapshot_limits(model)
         .is_some_and(|c| c.reasoning)
@@ -496,12 +421,10 @@ fn default_reasoning_effort(model: &str) -> Option<String> {
 }
 
 impl AgentEngine {
-    /// Seed an engine with the identity system prompt. `guides` are the names of
-    /// project convention files present in cwd — the agent reads them on demand
-    /// (we don't inject their contents). `context_window` (0 = unknown →
-    /// compaction falls back to [`DEFAULT_CONTEXT_WINDOW`]) honors an env
-    /// override; `max_steps` is the per-turn tool-step budget (0 = no cap — the
-    /// default for an interactive turn).
+    /// Seed an engine with the identity system prompt. `guides` = names of project
+    /// convention files in cwd (read on demand, not injected). `context_window`
+    /// (0 = unknown → [`DEFAULT_CONTEXT_WINDOW`]) honors an env override; `max_steps`
+    /// is the per-turn step budget (0 = no cap).
     pub fn new(
         cwd: &str,
         model: &str,
@@ -511,8 +434,7 @@ impl AgentEngine {
         context_window: u32,
         max_steps: u32,
     ) -> Self {
-        // Env override exists so compaction can be exercised without a
-        // small-context model (e.g. AIVO_AGENT_CONTEXT_WINDOW=2000).
+        // Env override so compaction can be exercised without a small-context model.
         let context_window = std::env::var("AIVO_AGENT_CONTEXT_WINDOW")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -526,8 +448,7 @@ impl AgentEngine {
         specs.push(notes::note_tool_spec());
         specs.push(subagent_tool_spec(&[]));
         let mut tools_openai: Vec<Value> = specs.into_iter().map(tool_to_openai).collect();
-        // Layer A: providers with native search get the server tool (bridge-translated)
-        // instead of the local one — mutually exclusive.
+        // Native-search providers get the server tool instead of the local one (mutually exclusive).
         if tools::native_web_search_enabled(model) {
             tools_openai.retain(|t| t["function"]["name"].as_str() != Some("web_search"));
             tools_openai.push(json!({ "type": "web_search" }));
@@ -582,9 +503,8 @@ impl AgentEngine {
         }
     }
 
-    /// Make this engine read-only for `/plan`: hide the mutating tools (and
-    /// `subagent`, which could spawn an editing sub-engine) from the model. The
-    /// execution guard refuses them too, in case one is hallucinated. One-way.
+    /// Read-only mode for `/plan`: hide mutating tools + `subagent`. The execution
+    /// guard also refuses them (in case one is hallucinated). One-way.
     pub fn restrict_read_only(&mut self) {
         self.read_only = true;
         self.tools_openai.retain(|t| {
@@ -593,15 +513,12 @@ impl AgentEngine {
         });
     }
 
-    /// Set the `reasoning_effort` level (the `/effort` command). Only meaningful
-    /// for reasoning-capable models.
+    /// Set the `reasoning_effort` level (`/effort`). Only meaningful for reasoning models.
     pub fn set_reasoning_effort(&mut self, effort: String) {
         self.reasoning_effort = Some(effort);
     }
 
-    /// Turn the model's thinking on/off for upcoming turns (the `/config`
-    /// toggle). Off makes [`Self::thinking_request`] emit a disable signal
-    /// instead of the chosen level.
+    /// Turn thinking on/off for upcoming turns (`/config`). Off makes [`Self::thinking_request`] emit a disable signal.
     pub fn set_thinking_enabled(&mut self, on: bool) {
         self.thinking_enabled = on;
     }
@@ -637,14 +554,10 @@ impl AgentEngine {
         self.reasoning_efforts.iter().any(|e| e == level)
     }
 
-    /// How to express thinking control on this step: `(reasoning_effort,
-    /// emit_thinking_disabled)`.
-    ///
-    /// Enabled → the resolved level (`None` for a non-reasoning model). Disabled →
-    /// the lowest "off" the model's catalog advertises, since the gpt-5 family
-    /// diverged (5.0 → `minimal`, 5.1+/5.4 → `none`, codex → `low`) and a name
-    /// guess 400s. A depth-only scale with no off level (`aivo/starter`, Anthropic)
-    /// → emit `thinking:{type:"disabled"}` instead, carried by the bridge.
+    /// Thinking control for this step: `(reasoning_effort, emit_thinking_disabled)`.
+    /// Enabled → resolved level. Disabled → the lowest "off" the catalog advertises
+    /// (gpt-5 diverged: 5.0 `minimal`, 5.1+/5.4 `none`, codex `low` — a guess 400s);
+    /// a depth-only scale with no off (aivo/starter, Anthropic) → `thinking:{type:"disabled"}`.
     fn thinking_request(&self) -> (Option<&str>, bool) {
         if self.thinking_enabled {
             return (self.reasoning_effort.as_deref(), false);
@@ -675,8 +588,7 @@ impl AgentEngine {
         }
     }
 
-    /// Enable `/rewind` tree-checkpointing for this engine (top-level chat only;
-    /// sub-engines never call this, so they don't pay the git cost). Idempotent.
+    /// Enable `/rewind` tree-checkpointing (top-level chat only, to avoid the git cost). Idempotent.
     pub fn enable_rewind_checkpoints(&mut self, cwd: &str) {
         if self.checkpoint_store.is_none() {
             self.checkpoint_store = Some(crate::agent::checkpoint::CheckpointStore::new(
@@ -685,10 +597,8 @@ impl AgentEngine {
         }
     }
 
-    /// Drain the last turn's provider-measured token split (prompt / completion /
-    /// cache, summed across the turn's steps). Returns the accumulated usage and
-    /// leaves the accumulator zeroed. The chat TUI calls this after a turn to fold
-    /// the real tokens into the chat session index for `aivo stats`.
+    /// Drain the last turn's provider-measured token split (zeroing the accumulator);
+    /// the chat TUI folds it into the chat session index for `aivo stats`.
     pub fn take_turn_usage(&mut self) -> SessionTokens {
         std::mem::take(&mut self.turn_usage)
     }
@@ -700,10 +610,9 @@ impl AgentEngine {
         self.external = Some(ext);
     }
 
-    /// Fill in the compaction context window if it was unknown (0) at
-    /// construction. A model only known via a background catalog warm resolves
-    /// its window AFTER the engine is built. Only fills a missing window — never
-    /// overrides a known one (incl. the test env override).
+    /// Fill in the compaction context window if unknown (0) at construction (a
+    /// catalog-warmed model resolves it after the engine is built). Only fills a
+    /// missing window — never overrides a known one.
     pub fn set_context_window(&mut self, window: u32) {
         if self.context_window == 0 && window > 0 {
             agent_debug(&format!(
@@ -711,8 +620,7 @@ impl AgentEngine {
             ));
             self.context_window = window;
         } else if window > 0 && window != self.context_window {
-            // Keep the known window, but surface drift so a wrong one can't
-            // silently mis-size compaction.
+            // Keep the known window, but surface drift so a wrong one can't mis-size compaction.
             agent_debug(&format!(
                 "context window drift: budgeting {} (assumed) but model lookup reports {window} (served)",
                 self.context_window
@@ -720,21 +628,17 @@ impl AgentEngine {
         }
     }
 
-    /// Register named specialist sub-agents (top-level engine only). Replaces the
-    /// `subagent` tool with one whose `agent` field enumerates them, and appends a
-    /// one-line advert of each to the system prompt (progressive disclosure, like
-    /// skills). No-op when empty so a project without authored sub-agents keeps the
-    /// plain generic `subagent` tool. Call once, after construction.
+    /// Register named specialist sub-agents (top-level engine only): swap the
+    /// generic `subagent` tool for one enumerating them in `agent`, and advertise
+    /// each in the system prompt (progressive disclosure). No-op when empty.
     pub fn set_subagents(&mut self, subagents: &[Subagent]) {
         if subagents.is_empty() {
             return;
         }
-        // Swap the generic subagent tool for one that advertises the named agents.
         self.tools_openai
             .retain(|t| t["function"]["name"].as_str() != Some("subagent"));
         self.tools_openai
             .push(tool_to_openai(subagent_tool_spec(subagents)));
-        // Advertise the names in the system prompt (messages[0]).
         let section = subagents::subagents_prompt_section(subagents);
         if !section.is_empty()
             && let Some(sys) = self.messages.first_mut()
@@ -749,13 +653,10 @@ impl AgentEngine {
         self.subagents = subagents.to_vec();
     }
 
-    /// Apply a named agent profile by folding its instructions into the system
-    /// prompt and, when it authored a `tools` scope, restricting the offered tools
-    /// to that allow-list (plus `update_plan`, always harmless). The list is an
-    /// allow-list over the full offered set, so under a scope any unlisted tool —
-    /// including MCP tools — is dropped. A list that resolves to nothing doesn't
-    /// scope (see `Subagent::resolved_tools`). Applied to a delegated sub-agent's
-    /// freshly built sub-engine.
+    /// Apply a named agent profile: fold its instructions into the system prompt
+    /// and, if it authored a `tools` scope, restrict the offered tools to that
+    /// allow-list (any unlisted tool, incl. MCP, is dropped; an empty resolution
+    /// doesn't scope). Applied to a delegated sub-agent's fresh sub-engine.
     pub fn apply_profile(&mut self, sa: &Subagent) {
         if !sa.body.is_empty()
             && let Some(sys) = self.messages.first_mut()
@@ -768,17 +669,15 @@ impl AgentEngine {
             sys["content"] = json!(format!("{cur}\n\n## Your role: {}\n{}", sa.name, sa.body));
         }
         if let Some(allowed) = sa.resolved_tools() {
-            // The edit tools are one equivalence class: authoring any of them grants
-            // whichever the model actually advertises (`apply_patch` on GPT-5/Codex,
-            // `edit_file`/`multi_edit` elsewhere), so an `Edit` scope never disarms.
+            // Edit tools are one equivalence class: authoring any grants whichever
+            // the model advertises (apply_patch on GPT-5/Codex, else edit_file/multi_edit).
             let editor_allowed = allowed.contains(&"edit_file")
                 || allowed.contains(&"multi_edit")
                 || allowed.contains(&"apply_patch");
             self.tools_openai.retain(|t| {
                 let name = t["function"]["name"].as_str().unwrap_or("");
                 let is_editor = matches!(name, "edit_file" | "multi_edit" | "apply_patch");
-                // `update_plan`/`take_note` have no side effects outside the engine,
-                // so a scoped specialist keeps planning + note-taking regardless.
+                // update_plan/take_note have no side effects, so a scoped specialist always keeps them.
                 name == "update_plan"
                     || name == "take_note"
                     || allowed.contains(&name)
@@ -787,41 +686,34 @@ impl AgentEngine {
         }
     }
 
-    /// Remove the `subagent` tool from this engine's offered tools — used on a
-    /// sub-engine so it can't itself spawn sub-agents (depth-1 only).
+    /// Remove the `subagent` tool — used on a sub-engine so it can't spawn sub-agents (depth-1 only).
     fn drop_subagent_tool(&mut self) {
         self.tools_openai
             .retain(|t| t["function"]["name"].as_str() != Some("subagent"));
     }
 
-    /// REPL `/clear`: drop the conversation, keep the system prompt (index 0).
-    /// Also clears the compaction working set (running summary, pinned plan,
-    /// touched files) — otherwise a cleared session would re-inject stale facts.
+    /// `/clear`: drop the conversation, keep the system prompt. Also clears the
+    /// compaction working set, else a cleared session would re-inject stale facts.
     pub fn reset(&mut self) {
         self.messages.truncate(1);
         self.last_summary = None;
         self.plan.clear();
         self.touched_files.clear();
         self.notes.clear();
-        // Drop `/rewind` checkpoints: their `msg_index` pointed into the cleared
-        // transcript.
+        // `/rewind` checkpoints' `msg_index` pointed into the cleared transcript.
         self.checkpoints.clear();
     }
 
-    /// Seed prior conversation into a freshly built engine (resume, or a mid-chat
-    /// model/key switch) so it isn't amnesiac. Only user/assistant text turns are
-    /// carried — tool steps are display-only and lack the call IDs needed to
-    /// rebuild valid tool messages. No-op once a turn has run (keeps the seed to
-    /// engine construction time).
+    /// Seed prior conversation into a fresh engine (resume / mid-chat switch) so it
+    /// isn't amnesiac. Only user/assistant text turns carry (tool steps lack call IDs).
+    /// No-op once a turn has run.
     pub fn seed_history(&mut self, turns: impl IntoIterator<Item = (String, String)>) {
         let mut seen_user = false;
         for (role, content) in turns {
             if !matches!(role.as_str(), "user" | "assistant") {
                 continue;
             }
-            // The conversation must open with a user turn — Anthropic (via the
-            // serve bridge) rejects an assistant-first sequence, so drop leading
-            // assistant turns until the first user.
+            // Must open with a user turn — Anthropic rejects assistant-first; drop leading assistants.
             if !seen_user {
                 if role != "user" {
                     continue;
@@ -832,44 +724,31 @@ impl AgentEngine {
         }
     }
 
-    /// Export the conversation (everything after the system prompt) as raw
-    /// OpenAI-format messages — assistant `tool_calls` and `tool` results with
-    /// their ids intact — for durable persistence. The system prompt (index 0) is
-    /// omitted; it's rebuilt fresh on restore (cwd/date/guides/skills/agent may
-    /// have changed). Empty before any turn has run.
+    /// Export the conversation after the system prompt as raw OpenAI messages
+    /// (tool_calls/results with ids intact) for persistence. The system prompt is
+    /// omitted — rebuilt fresh on restore. Empty before any turn has run.
     pub fn export_conversation(&self) -> Vec<Value> {
         self.messages.iter().skip(1).cloned().collect()
     }
 
-    /// Restore a previously [`export_conversation`]ed transcript into a freshly
-    /// built engine (resume), appending it after the system prompt verbatim so
-    /// tool-call history (and any folded compaction summary) survives exactly. A
-    /// no-op unless the engine is fresh (only the system prompt present) — never
-    /// call after a turn has run or `seed_history` was used. The exported tail came
-    /// from a converged engine, so it's already a valid alternating sequence;
-    /// `run_turn`'s `repair_interrupted_tail` heals it if it was captured mid-tool.
+    /// Restore an [`export_conversation`]ed transcript into a fresh engine (resume),
+    /// appended after the system prompt verbatim. No-op unless fresh — never after a
+    /// turn or `seed_history`. `run_turn`'s `repair_interrupted_tail` heals a mid-tool tail.
     pub fn restore_conversation(&mut self, conversation: Vec<Value>) {
         if self.messages.len() != 1 {
             return;
         }
-        // These turns predate this engine: no `checkpoints` entry, so the TUI's
-        // prompt back-match marks them conversation-only (no file revert).
+        // These turns predate this engine: no `checkpoints` entry, so the back-match marks them conversation-only.
         self.messages.extend(conversation);
         self.rebuild_working_set_from_log();
     }
 
-    /// Re-derive the live working set — plan, notes, touched files — from the
-    /// restored message log, so a resumed session continues with the state it had
-    /// rather than an amnesiac one. This is the stateless-reducer property
-    /// (12-factor: unify execution state with the log): the message log is the
-    /// single source of truth, and these fields are a deterministic reduction over
-    /// it. Reads the surviving `update_plan` / `take_note` / file-tool calls in
-    /// order; calls that were folded into a compaction summary live on as text in
-    /// the restored messages, so nothing the model can see is lost. Only meaningful
-    /// right after restore (the fields start empty on a fresh engine).
+    /// Re-derive the working set (plan, notes, touched files) from the restored log
+    /// so a resumed session isn't amnesiac — the stateless-reducer property (log is
+    /// the source of truth). Calls folded into a summary live on as text, so nothing
+    /// visible is lost. Only meaningful right after restore.
     fn rebuild_working_set_from_log(&mut self) {
-        // Collect first (immutable borrow), then apply (mutable) — `record_touched_file`
-        // borrows `self` mutably.
+        // Collect first (immutable borrow), then apply — `record_touched_file` borrows mut.
         let calls: Vec<(String, Value)> = self
             .messages
             .iter()
@@ -910,13 +789,10 @@ impl AgentEngine {
         }
     }
 
-    /// Append a user/assistant text turn, MERGING into the previous message when
-    /// it has the same role (and is plain text — not a `tool_calls`-bearing
-    /// assistant). The engine must never hold two consecutive same-role
-    /// messages: the OpenAI→Anthropic bridge forwards them verbatim and Anthropic
-    /// 400s on non-alternating roles (a non-retryable brick). Adjacent same-role
-    /// turns arise from seeding a history that already has them (a cancelled user
-    /// turn followed by the next) or appending a user turn right after one.
+    /// Append a user/assistant text turn, MERGING into the previous message when it
+    /// has the same role and is plain text. The engine must never hold two
+    /// consecutive same-role messages — Anthropic (via the bridge) 400s on
+    /// non-alternating roles (non-retryable brick).
     fn push_text_turn(&mut self, role: &str, content: String) {
         if let Some(last) = self.messages.last_mut()
             && last.get("role").and_then(|r| r.as_str()) == Some(role)
@@ -935,15 +811,11 @@ impl AgentEngine {
             .push(json!({"role": role, "content": content}));
     }
 
-    /// Restore the assistant↔tool invariant before composing a new turn. If a
-    /// prior turn was torn down mid-tool (the chat TUI aborts the engine task on
-    /// Esc/interrupt while a tool runs), `messages` can end with an `assistant`
-    /// bearing `tool_calls` whose `tool` results were never pushed. Appending a
-    /// `user` turn after that yields a sequence every provider rejects with a
-    /// 400 — and since 400 isn't retryable, the corrupted prefix re-sends every
-    /// turn and bricks the session. Synthesize an `[interrupted]` result for each
-    /// unanswered call id so the conversation can continue (and self-heal a
-    /// history already corrupted by an earlier interrupt).
+    /// Restore the assistant↔tool invariant before a new turn. A turn torn down
+    /// mid-tool (Esc/interrupt) can leave an `assistant` with `tool_calls` whose
+    /// results were never pushed; appending a `user` then 400s every provider
+    /// (non-retryable → the corrupted prefix re-sends every turn, bricking the
+    /// session). Synthesize an `[interrupted]` result per unanswered call id.
     fn repair_interrupted_tail(&mut self) {
         let Some(idx) = self.messages.iter().rposition(|m| {
             role(m) == "assistant"
@@ -962,8 +834,7 @@ impl AgentEngine {
                     .collect()
             })
             .unwrap_or_default();
-        // Tool results must sit immediately after the call, before any non-tool
-        // message — so answers (and the gap) live in that contiguous run.
+        // Tool results sit immediately after the call — answers live in that contiguous run.
         let answered: HashSet<&str> = self.messages[idx + 1..]
             .iter()
             .take_while(|m| role(m) == "tool")
@@ -987,15 +858,9 @@ impl AgentEngine {
         for (offset, msg) in missing.into_iter().enumerate() {
             self.messages.insert(insert_at + offset, msg);
         }
-        // The interrupted assistant never produced a textual reply to its tools,
-        // so the next message is a `user` turn sitting directly after the tool
-        // results. The OpenAI→Anthropic bridge maps each tool result to a `user`
-        // message, so [tool_result(user), next(user)] becomes two consecutive
-        // user messages — which Anthropic 400s on (non-retryable → bricks the
-        // session, same family as the compaction fix). Insert a short assistant
-        // turn after the results to keep roles alternating on every upstream.
-        // Only when the results sit at the tail / before a non-assistant turn —
-        // an assistant already following would itself be the alternating reply.
+        // The bridge maps each tool result to a `user` message, so [tool_result, next user]
+        // becomes two consecutive users (Anthropic 400 / brick). Insert an assistant turn
+        // after the results to keep alternation — unless one already follows.
         let after_results = insert_at + missing_count;
         if self.messages.get(after_results).map(role) != Some("assistant") {
             self.messages.insert(
@@ -1005,14 +870,11 @@ impl AgentEngine {
         }
     }
 
-    /// Run one user turn to convergence: call the model, execute any tool calls
-    /// it makes (permission-gated), repeat until it stops calling tools or a
-    /// stop condition trips (step cap / no-progress). Renders the end-of-turn
-    /// footer with this turn's stats.
-    /// chars/4 estimate of the next request's prompt: the system prompt + tool
-    /// schemas + the conversation so far. Seeds the live context-fill before the
-    /// model reports real usage — the visible chat transcript omits the system
-    /// prompt and tool definitions, which dominate an agent prompt.
+    /// Run one user turn to convergence: call the model, execute tool calls
+    /// (permission-gated), repeat until it stops or a stop condition trips; footer.
+    /// chars/4 estimate of the next request's prompt (system + tools + conversation).
+    /// Seeds the live context-fill before real usage — the visible transcript omits
+    /// the system prompt and tool defs, which dominate an agent prompt.
     fn estimated_prompt_tokens(&self) -> u64 {
         let msg_chars: usize = self.messages.iter().map(|m| m.to_string().len()).sum();
         let tool_chars: usize = self.tools_openai.iter().map(|t| t.to_string().len()).sum();
@@ -1043,25 +905,19 @@ impl AgentEngine {
     pub async fn run_turn(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi, user_text: String) {
         self.repair_interrupted_tail();
         self.check_prefix_drift();
-        // Record a `/rewind` checkpoint at the user message that opens this turn.
-        // `push_text_turn` merges into a trailing `user` message rather than
-        // appending, so when the tail is already `user` the turn starts there;
-        // otherwise it starts at the message about to be appended.
+        // `/rewind` checkpoint at this turn's opening user message. `push_text_turn`
+        // merges into a trailing `user`, so the turn starts there if the tail is `user`.
         let turn_start = if self.messages.last().map(role) == Some("user") {
             self.messages.len().saturating_sub(1)
         } else {
             self.messages.len()
         };
-        // When merging into an interrupted turn (a checkpoint already sits at this
-        // index), reuse it: a second checkpoint would alias `msg_index` (breaking
-        // the back-match) and snapshot a tree with the interrupted turn's partial
-        // edits. The existing pre-edit tree is the right rewind target.
+        // Reuse an existing checkpoint at this index (merging into an interrupted turn):
+        // a second would alias `msg_index` and snapshot the partial edits; the existing pre-edit tree is right.
         let already_checkpointed = self.checkpoints.last().map(|c| c.msg_index) == Some(turn_start);
         if !already_checkpointed {
-            // The tree snapshot is taken lazily — only once this turn is about to
-            // touch the workspace (see `execute_tool_batch`) — so a read-only or
-            // pure-Q&A turn pays no git cost. `tree` is filled in then; `None` here
-            // and `None` forever for a turn that never mutates.
+            // Tree snapshot is lazy (taken in `execute_tool_batch` once about to mutate),
+            // so a read-only turn pays no git cost; stays `None` for a turn that never mutates.
             self.checkpoints.push(Checkpoint {
                 msg_index: turn_start,
                 // Before `push_text_turn` may merge a resend in (see `Checkpoint`).
@@ -1070,20 +926,16 @@ impl AgentEngine {
                 changed: None,
             });
         }
-        // Merge into a preceding user turn rather than appending a second one —
-        // e.g. after a turn cancelled before its first reply, the tail is still a
-        // `user` message; a bare append would be two consecutive user messages
-        // (Anthropic 400 / brick).
+        // Merge into a preceding user turn (e.g. a turn cancelled before its first
+        // reply) rather than appending a second one (two consecutive users → Anthropic 400 / brick).
         self.push_text_turn("user", user_text);
 
         let mut steps = 0usize;
         let mut leaked_nudges = 0usize;
         let mut tokens = 0u64;
-        // Real provider-measured split, summed across this turn's steps (drained
-        // by the TUI into the chat index for stats). Reset per turn.
+        // Real provider-measured split, summed across steps (drained by the TUI for stats). Reset per turn.
         self.turn_usage = SessionTokens::default();
-        // Last step's prompt+completion — the real context-window fill after the
-        // turn (the cumulative `tokens` above re-counts the prompt every step).
+        // Last step's prompt+completion — the real context fill (`tokens` re-counts the prompt each step).
         let mut context_tokens = 0u64;
         let started = Instant::now();
         let mut last_batch = String::new();
@@ -1096,11 +948,8 @@ impl AgentEngine {
 
             let mut extra = Map::new();
             extra.insert("tool_choice".into(), json!("auto"));
-            // Thinking control for this step (see `thinking_request`). The loopback
-            // serve translates `reasoning_effort` to each upstream's surface
-            // (Anthropic `thinking`, Gemini `thinkingConfig`, OpenAI passthrough);
-            // `thinking:{type:"disabled"}` is the separate off-switch where the
-            // effort scale has no "off".
+            // Thinking control (see `thinking_request`); the serve translates
+            // `reasoning_effort` per upstream. `thinking:{type:"disabled"}` = the off-switch where the scale has no "off".
             let (effort, disable_thinking) = self.thinking_request();
             if let Some(effort) = effort {
                 extra.insert("reasoning_effort".into(), json!(effort));
@@ -1114,19 +963,14 @@ impl AgentEngine {
                 tools: self.tools_openai.clone(),
                 extra,
             };
-            // Paired with measured usage below to calibrate (see `update_calibration`);
-            // re-measured if overflow recovery shrinks the request.
+            // Paired with measured usage below to calibrate; re-measured if overflow recovery shrinks the request.
             let mut sent_estimate = estimate_tokens(&request.messages);
 
             ui.turn_start();
-            // Seed the live context-fill before the model reports usage; the measured
-            // total replaces it once the step returns.
+            // Seed the live context-fill; the measured total replaces it once the step returns.
             ui.context_usage(self.estimated_context_tokens(), false);
-            // Auto-retry transient failures (rate limit / overload / 5xx / network)
-            // with exponential backoff — but only when nothing streamed yet, since
-            // re-streaming would duplicate the rendered text.
+            // Auto-retry transient failures with backoff — only when nothing streamed yet (re-streaming double-renders).
             let mut retries = 0usize;
-            // Overflow-recovery attempts for this step (see `MAX_FORCED_COMPACTIONS`).
             let mut forced_compactions = 0usize;
             let message = loop {
                 let mut streamed = false;
@@ -1136,8 +980,7 @@ impl AgentEngine {
                     ctx.auth,
                     &request,
                     &mut |delta| {
-                        // Any streamed output (text OR reasoning) means a retry
-                        // would double-render, so guard the retry on `streamed`.
+                        // Any streamed output means a retry would double-render.
                         streamed = true;
                         match delta {
                             serve_client::StreamDelta::Text(t) => ui.assistant_text(t),
@@ -1155,9 +998,8 @@ impl AgentEngine {
                         ));
                         tokio::time::sleep(retry_delay(retries)).await;
                     }
-                    // Over the input limit despite our budget check (estimate undershot):
-                    // calibrate from the rejection, force-fit, and retry — a 400 is
-                    // otherwise terminal and the oversized prefix re-sends every turn.
+                    // Over the input limit despite our budget check: calibrate from the
+                    // rejection, force-fit, retry — else the 400 is terminal and re-sends every turn.
                     Err(e)
                         if forced_compactions < MAX_FORCED_COMPACTIONS
                             && !streamed
@@ -1186,12 +1028,9 @@ impl AgentEngine {
             if message.usage.is_some() {
                 context_tokens = step_tokens;
                 ui.context_usage(step_tokens, true);
-                // Correct the estimate toward the real tokenizer for the next compaction.
                 self.update_calibration(sent_estimate, step_tokens);
             }
-            // Sum the real prompt/completion/cache split across steps (same parser
-            // the loopback serve accounts with, so the index stays consistent with
-            // the lifetime per-tool counters).
+            // Sum the real prompt/completion/cache split across steps (same parser as the serve, for a consistent index).
             if let Some(u) = &message.usage
                 && let Some(split) = extract_usage_from_value(&json!({ "usage": u }))
             {
@@ -1204,12 +1043,7 @@ impl AgentEngine {
                 ui.turn_tokens(self.turn_usage.completion_tokens);
             }
 
-            // An empty completion (no text, no tool calls — content filters,
-            // empty refusals, a provider hiccup) converges the turn. Don't record
-            // it as an assistant turn: an empty assistant becomes an empty
-            // content array for Anthropic via the serve bridge, which 400s on it
-            // (non-retryable → bricks the next turn). Nothing was produced, so
-            // there's nothing to keep.
+            // Empty completion converges the turn; don't record it — an empty assistant 400s the Anthropic bridge (non-retryable → bricks the next turn).
             let no_output = message.tool_calls.is_empty()
                 && message.content.as_deref().is_none_or(str::is_empty);
             if no_output {
@@ -1229,8 +1063,7 @@ impl AgentEngine {
                 leaked_nudges += 1;
                 // Drop the markup that already streamed so it never persists.
                 ui.discard_streamed_segment();
-                // Assistant turn before the nudge keeps roles alternating: a user
-                // nudge right after `tool` results 400s the Anthropic bridge.
+                // Assistant turn before the nudge keeps alternation: a user nudge right after `tool` results 400s the bridge.
                 let recorded = if cleaned.trim().is_empty() {
                     LEAKED_TOOL_CALL_PLACEHOLDER.to_string()
                 } else {
@@ -1248,13 +1081,9 @@ impl AgentEngine {
             self.messages.push(assistant_to_openai(&message));
 
             if message.tool_calls.is_empty() {
-                converged = true; // the model answered without calling tools
-                // Engine owns plan state: on a real convergence (the model gave its
-                // final answer), finalize a started plan so it can't linger as
-                // "0/N done" when the model forgot to flip the last steps. Gated on
-                // `started` — an all-pending plan means the model planned but
-                // converged without executing (e.g. it asked the user something),
-                // so we leave that untouched.
+                converged = true; // answered without calling tools
+                // Finalize a started plan on real convergence so it can't linger as
+                // "0/N done". Gated on `started` — an all-pending plan (planned then converged) is left alone.
                 if plan::started(&self.plan) && plan::complete_all(&mut self.plan) {
                     ui.plan_updated(&self.plan);
                 }
@@ -1270,10 +1099,7 @@ impl AgentEngine {
                 last_batch = batch;
             }
 
-            // Execute this batch of tool calls (permission-gated, parallel-safe
-            // built-ins fanned out, the rest ordered), appending each result to
-            // `messages` in call order. Returns any extra tokens accrued inside the
-            // batch (sub-agent LLM calls), which the cumulative turn total absorbs.
+            // Execute this batch (permission-gated); returns extra tokens accrued inside it (sub-agent calls).
             tokens += self.execute_tool_batch(ctx, ui, &message.tool_calls).await;
 
             if repeats + 1 >= REPEAT_LIMIT {
@@ -1294,9 +1120,8 @@ impl AgentEngine {
             started.elapsed().as_secs(),
         );
 
-        // Record which paths this turn changed, so a later `/rewind` reverts only
-        // the agent's edits (not the user's). Interrupted turns skip this and are
-        // finalized lazily by `rewind_to`.
+        // Record paths this turn changed so `/rewind` reverts only the agent's edits.
+        // Interrupted turns skip this — finalized lazily by `rewind_to`.
         let changed = match self.checkpoints.last().and_then(|c| c.tree.clone()) {
             Some(tree) => match self.checkpoint_store.as_mut() {
                 Some(store) => Some(store.changed_since(&tree).await),
@@ -1309,23 +1134,18 @@ impl AgentEngine {
         }
     }
 
-    /// Execute one assistant turn's batch of tool calls, appending a `tool`
-    /// message for each in call order. Must stay behavior-identical to the inline
-    /// loop it replaced: classify + permission-gate up front (in call order), run
-    /// the side-effect-free built-ins concurrently and the rest sequentially, then
-    /// report results in call order. Returns the extra tokens accrued by any
-    /// sub-agent runs (the caller folds them into the turn total).
+    /// Execute one turn's batch of tool calls, appending a `tool` message for each
+    /// in call order: classify + permission-gate up front, run side-effect-free
+    /// built-ins concurrently and the rest sequentially, then report in call order.
+    /// Returns extra tokens accrued by any sub-agent runs.
     async fn execute_tool_batch(
         &mut self,
         ctx: &TurnCtx<'_>,
         ui: &mut dyn AgentUi,
         tool_calls: &[ToolCall],
     ) -> u64 {
-        // Lazy `/rewind` checkpoint: take the pre-edit tree snapshot now, the first
-        // time a turn runs a batch that isn't entirely read-only. Conservative —
-        // anything not on the `is_read_only` allowlist (writes, run_bash, subagent,
-        // MCP) triggers it, so we never miss a mutation; a fully read-only batch
-        // doesn't. The snapshot is the turn-start tree (reads didn't mutate it).
+        // Lazy `/rewind` checkpoint: snapshot the pre-edit (turn-start) tree the first
+        // time a batch isn't entirely read-only. Conservative — anything off the `is_read_only` allowlist triggers it.
         if self.checkpoints.last().is_some_and(|c| c.tree.is_none())
             && !tool_calls.iter().all(|c| tools::is_read_only(&c.name))
         {
@@ -1345,18 +1165,13 @@ impl AgentEngine {
 
         for (i, call) in tool_calls.iter().enumerate() {
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
-            // The plan tool renders as its own checklist card, not a generic
-            // tool step, and never needs permission — resolve it up front. Its
-            // result still joins history below so the call↔result invariant holds.
+            // The plan tool renders as a checklist card and never needs permission —
+            // resolve it up front; its result still joins history (call↔result invariant).
             if n == "update_plan" {
                 let content = match plan::parse_plan(&call.arguments) {
                     Ok(mut items) => {
-                        // The engine owns plan progression: fill in steps the
-                        // model advanced past but forgot to mark done, so the
-                        // checklist stays monotone (and the confirmation echoes
-                        // the corrected view back to the model).
+                        // Fill in steps the model advanced past but forgot to mark done, so the checklist stays monotone.
                         plan::normalize_progress(&mut items);
-                        // Retain the latest plan so it survives compaction.
                         self.plan = items.clone();
                         ui.plan_updated(&items);
                         plan::confirmation(&items)
@@ -1376,19 +1191,15 @@ Investigate with read-only tools and write the implementation plan instead."
                 ));
                 continue;
             }
-            // Confirm only genuinely risky actions: a destructive command, an
-            // out-of-cwd write, a blind overwrite of an existing file the model
-            // never read, or an external (MCP) tool whose server the user
-            // marked untrusted. Everything else runs uninterrupted.
+            // Confirm only genuinely risky actions: destructive command, out-of-cwd
+            // write, blind overwrite of an unread file, or an untrusted external tool.
             let needs_confirm = tools::is_dangerous(n, &call.arguments, ctx.cwd)
                 || self.write_clobbers_unread(n, &call.arguments, ctx.cwd)
                 || self
                     .external
                     .as_ref()
                     .is_some_and(|e| e.requires_approval(&call.name));
-            // A hard floor: an unrecoverable command (wipe `/`, format a disk, …) is
-            // confirmed even under auto-approve, and never remembered. Off a TTY
-            // `ask_permission` fails closed. See tools::is_catastrophic.
+            // Hard floor: an unrecoverable command is confirmed even under auto-approve, never remembered; off a TTY fails closed.
             let catastrophic = tools::is_catastrophic(n, &call.arguments);
             let pkey = permission_key(n, &call.arguments);
             let allowed = if catastrophic {
@@ -1415,9 +1226,8 @@ Investigate with read-only tools and write the implementation plan instead."
                 outcomes[i] = Some(Err("denied by user".to_string()));
                 continue;
             }
-            // A side-effect-free built-in can run concurrently — unless an
-            // external (MCP) tool shadows the same name, in which case it must
-            // route to its source sequentially.
+            // A side-effect-free built-in runs concurrently — unless an external tool
+            // shadows the same name, which must route to its source sequentially.
             let shadowed = self
                 .external
                 .as_ref()
@@ -1429,8 +1239,7 @@ Investigate with read-only tools and write the implementation plan instead."
             }
         }
 
-        // Fan out the side-effect-free calls. They share no mutable state, so
-        // we just poll them together on this task — no spawn, no Send bound.
+        // Fan out the side-effect-free calls: they share no mutable state, so poll them together (no spawn, no Send bound).
         if !parallel_idx.is_empty() {
             let cwd = ctx.cwd;
             let runs = parallel_idx.iter().map(|&i| {
@@ -1442,8 +1251,7 @@ Investigate with read-only tools and write the implementation plan instead."
             }
         }
 
-        // Run the ordered calls one at a time — these mutate the engine
-        // (subagent token folding) or the workspace, so concurrency is unsafe.
+        // Run the ordered calls one at a time — they mutate the engine or workspace, so concurrency is unsafe.
         for &i in &sequential_idx {
             let call = &tool_calls[i];
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
@@ -1462,9 +1270,7 @@ Investigate with read-only tools and write the implementation plan instead."
                         .to_string(),
                 )
             } else if n == "subagent" {
-                // Fresh sub-engine on the same serve/cwd; fold its total into the
-                // footer + turn usage below. Pass the UI + output base so it
-                // forwards live token growth.
+                // Fresh sub-engine on the same serve/cwd; fold its total in. Pass the UI + base so it forwards live token growth.
                 let base = self.turn_usage.completion_tokens;
                 match self.run_subagent(ctx, ui, base, &call.arguments).await {
                     Ok((msg, sub_tokens)) => {
@@ -1476,9 +1282,7 @@ Investigate with read-only tools and write the implementation plan instead."
                     Err(e) => Err(e),
                 }
             } else if n == "take_note" {
-                // Durable scratchpad: append to notes (capped, oldest dropped).
-                // Pinned into compaction + rebuilt on resume so it outlives the
-                // turns. Held in the engine, so it runs in the ordered pass.
+                // Durable scratchpad (capped, oldest dropped). Held in the engine, so it runs in the ordered pass.
                 match notes::parse_note(&call.arguments) {
                     Ok(note) => {
                         if self.notes.len() >= MAX_NOTES {
@@ -1490,12 +1294,10 @@ Investigate with read-only tools and write the implementation plan instead."
                     Err(e) => Err(e),
                 }
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
-                // MCP (or other) external tool — keyed on its raw advertised name
-                // (`mcp__*`), never normalized; matches the shadow check above.
+                // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
                 ext.call(&call.name, &call.arguments).await
             } else if n == "run_bash" {
-                // Run confined; if the sandbox blocks a write, offer an
-                // in-session escape hatch instead of a dead-end error.
+                // Run confined; a sandbox write-block offers an in-session escape hatch instead of a dead-end error.
                 self.run_bash_with_escalation(ctx, ui, &call.arguments)
                     .await
             } else {
@@ -1504,16 +1306,13 @@ Investigate with read-only tools and write the implementation plan instead."
             outcomes[i] = Some(result);
         }
 
-        // Emit results and append tool messages in the original call order so
-        // the call↔result pairing the providers require stays intact.
+        // Emit results and append tool messages in call order (call↔result pairing intact).
         for (i, call) in tool_calls.iter().enumerate() {
             let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
             let result = outcomes[i]
                 .take()
                 .unwrap_or_else(|| Err("tool produced no result".to_string()));
-            // update_plan already surfaced via plan_updated; the rest report here.
-            // Use the normalized name so the result label matches tool_start's and
-            // touched-file tracking recognizes aliased reads/writes.
+            // update_plan already surfaced via plan_updated. Normalized name so the label matches and aliased reads/writes track.
             if n != "update_plan" {
                 ui.tool_result(n, &result);
             }
@@ -1534,13 +1333,10 @@ Investigate with read-only tools and write the implementation plan instead."
         extra_tokens
     }
 
-    /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks
-    /// a write (the command tried to write outside the workspace), offer to
-    /// re-run it *outside* the sandbox — gated by the same approval flow as other
-    /// risky actions — instead of returning a dead-end error that makes the model
-    /// give up and tell the user to run the command by hand. Auto-approve (`-y` /
-    /// the live toggle) and a prior "always" both skip the prompt; off a TTY the
-    /// UI fails closed (Deny), so the blocked result (with its hint) flows back.
+    /// Run a `run_bash` call confined to the workspace. If the OS sandbox blocks a
+    /// write, offer to re-run outside the sandbox (same approval flow) instead of a
+    /// dead-end error. Auto-approve / a prior "always" skip the prompt; off a TTY it
+    /// fails closed, so the blocked result (with its hint) flows back.
     async fn run_bash_with_escalation(
         &mut self,
         ctx: &TurnCtx<'_>,
@@ -1556,8 +1352,7 @@ Investigate with read-only tools and write the implementation plan instead."
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
-        // Scoped to the exact command so "always" doesn't blanket-escalate every
-        // future bash call — mirrors `permission_key`'s per-command scoping.
+        // Scoped to the exact command so "always" doesn't blanket-escalate every bash call (mirrors `permission_key`).
         let ekey = format!("run_bash_unsandboxed\u{0}{command}");
         let approved = ctx.auto_approve_enabled() || self.always.contains(&ekey) || {
             let preview = format!(
@@ -1578,16 +1373,14 @@ Re-run the full command without write confinement?",
             }
         };
         if !approved {
-            // Keep the blocked output + hint so the model sees the escalation was
-            // declined (rather than a silent success).
+            // Keep the blocked output + hint so the model sees the escalation was declined.
             return outcome.result;
         }
         ui.notify(SANDBOX_ESCALATION_NOTICE);
         tools::run_bash_unconfined(args, ctx.cwd).await
     }
 
-    /// The window `maybe_compact` budgets against: the real context window, or
-    /// [`DEFAULT_CONTEXT_WINDOW`] when it's unknown (0).
+    /// The window `maybe_compact` budgets against: the real one, or [`DEFAULT_CONTEXT_WINDOW`] if unknown (0).
     fn compaction_window(&self) -> usize {
         if self.context_window == 0 {
             DEFAULT_CONTEXT_WINDOW
@@ -1597,16 +1390,14 @@ Re-run the full command without write confinement?",
     }
 
     /// Compaction budget in chars/4-estimate space: `(window - reserve) / calibration`,
-    /// so `estimate <= budget` implies the calibrated real size fits. `window - reserve`
-    /// at calibration 1.0.
+    /// so `estimate <= budget` implies the calibrated real size fits.
     fn compaction_budget_estimate(&self) -> usize {
         let real = self.compaction_window().saturating_sub(COMPACT_RESERVE);
         ((real as f64) / self.token_calibration).floor() as usize
     }
 
-    /// Fold a `(sent estimate, measured total)` sample into the calibration. Uses the
-    /// measured total (the footer number) to dodge per-provider cache-accounting quirks.
-    /// Rises at once on an undershoot, eases down slowly (biases toward over-compaction).
+    /// Fold a `(sent estimate, measured total)` sample into the calibration (measured
+    /// total dodges cache-accounting quirks). Rises at once on undershoot, eases down slowly.
     fn update_calibration(&mut self, sent_estimate: usize, measured_total: u64) {
         if sent_estimate < CALIBRATION_MIN_SAMPLE || measured_total == 0 {
             return;
@@ -1620,13 +1411,12 @@ Re-run the full command without write confinement?",
         };
     }
 
-    /// Raise the calibration from an overflow rejection: use the cited token count if
-    /// present (one retry suffices), else nudge up. Caller then runs `force_fit_budget`.
+    /// Raise the calibration from an overflow rejection: use the cited token count if present, else nudge up.
     fn recalibrate_from_overflow(&mut self, err: &str) {
         let estimate = estimate_tokens(&self.messages);
         match parse_overflow_actual(err) {
             Some(actual) if estimate >= CALIBRATION_MIN_SAMPLE => {
-                // rise-only (never lower on overflow), unlike update_calibration's EMA
+                // rise-only on overflow, unlike update_calibration's EMA
                 self.token_calibration = self
                     .token_calibration
                     .max(calibration_ratio(actual, estimate));
@@ -1635,14 +1425,12 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Deterministic recovery: fit the calibrated budget without a model call (a
-    /// summary round-trip could itself overflow mid-recovery). Clears stale tool
-    /// output, then hard-trims.
+    /// Deterministic recovery: fit the calibrated budget without a model call (a summary
+    /// round-trip could itself overflow mid-recovery). Clears stale tool output, then hard-trims.
     fn force_fit_budget(&mut self) {
         let budget = self.compaction_budget_estimate();
         let mut cut = find_cut(&self.messages, keep_recent_tokens());
-        // Single long turn (resume) has no interior user boundary → fall back so
-        // `enforce_budget` doesn't drop the whole prior turn to `[system, user]`.
+        // Single long turn (resume) has no interior user boundary → fall back so `enforce_budget` doesn't drop it to `[system, user]`.
         if cut <= 1 {
             cut = find_cut(&self.messages, 0);
         }
@@ -1655,12 +1443,9 @@ Re-run the full command without write confinement?",
         self.enforce_budget(budget);
     }
 
-    /// If the history would overflow the model's context window, summarize the
-    /// older messages (via a quiet `complete`) and replace them with the
-    /// summary. Cuts only at user-turn boundaries so tool-call/result pairs stay
-    /// intact; falls back to [`DEFAULT_CONTEXT_WINDOW`] when the window is unknown
-    /// (0). Returns tokens the summarization call consumed (counted toward the
-    /// turn, but not as a step).
+    /// If the history would overflow, summarize the older messages (quiet `complete`)
+    /// and replace them. Cuts only at user boundaries so tool-call/result pairs stay
+    /// intact. Returns tokens the summarization consumed (counted toward the turn, not a step).
     async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
         let budget = self.compaction_budget_estimate();
         let total = estimate_tokens(&self.messages);
@@ -1668,18 +1453,13 @@ Re-run the full command without write confinement?",
             return 0;
         }
         let mut cut = find_cut(&self.messages, keep_recent_tokens());
-        // Single long turn (resume) has no interior user boundary → summarize into
-        // the latest user turn instead of `enforce_budget` hard-dropping it.
+        // Single long turn (resume) has no interior user boundary → summarize into the latest user turn.
         if cut <= 1 {
             cut = find_cut(&self.messages, 0);
         }
 
-        // Cheap pass first: if clearing the bulky raw output of OLD tool messages
-        // (file dumps, command output the model has already acted on, sitting
-        // before the recent keep window) is enough on its own, do that and skip
-        // the LLM summary entirely — no model round-trip. Only taken when it alone
-        // brings us under budget, so the summary path below still sees full
-        // content whenever a real summary is actually needed.
+        // Cheap pass first: if clearing OLD tool output alone brings us under budget,
+        // do that and skip the LLM summary. Only when it alone suffices, so the summary path still sees full content.
         let savings = self.stale_tool_result_savings(cut);
         if savings > 0 && total.saturating_sub(savings) <= budget {
             ui.notify("freed context — cleared older tool output");
@@ -1688,10 +1468,8 @@ Re-run the full command without write confinement?",
         }
 
         let tokens = self.summarize_range(ctx, ui, cut).await;
-        // Backstop: guarantee the next request actually fits the window. A single
-        // summary pass can fall short when the recent tail is itself huge, and
-        // `cut <= 1` means nothing was old enough to fold even though we're over
-        // budget. Trim deterministically (no model call) so a turn is always sendable.
+        // Backstop: guarantee the next request fits. A single summary pass can fall
+        // short (huge recent tail, or `cut <= 1`). Trim deterministically so a turn is always sendable.
         self.enforce_budget(budget);
         tokens
     }
@@ -1720,15 +1498,13 @@ Re-run the full command without write confinement?",
                     self.apply_compaction(cut, &note);
                 } else {
                     self.apply_compaction(cut, &summary);
-                    // Carry forward so the next compaction updates it in place instead
-                    // of re-summarizing a blob that already contains it (anti-drift).
+                    // Carry forward so the next compaction updates it in place (anti-drift).
                     self.last_summary = Some(summary);
                 }
                 usage_tokens(&m.usage)
             }
             Err(_) => {
-                // Don't re-send an overflowed request (not retryable → bricks the
-                // turn). Drop the old transcript mechanically instead.
+                // Don't re-send an overflowed request (not retryable → bricks the turn); drop mechanically.
                 ui.notify("compaction summary unavailable — trimming older context");
                 let note = self.mechanical_summary();
                 self.apply_compaction(cut, &note);
@@ -1737,22 +1513,18 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Calibrated estimate of the current context fill — the footer's pre-measurement
-    /// value (`estimated_prompt_tokens` scaled by calibration).
+    /// Calibrated estimate of the current context fill (the footer's pre-measurement value).
     pub fn estimated_context_tokens(&self) -> u64 {
         (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64
     }
 
-    /// Whether a compaction could fold or clear anything — lets `/compact` skip a
-    /// pointless round-trip on a short conversation.
+    /// Whether a compaction could fold/clear anything — lets `/compact` skip a pointless round-trip.
     pub fn has_compactable_history(&self) -> bool {
         let cut = find_cut(&self.messages, keep_recent_tokens());
         cut > 1 || self.stale_tool_result_savings(cut) > 0
     }
 
-    /// Manual `/compact`: summarize older turns now regardless of budget (or clear
-    /// stale tool output when nothing is old enough), then `footer` so the chat's
-    /// finish path tears the serve down.
+    /// Manual `/compact`: summarize older turns regardless of budget (or clear stale output), then `footer`.
     pub async fn compact_now(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi, elapsed_ms: u64) {
         let cut = find_cut(&self.messages, keep_recent_tokens());
         let tokens = if cut > 1 {
@@ -1765,8 +1537,7 @@ Re-run the full command without write confinement?",
         ui.footer(None, 0, tokens, self.estimated_context_tokens(), elapsed_ms);
     }
 
-    /// `/compact fast`: clear stale tool output (older than the keep window), no model
-    /// call. Returns the `(before, after)` calibrated estimate for the freed report.
+    /// `/compact fast`: clear stale tool output, no model call. Returns `(before, after)` calibrated estimate.
     pub fn compact_now_local(&mut self) -> (u64, u64) {
         let before = self.estimated_context_tokens();
         let cut = find_cut(&self.messages, keep_recent_tokens());
@@ -1774,12 +1545,8 @@ Re-run the full command without write confinement?",
         (before, self.estimated_context_tokens())
     }
 
-    /// Tokens reclaimable by [`clear_stale_tool_results`]: for each OLD
-    /// (`messages[1..cut]`) `tool` message whose body exceeds the clear threshold,
-    /// the bytes dropped when its content is replaced by the stub, as a chars/4
-    /// estimate. The message overhead (role, id) stays in both the before and
-    /// after, so this is the accurate saving — `maybe_compact` takes the cheap
-    /// path only when it suffices.
+    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD
+    /// `tool` message over the threshold, the bytes dropped when stubbed.
     fn stale_tool_result_savings(&self, cut: usize) -> usize {
         self.messages
             .get(1..cut)
@@ -1792,10 +1559,8 @@ Re-run the full command without write confinement?",
             .sum()
     }
 
-    /// Replace the bulky raw output of OLD (`messages[1..cut]`) `tool` messages
-    /// with [`TOOL_RESULT_CLEARED`], reclaiming context without a model call. The
-    /// message and its `tool_call_id` stay (pairing intact); only stale bytes go.
-    /// Idempotent — an already-stubbed result is below the threshold and skipped.
+    /// Replace bulky OLD `tool` output with [`TOOL_RESULT_CLEARED`], reclaiming
+    /// context without a model call; message + `tool_call_id` stay (pairing intact). Idempotent.
     fn clear_stale_tool_results(&mut self, cut: usize) {
         let Some(old) = self.messages.get_mut(1..cut) else {
             return;
@@ -1814,9 +1579,7 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// A model-free stand-in for an LLM summary, used when summarization fails or
-    /// returns empty. Preserves any running summary so the thread isn't lost, and
-    /// notes that older turns were dropped without a fresh one.
+    /// Model-free stand-in for a failed/empty summary; preserves any running summary so the thread isn't lost.
     fn mechanical_summary(&self) -> String {
         match &self.last_summary {
             Some(prev) => {
@@ -1836,11 +1599,10 @@ Re-run the full command without write confinement?",
                 break; // only [system, last user turn] left — no boundary to drop
             }
             self.messages.drain(1..cut);
-            self.rebase_checkpoints(cut, cut - 1); // keep checkpoint indices valid
+            self.rebase_checkpoints(cut, cut - 1);
         }
-        // Shrink the largest string left. Also target tool-call `arguments`: a big
-        // call with empty `content` in the irreducible recent turn is otherwise
-        // unreducible and bricks the turn; truncated args stay paired with their id.
+        // Shrink the largest string left, incl. tool-call `arguments`: a big call with
+        // empty `content` in the irreducible recent turn is otherwise unreducible; truncated args stay paired with their id.
         while estimate_tokens(&self.messages) > budget {
             // loc: None = content; Some(j) = tool_calls[j] arguments.
             let pick = self
@@ -1883,11 +1645,9 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Build the throwaway 2-message summarization request. The first compaction
-    /// (`last_summary` None) summarizes the cut transcript fresh; later ones feed
-    /// the prior summary back and ask for an in-place update. Either way it's
-    /// exactly system + one user message — never folded into `self.messages`, so
-    /// it can't affect role alternation.
+    /// Build the throwaway system + user summarization request. First compaction
+    /// summarizes fresh; later ones feed the prior summary back for an in-place update.
+    /// Never folded into `self.messages`, so it can't affect role alternation.
     fn build_summary_request(&self, transcript: &str) -> ChatRequest {
         let (system, user) = match &self.last_summary {
             Some(prev) => (
@@ -1909,13 +1669,9 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Record a file the agent touched via a built-in file tool, for the pinned
-    /// working set. Deduped, insertion-ordered, capped (oldest evicted).
     /// True when a `write_file` would overwrite an existing file the model hasn't
-    /// read or written this session — a blind clobber worth confirming. New files
-    /// pass through, as do files already in the working set (`read_file` and the
-    /// write tools all record one). `edit_file`/`multi_edit` are excluded: they
-    /// must read the file to match, so they're never blind.
+    /// read/written this session — a blind clobber worth confirming. New or
+    /// already-touched files pass through; edit_file/multi_edit must read first, so never blind.
     fn write_clobbers_unread(&self, name: &str, args: &Value, cwd: &Path) -> bool {
         if name != "write_file" {
             return false;
@@ -1963,10 +1719,8 @@ Re-run the full command without write confinement?",
 
     // --- /rewind: tree checkpoints ---
 
-    /// Per-checkpoint `/rewind` targets in order, for the picker: `(prompt,
-    /// file_revertible)`. The TUI matches these to its display history by prompt
-    /// text from the newest backward, so trims/compaction/rebuilds can't misalign
-    /// the mapping. Cheap and in-memory (no git).
+    /// Per-checkpoint `/rewind` targets in order for the picker: `(prompt, file_revertible)`.
+    /// The TUI matches by prompt text newest-backward. Cheap and in-memory (no git).
     pub fn rewind_targets(&self) -> Vec<(String, bool)> {
         self.checkpoints
             .iter()
@@ -1974,16 +1728,14 @@ Re-run the full command without write confinement?",
             .collect()
     }
 
-    /// Rewind to checkpoint `ordinal`: revert the files the rewound turns changed
-    /// (scoped to their union, so the user's independent edits are left alone),
-    /// truncate the conversation to the turn's user message, drop the rewound
-    /// checkpoints, and re-derive the working set. A `None`-tree checkpoint rewinds
-    /// the conversation only.
+    /// Rewind to checkpoint `ordinal`: revert the union of files the rewound turns
+    /// changed (leaving the user's independent edits), truncate to the turn's user
+    /// message, drop the rewound checkpoints, re-derive the working set. A `None`-tree
+    /// checkpoint rewinds the conversation only.
     pub async fn rewind_to(&mut self, ordinal: usize) -> RewindOutcome {
         let mut outcome = RewindOutcome::default();
         let tree = self.checkpoints.get(ordinal).and_then(|c| c.tree.clone());
-        // Union of paths every rewound turn changed; finalize any interrupted turn
-        // (`changed == None`) lazily against the current tree.
+        // Union of paths every rewound turn changed; finalize interrupted turns (`changed == None`) lazily.
         let mut paths: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
         for i in ordinal..self.checkpoints.len() {
@@ -2016,10 +1768,8 @@ Re-run the full command without write confinement?",
         outcome
     }
 
-    /// The pinned working set (plan + touched files) rendered for a compaction
-    /// fold, trimmed to `PINNED_MAX_TOKENS`. The plan is kept whole; the files
-    /// list is trimmed (oldest first) until the block fits — so pinning can't
-    /// reintroduce overflow. Empty when there's nothing to pin.
+    /// The pinned working set (plan + touched files) rendered for a compaction fold,
+    /// trimmed to `PINNED_MAX_TOKENS` (plan kept whole, files trimmed oldest-first). Empty when nothing to pin.
     fn render_pinned_block(&self) -> String {
         let plan_block = plan::pinned_block(&self.plan);
         let mut notes: &[String] = &self.notes;
@@ -2029,9 +1779,7 @@ Re-run the full command without write confinement?",
             if block.is_empty() || estimate_str_tokens(&block) <= PINNED_MAX_TOKENS {
                 return block;
             }
-            // Keep the plan whole; trim the files list (just paths) first, then
-            // the notes (agent-curated, more valuable) — both oldest-first. Bail
-            // when only the plan remains so we always make progress.
+            // Keep the plan whole; trim files first, then notes (more valuable) — oldest-first. Bail at plan-only for progress.
             if !files.is_empty() {
                 files = &files[1..];
             } else if !notes.is_empty() {
@@ -2042,20 +1790,12 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Replace `messages[1..cut]` with the compaction summary, folding it INTO
-    /// the first kept turn (a user message — `find_cut` lands on a user boundary)
-    /// rather than inserting a standalone summary message before it. A standalone
-    /// summary would sit immediately before that user turn as two consecutive
-    /// `user` messages; the OpenAI→Anthropic bridge forwards consecutive user
-    /// messages verbatim and Anthropic 400s on non-alternating roles — and since
-    /// 400 isn't retryable and the corrupted prefix re-sends every turn, that
-    /// would brick the agent right after a compaction. Folding keeps roles
-    /// alternating on every upstream.
+    /// Replace `messages[1..cut]` with the summary, folding it INTO the first kept
+    /// turn (a user message) rather than a standalone message before it — a standalone
+    /// summary would be two consecutive users, which Anthropic 400s on (non-retryable → bricks after compaction).
     fn apply_compaction(&mut self, cut: usize, summary: &str) {
         let mut folded = format!("[Summary of earlier conversation]\n{summary}");
-        // Pin the plan + touched-files verbatim into the SAME fold, so they ride
-        // inside the one user message and never become a standalone same-role
-        // message (which would break role alternation — see the doc above).
+        // Pin plan + touched-files into the SAME fold so they never become a standalone same-role message.
         let pinned = self.render_pinned_block();
         if !pinned.is_empty() {
             folded.push_str("\n\n");
@@ -2076,8 +1816,7 @@ Re-run the full command without write confinement?",
             self.messages.drain(1..cut);
             self.rebase_checkpoints(cut, cut - 1); // drain removes cut-1 messages
         } else {
-            // Defensive: no user turn at `cut` (shouldn't happen with find_cut) —
-            // keep a standalone summary rather than drop it.
+            // Defensive (find_cut should land on a user turn): keep a standalone summary rather than drop it.
             self.messages.splice(
                 1..cut,
                 std::iter::once(json!({"role": "user", "content": summary})),
@@ -2086,10 +1825,9 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Keep `/rewind` checkpoints valid after a front-trim/compaction that removed
-    /// `removed` messages over `messages[1..cut]`: drop checkpoints whose turn was
-    /// folded away (`msg_index < cut`) and shift the survivors down. Without this,
-    /// `rewind_to` would truncate at a stale index after a compaction.
+    /// Keep `/rewind` checkpoints valid after a trim/compaction removed `removed`
+    /// messages over `[1..cut]`: drop folded-away checkpoints (`msg_index < cut`),
+    /// shift survivors down. Else `rewind_to` truncates at a stale index.
     fn rebase_checkpoints(&mut self, cut: usize, removed: usize) {
         self.checkpoints.retain_mut(|cp| {
             if cp.msg_index >= cut {
@@ -2102,12 +1840,9 @@ Re-run the full command without write confinement?",
     }
 
     /// Execute a `subagent` tool call: build a fresh sub-engine (same tools minus
-    /// `subagent`, same cwd + serve, optionally a stronger model) and run the
-    /// subtask to convergence, returning its final answer. The sub-engine runs
-    /// with a capturing UI — its individual tool steps don't surface in the parent
-    /// transcript, only the result comes back. Dangerous ops inside it inherit the
-    /// parent's auto-approve and otherwise fail closed (no interactive prompt can
-    /// nest inside a tool call).
+    /// `subagent`, same cwd + serve, optionally a stronger model), run to convergence,
+    /// return its answer. Capturing UI (only the result surfaces). Dangerous ops inherit
+    /// the parent's auto-approve, else fail closed (no nested prompt).
     async fn run_subagent(
         &self,
         ctx: &TurnCtx<'_>,
@@ -2121,17 +1856,14 @@ Re-run the full command without write confinement?",
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .ok_or_else(|| "subagent: missing `task`".to_string())?;
-        // A named specialist, if `agent` matches a discovered profile. Unknown
-        // names fall back to a generic sub-agent (the tool's enum should prevent
-        // them, but be lenient rather than fail the turn).
+        // Named specialist if `agent` matches; unknown names fall back to generic (lenient, don't fail the turn).
         let profile = args
             .get("agent")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .and_then(|n| self.subagents.iter().find(|s| s.name == n));
-        // Model precedence: an explicit `model` arg overrides the profile's pinned
-        // model, which overrides the parent's model.
+        // Model precedence: explicit `model` arg > profile's pinned model > parent's model.
         let model = args
             .get("model")
             .and_then(|v| v.as_str())
@@ -2149,31 +1881,24 @@ Re-run the full command without write confinement?",
             SUBAGENT_MAX_STEPS,
         );
         sub.drop_subagent_tool();
-        // A first-party (aivo-starter) parent keeps its delegates first-party too, so
-        // a sub-agent's output won't disclose the upstream provider either.
+        // First-party parent keeps delegates first-party so their output won't disclose the provider.
         if self.first_party {
             sub.set_first_party();
         }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
-        // Carry the parent's reasoning effort into delegated work, but only when
-        // it's a valid level for the sub's model (they may differ) — otherwise
-        // keep the sub model's own default rather than risk sending a level the
-        // model rejects.
+        // Carry the parent's reasoning effort — but only if it's valid for the sub's model (may differ), else keep the sub's default.
         if let Some(effort) = &self.reasoning_effort
             && crate::services::model_metadata::snapshot_limits(model)
                 .is_some_and(|c| c.reasoning_efforts.iter().any(|l| l == effort))
         {
             sub.set_reasoning_effort(effort.clone());
         }
-        // Share the parent's external tools (MCP) so a sub-agent can use them too,
-        // reusing the same already-connected servers.
+        // Share the parent's external tools (MCP), reusing the already-connected servers.
         if let Some(ext) = &self.external {
             sub.set_external_tools(ext.clone());
         }
-        // Fold in the specialist's role + tool scope. Done after MCP wiring so a
-        // `tools` allow-list applies to the full offered set (a scoped specialist
-        // keeps only its listed built-ins — MCP tools it didn't list are dropped).
+        // Fold in the specialist's role + scope. After MCP wiring so a `tools` allow-list applies to the full offered set.
         if let Some(p) = profile {
             sub.apply_profile(p);
         }
@@ -2184,16 +1909,14 @@ Re-run the full command without write confinement?",
             base,
             ..Default::default()
         };
-        // Box the recursive future (run_turn → subagent → run_turn) so the async
-        // fn isn't an infinitely-sized type.
+        // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(ctx, &mut ui, task.to_string())).await;
         Ok((ui.result_message(), ui.tokens))
     }
 }
 
-/// The `subagent` tool — engine-handled (it needs the serve + a fresh engine, so
-/// it can't live in `tools::execute`). Offered on the top-level engine only. When
-/// named specialist sub-agents are discovered, an `agent` field enumerates them.
+/// The `subagent` tool — engine-handled (needs the serve + a fresh engine), top-level
+/// engine only. When named specialists exist, an `agent` field enumerates them.
 fn subagent_tool_spec(subagents: &[Subagent]) -> ToolSpec {
     let mut properties = json!({
         "task": {"type": "string", "description": "A complete, standalone instruction for the sub-agent."},
@@ -2233,19 +1956,15 @@ use its role instead of a generic sub-agent.",
     }
 }
 
-/// Capturing UI for a sub-agent run. Text is captured per step: `cur_text` holds
-/// the in-flight step's text, and at each new step it rolls into `last_nonempty`.
-/// The answer is the converging (last) step's text, falling back to the most
-/// recent non-empty step — so a sub-agent that emits its answer in the same step
-/// as its final tool call (then converges silently) doesn't lose it. Permission
-/// inherits the parent's auto-approve, else denies (a nested tool call has no
-/// interactive prompt).
+/// Capturing UI for a sub-agent run. `cur_text` holds the in-flight step's text,
+/// rolling into `last_nonempty` at each new step. The answer is the converging step's
+/// text, falling back to the last non-empty step (so an answer emitted alongside the
+/// final tool call isn't lost). Permission inherits the parent's auto-approve, else denies.
 #[derive(Default)]
 struct SubagentUi<'a> {
     cur_text: String,
     last_nonempty: String,
-    /// Last engine notice (LLM error / step-limit / no-progress) — surfaced when
-    /// the sub-agent produces no answer, so the failure reason isn't swallowed.
+    /// Last engine notice — surfaced when the sub-agent produces no answer, so the failure reason isn't swallowed.
     last_notice: String,
     steps: usize,
     /// The sub-agent's cumulative token usage, folded into the parent turn's total.
@@ -2257,8 +1976,7 @@ struct SubagentUi<'a> {
 }
 
 impl SubagentUi<'_> {
-    /// The sub-agent's answer: the converging step's text, or the last non-empty
-    /// step's text if it converged without emitting any of its own.
+    /// The sub-agent's answer: the converging step's text, else the last non-empty step's.
     fn answer(&self) -> &str {
         if self.cur_text.trim().is_empty() {
             self.last_nonempty.trim()
@@ -2267,9 +1985,8 @@ impl SubagentUi<'_> {
         }
     }
 
-    /// The tool result the parent receives: the answer (+ step count), or — when
-    /// there's no answer — the failure notice (so an LLM error / step-limit isn't
-    /// masked as a vague "no answer").
+    /// The tool result the parent receives: the answer (+ step count), else the
+    /// failure notice (so an LLM error / step-limit isn't masked as "no answer").
     fn result_message(&self) -> String {
         let answer = self.answer();
         if !answer.is_empty() {
@@ -2290,8 +2007,7 @@ impl SubagentUi<'_> {
 
 impl AgentUi for SubagentUi<'_> {
     fn turn_start(&mut self) {
-        // A new step begins: the previous step's text (if any) becomes the
-        // fallback, and the current buffer resets for this step.
+        // New step: the previous step's text becomes the fallback, current buffer resets.
         if !self.cur_text.trim().is_empty() {
             self.last_nonempty = std::mem::take(&mut self.cur_text);
         }
@@ -2398,9 +2114,8 @@ fn tool_to_openai(t: ToolSpec) -> Value {
     })
 }
 
-/// Convert an assistant reply back into an OpenAI chat message for the history.
-/// OpenAI requires `arguments` as a string and `content` present when there are
-/// no tool calls.
+/// Convert an assistant reply to an OpenAI chat message for the history (`arguments`
+/// as a string, `content` present when there are no tool calls).
 fn assistant_to_openai(m: &AssistantMessage) -> Value {
     let mut msg = Map::new();
     msg.insert("role".into(), json!("assistant"));
@@ -2439,9 +2154,8 @@ fn batch_sig(calls: &[ToolCall]) -> String {
         .join("|")
 }
 
-/// Names of project-convention / AI-guide files present in `cwd`. We tell the
-/// agent which exist and let it read them on demand rather than injecting their
-/// contents into every turn (which would weigh down even a "hi").
+/// Names of project-convention / AI-guide files present in `cwd`. The agent reads
+/// them on demand rather than injecting their contents into every turn.
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
     const NAMES: &[&str] = &[
         "AGENTS.md",
@@ -2474,8 +2188,10 @@ to read one. Your `run_bash` is a real shell with network access — fetch live 
 (e.g. `curl wttr.in/<city>` for weather, web/HTTP APIs for other lookups), inspect the system, \
 run any command. If a command answers the request, run it instead of claiming you can't access \
 the internet or external services, explaining how the user could do it themselves, telling them it \
-\"can't be run from here,\" or asking whether to proceed. (Only destructive commands prompt for \
-approval — everything else runs immediately — so never ask permission in prose.) A non-zero exit \
+\"can't be run from here,\" or asking whether to proceed. (Risky local actions — destructive \
+commands, or writes outside the workspace — raise an \
+approval card the user clears with one keystroke; everything else local just runs, so don't ask \
+permission in prose for local work.) A non-zero exit \
 is normal feedback, not a wall: read the actual error and act on it — e.g. `git commit` reporting \
 \"nothing added to commit\" means stage with `git add` first, and a missing tool means install it. \
 If the same approach keeps failing the same way, change tactics rather than repeating it. The only \
@@ -2486,14 +2202,17 @@ That action bias is for read-only and easily-reversible local work. The approval
 catches local file and history damage — it does NOT catch outward-facing or hard-to-undo \
 actions. Before you send a mutating request to a remote API (POST/PUT/DELETE), publish or \
 deploy, send mail, or delete remote, cloud, or database data, say plainly what you're about to \
-do and wait for the user to confirm, even though no approval card appears. And never print, log, \
-hard-code, or commit secrets or credentials, and decline to write code whose evident purpose is \
-malicious.\n\n\
+do and wait for the user to confirm, even though no approval card appears. And handle credentials \
+with care: don't open secret-bearing files (`.env`, private keys, \
+cloud-credential or token stores) unless the task truly needs them, never surface a secret's \
+value in your reply or send it off-box, and never print, log, hard-code, or commit secrets or \
+credentials. Decline to write code whose evident purpose is malicious.\n\n\
 Be resourceful: when a request is unclear or names something that isn't in the working \
 directory, investigate with your tools before asking the user to clarify. `glob`, `grep`, and \
 `list_dir` default to the working directory — to look elsewhere, pass an absolute path or `~`, \
 or use `run_bash` (e.g. `find`, `ls`, `rg`). Only ask the user once you're genuinely stuck \
-after looking.\n\n\
+after looking. When several lookups are independent — multiple file reads, greps, globs, or web \
+searches — issue them in one turn; aivo runs read-only tools in parallel.\n\n\
 You are part of aivo, so you can inspect aivo itself: for questions about its API keys, models, \
 providers, configuration, or usage, run the `aivo` command (e.g. `aivo keys list`, `aivo \
 models`, `aivo stats`) or read the usage from `aivo --help-json`. Two commands are the \
@@ -2583,9 +2302,8 @@ fn estimate_str_tokens(s: &str) -> usize {
     s.len() / 4
 }
 
-/// Render the pinned working set folded into a compaction: a `## Pinned Plan`
-/// section (the rendered checklist), a `## Notes` scratchpad, and a `## Files
-/// touched` list. Each section is omitted when empty; returns "" when all are.
+/// Render the pinned working set for a compaction: `## Pinned Plan`, `## Notes`,
+/// `## Files touched`. Each section omitted when empty; "" when all are.
 fn compose_pinned(plan_block: &str, notes: &[String], files: &[String]) -> String {
     let mut out = String::new();
     if !plan_block.is_empty() {
@@ -2623,12 +2341,9 @@ fn role(m: &Value) -> &str {
     m.get("role").and_then(|r| r.as_str()).unwrap_or("")
 }
 
-/// The scope an "always allow" decision is remembered under. Deliberately
-/// narrow: approving one destructive command or out-of-cwd write must not
-/// silently whitelist *every* future call of that tool. `run_bash` keys on the
-/// exact command, file writes on the path; anything else (e.g. an untrusted MCP
-/// tool, already a specific server-tool) keys on the tool name. The NUL
-/// separator keeps a tool name from colliding with an argument value.
+/// The scope an "always allow" decision is remembered under — deliberately narrow
+/// so approving one action doesn't whitelist every future call. `run_bash` keys on
+/// the command, file writes on the path, else the tool name. NUL avoids name↔value collision.
 fn permission_key(name: &str, args: &Value) -> String {
     let arg = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").trim();
     match name {
@@ -2732,7 +2447,7 @@ mod tests {
         assert!(has(&e), "non-native model starts with web_search");
         e.set_web_search_enabled(false);
         assert!(!has(&e), "toggle off removes it");
-        e.set_web_search_enabled(false); // idempotent
+        e.set_web_search_enabled(false);
         assert!(!has(&e));
         e.set_web_search_enabled(true);
         assert!(has(&e), "toggle on re-adds it");
@@ -2740,8 +2455,7 @@ mod tests {
 
     #[test]
     fn gemini_keeps_local_web_search_not_native_server_tool() {
-        // Gemini 400s on google_search + function tools, and the agent always
-        // has function tools — so it keeps the local web_search, not the server tool.
+        // Gemini 400s on google_search + function tools, and the agent always has function tools.
         let e = AgentEngine::new("/tmp", "gemini-2.5-flash", "", &[], &[], 0, 0);
         assert!(
             e.tools_openai
@@ -2759,11 +2473,8 @@ mod tests {
 
     #[test]
     fn test_resolve_max_steps() {
-        // 0 → no cap (the interactive default).
-        assert_eq!(resolve_max_steps(0), usize::MAX);
-        // A positive budget (e.g. the subagent's) is taken as-is.
+        assert_eq!(resolve_max_steps(0), usize::MAX); // 0 → no cap
         assert_eq!(resolve_max_steps(20), 20);
-        // Absurd values are sanity-capped.
         assert_eq!(resolve_max_steps(1_000_000), MAX_STEPS_CEILING);
     }
 
@@ -2779,13 +2490,10 @@ mod tests {
         deny: bool,
         /// Reply `AlwaysAllow` instead of `Allow`/`Deny` (takes precedence).
         always_allow: bool,
-        /// How many times the engine asked for permission.
         asks: usize,
         /// The `tool` argument of each `ask_permission` call, in order.
         ask_tools: Vec<String>,
-        /// Each `turn_tokens` report, in order.
         turn_token_reports: Vec<u64>,
-        /// How many times the engine discarded a streamed segment (leaked call).
         discards: usize,
     }
     impl AgentUi for CapturingUi {
@@ -2867,8 +2575,6 @@ mod tests {
         }
     }
 
-    /// Raw-HTTP server that answers each connection with the next SSE body in
-    /// `bodies` (one connection per `complete()` call), then closes.
     /// Build a one-tool-call SSE body for the fake serve.
     fn tool_call_sse(name: &str, args: Value) -> String {
         let delta = json!({"choices":[{"delta":{"tool_calls":[{
@@ -2945,12 +2651,9 @@ mod tests {
             yes,
             auto_approve: flag,
         };
-        // The static `-y` flag.
         assert!(ctx(true, None).auto_approve_enabled());
-        // Neither source on → prompt.
         assert!(!ctx(false, None).auto_approve_enabled());
-        // The live flag flips the SAME ctx without rebuilding it: a mid-turn
-        // Shift+Tab is seen by the running turn (the snapshot bug is gone).
+        // The live flag flips the SAME ctx: a mid-turn Shift+Tab is seen by the running turn.
         let flag = AtomicBool::new(false);
         let live = ctx(false, Some(&flag));
         assert!(!live.auto_approve_enabled());
@@ -3050,22 +2753,20 @@ mod tests {
 
     #[test]
     fn thinking_request_tracks_capability_when_enabled() {
-        // Reasoning-capable model: the level is always requested (independent of
-        // whether the chat shows thinking); `/effort` changes it.
+        // Reasoning-capable model: the level is always requested; `/effort` changes it.
         let mut engine = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
         assert_eq!(engine.thinking_request(), (Some("medium"), false));
         engine.set_reasoning_effort("high".into());
         assert_eq!(engine.thinking_request(), (Some("high"), false));
 
-        // Non-reasoning model: never requested (would 400 strict providers).
+        // Non-reasoning model: never requested.
         let plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
         assert_eq!(plain.thinking_request(), (None, false));
     }
 
     #[test]
     fn thinking_request_disables_per_provider_disable_form() {
-        // gpt-5 / o-series reject `"none"` alongside tools and reject the
-        // `thinking` field → family effort floor instead.
+        // gpt-5 / o-series reject `"none"` alongside tools and reject `thinking` → family effort floor.
         let mut g5 = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
         g5.set_thinking_enabled(false);
         assert_eq!(g5.thinking_request(), (Some("minimal"), false));
@@ -3095,9 +2796,7 @@ mod tests {
         codex.set_thinking_enabled(false);
         assert_eq!(codex.thinking_request(), (Some("low"), false));
 
-        // Effort scale with no off (e.g. `aivo/starter` → deepseek: low..max, and
-        // absent from the snapshot): emit the `thinking` disable field, NOT an
-        // invalid `"none"` effort (which 400s the provider).
+        // Effort scale with no off (aivo/starter, snapshot-absent): emit the `thinking` disable field, not an invalid `"none"` effort.
         let mut alias = AgentEngine::new("/tmp", "aivo/starter", "", &[], &[], 0, 0);
         assert!(
             !alias.reasoning_capable,
@@ -3113,8 +2812,7 @@ mod tests {
         alias.set_thinking_enabled(false);
         assert_eq!(alias.thinking_request(), (None, true));
 
-        // Snapshot-known Anthropic model (no none/minimal in its scale): the
-        // `thinking` field too — the OpenAI→Anthropic bridge carries it through.
+        // Snapshot-known Anthropic model (no none/minimal): the `thinking` field, carried by the bridge.
         let mut claude = AgentEngine::new("/tmp", "claude-sonnet-4-5", "", &[], &[], 0, 0);
         claude.set_thinking_enabled(false);
         assert_eq!(claude.thinking_request(), (None, true));
@@ -3125,9 +2823,7 @@ mod tests {
         assert_eq!(plain.thinking_request(), (None, false));
     }
 
-    /// Full loop: first model turn emits a write_file tool call (executed
-    /// locally), the second turn answers with text → converges. Mirrors canary's
-    /// fake_openai idea but pure-Rust and provider-free.
+    /// Full loop: first turn emits a write_file call, second turn answers with text → converges.
     #[tokio::test]
     async fn engine_runs_tool_then_converges() {
         let dir = tmp();
@@ -3277,8 +2973,7 @@ mod tests {
         assert_no_consecutive_user(&engine.messages);
     }
 
-    /// `rm -rf /` prompts even with auto-approve on (`turn_ctx` sets `yes: true`).
-    /// The mock denies, so it never runs.
+    /// `rm -rf /` prompts even with auto-approve on; the mock denies so it never runs.
     #[tokio::test]
     async fn catastrophic_command_prompts_even_under_auto_approve() {
         let dir = tmp();
@@ -3293,17 +2988,16 @@ mod tests {
         };
         run_session(
             &mut engine,
-            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            &turn_ctx(&client, &base, &dir),
             Some("clean up".into()),
             &mut ui,
         )
         .await;
 
-        assert_eq!(ui.ask_tools, vec!["run_bash"]); // asked despite auto-approve
+        assert_eq!(ui.ask_tools, vec!["run_bash"]);
     }
 
-    /// Contrast: a workspace-local `rm -rf ./build` is not in the floor, so
-    /// auto-approve waives it. The path doesn't exist, so running it is a no-op.
+    /// Contrast: a workspace-local `rm -rf ./build` isn't in the floor, so auto-approve waives it (path absent → no-op).
     #[tokio::test]
     async fn auto_approve_waives_workspace_local_destructive() {
         let dir = tmp();
@@ -3318,20 +3012,18 @@ mod tests {
         let mut ui = CapturingUi::default();
         run_session(
             &mut engine,
-            &turn_ctx(&client, &base, &dir), // yes: true → auto-approve on
+            &turn_ctx(&client, &base, &dir),
             Some("clean build dir".into()),
             &mut ui,
         )
         .await;
 
-        assert_eq!(ui.asks, 0); // waived — no prompt
-        assert!(ui.tools.contains(&"run_bash".to_string())); // and it ran
+        assert_eq!(ui.asks, 0);
+        assert!(ui.tools.contains(&"run_bash".to_string()));
     }
 
-    /// A `run_bash` call the sandbox blocks (a write outside the workspace)
-    /// prompts to re-run *outside* the sandbox — scoped to the synthetic
-    /// `run_bash_unsandboxed` tool. Declining keeps the blocked result and never
-    /// runs the command unconfined. macOS-only + skipped when the sandbox is off.
+    /// A sandbox-blocked `run_bash` (write outside the workspace) prompts to re-run
+    /// outside, scoped to `run_bash_unsandboxed`; declining keeps the blocked result. macOS-only.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_block_prompts_to_run_unsandboxed_and_respects_deny() {
@@ -3364,7 +3056,6 @@ mod tests {
 
         let existed = outside.exists();
         let _ = std::fs::remove_file(&outside);
-        // The escalation prompt fired, scoped to the synthetic unsandboxed tool.
         assert_eq!(ui.ask_tools, vec!["run_bash_unsandboxed"]);
         // Declined → never ran unconfined, so the file was never written…
         assert!(
@@ -3381,8 +3072,7 @@ mod tests {
         );
     }
 
-    /// Approving the escalation re-runs the command outside the sandbox, so the
-    /// out-of-workspace write that was blocked now succeeds.
+    /// Approving the escalation re-runs outside the sandbox, so the blocked out-of-workspace write now succeeds.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_block_reruns_outside_when_approved() {
@@ -3431,9 +3121,7 @@ mod tests {
         );
     }
 
-    /// A batch of independent read-only calls runs concurrently (the fan-out
-    /// path), but its results are still recorded in call order and each paired to
-    /// its own `tool_call_id` — the invariant the providers require.
+    /// A batch of read-only calls runs concurrently but results stay in call order, each paired to its `tool_call_id`.
     #[tokio::test]
     async fn parallel_read_batch_preserves_order_and_pairing() {
         let dir = tmp();
@@ -3458,9 +3146,8 @@ mod tests {
         )
         .await;
 
-        // All three tool starts fire, in call order.
         assert_eq!(ui.tools, vec!["read_file", "read_file", "read_file"]);
-        // Tool results land in call order, each keyed to the right id and content.
+        // Results in call order, each keyed to the right id and content.
         let tool_msgs: Vec<(&str, &str)> = engine
             .messages
             .iter()
@@ -3482,8 +3169,7 @@ mod tests {
         assert_eq!(ui.text, "done");
     }
 
-    /// A mixed batch — a parallel-safe read and an ordered write — still records
-    /// every result in call order with the right pairing, and the write lands.
+    /// A mixed batch (parallel read + ordered write) records results in call order and the write lands.
     #[tokio::test]
     async fn mixed_batch_orders_results_and_runs_write() {
         let dir = tmp();
@@ -3531,9 +3217,7 @@ mod tests {
         );
     }
 
-    /// An empty completion (no content, no tool calls) converges the turn but is
-    /// NOT recorded as an assistant message — an empty assistant becomes an empty
-    /// (invalid) Anthropic content array via the serve bridge.
+    /// An empty completion converges the turn but isn't recorded as an assistant message (empty → invalid Anthropic content array).
     #[tokio::test]
     async fn empty_completion_is_not_recorded_as_assistant_turn() {
         let dir = tmp();
@@ -3556,7 +3240,7 @@ mod tests {
             "empty completion must not record an assistant turn: {:?}",
             engine.messages
         );
-        // The turn still ran (the user message is recorded).
+        // The turn still ran (user message recorded).
         assert!(
             engine
                 .messages
@@ -3565,13 +3249,12 @@ mod tests {
         );
     }
 
-    /// A denied DANGEROUS tool (destructive bash) doesn't run; the engine feeds
-    /// the refusal back and the second turn converges.
+    /// A denied dangerous tool (destructive bash) doesn't run; the refusal feeds back and the next turn converges.
     #[tokio::test]
     async fn denied_dangerous_tool_does_not_run() {
         let dir = tmp();
         let sentinel = dir.join("RAN");
-        // `rm -rf` makes this dangerous → gated. If it ran it would touch RAN.
+        // `rm -rf` makes this dangerous → gated; if it ran it would touch RAN.
         let cmd = format!("rm -rf zzz_absent && touch {}", sentinel.display());
         let bash = tool_call_sse("run_bash", json!({ "command": cmd }));
         let port = spawn_sse_sequence(vec![bash, FINAL_TEXT_SSE.to_string()]);
@@ -3602,8 +3285,7 @@ mod tests {
 
     #[test]
     fn permission_key_scopes_to_command_and_path() {
-        // Different bash commands get different scopes — approving one risky
-        // command must not whitelist another.
+        // Different bash commands get different scopes — approving one must not whitelist another.
         assert_ne!(
             permission_key("run_bash", &json!({"command":"rm -rf build"})),
             permission_key("run_bash", &json!({"command":"rm -rf /"})),
@@ -3625,13 +3307,8 @@ mod tests {
         );
     }
 
-    /// "Always allow" remembers the exact command, not the whole tool: approving
-    /// one destructive `rm` doesn't silently auto-run a *different* destructive
-    /// command — that one prompts again.
-    ///
-    /// Unix-only: the test executes `rm -rf … && touch …`, which PowerShell 5.1
-    /// (the Windows shell) can't run (no `touch`, no `&&`). The permission-scoping
-    /// logic under test is platform-agnostic.
+    /// "Always allow" remembers the exact command, not the whole tool — a different
+    /// destructive command prompts again. Unix-only (uses `rm -rf … && touch …`); the logic is platform-agnostic.
     #[cfg(unix)]
     #[tokio::test]
     async fn always_allow_is_scoped_to_the_exact_command() {
@@ -3639,7 +3316,7 @@ mod tests {
         let (sa, sb) = (dir.join("RAN_A"), dir.join("RAN_B"));
         let cmd_a = format!("rm -rf zzz_a && touch {}", sa.display());
         let cmd_b = format!("rm -rf zzz_b && touch {}", sb.display());
-        // Steps within one turn: A, then A again, then a different B, then text.
+        // Steps in one turn: A, A again, a different B, then text.
         let port = spawn_sse_sequence(vec![
             tool_call_sse("run_bash", json!({ "command": cmd_a })),
             tool_call_sse("run_bash", json!({ "command": cmd_a })),
@@ -3667,8 +3344,7 @@ mod tests {
         };
         run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
 
-        // A prompted once (then its repeat reused the remembered scope); B, a
-        // different command, prompted separately → two asks total.
+        // A prompts once (repeat reuses the scope); B is different → two asks total.
         assert_eq!(ui.asks, 2, "expected A once + B once");
         assert_eq!(ui.tools, vec!["run_bash", "run_bash", "run_bash"]);
         assert!(sa.exists(), "command A did not run");
@@ -3691,8 +3367,7 @@ mod tests {
         assert!(!engine.write_clobbers_unread("edit_file", &json!({"path":"exists.txt"}), &dir));
     }
 
-    /// A `write_file` that would overwrite a pre-existing, unread file is gated;
-    /// denying it leaves the original contents intact.
+    /// A `write_file` overwriting a pre-existing unread file is gated; denying leaves it intact.
     #[tokio::test]
     async fn blind_overwrite_of_existing_file_is_gated() {
         let dir = tmp();
@@ -3731,8 +3406,7 @@ mod tests {
         );
     }
 
-    /// A SAFE mutating tool (in-project write) runs WITHOUT a permission prompt,
-    /// even when the UI would deny — i.e. only dangerous actions are gated.
+    /// A safe mutating tool (in-project write) runs WITHOUT a prompt even when the UI would deny — only dangerous actions are gated.
     #[tokio::test]
     async fn safe_tool_runs_without_prompt() {
         let dir = tmp();
@@ -3789,8 +3463,7 @@ mod tests {
         )
         .await;
 
-        // Two plan events: the model's update (2 steps), then the engine's
-        // finalization when the turn converged.
+        // Model's update (2 steps), then the engine's finalization on convergence.
         assert_eq!(ui.plans, vec![2, 2], "plan_updated should fire twice");
         assert_eq!(
             ui.last_plan,
@@ -3812,10 +3485,7 @@ mod tests {
         );
     }
 
-    /// A started plan whose steps the model never finished is finalized by the
-    /// engine when the turn converges — the screenshot bug: the model set step 1
-    /// `in_progress`, did the work, then answered without ever flipping the steps,
-    /// leaving the card stuck at "0/N done".
+    /// A started plan the model never finished is finalized by the engine on convergence (the "0/N done" stuck-card bug).
     #[tokio::test]
     async fn engine_finalizes_started_plan_on_convergence() {
         let dir = tmp();
@@ -3840,7 +3510,6 @@ mod tests {
         )
         .await;
 
-        // The model's update, then the engine's finalization.
         assert_eq!(ui.plans, vec![3, 3]);
         assert_eq!(
             ui.last_plan,
@@ -3853,9 +3522,8 @@ mod tests {
         );
     }
 
-    /// An all-pending plan means the model planned but converged WITHOUT executing
-    /// (e.g. it asked the user a question). The engine must not fabricate
-    /// completion — the `started` gate leaves it alone.
+    /// An all-pending plan means the model planned but converged WITHOUT executing;
+    /// the `started` gate must not fabricate completion.
     #[tokio::test]
     async fn engine_leaves_unstarted_plan_alone_on_convergence() {
         let dir = tmp();
@@ -3884,10 +3552,7 @@ mod tests {
         assert_eq!(ui.last_plan, vec![PlanStatus::Pending, PlanStatus::Pending]);
     }
 
-    /// A `subagent` call spawns a fresh sub-engine on the same fake serve: the
-    /// sub-engine answers with text, its result is fed back to the parent as the
-    /// tool result, and the parent converges. Three connections: parent's call,
-    /// the sub-agent's turn, the parent's final answer.
+    /// A `subagent` call spawns a fresh sub-engine; its text result feeds back as the parent's tool result and the parent converges.
     #[tokio::test]
     async fn engine_runs_subagent_and_returns_result() {
         let dir = tmp();
@@ -3908,7 +3573,6 @@ mod tests {
         )
         .await;
 
-        // The parent saw `subagent` as a tool step and converged on the final text.
         assert_eq!(ui.tools, vec!["subagent"]);
         assert_eq!(ui.text, "done");
         // The sub-agent's answer came back as the parent's tool result.
@@ -3921,9 +3585,7 @@ mod tests {
         );
     }
 
-    /// An external tool source's schemas are offered to the model, and a call to
-    /// one is routed to the source (not the built-in executor). Uses a mock so the
-    /// engine wiring is tested without a real MCP subprocess.
+    /// An external source's schemas are offered and a call routes to the source, not the built-in executor (mock, no real MCP subprocess).
     #[tokio::test]
     async fn external_tools_are_offered_and_routed() {
         struct MockExt;
@@ -3982,13 +3644,10 @@ mod tests {
         );
     }
 
-    /// #3 end-to-end: the model calls `take_note`; the engine stores it (no
-    /// permission prompt, no `tools::execute`), echoes a confirmation, and the
-    /// note is retained for pinning into later compactions.
+    /// The model calls `take_note`; the engine stores it (no prompt, no `tools::execute`), echoes a confirmation, retains it for pinning.
     #[tokio::test]
     async fn take_note_is_dispatched_and_stored() {
         let dir = tmp();
-        // Turn 1: take a note; turn 2: converge.
         let call = tool_call_sse("take_note", json!({"note": "the parser is in lexer.rs"}));
         let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -4024,8 +3683,7 @@ mod tests {
         );
     }
 
-    /// An external source that `requires_approval` gets permission-gated: with a
-    /// denying UI and no auto-approve, the call is refused (not executed).
+    /// An external source that `requires_approval` is gated: a denying UI refuses the call (not executed).
     #[tokio::test]
     async fn external_tool_requiring_approval_is_gated() {
         struct GatedExt;
@@ -4068,7 +3726,6 @@ mod tests {
         };
         run_session(&mut engine, &ctx, Some("wipe it".into()), &mut ui).await;
 
-        // The untrusted tool was offered + asked-about, but the deny blocked it.
         assert_eq!(ui.tools, vec!["mcp__risky__wipe"]);
         assert!(
             engine
@@ -4083,8 +3740,7 @@ mod tests {
         );
     }
 
-    /// The sub-agent UI recovers an answer emitted in the same step as the final
-    /// tool call (then a silent convergence), instead of losing it.
+    /// The sub-agent UI recovers an answer emitted in the same step as the final tool call, instead of losing it.
     #[test]
     fn subagent_ui_recovers_answer_before_final_tool() {
         let mut ui = SubagentUi::default();
@@ -4106,8 +3762,7 @@ mod tests {
         assert_eq!(ui2.answer(), "plain answer");
     }
 
-    /// A sub-agent's token usage is folded into the parent turn's total, so the
-    /// footer reflects the real cost (the sub's LLM calls aren't parent steps).
+    /// A sub-agent's token usage folds into the parent turn's total (the sub's LLM calls aren't parent steps).
     #[tokio::test]
     async fn subagent_tokens_fold_into_parent_total() {
         let dir = tmp();
@@ -4127,8 +3782,7 @@ mod tests {
         )
         .await;
 
-        // The parent's own steps report no usage here, so the 100 came from the
-        // sub-agent — proving it was folded into the turn total.
+        // The parent's own steps report no usage, so the 100 came from the sub-agent.
         assert!(
             ui.footer_tokens >= 100,
             "sub-agent tokens not folded into the parent total: {}",
@@ -4136,9 +3790,7 @@ mod tests {
         );
     }
 
-    /// The engine sums each step's provider-measured token split (prompt /
-    /// completion / cache) across a turn and surfaces it via `take_turn_usage`,
-    /// so the chat TUI can fold real tokens into the session index for stats.
+    /// The engine sums each step's provider-measured token split across a turn and surfaces it via `take_turn_usage`.
     #[tokio::test]
     async fn turn_usage_accumulates_split_across_steps() {
         let dir = tmp();
@@ -4170,8 +3822,7 @@ mod tests {
         assert_eq!(engine.take_turn_usage(), SessionTokens::default());
     }
 
-    /// When a sub-agent produces no answer, the failure reason (a step-limit /
-    /// LLM-error notice) is surfaced instead of a vague "no answer".
+    /// When a sub-agent produces no answer, the failure reason is surfaced instead of a vague "no answer".
     #[test]
     fn subagent_ui_surfaces_failure_notice_when_no_answer() {
         let mut ui = SubagentUi::default();
@@ -4223,8 +3874,7 @@ mod tests {
         assert!(!is_retryable_error(
             "upstream 400: maximum context length exceeded"
         ));
-        // Auth/bad-request stay terminal even when the message mentions a
-        // retryable word — don't burn retries (and delay the error).
+        // Auth/bad-request stay terminal even when the message mentions a retryable word.
         assert!(!is_retryable_error(
             "401 unauthorized: connection token expired"
         ));
@@ -4232,15 +3882,11 @@ mod tests {
         assert!(!is_retryable_error("bad request: malformed timeout field"));
     }
 
-    // Unix-only: the mock is a hand-rolled raw `TcpListener` serving sequential
-    // blocking `accept()`s (503 then 200), whose connection sequencing is fragile
-    // on Windows. The retry-past-503 logic it exercises is platform-agnostic and
-    // stays covered on Linux/macOS.
+    // Unix-only: the mock's raw sequential-`accept()` sequencing is fragile on Windows; the retry-past-503 logic is platform-agnostic.
     #[cfg(unix)]
     #[tokio::test]
     async fn engine_retries_then_succeeds() {
-        // First connection returns 503 (retryable, before any stream); the retry
-        // hits a 200 with content.
+        // First connection returns 503 (retryable, before any stream); the retry hits a 200.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
@@ -4320,8 +3966,7 @@ mod tests {
         assert_eq!(role(&engine.messages[0]), "system");
     }
 
-    /// `set_context_window` fills a window that was unknown (0) at construction —
-    /// the late-catalog-warm case — but never overrides a known one.
+    /// `set_context_window` fills an unknown (0) window (late catalog warm) but never overrides a known one.
     #[test]
     fn set_context_window_fills_only_a_missing_window() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4472,8 +4117,7 @@ mod tests {
         assert!(!is_context_overflow_error("connection reset by peer"));
     }
 
-    /// A tool call whose bulk is in `arguments` (empty `content`) in the irreducible
-    /// recent turn must be shrunk to fit — content-only truncation would leave it over.
+    /// A tool call whose bulk is in `arguments` (empty `content`) in the irreducible recent turn must be shrunk — content-only truncation would leave it over.
     #[test]
     fn enforce_budget_shrinks_oversized_tool_call_arguments() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4501,9 +4145,7 @@ mod tests {
         assert_eq!(role(&engine.messages[0]), "system", "system prompt kept");
     }
 
-    /// A transcript whose estimate clears the raw budget but which the provider still
-    /// rejects: calibrating from the rejection + force-fitting brings the real size
-    /// under the window.
+    /// A transcript whose estimate clears the raw budget but the provider rejects: calibrating from the rejection + force-fitting brings the real size under the window.
     #[test]
     fn overflow_recovery_calibrates_from_rejection_and_fits() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4552,8 +4194,7 @@ mod tests {
         );
     }
 
-    /// Overflow recovery on a resumed single long turn keeps a marker for the
-    /// dropped work instead of vanishing to `[system, latest-user]`.
+    /// Overflow recovery on a resumed single long turn keeps a marker for dropped work instead of vanishing to `[system, latest-user]`.
     #[test]
     fn force_fit_recovery_keeps_prior_context_on_single_long_turn() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4639,8 +4280,7 @@ mod tests {
         );
     }
 
-    /// Forcing a tiny window + zero keep-recent makes an over-budget transcript
-    /// compact at the boundary; with only stale OLD tool output overflowing,
+    /// Tiny window + zero keep-recent: with only stale OLD tool output overflowing,
     /// `maybe_compact` takes the no-model cheap path (clears them, returns 0).
     #[tokio::test]
     async fn forced_tiny_window_compacts_at_boundary_without_a_model_call() {
@@ -4699,8 +4339,7 @@ mod tests {
         );
     }
 
-    /// A resumed single long turn over budget keeps its prior context as a folded
-    /// summary instead of `enforce_budget` dropping it to `[system, latest-user]`.
+    /// A resumed single long turn over budget keeps prior context as a folded summary instead of dropping to `[system, latest-user]`.
     #[tokio::test]
     async fn resume_single_long_turn_keeps_prior_context_on_compaction() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4762,10 +4401,8 @@ mod tests {
         assert_eq!(content_str(&engine.messages[3]), "next");
     }
 
-    /// `push_text_turn` merges into a preceding same-role plain-text message so
-    /// the engine never holds two consecutive same-role turns (Anthropic 400s on
-    /// those via the bridge). Different roles and tool_call-bearing assistants
-    /// are never merged.
+    /// `push_text_turn` merges into a preceding same-role plain-text message (never
+    /// two consecutive same-role turns — Anthropic 400s). Different roles / tool_call assistants aren't merged.
     #[test]
     fn push_text_turn_merges_consecutive_same_role() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4792,8 +4429,7 @@ mod tests {
         );
     }
 
-    /// Seeding a history that already has two adjacent user turns (a cancelled
-    /// turn + the next) must not reproduce them as consecutive user messages.
+    /// Seeding a history with two adjacent user turns (cancelled + next) must not reproduce them as consecutive user messages.
     #[test]
     fn seed_history_merges_adjacent_user_turns() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4812,9 +4448,7 @@ mod tests {
         );
     }
 
-    /// A trimmed history can start mid-exchange with assistant turns; seeding
-    /// must drop those leading non-user turns so the conversation opens with a
-    /// user message (Anthropic rejects an assistant-first sequence).
+    /// Seeding drops leading assistant turns so the conversation opens with a user message (Anthropic rejects assistant-first).
     #[test]
     fn seed_history_drops_leading_assistant_for_user_first() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4845,24 +4479,19 @@ mod tests {
 
     #[test]
     fn system_prompt_points_to_guides_lazily() {
-        // With guides present: name is referenced, content is NOT inlined, and the
-        // agent is told to skip them for trivial messages.
+        // With guides: name referenced, content NOT inlined, skip-for-trivial told.
         let p = system_prompt("/tmp/proj", "2026-01-01", &["AGENTS.md".to_string()], &[]);
         assert!(p.contains("AGENTS.md"));
         assert!(p.contains("Skip them for questions"));
         assert!(p.contains("just to say hello"));
-        // No guides → no convention-file section at all. (Match the section's
-        // unique opener, not the bare phrase "convention file" — the base prompt
-        // now points at convention files as a place to find build/test commands.)
+        // No guides → no convention-file section. Match the section opener, not "convention file" (the base prompt mentions those too).
         let none = system_prompt("/tmp/proj", "", &[], &[]);
         assert!(!none.contains("This project has convention file"));
     }
 
     #[test]
     fn system_prompt_names_the_host_shell() {
-        // The model is told which shell `run_bash` uses so it writes commands in
-        // the right syntax (not bash on a Windows host). The label must match what
-        // `sandbox::bare_shell` actually spawns on this platform.
+        // The model is told which shell `run_bash` uses (right syntax, not bash on Windows); label must match what's spawned.
         let p = system_prompt("/tmp/proj", "", &[], &[]);
         assert!(p.contains("Environment:"));
         assert!(p.contains(crate::agent::sandbox::shell_label()));
@@ -4870,10 +4499,7 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_restraint_guardrails() {
-        // The action-biased prompt carries its counterweights: verify-before-done,
-        // don't-claim-unverified, don't-commit-unprompted, and confirm-before an
-        // irreversible / outward-facing action (the gap the destructive-command
-        // heuristic can't see).
+        // The action-biased prompt carries its counterweights (verify-before-done, don't-claim-unverified, confirm-before-irreversible).
         let p = system_prompt("/tmp/proj", "", &[], &[]);
         assert!(p.contains("verify it before you call the task done"));
         assert!(p.contains(
@@ -4882,9 +4508,9 @@ mod tests {
         assert!(p.contains("Don't commit, push, create"));
         assert!(p.contains("does NOT catch outward-facing or hard-to-undo"));
         assert!(p.contains("wait for the user to confirm"));
-        // Added after a cross-model review converged on the same gaps:
         assert!(p.contains("never invent file contents")); // don't fabricate
         assert!(p.contains("never print, log, hard-code, or commit secrets")); // secrets hygiene
+        assert!(p.contains("don't open secret-bearing files")); // secrets: read/exfil, not just write
         assert!(p.contains("change tactics rather than repeating it")); // loop-breaking
         assert!(p.contains("run those in their own terminal rather than running them yourself")); // interactive login is the user's
     }
@@ -4892,16 +4518,14 @@ mod tests {
     #[test]
     fn first_party_branding_is_opt_in_idempotent_and_durable() {
         let mut e = AgentEngine::new("/tmp", "aivo/starter", "", &[], &[], 0, 0);
-        // Off by default: the base prompt never names the model/provider, so BYOK
-        // (and anything not explicitly branded) stays honest.
+        // Off by default: the base prompt never names the model/provider (BYOK stays honest).
         assert!(!system_content(&e).contains("aivo's own assistant"));
 
         e.set_first_party();
         let branded = system_content(&e);
         assert!(branded.contains("aivo's own assistant"));
         assert!(branded.contains("aivo models"));
-        // Must mutate the system message in place, not push one — `restore_conversation`
-        // no-ops unless `messages.len() == 1`.
+        // Must mutate in place, not push — `restore_conversation` no-ops unless `messages.len() == 1`.
         assert_eq!(e.messages.len(), 1);
 
         // Idempotent: a rebuild/resume re-runs it; a double call doesn't duplicate.
@@ -4932,10 +4556,8 @@ mod tests {
         assert_eq!(role(&messages[cut]), "user");
     }
 
-    /// Compaction must not leave two consecutive `user` messages: the summary is
-    /// folded INTO the first kept user turn (not inserted before it), so the
-    /// roles keep alternating — Anthropic (via the serve bridge) 400s otherwise,
-    /// which would brick the agent right after a compaction.
+    /// Compaction folds the summary INTO the first kept user turn (not before it) so
+    /// roles keep alternating — Anthropic 400s otherwise, bricking the agent post-compaction.
     #[test]
     fn apply_compaction_folds_summary_and_keeps_roles_alternating() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -4974,9 +4596,7 @@ mod tests {
         assert_eq!(role(&engine.messages[2]), "assistant");
     }
 
-    /// The pinned working set (plan + touched files) survives a compaction
-    /// verbatim — folded into the SAME kept user turn, so alternation still holds
-    /// even with a non-empty pinned block (the critical regression).
+    /// The pinned working set survives a compaction verbatim, folded into the SAME kept user turn so alternation holds even with a non-empty block.
     #[test]
     fn pinned_plan_and_files_survive_compaction() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5034,12 +4654,9 @@ mod tests {
         assert!(!folded.contains("## Files touched"));
     }
 
-    /// Compaction must preserve the tool_use↔tool_result pairing in the KEPT
-    /// region: every `tool` message that survives the drain still follows an
-    /// assistant `tool_calls` that names its `tool_call_id`, and no orphan `tool`
-    /// message is left at the head of the kept history (a leading tool result with
-    /// no preceding call also 400s strict providers). `find_cut` lands on a user
-    /// boundary, so a whole assistant→tool pair is never split by the cut.
+    /// Compaction preserves tool_use↔tool_result pairing in the KEPT region: every
+    /// surviving `tool` follows an assistant `tool_calls` naming its id, and no orphan
+    /// tool heads the kept history (a leading tool result also 400s strict providers).
     #[test]
     fn apply_compaction_preserves_tool_pairing_across_cut() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5111,9 +4728,7 @@ mod tests {
         );
     }
 
-    /// The budget backstop drops whole oldest turns at user boundaries (never the
-    /// system prompt) until the history fits — the guard that keeps a
-    /// post-compaction overflow from bricking a turn with a non-retryable 413.
+    /// The budget backstop drops oldest turns at user boundaries (never the system prompt) until it fits — guards against a non-retryable post-compaction 413.
     #[test]
     fn enforce_budget_drops_oldest_turns_at_user_boundaries() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5151,9 +4766,7 @@ mod tests {
         );
     }
 
-    /// When even [system, last user turn] overflows — a single pasted turn larger
-    /// than the window — the backstop shortens the oversized content instead of
-    /// looping forever, so the turn still fits.
+    /// When even [system, last user turn] overflows (one huge pasted turn), the backstop shortens the content instead of looping forever.
     #[test]
     fn enforce_budget_truncates_a_single_oversized_turn() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5212,7 +4825,7 @@ mod tests {
     #[test]
     fn build_summary_request_carries_prior_summary() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
-        // First pass: no prior summary → fresh prompt, transcript verbatim.
+        // No prior summary → fresh prompt, transcript verbatim.
         let r1 = engine.build_summary_request("TRANSCRIPT");
         assert_eq!(r1.messages[0]["content"], json!(SUMMARY_SYSTEM_PROMPT));
         assert_eq!(r1.messages[1]["content"], json!("TRANSCRIPT"));
@@ -5235,8 +4848,7 @@ mod tests {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
         engine.plan =
             plan::parse_plan(&json!({"plan":[{"step":"keep me","status":"pending"}]})).unwrap();
-        // Far more files than fit under PINNED_MAX_TOKENS (set the field directly
-        // to bypass MAX_TOUCHED_FILES, simulating a giant historical list).
+        // Far more files than fit under PINNED_MAX_TOKENS (set directly to bypass MAX_TOUCHED_FILES).
         engine.touched_files = (0..600)
             .map(|i| format!("src/very/long/path/segment/file_{i}.rs"))
             .collect();
@@ -5266,9 +4878,7 @@ mod tests {
         assert!(engine.notes.is_empty());
     }
 
-    /// #1: the cheap compaction pass clears bulky OLD tool outputs (before the
-    /// keep window) to a stub, leaving recent ones — and their `tool_call_id`s —
-    /// intact, and is idempotent.
+    /// The cheap pass stubs bulky OLD tool outputs (before the keep window), leaving recent ones + their ids intact; idempotent.
     #[test]
     fn clear_stale_tool_results_clears_only_old_bulky_outputs() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5297,8 +4907,7 @@ mod tests {
         assert_eq!(e.stale_tool_result_savings(cut), 0, "idempotent");
     }
 
-    /// #3: `take_note` content rides into a compaction via the pinned block, and
-    /// the per-block cap trims files before notes (notes kept, plan whole).
+    /// `take_note` content rides into a compaction via the pinned block; the cap trims files before notes (notes kept, plan whole).
     #[test]
     fn notes_pin_into_compaction_block() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5314,9 +4923,7 @@ mod tests {
         assert!(!block.contains("file_0.rs"), "files trimmed before notes");
     }
 
-    /// #4: restore re-derives the working set (plan, notes, touched files) from the
-    /// message log — the stateless-reducer property, so a resumed session is not
-    /// amnesiac about its state.
+    /// Restore re-derives the working set (plan, notes, touched files) from the message log — the stateless-reducer property.
     #[test]
     fn restore_rebuilds_working_set_from_log() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5367,9 +4974,7 @@ mod tests {
         assert!(out.starts_with("abc…") && out.contains("+5 chars"));
     }
 
-    /// An assistant turn left with dangling tool_calls (interrupted mid-tool) is
-    /// repaired into a valid sequence before the next user turn: every unanswered
-    /// call id gets a synthetic tool result, inserted right after the call.
+    /// A dangling-tool_calls assistant (interrupted mid-tool) is repaired before the next turn: each unanswered call id gets a synthetic result.
     #[test]
     fn repair_interrupted_tail_answers_dangling_calls() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5398,10 +5003,7 @@ mod tests {
             .filter_map(|m| m["tool_call_id"].as_str())
             .collect();
         assert_eq!(tool_ids, vec!["c1", "c2"]);
-        // A short assistant turn caps the synthesized tool results so the next
-        // user turn alternates (tool results map to a user message upstream; a
-        // bare user turn after them would be a 2nd consecutive user → Anthropic
-        // 400). The tail is now that assistant turn, not the last tool result.
+        // A short assistant turn caps the synthesized results so the next user turn alternates (bare user after them → 2nd consecutive user, Anthropic 400).
         let last = engine.messages.last().unwrap();
         assert_eq!(role(last), "assistant");
         assert_eq!(last["content"], "[interrupted]");
@@ -5411,8 +5013,7 @@ mod tests {
         engine.repair_interrupted_tail();
         assert_eq!(engine.messages.len(), len);
 
-        // With a real next turn appended, the synthetic assistant sits between
-        // the tool results and the user — so roles alternate, no consecutive user.
+        // With a real next turn appended, the synthetic assistant sits between the results and the user, so roles alternate.
         engine
             .messages
             .push(json!({"role":"user","content":"next"}));
@@ -5425,10 +5026,7 @@ mod tests {
         );
     }
 
-    /// The repaired tail's core invariant: no assistant turn bearing `tool_calls`
-    /// is left without a matching `tool` result for EVERY one of its call ids in
-    /// the contiguous tool run that follows. Asserted generically over a transcript
-    /// with several unanswered ids (the dangling-tool_use → Anthropic-400 brick).
+    /// Repaired-tail invariant: no assistant `tool_calls` is left without a matching `tool` result for every call id in the following run.
     #[test]
     fn repair_interrupted_tail_leaves_no_unanswered_tool_use() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5472,9 +5070,7 @@ mod tests {
         }
     }
 
-    /// A clean transcript — every tool_use already answered AND already capped by a
-    /// following assistant — must be left byte-for-byte unchanged (no spurious
-    /// `[interrupted]` results, no duplicate synthetic assistant cap on rerun).
+    /// A clean transcript (every tool_use answered AND capped by a following assistant) must be left byte-for-byte unchanged.
     #[test]
     fn repair_interrupted_tail_leaves_clean_transcript_unchanged() {
         let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5490,8 +5086,7 @@ mod tests {
         engine
             .messages
             .push(json!({"role":"tool","tool_call_id":"c1","content":"ok"}));
-        // An assistant already follows the result → the tool run is already capped,
-        // so the alternation-guard branch (line ~648) must NOT add a second cap.
+        // An assistant already follows the result → already capped, so the alternation guard must NOT add a second cap.
         engine
             .messages
             .push(json!({"role":"assistant","content":"all done"}));
@@ -5605,8 +5200,7 @@ mod tests {
         );
     }
 
-    /// A profile's body folds into the system prompt, and a `tools` allow-list
-    /// restricts the offered built-ins (keeping `update_plan`), dropping the rest.
+    /// A profile's body folds into the system prompt; a `tools` allow-list restricts the built-ins (keeping `update_plan`).
     #[test]
     fn apply_profile_folds_role_and_scopes_tools() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5651,9 +5245,7 @@ mod tests {
         assert!(!after.contains(&"run_bash".to_string()));
     }
 
-    /// The reverse of the gpt-5 case: an authored `apply_patch` scope grants the
-    /// `edit_file` the model actually advertises — the edit family is one class,
-    /// so scoping is symmetric regardless of which member the author named.
+    /// Reverse of the gpt-5 case: an `apply_patch` scope grants `edit_file` — the edit family is one class, so scoping is symmetric.
     #[test]
     fn apply_profile_apply_patch_scope_grants_edit_file_off_codex() {
         let mut e = AgentEngine::new("/tmp", "claude-sonnet-4-6", "", &[], &[], 0, 0);
@@ -5683,10 +5275,9 @@ mod tests {
         assert_eq!(tool_names(&e), before);
     }
 
-    /// Durable resume: `export_conversation` drops the system prompt but keeps the
-    /// exact tool-call / tool-result pairing (with ids), and `restore_conversation`
-    /// rebuilds it verbatim after a fresh system prompt — the round trip a resume
-    /// performs. Restore is a no-op once the engine is non-fresh.
+    /// Durable resume round trip: `export_conversation` drops the system prompt but keeps
+    /// exact tool-call/result pairing, and `restore_conversation` rebuilds it after a fresh
+    /// system prompt. Restore is a no-op once non-fresh.
     #[test]
     fn export_then_restore_round_trips_tool_history() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
@@ -5863,9 +5454,8 @@ mod tests {
 
     #[tokio::test]
     async fn rewind_target_survives_interrupted_turn_merge() {
-        // A resend after an interrupt merges into the trailing `user` message
-        // ("first\n\nsecond"); the stored prompt must stay "first" so the turn
-        // keeps file revert instead of dropping to conversation-only.
+        // A resend after an interrupt merges into the trailing `user` ("first\n\nsecond");
+        // the stored prompt must stay "first" so the turn keeps file revert, not conversation-only.
         let dir = tempfile::tempdir().unwrap();
         let mut engine = rewind_engine(dir.path());
         engine.checkpoints.push(Checkpoint {

@@ -370,7 +370,7 @@ impl ChatTuiApp {
             })
             .to_string();
             render_local_command(&mut block, &content, OutputView::Live);
-            push_block(&mut lines, &mut bars, block, Some(TOOL));
+            push_block(&mut lines, &mut bars, block, Some(SHELL));
         }
         if let Some((color, _)) = notice_display(self.notice.as_ref()) {
             lines.push(blank_line());
@@ -1392,10 +1392,10 @@ impl ChatTuiApp {
     /// terminals.
     pub(super) fn composer_rule_line(&self, width: u16) -> Line<'static> {
         let width = usize::from(width);
-        // In `!cmd` shell mode the prompt's top line picks up the accent hue,
-        // matching the accent-tinted draft text so shell mode reads at a glance.
+        // In `!cmd` shell mode the prompt's top line picks up the magenta shell
+        // hue, matching the tinted draft text so shell mode reads at a glance.
         let rule_style = if self.draft_is_shell_command() {
-            Style::default().fg(ACCENT)
+            Style::default().fg(SHELL)
         } else {
             Style::default().fg(FAINT)
         };
@@ -1778,10 +1778,10 @@ impl ChatTuiApp {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )
         } else if self.draft_is_shell_command() {
-            // `!cmd` shell mode tints the prompt itself in the accent hue too.
+            // `!cmd` shell mode tints the prompt itself in the magenta shell hue too.
             Span::styled(
                 "> ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default().fg(SHELL).add_modifier(Modifier::BOLD),
             )
         } else {
             Span::styled("> ", Style::default().fg(USER).add_modifier(Modifier::BOLD))
@@ -1805,10 +1805,10 @@ impl ChatTuiApp {
         // Ghost hint trailing a bare slash command (Claude-Code style), e.g.
         // `> /mcp [add … | rm <name>]`. Only set when the draft is a single line.
         let ghost = self.composer_command_hint();
-        // A `!cmd` draft is tinted in the accent hue, so shell mode reads at a
-        // glance — the prompt and its top divider pick up the same accent color.
+        // A `!cmd` draft is tinted in the magenta shell hue, so shell mode reads at
+        // a glance — the prompt and its top divider pick up the same magenta color.
         let draft_color = if self.draft_is_shell_command() {
-            ACCENT
+            SHELL
         } else {
             TEXT
         };

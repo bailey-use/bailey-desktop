@@ -17,6 +17,9 @@ pub(super) const USER: Color = Color::Rgb(181, 164, 235);
 // Agent tool steps (call/result) — a steel cyan distinct from user lavender,
 // assistant jade, and link blue.
 pub(super) const TOOL: Color = Color::Rgb(110, 170, 188);
+// `!cmd` local shell runs — a muted magenta so a user-run shell command reads
+// apart from agent tool steps (cyan) and the brand accent (lime).
+pub(super) const SHELL: Color = Color::Rgb(204, 112, 176);
 pub(super) const LINK: Color = Color::Rgb(143, 178, 222);
 pub(super) const QUOTE: Color = Color::Rgb(150, 150, 128); // warm olive aside
 pub(super) const ERROR: Color = Color::Rgb(228, 128, 114); // warm coral

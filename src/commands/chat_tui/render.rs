@@ -237,12 +237,14 @@ fn fill_trailing_background(mut row: StyledLine, width: usize) -> StyledLine {
 }
 
 /// Accent-bar color for a transcript role: user = lavender, assistant = brand
-/// accent (aivo's voice), agent tool steps = cyan, everything else = muted.
+/// accent (aivo's voice), `!cmd` shell runs = magenta, agent tool steps = cyan,
+/// everything else = muted.
 pub(super) fn role_bar_color(role: &str) -> Color {
     match role {
         "user" => USER,
         "assistant" => ACCENT,
-        "tool_call" | "tool_result" | "local_command" | "plan" => TOOL,
+        "local_command" => SHELL,
+        "tool_call" | "tool_result" | "plan" => TOOL,
         _ => MUTED,
     }
 }
@@ -1269,7 +1271,7 @@ pub(super) fn render_local_command(
     lines.push(line_with_plain(vec![
         Span::styled(
             "! ".to_string(),
-            Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+            Style::default().fg(SHELL).add_modifier(Modifier::BOLD),
         ),
         Span::styled(command.to_string(), Style::default().fg(TEXT)),
     ]));

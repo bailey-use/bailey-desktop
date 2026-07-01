@@ -90,12 +90,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "grep",
-            "Search file contents for a pattern (regex via ripgrep when available). Returns path:line:text.",
+            "Search file contents for a pattern (regex via ripgrep when available). Returns path:line:text. Set `context` to also show N lines around each match (like grep -C) — see a match's surrounding code in one call instead of a follow-up read_file.",
             json!({
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Search pattern"},
-                    "path": {"type": "string", "description": "File or directory to search (default current dir)"}
+                    "path": {"type": "string", "description": "File or directory to search (default current dir)"},
+                    "context": {"type": "integer", "description": "Lines of context to show around each match (default 0)"}
                 },
                 "required": ["pattern"]
             }),
@@ -1137,6 +1138,8 @@ fn wm(p: &[char], t: &[char]) -> bool {
 async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
     let pattern = arg_str(args, "pattern")?;
     let path = arg_str_opt(args, "path").unwrap_or(".");
+    // Context lines per match (grep -C), clamped so it can't dump whole files.
+    let context = arg_u64(args, "context").unwrap_or(0).min(100) as usize;
     // All three tiers (rg → grep -rn → pure-Rust walk) must search the SAME file
     // set, or results would vary by which tool is installed. The pure-Rust walk
     // defines the contract: skip only `IGNORED_DIRS`, do NOT honor `.gitignore`.
@@ -1151,6 +1154,10 @@ async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
         "--no-ignore".into(),
         "--hidden".into(),
     ];
+    if context > 0 {
+        rg_args.push("-C".into());
+        rg_args.push(context.to_string());
+    }
     for dir in IGNORED_DIRS {
         rg_args.push("-g".into());
         rg_args.push(format!("!{dir}"));
@@ -1163,6 +1170,10 @@ async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
     }
 
     let mut grep_args: Vec<String> = vec!["-rn".into()];
+    if context > 0 {
+        grep_args.push("-C".into());
+        grep_args.push(context.to_string());
+    }
     for dir in IGNORED_DIRS {
         grep_args.push(format!("--exclude-dir={dir}"));
     }
@@ -1176,7 +1187,7 @@ async fn grep(args: &Value, cwd: &Path) -> Result<String, String> {
     // No external tool: literal-substring walk (also skips IGNORED_DIRS only).
     let base = resolve(cwd, path);
     let mut out = Vec::new();
-    grep_fallback(&base, &base, pattern, &mut out);
+    grep_fallback(&base, &base, pattern, context, &mut out);
     if out.is_empty() {
         return Ok("(no matches)".to_string());
     }
@@ -1191,7 +1202,7 @@ fn grep_result(out: String) -> String {
     }
 }
 
-fn grep_fallback(root: &Path, dir: &Path, needle: &str, out: &mut Vec<String>) {
+fn grep_fallback(root: &Path, dir: &Path, needle: &str, context: usize, out: &mut Vec<String>) {
     if out.len() >= GLOB_CAP {
         return;
     }
@@ -1210,7 +1221,7 @@ fn grep_fallback(root: &Path, dir: &Path, needle: &str, out: &mut Vec<String>) {
         let name = e.file_name();
         if path.is_dir() {
             if !IGNORED_DIRS.contains(&name.to_string_lossy().as_ref()) {
-                grep_fallback(root, &path, needle, out);
+                grep_fallback(root, &path, needle, context, out);
             }
             continue;
         }
@@ -1222,14 +1233,61 @@ fn grep_fallback(root: &Path, dir: &Path, needle: &str, out: &mut Vec<String>) {
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        for (i, line) in content.lines().enumerate() {
-            if line.contains(needle) {
-                out.push(format!("{rel}:{}:{line}", i + 1));
-                if out.len() >= GLOB_CAP {
-                    return;
-                }
+        let lines: Vec<&str> = content.lines().collect();
+        let matched: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(i, _)| i)
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // grep -C divides separated groups (including across files) with `--`.
+        if context > 0 && !out.is_empty() {
+            out.push("--".into());
+        }
+        emit_context(&rel, &lines, &matched, context, out);
+        if out.len() >= GLOB_CAP {
+            return;
+        }
+    }
+}
+
+/// Emit one file's matches like `grep -C`: `:` on match lines, `-` on context
+/// lines, `--` between non-adjacent windows. context 0 = one path:line:text/match.
+fn emit_context(
+    rel: &str,
+    lines: &[&str],
+    matched: &[usize],
+    context: usize,
+    out: &mut Vec<String>,
+) {
+    let mut last: Option<usize> = None; // last emitted line index
+    for &m in matched {
+        let start = m.saturating_sub(context);
+        let end = (m + context).min(lines.len().saturating_sub(1));
+        let from = match last {
+            Some(l) if start <= l + 1 => l + 1, // merge with previous window
+            Some(_) => {
+                out.push("--".into());
+                start
+            }
+            None => start,
+        };
+        for (offset, line) in lines[from..=end].iter().enumerate() {
+            let i = from + offset;
+            let sep = if matched.binary_search(&i).is_ok() {
+                ':'
+            } else {
+                '-'
+            };
+            out.push(format!("{rel}{sep}{}{sep}{}", i + 1, line));
+            if out.len() >= GLOB_CAP {
+                return;
             }
         }
+        last = Some(end);
     }
 }
 
@@ -2555,7 +2613,7 @@ mod tests {
         write_file(&json!({"path":"f.txt","content":"needle"}), &dir).unwrap();
         std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
         let mut out = Vec::new();
-        grep_fallback(&dir, &dir, "needle", &mut out);
+        grep_fallback(&dir, &dir, "needle", 0, &mut out);
         assert!(
             out.iter().any(|l| l.contains("f.txt")),
             "missing match: {out:?}"
@@ -2800,6 +2858,55 @@ mod tests {
             out.contains("secret.txt"),
             "gitignored file should still be searched (consistency): {out}"
         );
+    }
+
+    /// Tier-agnostic: rg, grep, and the pure-Rust fallback all honor `context`.
+    #[tokio::test]
+    async fn grep_context_shows_neighbors() {
+        let dir = tmp();
+        write_file(
+            &json!({"path":"f.txt","content":"before_line\nHITHERE\nafter_line"}),
+            &dir,
+        )
+        .unwrap();
+        let plain = grep(&json!({"pattern":"HITHERE"}), &dir).await.unwrap();
+        assert!(plain.contains("HITHERE") && !plain.contains("before_line"));
+        let ctx = grep(&json!({"pattern":"HITHERE","context":1}), &dir)
+            .await
+            .unwrap();
+        assert!(
+            ctx.contains("before_line") && ctx.contains("HITHERE") && ctx.contains("after_line"),
+            "context=1 should include both neighbors: {ctx}"
+        );
+    }
+
+    #[test]
+    fn emit_context_zero_is_one_line_per_match() {
+        let lines = ["a", "b", "c"];
+        let mut out = Vec::new();
+        emit_context("f", &lines, &[1], 0, &mut out);
+        assert_eq!(out, vec!["f:2:b"]);
+    }
+
+    #[test]
+    fn emit_context_marks_match_and_context_separators() {
+        let lines = ["a", "b", "c", "d", "e"];
+        let mut out = Vec::new();
+        emit_context("f", &lines, &[2], 1, &mut out);
+        assert_eq!(out, vec!["f-2-b", "f:3:c", "f-4-d"]);
+    }
+
+    #[test]
+    fn emit_context_merges_adjacent_and_splits_disjoint() {
+        let lines = ["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"];
+        let mut merged = Vec::new();
+        emit_context("f", &lines, &[1, 2], 1, &mut merged); // context 1 → one window
+        assert!(!merged.iter().any(|l| l == "--"), "adjacent: {merged:?}");
+        assert_eq!(merged.len(), 4); // lines 0..=3
+
+        let mut split = Vec::new();
+        emit_context("f", &lines, &[1, 5], 1, &mut split); // gap → two windows
+        assert!(split.iter().any(|l| l == "--"), "disjoint: {split:?}");
     }
 
     #[test]

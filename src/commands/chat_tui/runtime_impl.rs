@@ -219,6 +219,14 @@ impl ChatTuiApp {
             if command.is_empty() {
                 anyhow::bail!("Type a command after '!'");
             }
+            // `!cmd` forwards no keystrokes (see `system.rs`), so most interactive
+            // programs would hang until esc/the 120s cap; refuse those before spawning
+            // (bail keeps the draft). `tail -f`/`watch` still stream, so they're allowed.
+            if let Some(blocker) = crate::agent::tools::interactive_block_reason(command)
+                && blocker.blocks_bang_cmd()
+            {
+                anyhow::bail!("{}", blocker.user_message());
+            }
             return Ok(Some(SubmitAction::Shell(command.to_string())));
         }
         Ok(Some(SubmitAction::Send(trimmed.to_string())))

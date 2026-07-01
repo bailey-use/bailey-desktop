@@ -1463,84 +1463,164 @@ fn ssh_has_remote_command(args: &[String]) -> bool {
     false
 }
 
+/// A command that stalls a shell with no interactive input — the agent's `run_bash`
+/// (no TTY) or the chat's `!cmd` (a PTY, but no keystrokes forwarded). One detector,
+/// two messages: `agent_message` steers to tools/flags, `user_message` to a terminal.
+#[derive(Debug, PartialEq)]
+pub(crate) enum InteractiveBlocker {
+    Editor(String),
+    InteractiveRemote(String),
+    Sudo,
+    FullScreenMonitor(String),
+    Watch,
+    TailFollow,
+    GitRebaseInteractive,
+    GitAddPatch,
+    ContainerTty(String),
+}
+
+impl InteractiveBlocker {
+    pub(crate) fn agent_message(&self) -> String {
+        match self {
+            Self::Editor(prog) => format!(
+                "`{prog}` opens an interactive editor, which can't run under the agent's \
+                 non-interactive shell. Edit files with the write/edit tools instead, or ask the \
+                 user to run it."
+            ),
+            Self::InteractiveRemote(prog) => format!(
+                "`{prog}` with no remote command opens an interactive session that will block \
+                 here. Run a non-interactive form like `{prog} <host> '<command>'`, or ask the \
+                 user to run it."
+            ),
+            Self::Sudo => "`sudo` may prompt for a password on the terminal and block here. Use \
+                 `sudo -n` (it fails fast when credentials aren't cached), or ask the user to run \
+                 it."
+            .into(),
+            Self::FullScreenMonitor(prog) => format!(
+                "`{prog}` is a full-screen monitor that never exits on its own. Use a one-shot \
+                 snapshot like `ps aux` (or `top -b -n1`)."
+            ),
+            Self::Watch => {
+                "`watch` reruns a command forever and never exits. Run the command once instead."
+                    .into()
+            }
+            Self::TailFollow => "`tail -f` follows the file forever and never exits. Read a \
+                 bounded slice with `tail -n <N>`, or background it."
+                .into(),
+            Self::GitRebaseInteractive => "`git rebase -i` opens an interactive editor and can't \
+                 run here. Script the rebase non-interactively, or ask the user to run it."
+                .into(),
+            Self::GitAddPatch => "`git add -p/-i` is interactive and can't run here. Stage paths \
+                 explicitly (`git add <path>`) instead."
+                .into(),
+            Self::ContainerTty(prog) => format!(
+                "`{prog}` with an interactive TTY (`-it`) opens a session that will block here. \
+                 Drop `-t` and pass the command non-interactively, or ask the user to run it."
+            ),
+        }
+    }
+
+    pub(crate) fn user_message(&self) -> String {
+        match self {
+            Self::Editor(prog) => format!(
+                "`{prog}` is an interactive editor, but `!cmd` forwards no keystrokes to it — it'd \
+                 just hang. Run it in a separate terminal."
+            ),
+            Self::InteractiveRemote(prog) => format!(
+                "`{prog}` with no remote command opens an interactive session, which `!cmd` can't \
+                 drive (it forwards no keystrokes). Add a command (`{prog} <host> '<cmd>'`), or \
+                 run it in a separate terminal."
+            ),
+            Self::Sudo => "`sudo`'s password prompt can't be answered under `!cmd` (it forwards \
+                 no keystrokes). Use `sudo -n`, or run it in a separate terminal."
+                .into(),
+            Self::FullScreenMonitor(prog) => format!(
+                "`{prog}` is a full-screen monitor that never exits on its own. Use a snapshot \
+                 like `ps aux` (or `top -b -n1`)."
+            ),
+            Self::Watch => {
+                "`watch` reruns forever and never exits. Run the command once instead.".into()
+            }
+            Self::TailFollow => "`tail -f` follows forever and never exits under `!cmd`. Use \
+                 `tail -n <N>`, or run it in a separate terminal."
+                .into(),
+            Self::GitRebaseInteractive => "`git rebase -i` opens an interactive editor, which \
+                 `!cmd` can't drive. Run it in a separate terminal."
+                .into(),
+            Self::GitAddPatch => "`git add -p/-i` is interactive, which `!cmd` can't drive. Stage \
+                 paths explicitly (`git add <path>`)."
+                .into(),
+            Self::ContainerTty(prog) => format!(
+                "`{prog} -it` opens an interactive session `!cmd` can't drive. Drop `-t` for a \
+                 one-shot command, or run it in a separate terminal."
+            ),
+        }
+    }
+
+    /// Whether the chat's `!cmd` should refuse this too. Unlike the agent, `!cmd`
+    /// streams PTY output live and esc stops it, so an endless-but-streaming monitor
+    /// (`tail -f`, `watch`) is a legit in-chat use there; only the rest (editors,
+    /// full-screen TUIs, prompts we can't answer) genuinely can't work.
+    pub(crate) fn blocks_bang_cmd(&self) -> bool {
+        !matches!(self, Self::Watch | Self::TailFollow)
+    }
+}
+
 /// Interactive `git` subcommands (`git commit` w/o `-m` is handled by `GIT_EDITOR`).
-fn blocking_git(args: &[String]) -> Option<String> {
+fn blocking_git(args: &[String]) -> Option<InteractiveBlocker> {
     let sub = args
         .iter()
         .find(|a| !a.starts_with('-'))
         .map(String::as_str);
     let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
     match sub {
-        Some("rebase") if has(&["-i", "--interactive"]) => Some(
-            "`git rebase -i` opens an interactive editor and can't run here. Script the rebase \
-             non-interactively, or ask the user to run it."
-                .into(),
-        ),
-        Some("add") if has(&["-p", "--patch", "-i", "--interactive"]) => Some(
-            "`git add -p/-i` is interactive and can't run here. Stage paths explicitly \
-             (`git add <path>`) instead."
-                .into(),
-        ),
-        _ => None,
-    }
-}
-
-/// The refusal reason if `prog`+`args` would block the non-interactive shell.
-fn blocking_program(prog: &str, args: &[String]) -> Option<String> {
-    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
-    match prog {
-        "vim" | "vi" | "nvim" | "nano" | "pico" | "emacs" | "joe" | "mcedit" => Some(format!(
-            "`{prog}` opens an interactive editor, which can't run under the agent's \
-             non-interactive shell. Edit files with the write/edit tools instead, or ask the \
-             user to run it."
-        )),
-        "ssh" | "sftp" | "telnet" if !ssh_has_remote_command(args) => Some(format!(
-            "`{prog}` with no remote command opens an interactive session that will block here. \
-             Run a non-interactive form like `{prog} <host> '<command>'`, or ask the user to \
-             run it."
-        )),
-        "sudo" if !has(&["-n", "--non-interactive", "-A", "--askpass"]) => Some(
-            "`sudo` may prompt for a password on the terminal and block here. Use `sudo -n` \
-             (it fails fast when credentials aren't cached), or ask the user to run it."
-                .into(),
-        ),
-        "top" | "htop" if !has(&["-b", "--batch"]) => Some(format!(
-            "`{prog}` is a full-screen monitor that never exits on its own. Use a one-shot \
-             snapshot like `ps aux` (or `top -b -n1`)."
-        )),
-        "watch" => Some(
-            "`watch` reruns a command forever and never exits. Run the command once instead."
-                .into(),
-        ),
-        "tail" if has(&["-f", "-F", "--follow"]) => Some(
-            "`tail -f` follows the file forever and never exits. Read a bounded slice with \
-             `tail -n <N>`, or background it."
-                .into(),
-        ),
-        "git" => blocking_git(args),
-        "docker" | "podman" | "kubectl"
-            if has(&["-it", "-ti"]) || (has(&["-i", "--interactive"]) && has(&["-t", "--tty"])) =>
-        {
-            Some(format!(
-                "`{prog}` with an interactive TTY (`-it`) opens a session that will block here. \
-                 Drop `-t` and pass the command non-interactively, or ask the user to run it."
-            ))
+        Some("rebase") if has(&["-i", "--interactive"]) => {
+            Some(InteractiveBlocker::GitRebaseInteractive)
+        }
+        Some("add") if has(&["-p", "--patch", "-i", "--interactive"]) => {
+            Some(InteractiveBlocker::GitAddPatch)
         }
         _ => None,
     }
 }
 
-/// Refusal reason if `command` would block the shell (TTY prompt, full-screen
-/// program, or never terminates). Conservative + argument-aware so ordinary slow
-/// commands still run to the timeout; each pipeline segment's program is checked.
-fn interactive_block_reason(command: &str) -> Option<String> {
+fn blocking_program(prog: &str, args: &[String]) -> Option<InteractiveBlocker> {
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    match prog {
+        "vim" | "vi" | "nvim" | "nano" | "pico" | "emacs" | "joe" | "mcedit" => {
+            Some(InteractiveBlocker::Editor(prog.to_string()))
+        }
+        "ssh" | "sftp" | "telnet" if !ssh_has_remote_command(args) => {
+            Some(InteractiveBlocker::InteractiveRemote(prog.to_string()))
+        }
+        "sudo" if !has(&["-n", "--non-interactive", "-A", "--askpass"]) => {
+            Some(InteractiveBlocker::Sudo)
+        }
+        "top" | "htop" if !has(&["-b", "--batch"]) => {
+            Some(InteractiveBlocker::FullScreenMonitor(prog.to_string()))
+        }
+        "watch" => Some(InteractiveBlocker::Watch),
+        "tail" if has(&["-f", "-F", "--follow"]) => Some(InteractiveBlocker::TailFollow),
+        "git" => blocking_git(args),
+        "docker" | "podman" | "kubectl"
+            if has(&["-it", "-ti"]) || (has(&["-i", "--interactive"]) && has(&["-t", "--tty"])) =>
+        {
+            Some(InteractiveBlocker::ContainerTty(prog.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// The blocker if any pipeline segment of `command` would stall a no-input shell.
+/// Conservative + argument-aware, so ordinary slow commands still run to the timeout.
+pub(crate) fn interactive_block_reason(command: &str) -> Option<InteractiveBlocker> {
     let tokens = shlex::split(command)?;
     for seg in tokens.split(|t| is_shell_operator(t)) {
         let Some((prog, rest)) = seg.split_first() else {
             continue;
         };
-        if let Some(reason) = blocking_program(program_basename(prog), rest) {
-            return Some(reason);
+        if let Some(blocker) = blocking_program(program_basename(prog), rest) {
+            return Some(blocker);
         }
     }
     None
@@ -1556,8 +1636,8 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
         Err(e) => return early(Err(e)),
     };
     // Refuse blockers up front, so they don't burn the whole timeout as dead air.
-    if let Some(reason) = interactive_block_reason(command) {
-        return early(Err(reason));
+    if let Some(blocker) = interactive_block_reason(command) {
+        return early(Err(blocker.agent_message()));
     }
     let timeout = arg_u64(args, "timeout")
         .unwrap_or(BASH_DEFAULT_TIMEOUT)
@@ -2642,6 +2722,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("interactive editor"), "got: {err}");
+    }
+
+    #[test]
+    fn blocker_messages_are_audience_specific() {
+        assert_eq!(
+            interactive_block_reason("vim x"),
+            Some(InteractiveBlocker::Editor("vim".into()))
+        );
+        let editor = InteractiveBlocker::Editor("vim".into());
+        assert!(editor.agent_message().contains("write/edit tools"));
+        assert!(editor.user_message().contains("separate terminal"));
+        assert_ne!(editor.agent_message(), editor.user_message());
+        // `!cmd` phrasing never says "ask the user" (the human IS the user).
+        for cmd in ["ssh prod", "sudo apt update", "git rebase -i HEAD~2"] {
+            let msg = interactive_block_reason(cmd).unwrap().user_message();
+            assert!(!msg.contains("ask the user"), "{cmd}: {msg}");
+        }
+    }
+
+    #[test]
+    fn tail_and_watch_stream_under_bang_but_agent_refuses() {
+        // The agent refuses them (it can't watch the stream or press esc); `!cmd`
+        // streams them live, so only its refusal is relaxed.
+        for cmd in ["tail -f log", "watch ls"] {
+            assert!(
+                !interactive_block_reason(cmd).unwrap().blocks_bang_cmd(),
+                "{cmd}"
+            );
+        }
+        for cmd in ["vim x", "top", "ssh host", "docker run -it ubuntu bash"] {
+            assert!(
+                interactive_block_reason(cmd).unwrap().blocks_bang_cmd(),
+                "{cmd}"
+            );
+        }
     }
 
     #[tokio::test]

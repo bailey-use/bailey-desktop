@@ -8120,6 +8120,44 @@ fn test_prepare_submit_action_bare_bang_errors() {
     assert!(app.prepare_submit_action().is_err());
 }
 
+#[test]
+fn test_prepare_submit_action_interactive_bang_is_refused() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for draft in ["!vim notes.txt", "!make && vim Cargo.toml", "!top"] {
+        app.draft = draft.to_string();
+        // `SubmitAction` isn't `Debug`, so match rather than `unwrap_err`.
+        match app.prepare_submit_action() {
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains("separate terminal") || err.contains("ps aux"),
+                    "{draft}: {err}"
+                );
+            }
+            Ok(_) => panic!("{draft} should be refused"),
+        }
+    }
+    // A non-interactive command in the same family still runs.
+    app.draft = "!git add src/".to_string();
+    assert!(matches!(
+        app.prepare_submit_action().unwrap(),
+        Some(SubmitAction::Shell(cmd)) if cmd == "git add src/"
+    ));
+    // `tail -f`/`watch` stream live under the PTY (esc stops them), so `!cmd` runs
+    // them even though the agent's `run_bash` refuses them.
+    for draft in ["!tail -f server.log", "!watch ls"] {
+        app.draft = draft.to_string();
+        assert!(
+            matches!(
+                app.prepare_submit_action().unwrap(),
+                Some(SubmitAction::Shell(_))
+            ),
+            "{draft} should run under !cmd"
+        );
+    }
+}
+
 // Unix-only: drives the `!cmd` PTY with POSIX commands (`printf`) that the
 // Windows shell (PowerShell) doesn't provide, and a PTY read that blocks until
 // the child exits would stall the tokio runtime drop on Windows. The `!cmd`

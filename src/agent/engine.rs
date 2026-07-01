@@ -67,11 +67,8 @@ fn retry_delay(attempt: usize) -> std::time::Duration {
 /// it); auth (401/403) and bad-request (400) aren't either.
 fn is_retryable_error(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    if e.contains("context length")
-        || e.contains("context_length")
-        || e.contains("maximum context")
-        || e.contains("too many tokens")
-    {
+    // Overflow is handled by compaction/recovery, not by retrying the same request.
+    if is_context_overflow_error(err) {
         return false;
     }
     // Auth / bad-request are terminal — surface them now, don't burn retries (and
@@ -114,13 +111,85 @@ fn is_retryable_error(err: &str) -> bool {
     ];
     PATTERNS.iter().any(|p| e.contains(p))
 }
+
+/// Whether an error is the provider rejecting the request as over the model's input
+/// limit — recoverable by compaction+retry. Wordings vary, hence the phrase list.
+fn is_context_overflow_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    const PHRASES: &[&str] = &[
+        "maximum allowed input length",
+        "maximum input length",
+        "context length", // also matches "maximum context length"
+        "context_length",
+        "context window",
+        "maximum context",
+        "input length of",
+        "too many tokens",
+        "prompt is too long",
+        "reduce the length",
+    ];
+    PHRASES.iter().any(|p| e.contains(p))
+}
+
+/// Best-effort real token count from an overflow error, for one-shot calibration.
+/// Only integers next to a token-context keyword count (so request-ids/timestamps
+/// aren't picked); commas stripped; no floor, so small-window models still calibrate.
+fn parse_overflow_actual(err: &str) -> Option<u64> {
+    // Token-context words only — excludes "request"/"message"/"count" (id contexts).
+    const KW: &[&str] = &[
+        "token", "length", "input", "context", "exceed", "maximum", "limit", "window", "prompt",
+        "allow", "than",
+    ];
+    // Strip grouping separators so "262,112" reads as one number.
+    let norm: String = err
+        .chars()
+        .filter(|c| *c != ',' && *c != '_')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let words: Vec<&str> = norm.split_whitespace().collect();
+    let kw: Vec<bool> = words
+        .iter()
+        .map(|w| KW.iter().any(|k| w.contains(k)))
+        .collect();
+    let mut best: Option<u64> = None;
+    for (i, w) in words.iter().enumerate() {
+        let digits: String = w.chars().filter(char::is_ascii_digit).collect();
+        let Ok(n) = digits.parse::<u64>() else {
+            continue; // no digits, or overflows u64
+        };
+        let near = kw[i] || (i > 0 && kw[i - 1]) || (i + 1 < words.len() && kw[i + 1]);
+        if near && best.is_none_or(|b| n > b) {
+            best = Some(n);
+        }
+    }
+    best
+}
 const KEEP_RECENT_TOKENS: usize = 20_000;
+/// Recent-window size held out of compaction; `AIVO_AGENT_KEEP_RECENT` overrides.
+fn keep_recent_tokens() -> usize {
+    std::env::var("AIVO_AGENT_KEEP_RECENT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(KEEP_RECENT_TOKENS)
+}
 /// Tokens held back from the window for the response + tool schemas.
 const COMPACT_RESERVE: usize = 16_000;
 /// Window assumed for compaction when the model's real context window is unknown
 /// (0); without it such models never compact and resend the whole transcript
 /// every turn. A real window, once known, takes precedence.
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
+/// Ceiling on the calibration multiplier — clamps a stray measurement.
+const MAX_CALIBRATION: f64 = 2.5;
+/// Below this estimate the measured/estimate ratio is too noisy to calibrate from.
+const CALIBRATION_MIN_SAMPLE: usize = 2_000;
+/// Clamped measured/estimate ratio: floor 1.0 (estimate never trusted to overshoot),
+/// ceiling [`MAX_CALIBRATION`]. `.max(1)` keeps the division safe.
+fn calibration_ratio(measured: u64, estimate: usize) -> f64 {
+    (measured as f64 / estimate.max(1) as f64).clamp(1.0, MAX_CALIBRATION)
+}
+/// Cap on force-compact-and-retry attempts per step after an input-overflow rejection.
+const MAX_FORCED_COMPACTIONS: usize = 3;
 
 /// A `tool` result longer than this (in chars) is eligible for clearing once it
 /// ages out of the recent window; smaller results aren't worth the churn.
@@ -325,6 +394,10 @@ pub struct AgentEngine {
     tools_openai: Vec<Value>,
     messages: Vec<Value>,
     context_window: u32,
+    /// Multiplier (>= 1.0) correcting the chars/4 [`estimate_tokens`] undershoot toward
+    /// the real tokenizer, learned from measured usage; compaction budgets against
+    /// `estimate * calibration`. Starts at 1.0 until the first measurement.
+    token_calibration: f64,
     max_steps: usize,
     /// Actions the user approved for the rest of the session ("always"), keyed by
     /// [`permission_key`] — scoped to the specific command/path, not the whole
@@ -468,6 +541,7 @@ impl AgentEngine {
             tools_openai,
             messages,
             context_window,
+            token_calibration: 1.0,
             max_steps,
             always: HashSet::new(),
             skills: skills.to_vec(),
@@ -1029,22 +1103,31 @@ impl AgentEngine {
             if disable_thinking {
                 extra.insert("thinking".into(), json!({ "type": "disabled" }));
             }
-            let request = ChatRequest {
+            let mut request = ChatRequest {
                 model: self.model.clone(),
                 messages: self.messages.clone(),
                 tools: self.tools_openai.clone(),
                 extra,
             };
+            // Paired with measured usage below to calibrate (see `update_calibration`);
+            // re-measured if overflow recovery shrinks the request.
+            let mut sent_estimate = estimate_tokens(&request.messages);
 
             ui.turn_start();
             // Seed the live context-fill with a request estimate (system prompt +
             // tools + conversation) so the UI's stat is realistic before the model
             // reports usage; the measured total replaces it once the step returns.
-            ui.context_usage(self.estimated_prompt_tokens(), false);
+            // Scaled by calibration to match the enforced budget.
+            ui.context_usage(
+                (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64,
+                false,
+            );
             // Auto-retry transient failures (rate limit / overload / 5xx / network)
             // with exponential backoff — but only when nothing streamed yet, since
             // re-streaming would duplicate the rendered text.
             let mut retries = 0usize;
+            // Overflow-recovery attempts for this step (see `MAX_FORCED_COMPACTIONS`).
+            let mut forced_compactions = 0usize;
             let message = loop {
                 let mut streamed = false;
                 let result = serve_client::complete(
@@ -1072,6 +1155,21 @@ impl AgentEngine {
                         ));
                         tokio::time::sleep(retry_delay(retries)).await;
                     }
+                    // Over the input limit despite our budget check (estimate undershot):
+                    // calibrate from the rejection, force-fit, and retry — a 400 is
+                    // otherwise terminal and the oversized prefix re-sends every turn.
+                    Err(e)
+                        if forced_compactions < MAX_FORCED_COMPACTIONS
+                            && !streamed
+                            && is_context_overflow_error(&e) =>
+                    {
+                        forced_compactions += 1;
+                        self.recalibrate_from_overflow(&e);
+                        self.force_fit_budget();
+                        request.messages = self.messages.clone();
+                        sent_estimate = estimate_tokens(&request.messages);
+                        ui.notify("context over the model's limit — compacting and retrying…");
+                    }
                     Err(e) => {
                         ui.notify_error(&format!("LLM error: {e}"));
                         break AssistantMessage {
@@ -1088,6 +1186,8 @@ impl AgentEngine {
             if message.usage.is_some() {
                 context_tokens = step_tokens;
                 ui.context_usage(step_tokens, true);
+                // Correct the estimate toward the real tokenizer for the next compaction.
+                self.update_calibration(sent_estimate, step_tokens);
             }
             // Sum the real prompt/completion/cache split across steps (same parser
             // the loopback serve accounts with, so the index stays consistent with
@@ -1490,6 +1590,55 @@ Re-run the full command without write confinement?",
         }
     }
 
+    /// Compaction budget in chars/4-estimate space: `(window - reserve) / calibration`,
+    /// so `estimate <= budget` implies the calibrated real size fits. `window - reserve`
+    /// at calibration 1.0.
+    fn compaction_budget_estimate(&self) -> usize {
+        let real = self.compaction_window().saturating_sub(COMPACT_RESERVE);
+        ((real as f64) / self.token_calibration).floor() as usize
+    }
+
+    /// Fold a `(sent estimate, measured total)` sample into the calibration. Uses the
+    /// measured total (the footer number) to dodge per-provider cache-accounting quirks.
+    /// Rises at once on an undershoot, eases down slowly (biases toward over-compaction).
+    fn update_calibration(&mut self, sent_estimate: usize, measured_total: u64) {
+        if sent_estimate < CALIBRATION_MIN_SAMPLE || measured_total == 0 {
+            return;
+        }
+        let ratio = calibration_ratio(measured_total, sent_estimate);
+        // both operands >= 1.0, so the blend needs no floor
+        self.token_calibration = if ratio > self.token_calibration {
+            ratio
+        } else {
+            0.8 * self.token_calibration + 0.2 * ratio
+        };
+    }
+
+    /// Raise the calibration from an overflow rejection: use the cited token count if
+    /// present (one retry suffices), else nudge up. Caller then runs `force_fit_budget`.
+    fn recalibrate_from_overflow(&mut self, err: &str) {
+        let estimate = estimate_tokens(&self.messages);
+        match parse_overflow_actual(err) {
+            Some(actual) if estimate >= CALIBRATION_MIN_SAMPLE => {
+                // rise-only (never lower on overflow), unlike update_calibration's EMA
+                self.token_calibration = self
+                    .token_calibration
+                    .max(calibration_ratio(actual, estimate));
+            }
+            _ => self.token_calibration = (self.token_calibration * 1.2).min(MAX_CALIBRATION),
+        }
+    }
+
+    /// Deterministic recovery: fit the calibrated budget without a model call (a
+    /// summary round-trip could itself overflow mid-recovery). Clears stale tool
+    /// output, then hard-trims.
+    fn force_fit_budget(&mut self) {
+        let budget = self.compaction_budget_estimate();
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        self.clear_stale_tool_results(cut);
+        self.enforce_budget(budget);
+    }
+
     /// If the history would overflow the model's context window, summarize the
     /// older messages (via a quiet `complete`) and replace them with the
     /// summary. Cuts only at user-turn boundaries so tool-call/result pairs stay
@@ -1497,16 +1646,12 @@ Re-run the full command without write confinement?",
     /// (0). Returns tokens the summarization call consumed (counted toward the
     /// turn, but not as a step).
     async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
-        let budget = self.compaction_window().saturating_sub(COMPACT_RESERVE);
+        let budget = self.compaction_budget_estimate();
         let total = estimate_tokens(&self.messages);
         if total <= budget {
             return 0;
         }
-        let keep_recent = std::env::var("AIVO_AGENT_KEEP_RECENT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(KEEP_RECENT_TOKENS);
-        let cut = find_cut(&self.messages, keep_recent);
+        let cut = find_cut(&self.messages, keep_recent_tokens());
 
         // Cheap pass first: if clearing the bulky raw output of OLD tool messages
         // (file dumps, command output the model has already acted on, sitting
@@ -1627,11 +1772,9 @@ Re-run the full command without write confinement?",
         }
     }
 
-    /// Last-resort, model-free trim guaranteeing `messages` fits `budget`. First
-    /// drops whole oldest turns at user boundaries (keeping the call↔result
-    /// pairing intact); then, if a single turn is still irreducibly large (a giant
-    /// pasted message or tool result), shortens string contents largest first.
-    /// Always terminates and never touches the system prompt or any `tool_calls`.
+    /// Last-resort, model-free trim to fit `budget`: drop whole oldest turns at user
+    /// boundaries, then shorten the biggest string left (a `content` or a tool-call
+    /// `arguments` blob). Always terminates; keeps the system prompt and call↔result pairing.
     fn enforce_budget(&mut self, budget: usize) {
         while estimate_tokens(&self.messages) > budget {
             let cut = find_cut(&self.messages, 0);
@@ -1641,31 +1784,48 @@ Re-run the full command without write confinement?",
             self.messages.drain(1..cut);
             self.rebase_checkpoints(cut, cut - 1); // keep checkpoint indices valid
         }
-        // Threshold well above truncate_str's marker so each pass strictly shrinks
-        // the history; bail when nothing sizeable remains.
+        // Shrink the largest string left. Also target tool-call `arguments`: a big
+        // call with empty `content` in the irreducible recent turn is otherwise
+        // unreducible and bricks the turn; truncated args stay paired with their id.
         while estimate_tokens(&self.messages) > budget {
+            // loc: None = content; Some(j) = tool_calls[j] arguments.
             let pick = self
                 .messages
                 .iter()
                 .enumerate()
                 .skip(1)
-                .filter_map(|(i, m)| {
-                    m.get("content")
+                .flat_map(|(i, m)| {
+                    let content = m
+                        .get("content")
                         .and_then(|c| c.as_str())
-                        .map(|s| (i, s.chars().count()))
+                        .map(|s| (i, None, s.chars().count()));
+                    let args = m
+                        .get("tool_calls")
+                        .and_then(|c| c.as_array())
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .filter_map(move |(j, tc)| {
+                            tc.get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|a| a.as_str())
+                                .map(|s| (i, Some(j), s.chars().count()))
+                        });
+                    content.into_iter().chain(args)
                 })
-                .filter(|&(_, n)| n > 256)
-                .max_by_key(|&(_, n)| n);
-            let Some((idx, n)) = pick else { break };
-            let cur = self.messages[idx]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+                .filter(|&(_, _, n)| n > 256)
+                .max_by_key(|&(_, _, n)| n);
+            let Some((idx, loc, n)) = pick else { break };
+            let slot: &mut Value = match loc {
+                None => &mut self.messages[idx]["content"],
+                Some(j) => &mut self.messages[idx]["tool_calls"][j]["function"]["arguments"],
+            };
+            let cur = slot.as_str().unwrap_or("").to_string();
             let shortened = truncate_str(&cur, n / 2);
             if shortened.len() >= cur.len() {
                 break;
             }
-            self.messages[idx]["content"] = json!(shortened);
+            *slot = json!(shortened);
         }
     }
 
@@ -4136,6 +4296,202 @@ mod tests {
             engine.compaction_window(),
             500_000,
             "a known window takes precedence over the default"
+        );
+    }
+
+    #[test]
+    fn token_calibration_deflates_compaction_budget() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 262_144;
+        let raw = engine.compaction_window() - COMPACT_RESERVE;
+        assert_eq!(
+            engine.compaction_budget_estimate(),
+            raw,
+            "calibration 1.0 leaves the old window − reserve budget unchanged"
+        );
+        engine.token_calibration = 1.2;
+        let deflated = engine.compaction_budget_estimate();
+        assert_eq!(deflated, ((raw as f64) / 1.2).floor() as usize);
+        assert!(
+            deflated < raw,
+            "calibration > 1 shrinks the estimate-space budget so denser-than-chars/4 \
+             content still fits the real window"
+        );
+    }
+
+    #[test]
+    fn update_calibration_rises_on_undershoot_then_eases_and_clamps() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.update_calibration(100, 400);
+        assert_eq!(engine.token_calibration, 1.0, "tiny request is ignored");
+        engine.update_calibration(100_000, 110_000);
+        assert!(
+            (engine.token_calibration - 1.1).abs() < 1e-9,
+            "undershoot raises calibration to the measured ratio, got {}",
+            engine.token_calibration
+        );
+        engine.update_calibration(100_000, 100_000);
+        assert!(
+            engine.token_calibration > 1.0 && engine.token_calibration < 1.1,
+            "calibration eases down slowly, got {}",
+            engine.token_calibration
+        );
+        engine.update_calibration(100_000, 100_000_000);
+        assert_eq!(
+            engine.token_calibration, MAX_CALIBRATION,
+            "ratio clamped to the ceiling"
+        );
+    }
+
+    #[test]
+    fn context_overflow_error_classified_across_providers() {
+        assert!(is_context_overflow_error(
+            "upstream 400 Bad Request: token count of 264378 exceeds the maximum allowed input length of 262112 tokens"
+        ));
+        assert!(is_context_overflow_error(
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens"
+        ));
+        assert!(is_context_overflow_error("error: context_length_exceeded"));
+        assert!(!is_context_overflow_error(
+            "429 Too Many Requests: rate limit exceeded"
+        ));
+        assert!(!is_context_overflow_error(
+            "401 Unauthorized: invalid api key"
+        ));
+    }
+
+    #[test]
+    fn parse_overflow_actual_reads_the_token_count_not_other_numbers() {
+        assert_eq!(
+            parse_overflow_actual(
+                "264378 exceeds the maximum allowed input length of 262112 tokens"
+            ),
+            Some(264378)
+        );
+        assert_eq!(
+            parse_overflow_actual(
+                "maximum context length is 128000 tokens; your messages resulted in 130000 tokens"
+            ),
+            Some(130000)
+        );
+        // A larger id/timestamp isn't next to a token keyword, so it's not picked.
+        assert_eq!(
+            parse_overflow_actual(
+                "request 1719800000000 failed: token count 264378 exceeds the input limit of 262112"
+            ),
+            Some(264378)
+        );
+        // Grouped numerals parse; small-window counts have no floor.
+        assert_eq!(
+            parse_overflow_actual("prompt of 264,378 tokens exceeds the limit of 262,112"),
+            Some(264378)
+        );
+        assert_eq!(
+            parse_overflow_actual("maximum context length is 8192 tokens, resulted in 9001 tokens"),
+            Some(9001)
+        );
+        assert_eq!(parse_overflow_actual("model laguna-m.1 returned 400"), None);
+        assert_eq!(parse_overflow_actual("no numbers here"), None);
+    }
+
+    #[test]
+    fn overflow_classifier_makes_error_non_retryable_even_with_transient_wording() {
+        // An overflow error carrying a transient token must still be non-retryable.
+        for e in [
+            "connection to model failed: input exceeds the maximum allowed input length",
+            "stream reset: prompt is too long for the context window",
+            "request failed: 130000 tokens exceeds the maximum context length",
+        ] {
+            assert!(
+                is_context_overflow_error(e),
+                "should classify as overflow: {e}"
+            );
+            assert!(
+                !is_retryable_error(e),
+                "overflow must not be treated as a retryable transient: {e}"
+            );
+        }
+        assert!(is_retryable_error("connection reset by peer"));
+        assert!(!is_context_overflow_error("connection reset by peer"));
+    }
+
+    /// A tool call whose bulk is in `arguments` (empty `content`) in the irreducible
+    /// recent turn must be shrunk to fit — content-only truncation would leave it over.
+    #[test]
+    fn enforce_budget_shrinks_oversized_tool_call_arguments() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        let huge_args = format!("{{\"content\":\"{}\"}}", "x".repeat(40_000));
+        engine.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"write the file"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"write_file","arguments": huge_args}}]}),
+        ];
+        assert!(estimate_tokens(&engine.messages) > 300);
+        engine.enforce_budget(300);
+        assert!(
+            estimate_tokens(&engine.messages) <= 300,
+            "must fit budget by shrinking tool-call arguments, got {}",
+            estimate_tokens(&engine.messages)
+        );
+        let tc = &engine.messages[2]["tool_calls"][0];
+        assert_eq!(tc["id"], "c1", "tool_call_id preserved");
+        assert_eq!(tc["function"]["name"], "write_file", "call name preserved");
+        assert!(
+            tc["function"]["arguments"].as_str().unwrap().len() < huge_args.len(),
+            "arguments were truncated"
+        );
+        assert_eq!(role(&engine.messages[0]), "system", "system prompt kept");
+    }
+
+    /// A transcript whose estimate clears the raw budget but which the provider still
+    /// rejects: calibrating from the rejection + force-fitting brings the real size
+    /// under the window.
+    #[test]
+    fn overflow_recovery_calibrates_from_rejection_and_fits() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        engine.context_window = 262_144;
+        let raw_budget = engine.compaction_window() - COMPACT_RESERVE;
+        let pad = "x".repeat(4 * (raw_budget - 20_000));
+        engine.messages = vec![
+            json!({"role":"system","content":"sys"}),
+            json!({"role":"user","content":"q1"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}]}),
+            json!({"role":"tool","tool_call_id":"a","content": pad}),
+            json!({"role":"user","content":"now"}),
+        ];
+        let est = estimate_tokens(&engine.messages);
+        assert!(
+            est <= raw_budget,
+            "pre-fix budget check would pass (no compaction): est={est} raw={raw_budget}"
+        );
+
+        let err = "token count of 290000 exceeds the maximum allowed input length of 262112 tokens";
+        assert!(is_context_overflow_error(err));
+        engine.recalibrate_from_overflow(err);
+        assert!(
+            engine.token_calibration > 1.0,
+            "the rejection raised the calibration, got {}",
+            engine.token_calibration
+        );
+        engine.force_fit_budget();
+
+        let budget = engine.compaction_budget_estimate();
+        assert!(
+            estimate_tokens(&engine.messages) <= budget,
+            "recovery brought the transcript under the calibrated budget"
+        );
+        let projected =
+            (estimate_tokens(&engine.messages) as f64 * engine.token_calibration) as usize;
+        assert!(
+            projected <= engine.compaction_window(),
+            "the calibrated real size now fits the window: projected={projected}"
+        );
+        assert_eq!(
+            role(&engine.messages[0]),
+            "system",
+            "the system prompt is never dropped"
         );
     }
 

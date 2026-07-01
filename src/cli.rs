@@ -169,10 +169,6 @@ pub struct ShareArgs {
     #[arg(value_name = "SESSION_ID")]
     pub session_id: Option<String>,
 
-    /// Follow ongoing changes; default is a one-time snapshot taken at share time.
-    #[arg(long)]
-    pub live: bool,
-
     /// Skip redaction. Default scrubs API keys, OAuth tokens, $HOME paths,
     /// and secret-shaped env values.
     #[arg(long)]
@@ -773,10 +769,6 @@ pub struct LogsArgs {
     pub errors: bool,
 
     // `logs share` only — guarded by validate_args() for non-share actions.
-    /// `logs share`: follow ongoing changes (default: one-time snapshot).
-    #[arg(long)]
-    pub live: bool,
-
     /// `logs share`: skip redaction (default: scrub API keys, OAuth, $HOME, secret env).
     #[arg(long)]
     pub no_redact: bool,
@@ -872,9 +864,9 @@ pub struct ChatArgs {
     pub dry_run: bool,
 
     /// Publish a live, redacted view of this chat to a viewer URL (shown in the
-    /// TUI). Needs a linked account (`aivo login`); toggle in-chat with `/live`.
+    /// TUI). Needs a linked account (`aivo login`); toggle in-chat with `/share`.
     #[arg(long)]
-    pub live: bool,
+    pub share: bool,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE

@@ -1861,7 +1861,7 @@ impl ChatTuiApp {
         } else {
             area.width.saturating_sub(right_label_width + 1)
         };
-        // Reserve columns for the `● live` badge so the text truncates to fit it.
+        // Reserve columns for the `● sharing` badge so the text truncates to fit it.
         let live = self.live_share.is_some();
         let badge_w = if live {
             display_width(LIVE_BADGE) as u16 + 3 // + " · " glue

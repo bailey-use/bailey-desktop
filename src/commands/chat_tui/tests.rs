@@ -5751,14 +5751,14 @@ fn test_parse_slash_command_with_argument() {
 }
 
 #[test]
-fn test_parse_slash_live() {
+fn test_parse_slash_share() {
     assert_eq!(
-        parse_slash_command("live").unwrap(),
-        SlashCommand::Live(None)
+        parse_slash_command("share").unwrap(),
+        SlashCommand::Share(None)
     );
     assert_eq!(
-        parse_slash_command("live stop").unwrap(),
-        SlashCommand::Live(Some("stop".to_string()))
+        parse_slash_command("share stop").unwrap(),
+        SlashCommand::Share(Some("stop".to_string()))
     );
 }
 
@@ -5796,12 +5796,12 @@ async fn test_compact_command_no_engine_notices() {
 }
 
 #[tokio::test]
-async fn test_live_command_stop_and_usage_notices() {
+async fn test_share_command_stop_and_usage_notices() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // `/live stop` with no active share → informative notice, nothing started.
-    app.run_live_command(Some("stop".to_string())).await;
+    // `/share stop` with no active share → informative notice, nothing started.
+    app.run_share_command(Some("stop".to_string())).await;
     assert!(
         app.notice.as_ref().unwrap().1.contains("Not currently"),
         "notice: {:?}",
@@ -5810,7 +5810,7 @@ async fn test_live_command_stop_and_usage_notices() {
     assert!(app.live_share.is_none());
 
     // Unknown argument → usage notice (no background start).
-    app.run_live_command(Some("frobnicate".to_string())).await;
+    app.run_share_command(Some("frobnicate".to_string())).await;
     assert!(
         app.notice.as_ref().unwrap().1.contains("Usage"),
         "notice: {:?}",
@@ -5820,7 +5820,7 @@ async fn test_live_command_stop_and_usage_notices() {
 }
 
 #[tokio::test]
-async fn test_live_command_reshows_url_then_stops() {
+async fn test_share_command_reshows_url_then_stops() {
     use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -5828,8 +5828,8 @@ async fn test_live_command_reshows_url_then_stops() {
         "https://s.getaivo.dev/v.html?t=zz",
     ));
 
-    // Bare `/live` while already sharing just re-shows the URL — no new start.
-    app.run_live_command(None).await;
+    // Bare `/share` while already sharing just re-shows the URL — no new start.
+    app.run_share_command(None).await;
     assert!(
         app.notice.as_ref().unwrap().1.contains("t=zz"),
         "notice: {:?}",
@@ -5838,8 +5838,8 @@ async fn test_live_command_reshows_url_then_stops() {
     assert!(app.live_share.is_some());
     assert!(!app.live_share_starting);
 
-    // `/live stop` tears it down.
-    app.run_live_command(Some("stop".to_string())).await;
+    // `/share stop` tears it down.
+    app.run_share_command(Some("stop".to_string())).await;
     assert!(app.live_share.is_none());
     assert!(app.notice.as_ref().unwrap().1.contains("stopped"));
 }
@@ -5868,7 +5868,7 @@ fn test_apply_live_share_ready_ok_and_err() {
 }
 
 #[test]
-fn test_footer_shows_live_badge_only_when_sharing() {
+fn test_footer_shows_share_badge_only_when_sharing() {
     use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -5876,18 +5876,18 @@ fn test_footer_shows_live_badge_only_when_sharing() {
     // No share → no badge.
     let (screen, _) = render_full_screen(&mut app, 80, 12);
     assert!(
-        !screen.contains("● live"),
-        "live badge shown without an active share:\n{screen}"
+        !screen.contains("● sharing"),
+        "share badge shown without an active share:\n{screen}"
     );
 
-    // Active share → the `● live` badge appears in the footer.
+    // Active share → the `● sharing` badge appears in the footer.
     app.live_share = Some(LiveShareHandle::for_test(
         "https://s.getaivo.dev/v.html?t=ab",
     ));
     let (screen, _) = render_full_screen(&mut app, 80, 12);
     assert!(
-        screen.contains("● live"),
-        "no live badge in footer while sharing:\n{screen}"
+        screen.contains("● sharing"),
+        "no share badge in footer while sharing:\n{screen}"
     );
 }
 
@@ -5897,7 +5897,7 @@ async fn test_maybe_start_live_share_defers_until_session_settles() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // No `--live` request → never starts.
+    // No `--share` request → never starts.
     assert!(!app.maybe_start_live_share().await);
 
     app.live_requested = true;
@@ -5937,7 +5937,7 @@ fn test_empty_state_notice_selects_via_screen_surface() {
     use crate::services::share_live::LiveShareHandle;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // `--live` launch state: empty transcript, live-URL notice (the notice draws
+    // `--share` launch state: empty transcript, share-URL notice (the notice draws
     // the URL line; the handle just drives the badge).
     assert!(app.is_transcript_empty());
     app.live_share = Some(LiveShareHandle::for_test(
@@ -5971,13 +5971,13 @@ fn test_empty_state_notice_selects_via_screen_surface() {
 
 #[test]
 fn test_notice_spans_splits_live_url_from_indicator() {
-    // The live notice paints `● Live:` red but the URL a calm link color, so the
-    // long line doesn't read as an error. Other notices stay a single span.
-    let live = (
+    // The share notice paints `● Sharing:` red but the URL a calm link color, so
+    // the long line doesn't read as an error. Other notices stay a single span.
+    let share = (
         LIVE,
         format!("{LIVE_NOTICE_PREFIX}https://s.getaivo.dev/s/abc"),
     );
-    let spans = notice_spans(Some(&live)).unwrap();
+    let spans = notice_spans(Some(&share)).unwrap();
     assert_eq!(spans.len(), 2);
     assert_eq!(spans[0].content.as_ref(), LIVE_NOTICE_PREFIX);
     assert_eq!(spans[0].style.fg, Some(LIVE));

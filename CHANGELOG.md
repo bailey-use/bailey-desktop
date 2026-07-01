@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Sharing is now a single concept. The chat `--live` flag and in-chat `/live`
+command are renamed to `--share` and `/share`, and `aivo share` /
+`aivo logs share` drop `--live` — a share always follows the session live now
+(a finished session simply stops updating). Breaking: the old `--live` and
+`/live` names are removed with no alias.
+
+- refactor(share)!: unify live-sharing under `share` — `--live`/`/live` → `--share`/`/share`, `aivo share` always live
+
 ## v0.34.0
 
 Account and sharing lead this release. `aivo chat` can now live-share a

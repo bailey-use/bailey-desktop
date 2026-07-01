@@ -24,11 +24,11 @@ pub(super) const LINK: Color = Color::Rgb(143, 178, 222);
 pub(super) const QUOTE: Color = Color::Rgb(150, 150, 128); // warm olive aside
 pub(super) const ERROR: Color = Color::Rgb(228, 128, 114); // warm coral
 pub(super) const WARNING: Color = Color::Rgb(224, 180, 104); // brand gold (--code-string)
-pub(super) const LIVE: Color = Color::Rgb(232, 96, 92); // live-share "recording" red
-/// Live-share URL notice prefix; `notice_spans` matches it to color the line.
-pub(super) const LIVE_NOTICE_PREFIX: &str = "● Live: ";
-/// Footer badge shown while live sharing.
-pub(super) const LIVE_BADGE: &str = "● live";
+pub(super) const LIVE: Color = Color::Rgb(232, 96, 92); // share "recording" red
+/// Share URL notice prefix; `notice_spans` matches it to color the line.
+pub(super) const LIVE_NOTICE_PREFIX: &str = "● Sharing: ";
+/// Footer badge shown while sharing.
+pub(super) const LIVE_BADGE: &str = "● sharing";
 // Inline-diff palette for the compact edit preview under a tool call. The
 // changed line gets a subtle dark tint (not a saturated terminal-diff fill) that
 // fills the full row width (see `fill_trailing_background`) so a wrapped line
@@ -228,9 +228,9 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         takes_argument: true,
     },
     SlashCommandSpec {
-        name: "live",
-        help_label: "/live [stop]",
-        description: "share this chat live to a viewer URL (stop to end)",
+        name: "share",
+        help_label: "/share [stop]",
+        description: "share this chat to a viewer URL (stop to end)",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -254,7 +254,7 @@ pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),
         "plan" => Some("<objective> | go [guidance] | stop"),
-        "live" => Some("[stop]"),
+        "share" => Some("[stop]"),
         "compact" => Some("[fast]"),
         "model" => Some("[name]"),
         "key" => Some("[id|name]"),
@@ -310,8 +310,8 @@ pub(crate) struct ChatTuiParams {
     pub initial_resume: Option<String>,
     /// `--max-context <SIZE>` manual context-window override (tokens). Session-only.
     pub max_context: Option<u64>,
-    /// `--live`: start live sharing at launch (device-link verified beforehand).
-    pub live: bool,
+    /// `--share`: start live sharing at launch (device-link verified beforehand).
+    pub share: bool,
 }
 
 #[derive(Clone)]
@@ -1300,9 +1300,9 @@ pub(super) enum SlashCommand {
     Compact {
         fast: bool,
     },
-    /// Live share: bare/`start` opens a viewer URL (re-shown if already live);
-    /// `stop` ends it.
-    Live(Option<String>),
+    /// Share this chat: bare/`start` opens a viewer URL (re-shown if already
+    /// live); `stop` ends it.
+    Share(Option<String>),
     Help,
 }
 
@@ -1446,7 +1446,7 @@ pub(super) enum RuntimeEvent {
         source: String,
         result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
     },
-    /// A `/live` (or `--live`) start finished: `Ok` the handle, `Err` the reason.
+    /// A `/share` (or `--share`) start finished: `Ok` the handle, `Err` the reason.
     LiveShareReady(std::result::Result<crate::services::share_live::LiveShareHandle, String>),
 }
 
@@ -1786,12 +1786,12 @@ pub(super) struct ChatTuiApp {
     pub(super) reasoning_elapsed_ms: Option<u64>,
     /// In-flight `/skills add` install `(source, started)`; drives the spinner.
     pub(super) installing_skill: Option<(String, Instant)>,
-    /// Active live share, `None` when not sharing; its presence drives the footer
-    /// `● live` badge. Stopped on `/live stop`, `/new`, resume, and exit.
+    /// Active share, `None` when not sharing; its presence drives the footer
+    /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
     pub(super) live_share: Option<crate::services::share_live::LiveShareHandle>,
     /// True between a start and its `LiveShareReady` event; blocks a second start.
     pub(super) live_share_starting: bool,
-    /// `--live` requested but not yet started — `maybe_start_live_share` defers it
+    /// `--share` requested but not yet started — `maybe_start_live_share` defers it
     /// until the session settles so it pins the final session id.
     pub(super) live_requested: bool,
 }

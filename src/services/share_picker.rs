@@ -122,7 +122,6 @@ fn build_logs_args(project_root: &Path, all: bool) -> LogsArgs {
         since: None,
         until: None,
         errors: false,
-        live: false,
         no_redact: false,
         open: false,
         debug_local_only: false,

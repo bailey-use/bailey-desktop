@@ -15,8 +15,8 @@
 //! `wake` notify with `tokio::select!`-d wait deadline. The notify fires
 //! from two sources:
 //!
-//! - In `--live` mode, a background refresher re-resolves the transcript
-//!   every `LIVE_REFRESH_INTERVAL` and notifies on any cursor advance.
+//! - A background refresher re-resolves the transcript every
+//!   `LIVE_REFRESH_INTERVAL` and notifies on any cursor advance.
 //! - On shutdown, every parked handler wakes immediately and returns 304
 //!   so the proxy can close out the request promptly. This is what makes
 //!   `aivo logs share` Ctrl+C close in milliseconds instead of waiting on
@@ -66,7 +66,6 @@ pub struct LiveState {
     snapshot: SharePayload,
     messages_json: Vec<Vec<u8>>,
     cursor: String,
-    live: bool,
     redact_ctx: RedactCtx,
     resolver_ctx: Option<Arc<ResolverContext>>,
     /// Notified by the live refresher every time the cursor advances. Parked
@@ -78,30 +77,27 @@ impl LiveState {
     fn from_snapshot(
         session_id: String,
         mut snapshot: SharePayload,
-        live: bool,
         redact_ctx: RedactCtx,
         resolver_ctx: Option<Arc<ResolverContext>>,
     ) -> Self {
-        snapshot.meta.live = live;
+        // `live` in the wire meta means "the server follows the session" —
+        // exactly when a resolver context is present.
+        snapshot.meta.live = resolver_ctx.is_some();
         let (messages_json, cursor) = serialize_messages(&snapshot);
         Self {
             session_id,
             snapshot,
             messages_json,
             cursor,
-            live,
             redact_ctx,
             resolver_ctx,
             wake: Arc::new(Notify::new()),
         }
     }
 
-    /// Re-resolve + re-redact in live mode. Returns `true` if the cursor
-    /// changed (the caller fires `wake` on `true`).
-    async fn refresh_if_live(&mut self) -> Result<bool> {
-        if !self.live {
-            return Ok(false);
-        }
+    /// Re-resolve + re-redact from disk. Returns `true` if the cursor changed
+    /// (the caller fires `wake` on `true`). No-op without a resolver context.
+    async fn refresh(&mut self) -> Result<bool> {
         let Some(resolver) = self.resolver_ctx.clone() else {
             return Ok(false);
         };
@@ -147,10 +143,11 @@ pub async fn start_local_server(
 ) -> Result<(u16, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind_addr).await?;
     let port = listener.local_addr()?.port();
-    let live = state.live;
+    // Follow the session only when there's a resolver to re-read it from.
+    let follow = state.resolver_ctx.is_some();
     let state = Arc::new(RwLock::new(state));
 
-    if live {
+    if follow {
         let refresher_state = state.clone();
         let refresher_shutdown = shutdown.clone();
         tokio::spawn(live_refresher(refresher_state, refresher_shutdown));
@@ -160,16 +157,15 @@ pub async fn start_local_server(
     Ok((port, handle))
 }
 
-/// Public constructor so the share command can build a state without the
-/// resolver context (snapshot-only) or with it (live mode).
+/// Public constructor. With a resolver context the server follows the session
+/// live; `None` serves a static snapshot (used in tests).
 pub fn build_state(
     session_id: String,
     snapshot: SharePayload,
-    live: bool,
     redact_ctx: RedactCtx,
     resolver_ctx: Option<Arc<ResolverContext>>,
 ) -> LiveState {
-    LiveState::from_snapshot(session_id, snapshot, live, redact_ctx, resolver_ctx)
+    LiveState::from_snapshot(session_id, snapshot, redact_ctx, resolver_ctx)
 }
 
 async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: ShutdownSignal) {
@@ -181,7 +177,7 @@ async fn live_refresher(state: Arc<RwLock<LiveState>>, shutdown: ShutdownSignal)
             _ = shutdown.wait() => return,
         }
         let mut guard = state.write().await;
-        match guard.refresh_if_live().await {
+        match guard.refresh().await {
             Ok(true) => guard.wake.notify_waiters(),
             Ok(false) => {}
             Err(err) => {
@@ -448,7 +444,7 @@ fn meta_value(state: &LiveState) -> serde_json::Value {
         "project": state.snapshot.project,
         "created_at": state.snapshot.created_at,
         "updated_at": state.snapshot.updated_at,
-        "live": state.live,
+        "live": state.snapshot.meta.live,
         "message_count": state.snapshot.messages.len(),
         "schema_version": state.snapshot.schema_version,
     })
@@ -570,13 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_request_returns_full_snapshot() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
@@ -599,13 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn cursor_matches_returns_304_after_wait() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
@@ -639,13 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_unblocks_parked_long_poll() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
@@ -675,13 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_404_for_unknown_routes_and_405_for_post() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
@@ -699,13 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn cors_preflight_returns_204() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await
@@ -787,13 +753,7 @@ mod tests {
     /// JSON-line chunk, then terminator.
     #[tokio::test]
     async fn long_poll_with_advance_streams_chunked_ndjson() {
-        let state = build_state(
-            "T-test".into(),
-            fake_payload(),
-            false,
-            RedactCtx::default(),
-            None,
-        );
+        let state = build_state("T-test".into(), fake_payload(), RedactCtx::default(), None);
         let shutdown = ShutdownSignal::new();
         let (port, _h) = start_local_server("127.0.0.1:0", state, shutdown.clone())
             .await

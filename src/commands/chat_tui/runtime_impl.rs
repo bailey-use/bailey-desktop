@@ -1035,8 +1035,8 @@ impl ChatTuiApp {
                 self.run_compact_command(fast).await;
                 Ok(false)
             }
-            SlashCommand::Live(arg) => {
-                self.run_live_command(arg).await;
+            SlashCommand::Share(arg) => {
+                self.run_share_command(arg).await;
                 Ok(false)
             }
             SlashCommand::Help => {

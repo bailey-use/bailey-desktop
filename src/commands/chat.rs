@@ -403,7 +403,7 @@ impl ChatCommand {
         resume: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
-        live: bool,
+        share: bool,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -416,7 +416,7 @@ impl ChatCommand {
                 resume,
                 max_context,
                 dry_run,
-                live,
+                share,
             )
             .await
         {
@@ -440,7 +440,7 @@ impl ChatCommand {
         resume: Option<String>,
         max_context: Option<String>,
         dry_run: bool,
-        live: bool,
+        share: bool,
     ) -> Result<ExitCode> {
         // Validate `--max-context` up front so a malformed value fails fast.
         let max_context: Option<u64> = match max_context.as_deref() {
@@ -811,8 +811,8 @@ impl ChatCommand {
             );
         }
 
-        // `--live` needs a linked account; fail fast rather than launch unshared.
-        if live && !crate::commands::share::device_linked().await {
+        // `--share` needs a linked account; fail fast rather than launch unshared.
+        if share && !crate::commands::share::device_linked().await {
             return Err(crate::commands::share::not_linked_error());
         }
 
@@ -840,7 +840,7 @@ impl ChatCommand {
             startup_notice,
             initial_resume: resume,
             max_context,
-            live,
+            share,
         })
         .await?;
 
@@ -893,8 +893,8 @@ impl ChatCommand {
             "Resume a saved chat: picker (bare), most recent (last), or by session id",
         );
         print_opt(
-            "--live",
-            "Share this chat live to a viewer URL (needs `aivo login`; toggle in-chat with /live)",
+            "--share",
+            "Share this chat live to a viewer URL (needs `aivo login`; toggle in-chat with /share)",
         );
         print_opt(
             "--attach <path>",

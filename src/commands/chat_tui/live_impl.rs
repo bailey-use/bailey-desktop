@@ -1,29 +1,29 @@
-//! `--live` / `/live` live-share lifecycle for the chat TUI. Starts off the
+//! `--share` / `/share` live-share lifecycle for the chat TUI. Starts off the
 //! event loop (so the handshake never blocks rendering) and reports back via
 //! [`RuntimeEvent::LiveShareReady`]; torn down on `/new`, resume, and exit.
 
 use super::*;
 
 impl ChatTuiApp {
-    /// `/live [stop]`: bare/`start` opens a share (re-showing the URL if already
+    /// `/share [stop]`: bare/`start` opens a share (re-showing the URL if already
     /// live); `stop` ends it.
-    pub(super) async fn run_live_command(&mut self, arg: Option<String>) {
+    pub(super) async fn run_share_command(&mut self, arg: Option<String>) {
         match arg.as_deref().map(str::trim) {
             Some("stop") | Some("off") | Some("end") => {
                 if self.stop_live_share() {
-                    self.notice = Some((MUTED, "Live share stopped.".to_string()));
+                    self.notice = Some((MUTED, "Sharing stopped.".to_string()));
                 } else {
-                    self.notice = Some((MUTED, "Not currently live sharing.".to_string()));
+                    self.notice = Some((MUTED, "Not currently sharing.".to_string()));
                 }
             }
             Some(other) if !other.is_empty() && other != "start" && other != "on" => {
-                self.notice = Some((ERROR, format!("Usage: /live [stop]  (got '{other}')")));
+                self.notice = Some((ERROR, format!("Usage: /share [stop]  (got '{other}')")));
             }
             _ => self.begin_live_share().await,
         }
     }
 
-    /// Start a deferred `--live` share once the session settles — after any
+    /// Kick off the launch-time `--share` once the session settles — after any
     /// `--resume` load and with no startup picker open — so it pins the final
     /// session id, not the transient launch one. Fires at most once.
     pub(super) async fn maybe_start_live_share(&mut self) -> bool {
@@ -49,27 +49,27 @@ impl ChatTuiApp {
             return;
         }
         if self.live_share_starting {
-            self.notice = Some((MUTED, "Live share is already starting…".to_string()));
+            self.notice = Some((MUTED, "Share is already starting…".to_string()));
             return;
         }
         // Persist first so the resolver can read this chat — even an empty one.
         if let Err(e) = self.persist_history().await {
-            self.notice = Some((ERROR, format!("Couldn't start live share: {e:#}")));
+            self.notice = Some((ERROR, format!("Couldn't start share: {e:#}")));
             return;
         }
 
         self.live_share_starting = true;
-        self.notice = Some((MUTED, "Starting live share…".to_string()));
+        self.notice = Some((MUTED, "Starting share…".to_string()));
 
         let tx = self.tx.clone();
         let session_store = self.session_store.clone();
         let session_id = self.session_id.clone();
         let cwd = self.real_cwd.clone();
         tokio::spawn(async move {
-            // `/live` without a login gets a clear notice; `--live` gated pre-TUI.
+            // `/share` without a login gets a clear notice; `--share` gated pre-TUI.
             if !crate::commands::share::device_linked().await {
                 let _ = tx.send(RuntimeEvent::LiveShareReady(Err(
-                    "Live sharing needs a linked account — run `aivo login`, then `/live` again."
+                    "Sharing needs a linked account — run `aivo login`, then `/share` again."
                         .to_string(),
                 )));
                 return;
@@ -103,7 +103,7 @@ impl ChatTuiApp {
         #[cfg(not(test))]
         {
             if write_system_clipboard(url).is_ok() {
-                self.show_toast("Live URL copied to clipboard");
+                self.show_toast("Share URL copied to clipboard");
             }
         }
     }

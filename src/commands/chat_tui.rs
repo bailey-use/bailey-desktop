@@ -250,7 +250,7 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
         original_hook(info);
     }));
     let initial_resume = params.initial_resume.clone();
-    let live = params.live;
+    let share = params.share;
     let mut app = ChatTuiApp::new(params).await?;
     app.refresh_context_window().await;
     // Surface discovered skills as `/`-typeable slash commands (e.g. `/repo-study`)
@@ -283,7 +283,7 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     }
     // The event loop starts the share once the session settles (an async
     // `--resume` could still be loading a different session id here).
-    app.live_requested = live;
+    app.live_requested = share;
     let result = app.run().await;
     // The public link dies with the chat.
     app.stop_live_share();

@@ -1092,7 +1092,7 @@ impl ChatTuiApp {
                 Err(err) => break Err(err),
             }
 
-            // Deferred `--live` start, once the session has settled.
+            // Deferred `--share` start, once the session has settled.
             if self.maybe_start_live_share().await {
                 needs_redraw = true;
             }

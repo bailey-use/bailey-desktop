@@ -1201,7 +1201,7 @@ const HELP_COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Chat",
         &[
-            "new", "resume", "rewind", "copy", "config", "effort", "live", "help", "exit",
+            "new", "resume", "rewind", "copy", "config", "effort", "share", "help", "exit",
         ],
     ),
     ("Model & key", &["model", "key"]),

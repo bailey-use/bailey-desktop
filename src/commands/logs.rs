@@ -319,7 +319,6 @@ impl LogsCommand {
 
         let share_args = ShareArgs {
             session_id: args.target,
-            live: args.live,
             no_redact: args.no_redact,
             all: args.all,
             open: args.open,
@@ -646,11 +645,11 @@ fn print_help_share() {
     println!();
     println!(
         "{}",
-        style::dim("Share a session via a tunneled viewer URL. Default is a one-shot snapshot")
+        style::dim("Share a session via a tunneled viewer URL. The viewer follows the session")
     );
     println!(
         "{}",
-        style::dim("of the session at share time; secrets and $HOME paths are redacted.")
+        style::dim("live as it changes; secrets and $HOME paths are redacted.")
     );
     println!(
         "{}",
@@ -658,10 +657,6 @@ fn print_help_share() {
     );
     println!();
     println!("{}", style::bold("Options:"));
-    logs_help_row(
-        "--live",
-        "Follow ongoing changes (default: snapshot at share time)",
-    );
     logs_help_row(
         "--no-redact",
         "Skip redaction (API keys, OAuth tokens, $HOME, secret-shaped env)",
@@ -678,7 +673,7 @@ fn print_help_share() {
     println!("{}", style::bold("Examples:"));
     println!("  {}", style::dim("aivo logs share"));
     println!("  {}", style::dim("aivo logs share 1335c631"));
-    println!("  {}", style::dim("aivo logs share --live --open"));
+    println!("  {}", style::dim("aivo logs share --open"));
 }
 
 fn print_help_prune() {
@@ -716,10 +711,8 @@ fn validate_args(args: &LogsArgs) -> Result<()> {
         anyhow::bail!("--watch is only supported for `aivo logs` list output");
     }
     let is_share = args.action.as_deref() == Some("share");
-    if !is_share && (args.live || args.no_redact || args.open || args.debug_local_only) {
-        anyhow::bail!(
-            "--live, --no-redact, --open, --debug-local-only only apply to `aivo logs share`"
-        );
+    if !is_share && (args.no_redact || args.open || args.debug_local_only) {
+        anyhow::bail!("--no-redact, --open, --debug-local-only only apply to `aivo logs share`");
     }
     Ok(())
 }
@@ -2199,7 +2192,6 @@ mod tests {
             since: None,
             until: None,
             errors: false,
-            live: false,
             no_redact: false,
             open: false,
             debug_local_only: false,
@@ -2429,7 +2421,6 @@ mod tests {
             since: None,
             until: None,
             errors: false,
-            live: false,
             no_redact: false,
             open: false,
             debug_local_only: false,

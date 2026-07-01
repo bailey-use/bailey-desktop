@@ -1,7 +1,7 @@
-//! In-process live share for `aivo chat --live` / `/live`: reuses the
-//! `aivo logs share --live` server + tunnel but returns the URL instead of
-//! printing it. The refresher follows the on-disk session, so the viewer tracks
-//! the conversation as `persist_history` writes each turn.
+//! In-process live share for `aivo chat --share` / `/share`: reuses the
+//! `aivo logs share` server + tunnel but returns the URL instead of printing
+//! it. The refresher follows the on-disk session, so the viewer tracks the
+//! conversation as `persist_history` writes each turn.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +64,7 @@ pub async fn start_live_share(
         payload.meta.redacted = false;
     }
 
-    let state = build_state(session_id, payload, true, redact_ctx, Some(resolver_ctx));
+    let state = build_state(session_id, payload, redact_ctx, Some(resolver_ctx));
 
     let shutdown = ShutdownSignal::new();
     // Detached: the server loop runs until `shutdown` fires.

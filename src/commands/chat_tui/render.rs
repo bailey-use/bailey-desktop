@@ -786,8 +786,8 @@ pub(super) fn notice_display(notice: Option<&(Color, String)>) -> Option<(Color,
     })
 }
 
-/// Styled spans for the active notice. The live-share notice splits into a red
-/// `● Live:` indicator + a link-colored URL (an all-red line reads as an error);
+/// Styled spans for the active notice. The share notice splits into a red
+/// `● Sharing:` indicator + a link-colored URL (an all-red line reads as an error);
 /// everything else is one color.
 pub(super) fn notice_spans(notice: Option<&(Color, String)>) -> Option<Vec<Span<'static>>> {
     let (color, text) = notice_display(notice)?;

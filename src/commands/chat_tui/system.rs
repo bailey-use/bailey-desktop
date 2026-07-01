@@ -715,7 +715,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "compact" => Ok(SlashCommand::Compact {
             fast: argument.as_deref() == Some("fast"),
         }),
-        "live" => Ok(SlashCommand::Live(argument)),
+        "share" => Ok(SlashCommand::Share(argument)),
         "help" => Ok(SlashCommand::Help),
         "" => anyhow::bail!("Type a command after '/'"),
         other => anyhow::bail!("Unknown command '/{other}'"),

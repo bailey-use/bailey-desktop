@@ -109,18 +109,10 @@ impl ShareCommand {
             payload = red;
         }
 
-        print_preview(&payload, args.live);
+        print_preview(&payload);
 
-        let live = args.live;
         let session_id_owned = session_id.to_string();
-        let resolver_ctx_for_state = if live { Some(resolver_ctx) } else { None };
-        let state = build_state(
-            session_id_owned,
-            payload,
-            live,
-            redact_ctx,
-            resolver_ctx_for_state,
-        );
+        let state = build_state(session_id_owned, payload, redact_ctx, Some(resolver_ctx));
 
         let shutdown = ShutdownSignal::new();
         let (port, handle) = start_local_server("127.0.0.1:0", state, shutdown.clone()).await?;
@@ -204,10 +196,6 @@ impl ShareCommand {
         println!();
         println!("{}", style::bold("Options:"));
         print_opt(
-            "--live",
-            "Follow ongoing changes (default: snapshot at share time)",
-        );
-        print_opt(
             "--no-redact",
             "Skip redaction (default: scrub API keys, OAuth tokens, $HOME, secret env)",
         );
@@ -233,10 +221,6 @@ impl ShareCommand {
             "  {}",
             style::dim("aivo logs share 1335c631          # share by id prefix")
         );
-        println!(
-            "  {}",
-            style::dim("aivo logs share 1335c631 --live   # follow changes live")
-        );
     }
 }
 
@@ -258,7 +242,7 @@ async fn ensure_device_linked() -> Result<()> {
     }
 }
 
-/// Non-printing device-link check for the chat TUI's `--live` / `/live`. Fails
+/// Non-printing device-link check for the chat TUI's `--share` / `/share`. Fails
 /// open on a server hiccup, like `ensure_device_linked`.
 pub(crate) async fn device_linked() -> bool {
     use crate::commands::login::{AccountSync, sync_account_status};
@@ -278,17 +262,15 @@ pub(crate) fn not_linked_error() -> anyhow::Error {
     .into()
 }
 
-fn print_preview(payload: &SharePayload, live: bool) {
+fn print_preview(payload: &SharePayload) {
     let kb = payload.approximate_chars() / 1024;
     let model = payload.model.as_deref().unwrap_or("(none)");
-    let mode = if live { "live" } else { "snapshot" };
     println!(
-        "    {} messages · ~{} KB · {} · {} · {}",
+        "    {} messages · ~{} KB · {} · {}",
         payload.messages.len(),
         kb,
         style::cyan(&payload.source_cli),
         style::cyan(model),
-        style::cyan(mode),
     );
 }
 

@@ -1634,6 +1634,9 @@ pub(super) struct ChatTuiApp {
     /// color; on expiry the selection auto-clears.
     pub(super) selection_flash_until: Option<Instant>,
     pub(super) scroll_speed: usize,
+    /// Bare Up/Down at the composer edge scroll the transcript instead of walking
+    /// draft history — for mobile terminals (Termux) where swipes arrive as arrows.
+    pub(super) swipe_scroll: bool,
     pub(super) toast: Option<Toast>,
     pub(super) tx: UnboundedSender<RuntimeEvent>,
     pub(super) rx: UnboundedReceiver<RuntimeEvent>,

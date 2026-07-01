@@ -23,6 +23,18 @@ fn test_chat_mouse_enabled_policy() {
 }
 
 #[test]
+fn test_chat_swipe_scroll_policy() {
+    // No override: on under Termux (swipes arrive as arrows there), off elsewhere.
+    assert!(!chat_swipe_scroll_enabled_for(None, false));
+    assert!(chat_swipe_scroll_enabled_for(None, true));
+    // Explicit override wins either way.
+    assert!(chat_swipe_scroll_enabled_for(Some("1"), false));
+    assert!(chat_swipe_scroll_enabled_for(Some("yes"), false));
+    assert!(!chat_swipe_scroll_enabled_for(Some("0"), true));
+    assert!(!chat_swipe_scroll_enabled_for(Some("false"), true));
+}
+
+#[test]
 fn test_cursor_position_multiline() {
     assert_eq!(cursor_position("hello", 5, 10, 2), (7, 0));
     assert_eq!(cursor_position("hello\nworld", 11, 10, 2), (7, 1));
@@ -701,6 +713,79 @@ async fn test_history_nav_past_recalled_slash_command() {
 }
 
 #[tokio::test]
+async fn test_swipe_scroll_arrows_scroll_transcript() {
+    // Mobile: a swipe arrives as Up/Down; with an empty composer they scroll.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.swipe_scroll = true;
+    app.draft_history = vec!["older".to_string()];
+    app.last_max_scroll = Some(50);
+    app.transcript_scroll = 50;
+    app.follow_output = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.transcript_scroll < 50);
+    assert!(!app.follow_output);
+    assert!(app.draft.is_empty());
+    assert!(app.draft_history_index.is_none());
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.transcript_scroll, 50);
+    assert!(app.follow_output);
+    assert!(app.draft.is_empty());
+}
+
+#[tokio::test]
+async fn test_arrows_recall_history_without_swipe_scroll() {
+    // Desktop: bare Up still walks draft history, transcript stays pinned.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.swipe_scroll = false;
+    app.draft_history = vec!["older".to_string()];
+    app.last_max_scroll = Some(50);
+    app.transcript_scroll = 50;
+    app.follow_output = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.draft, "older");
+    assert_eq!(app.draft_history_index, Some(0));
+    assert_eq!(app.transcript_scroll, 50);
+    assert!(app.follow_output);
+}
+
+#[tokio::test]
+async fn test_swipe_scroll_yields_to_multiline_cursor() {
+    // Swipe-scroll still yields to caret movement in a multi-line draft; it only
+    // scrolls at the top edge.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.swipe_scroll = true;
+    app.draft = "line one\nline two".to_string();
+    app.cursor = app.draft.len();
+    app.last_max_scroll = Some(50);
+    app.transcript_scroll = 50;
+    app.follow_output = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.cursor < app.draft.len());
+    assert_eq!(app.transcript_scroll, 50);
+    assert!(app.follow_output);
+
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.transcript_scroll < 50);
+}
+
+#[tokio::test]
 async fn test_escape_dismisses_command_menu_until_query_changes() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -1065,6 +1150,7 @@ fn make_test_app(
         last_click: None,
         selection_flash_until: None,
         scroll_speed: DEFAULT_CHAT_SCROLL_SPEED,
+        swipe_scroll: false,
         toast: None,
         tx,
         rx,

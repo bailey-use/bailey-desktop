@@ -670,15 +670,13 @@ impl ChatTuiApp {
             KeyCode::Down if command_menu_visible => {
                 self.select_next_command();
             }
-            // Up / Ctrl+P move the cursor up one visual (wrapped) row; once on the
-            // top row they recall the previous draft from history (Claude-Code
-            // style: history at the edge). Ctrl+N / Down mirror it downward. A
-            // single-line draft has one row, so these collapse to history nav.
-            KeyCode::Up => self.composer_up_or_history_prev(),
+            // Bare Up/Down move the caret in a multi-line draft, else scroll or
+            // recall history at the edge (see composer_up_key). Ctrl+P/N: history.
+            KeyCode::Up => self.composer_up_key(),
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer_up_or_history_prev()
             }
-            KeyCode::Down => self.composer_down_or_history_next(),
+            KeyCode::Down => self.composer_down_key(),
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer_down_or_history_next()
             }

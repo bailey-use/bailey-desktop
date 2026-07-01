@@ -174,6 +174,7 @@ impl ChatTuiApp {
             last_click: None,
             selection_flash_until: None,
             scroll_speed: chat_scroll_speed(),
+            swipe_scroll: chat_swipe_scroll_enabled(),
             toast: None,
             tx,
             rx,
@@ -363,6 +364,22 @@ fn chat_mouse_enabled_for(disable_override: Option<&str>, is_termux: bool) -> bo
         return !matches!(value, "1" | "true" | "TRUE" | "yes" | "YES");
     }
     !is_termux
+}
+
+fn chat_swipe_scroll_enabled() -> bool {
+    chat_swipe_scroll_enabled_for(
+        env::var("AIVO_CHAT_SWIPE_SCROLL").ok().as_deref(),
+        crate::services::termux_exec::is_termux(),
+    )
+}
+
+/// Pure swipe-scroll policy (see the `swipe_scroll` field), split out for testing.
+/// On under Termux; `AIVO_CHAT_SWIPE_SCROLL` forces it on/off.
+fn chat_swipe_scroll_enabled_for(override_val: Option<&str>, is_termux: bool) -> bool {
+    if let Some(value) = override_val {
+        return matches!(value, "1" | "true" | "TRUE" | "yes" | "YES");
+    }
+    is_termux
 }
 
 #[cfg(test)]

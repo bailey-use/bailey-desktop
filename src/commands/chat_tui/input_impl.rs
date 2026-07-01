@@ -106,6 +106,31 @@ impl ChatTuiApp {
         }
     }
 
+    /// Bare Up: move up a visual row, or at the top edge scroll the transcript
+    /// (`swipe_scroll`) or recall the previous draft. Ctrl+P always means history.
+    pub(super) fn composer_up_key(&mut self) {
+        if self.composer_cursor_up() {
+            return;
+        }
+        if self.swipe_scroll {
+            self.scroll_up_lines(self.scroll_speed);
+        } else {
+            self.history_prev();
+        }
+    }
+
+    /// Bare Down; mirror of [`Self::composer_up_key`] downward.
+    pub(super) fn composer_down_key(&mut self) {
+        if self.composer_cursor_down() {
+            return;
+        }
+        if self.swipe_scroll {
+            self.scroll_down_lines(self.scroll_speed);
+        } else {
+            self.history_next();
+        }
+    }
+
     pub(super) fn insert_char_at_cursor(&mut self, ch: char) {
         self.draft.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();

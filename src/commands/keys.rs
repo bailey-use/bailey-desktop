@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::cli::KeysArgs;
 use crate::commands::keys_ui;
-use crate::commands::{paint_plan_cell, starter_provider_label, truncate_url_for_display};
+use crate::commands::{starter_provider_label, truncate_url_for_display};
 use crate::tui::{FuzzyOutcome, FuzzySelect};
 
 use crate::errors::ExitCode;
@@ -1178,14 +1178,15 @@ impl KeysCommand {
             };
             let id_padded = format!("{:<3}", key.short_id());
             let name_padded = format!("{:<width$}", key.name, width = max_name_len);
+            // First-party aivo key: tint only the name; plan label sits dim in the URL column.
             let starter = is_aivo_starter_base(&key.base_url)
                 .then(|| starter_provider_label(cached_plan, cached_label));
             let name_col = match &starter {
-                Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                Some(_) => style::magenta(&name_padded),
                 None => name_padded,
             };
             let url_col = match &starter {
-                Some((label, paid)) => paint_plan_cell(*paid, label),
+                Some(label) => style::dim(label),
                 None => style::dim(truncate_url_for_display(&key.base_url, 50)),
             };
             println!(
@@ -1260,7 +1261,7 @@ impl KeysCommand {
             let starter = is_aivo_starter_base(&key.base_url)
                 .then(|| starter_provider_label(cached_plan, cached_label));
             let name_col = match &starter {
-                Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                Some(_) => style::magenta(&name_padded),
                 None => name_padded,
             };
 
@@ -1282,9 +1283,9 @@ impl KeysCommand {
             };
 
             let url_col = match &starter {
-                Some((label, paid)) => {
+                Some(label) => {
                     let padded = format!("{:<width$}", label, width = url_display_width);
-                    paint_plan_cell(*paid, &padded)
+                    style::dim(&padded)
                 }
                 None => {
                     let url_display = truncate_url_for_display(&key.base_url, url_display_width);

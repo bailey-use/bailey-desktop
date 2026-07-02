@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use crate::commands::keys::{
     PingResult, PingStatus, key_metadata_json, ping_keys_streaming, ping_result_json,
 };
-use crate::commands::{paint_plan_cell, starter_provider_label, truncate_url_for_display};
+use crate::commands::{starter_provider_label, truncate_url_for_display};
 use crate::errors::ExitCode;
 use crate::services::account_store;
 use crate::services::path_search::{collect_path_dirs, find_in_dirs};
@@ -138,15 +138,15 @@ impl InfoCommand {
                     };
                     let name_padded =
                         format!("{:width$}", key.display_name(), width = max_name_len);
-                    // First-party key: name shares the plan label's colour (green when paid).
+                    // First-party key: tint only the name; plan label sits dim in the URL column.
                     let starter = is_aivo_starter_base(&key.base_url)
                         .then(|| starter_provider_label(cached_plan, cached_label));
                     let name_col = match &starter {
-                        Some((_, paid)) => paint_plan_cell(*paid, &name_padded),
+                        Some(_) => style::magenta(&name_padded),
                         None => name_padded,
                     };
                     let url_col = match &starter {
-                        Some((label, paid)) => paint_plan_cell(*paid, label),
+                        Some(label) => style::dim(label),
                         None => style::dim(truncate_url_for_display(&key.base_url, 50)),
                     };
                     println!(

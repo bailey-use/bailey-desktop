@@ -64,30 +64,19 @@ pub(crate) fn truncate_url_for_display(url: &str, max_len: usize) -> String {
     format!("{prefix}…{suffix}")
 }
 
-/// Provider-cell label for the first-party aivo key: the plan label (or slug)
-/// when paid, else the free-tier sentinel. Returns `(label, is_paid)`.
+/// Provider-cell label for the first-party aivo key: the plan label (or slug) when
+/// known, else the free-tier sentinel. One colour for every plan.
 pub(crate) fn starter_provider_label(
     cached_plan: Option<&str>,
     cached_label: Option<&str>,
-) -> (String, bool) {
+) -> String {
     match cached_plan.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(plan) => {
-            let display = cached_label
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(plan);
-            (display.to_string(), true)
-        }
-        None => (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false),
-    }
-}
-
-/// First-party key cell colour: green when paid, magenta for the free starter.
-pub(crate) fn paint_plan_cell(paid: bool, text: &str) -> String {
-    if paid {
-        crate::style::green(text)
-    } else {
-        crate::style::magenta(text)
+        Some(plan) => cached_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(plan)
+            .to_string(),
+        None => crate::constants::AIVO_STARTER_SENTINEL.to_string(),
     }
 }
 
@@ -198,31 +187,28 @@ mod tests {
     fn starter_provider_label_falls_back_to_sentinel() {
         assert_eq!(
             starter_provider_label(None, None),
-            (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
+            crate::constants::AIVO_STARTER_SENTINEL
         );
         assert_eq!(
             starter_provider_label(Some(""), Some("ignored")),
-            (crate::constants::AIVO_STARTER_SENTINEL.to_string(), false)
+            crate::constants::AIVO_STARTER_SENTINEL
         );
     }
 
     #[test]
-    fn starter_provider_label_uses_plan_when_paid() {
-        assert_eq!(
-            starter_provider_label(Some("aivo-pro"), None),
-            ("aivo-pro".to_string(), true)
-        );
+    fn starter_provider_label_uses_plan_slug() {
+        assert_eq!(starter_provider_label(Some("aivo-pro"), None), "aivo-pro");
     }
 
     #[test]
     fn starter_provider_label_prefers_server_label() {
         assert_eq!(
             starter_provider_label(Some("aivo-friend"), Some("Friend")),
-            ("Friend".to_string(), true)
+            "Friend"
         );
         assert_eq!(
             starter_provider_label(Some("aivo-pro"), Some("  ")),
-            ("aivo-pro".to_string(), true)
+            "aivo-pro"
         );
     }
 

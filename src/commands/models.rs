@@ -417,13 +417,13 @@ impl ModelsCommand {
 
         let label = if searching { "matches" } else { "models" };
         let provider_cell = if is_starter {
-            let (plan_label, paid) = crate::commands::starter_provider_label(
+            let plan_label = crate::commands::starter_provider_label(
                 starter_account.as_ref().and_then(|a| a.plan.as_deref()),
                 starter_account
                     .as_ref()
                     .and_then(|a| a.plan_label.as_deref()),
             );
-            crate::commands::paint_plan_cell(paid, &plan_label)
+            style::dim(&plan_label)
         } else {
             style::dim(&key.base_url)
         };

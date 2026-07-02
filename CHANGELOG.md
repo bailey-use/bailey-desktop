@@ -1,14 +1,47 @@
 # Changelog
 
-## Unreleased
+## v0.35.0
 
-Sharing is now a single concept. The chat `--live` flag and in-chat `/live`
-command are renamed to `--share` and `/share`, and `aivo share` /
-`aivo logs share` drop `--live` — a share always follows the session live now
-(a finished session simply stops updating). Breaking: the old `--live` and
-`/live` names are removed with no alias.
+The chat agent takes center stage. `aivo chat` is now fully the native agent:
+it knows its own live model and effort, can switch them mid-session
+(`switch_model`/`set_effort`), and reads an embedded `aivo guide` to answer
+questions about itself. A new `-e/--exec` flag runs the agent headlessly on a
+single prompt, `/compact` compacts context on demand, and a `/config` master
+switch turns every agent tool off for plain chat. Under auto-approve the agent
+now proposes a plan and confirms before large builds, streams sub-agent
+activity to the parent status line, and caps the plan checklist at five items.
+On the safety side, `run_bash` gates remote side-effect commands, project
+skills are treated as untrusted, and a code-review pass hardened the agent core
+(retries, vision, path safety). Breaking: live-sharing is unified under a
+single `share` concept — the `--live` flag and `/live` command are removed with
+no alias.
 
-- refactor(share)!: unify live-sharing under `share` — `--live`/`/live` → `--share`/`/share`, `aivo share` always live
+- feat(chat): agent knows its live model/effort, adds switch_model/set_effort, reads embedded `aivo guide` (5ce6a33)
+- feat(chat): run the agent headlessly on one prompt with `-e/--exec` (113c266)
+- feat(chat): `/compact` command to compact context on demand (a077785)
+- feat(chat): `/config` "Agent tools" master switch — plain chat when off (1706f92)
+- feat(agent): propose a plan and confirm before large builds in interactive chat (38b567f)
+- feat(chat): stream sub-agent activity to the parent status line (946b6c7)
+- feat(chat): cap plan checklist at 5 and hide finished plans (e2da253)
+- feat(chat): scroll transcript on mobile swipe (bare Up/Down under Termux) (c1dda2d)
+- feat(agent): add opt-in `context` param to grep (grep -C across all tiers) (ef77156)
+- feat(agent): gate remote side-effect commands in run_bash (1aaeff4)
+- feat(agent): treat project skills as untrusted (21bb799)
+- feat(keys): color aivo key name magenta, plan cell dim (56f1136)
+- feat(chat): color the `!cmd` shell feature magenta throughout (34cf298)
+- refactor(share)!: unify live-sharing under `share` — `--live`/`/live` → `--share`/`/share`, `aivo share` always live (5f5b5fb)
+- refactor(chat): remove top-level `--agent` flag and `/agent` command (855e6e1)
+- refactor(cli): shorten per-command `--help` output (a3275bb)
+- refactor(chat): remove the transcript scrollbar, reclaim its column (fd3ed9d)
+- refactor(agent): trim engine.rs comments and system prompt (7d0c140)
+- fix(agent): harden agent core per code review (safety, retries, vision) (34bfe25)
+- fix(chat): clear stale plan card and stuck retry notice (b5429fb)
+- fix(chat): calibrate token estimate so compaction beats the hard input limit (8e00475)
+- fix(agent): keep prior context when compacting a resumed single-long-turn (aad54e4)
+- fix(agent): normalize tool-name aliases throughout dispatch (shell→run_bash, apply→apply_patch, …) (d933689)
+- fix(agent): don't hang the chat agent on interactive commands run headless (dea194f)
+- fix(chat): refuse interactive `!cmd` up front instead of hanging on it (c67e716)
+- chore: remove padding from `aivo hf` list output (ec9666b)
 
 ## v0.34.0
 

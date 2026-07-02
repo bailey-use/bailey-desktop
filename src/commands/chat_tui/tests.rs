@@ -4565,6 +4565,90 @@ fn test_plan_renders_in_pinned_panel_not_inline() {
     assert!(screen.contains('✔') && screen.contains('▸') && screen.contains('○'));
 }
 
+fn render_screen(app: &mut ChatTuiApp, w: u16, h: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_main(frame, frame.area());
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn test_completed_plan_hidden_from_panel() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "plan".to_string(),
+        content: r#"[{"step":"scan code","status":"completed"},{"step":"write fix","status":"completed"}]"#.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let screen = render_screen(&mut app, 80, 20);
+    assert!(
+        !screen.contains("Plan") && !screen.contains("scan code"),
+        "a fully-done plan must not stay pinned:\n{screen}"
+    );
+}
+
+#[test]
+fn test_long_plan_windows_to_five_with_more_marker() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // 10 steps: 3 done, step 3 in progress, rest pending.
+    let mut plan = Vec::new();
+    for i in 0..10 {
+        let status = match i {
+            0..=2 => "completed",
+            3 => "in_progress",
+            _ => "pending",
+        };
+        plan.push(serde_json::json!({"step": format!("step {i}"), "status": status}));
+    }
+    app.history.push(ChatMessage {
+        role: "plan".to_string(),
+        content: serde_json::Value::Array(plan).to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    let screen = render_screen(&mut app, 80, 24);
+    assert!(
+        screen.contains("3/10 done"),
+        "full count in header:\n{screen}"
+    );
+    assert!(
+        screen.contains("step 3"),
+        "active step must show:\n{screen}"
+    );
+    assert!(
+        screen.contains("more"),
+        "hidden steps need a marker:\n{screen}"
+    );
+    let step_rows = screen
+        .lines()
+        .filter(|l| l.contains('✔') || l.contains('▸') || l.contains('○'))
+        .count();
+    assert!(
+        step_rows <= 5,
+        "at most 5 steps shown, got {step_rows}:\n{screen}"
+    );
+    assert!(
+        !screen.contains("step 0"),
+        "collapsed done step leaked:\n{screen}"
+    );
+}
+
 #[test]
 fn test_completed_plan_clears_on_next_user_message() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

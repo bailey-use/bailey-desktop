@@ -1437,8 +1437,9 @@ impl ChatTuiApp {
     }
 
     /// The pinned plan/task-list panel's content lines (the `Plan N/M done`
-    /// header plus one line per step), or empty when there's no plan. Built fresh
-    /// each frame — it's small, and the plan changes rarely.
+    /// header plus one line per step), or empty when there's no plan or the plan
+    /// is fully done. Built fresh each frame — it's small, and the plan changes
+    /// rarely.
     fn plan_panel_lines(&self) -> Vec<StyledLine> {
         let Some(content) = self
             .history
@@ -1449,6 +1450,10 @@ impl ChatTuiApp {
         else {
             return Vec::new();
         };
+        // A finished plan is hidden (clutter, and reads as false "done" on error).
+        if plan_all_completed(content) {
+            return Vec::new();
+        }
         let mut lines = Vec::new();
         render_plan(&mut lines, content);
         lines

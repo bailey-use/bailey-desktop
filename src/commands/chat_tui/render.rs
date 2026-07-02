@@ -1956,10 +1956,44 @@ pub(super) fn push_plan_card(
     bars.push(Some(TOOL));
 }
 
+pub(super) const PLAN_MAX_VISIBLE: usize = 5;
+
+fn plan_status(item: &serde_json::Value) -> &str {
+    item.get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("pending")
+}
+
+/// `[start, end)` window of steps to show when a plan exceeds `max`: the active
+/// step (`in_progress`, else first `pending`) at the top, backfilling upward only
+/// when it sits near the end.
+fn plan_window(items: &[serde_json::Value], max: usize) -> (usize, usize) {
+    let len = items.len();
+    if len <= max {
+        return (0, len);
+    }
+    let focus = items
+        .iter()
+        .position(|i| plan_status(i) == "in_progress")
+        .or_else(|| items.iter().position(|i| plan_status(i) == "pending"))
+        .unwrap_or(0);
+    let start = focus.min(len - max);
+    (start, start + max)
+}
+
+/// A faint `… N more` marker for a run of hidden plan steps.
+fn plan_more_line(n: usize) -> StyledLine {
+    line_with_plain(vec![Span::styled(
+        format!("  … {n} more"),
+        Style::default().fg(FAINT),
+    )])
+}
+
 /// Render an `update_plan` checklist card: a "Plan N/M done" header over one
 /// line per step, each prefixed by a status glyph (done = green ✔, active =
 /// teal ▸, pending = muted ○). Completed steps are dimmed and struck through so
-/// the eye lands on what's left. `content` is the JSON array of `{step, status}`.
+/// the eye lands on what's left. Over `PLAN_MAX_VISIBLE` steps windows to the
+/// active step (`… N more` for the rest). `content` is the JSON `[{step,status}]`.
 pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
     let items = serde_json::from_str::<serde_json::Value>(content)
         .ok()
@@ -1970,7 +2004,7 @@ pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
     }
     let done = items
         .iter()
-        .filter(|i| i.get("status").and_then(|s| s.as_str()) == Some("completed"))
+        .filter(|i| plan_status(i) == "completed")
         .count();
     lines.push(line_with_plain(vec![
         Span::styled(
@@ -1982,13 +2016,13 @@ pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
             Style::default().fg(FAINT),
         ),
     ]));
-    for item in &items {
+    let (start, end) = plan_window(&items, PLAN_MAX_VISIBLE);
+    if start > 0 {
+        lines.push(plan_more_line(start));
+    }
+    for item in &items[start..end] {
         let step = item.get("step").and_then(|v| v.as_str()).unwrap_or("");
-        let status = item
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pending");
-        let (glyph, glyph_color, text_style) = match status {
+        let (glyph, glyph_color, text_style) = match plan_status(item) {
             "completed" => (
                 "✔",
                 ASSISTANT,
@@ -2008,11 +2042,15 @@ pub(super) fn render_plan(lines: &mut Vec<StyledLine>, content: &str) {
             Span::styled(step.to_string(), text_style),
         ]));
     }
+    if end < items.len() {
+        lines.push(plan_more_line(items.len() - end));
+    }
 }
 
 /// Whether a stored plan card (`content` is the JSON `[{step,status}]` array) has
-/// at least one step and every step is `completed`. Drives the pinned-panel
-/// lifecycle: a finished plan stays pinned until the next user message clears it.
+/// at least one step and every step is `completed`. A finished plan is hidden
+/// from the panel (`plan_panel_lines`) and dropped on the next message
+/// (`clear_completed_plan`).
 pub(super) fn plan_all_completed(content: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(content)
         .ok()

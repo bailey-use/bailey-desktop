@@ -343,21 +343,28 @@ impl ChatTuiApp {
         self.sending = true;
         self.follow_output = true;
 
-        // The agent is text-only and drops attachments, so once an image is in the
-        // conversation, keep every turn on the vision chat (which re-sends history)
-        // rather than the blind agent that would answer "I can't see the image".
         let conversation_has_image = self.history_has_image();
+        let all_images = !attachments.is_empty()
+            && attachments
+                .iter()
+                .all(|a| a.mime_type.starts_with("image/"));
+        // Route images to the agent only on a model we KNOW reads them; unknown/text-only
+        // keep the plain-chat route (which has 400-recovery; text-only was refused above).
+        let agent_vision_ok = all_images && self.model_image_input == Some(true);
+        // Images that accrued on plain chat must keep re-sending there.
+        let stay_plain_for_vision = conversation_has_image && self.model_image_input != Some(true);
+        let route_agent = self.agent_capable()
+            && ((attachments.is_empty() && !stay_plain_for_vision) || agent_vision_ok);
         if self.key.is_cursor_acp() {
             self.spawn_cursor_turn(input, attachments);
-        } else if self.agent_capable() && attachments.is_empty() && !conversation_has_image {
-            // The API-key path is the native agent: tools + cwd + permission gate.
-            // (Attachments/OAuth/copilot fall back to plain chat below.)
-            self.spawn_agent_turn(input).await;
+        } else if route_agent {
+            self.spawn_agent_turn(input, attachments).await;
         } else {
-            // Note the downgrade: an image routes through vision chat, no agent tools.
             if self.agent_capable() && (!attachments.is_empty() || conversation_has_image) {
                 let msg = if attachments.is_empty() {
                     "Image in context — plain vision chat (agent tools off until /new)"
+                } else if all_images {
+                    "Image sent as plain chat — this model isn't confirmed vision-capable for the agent"
                 } else {
                     "Attachment sent as plain chat — agent tools are off for this message"
                 };
@@ -521,7 +528,7 @@ impl ChatTuiApp {
     /// Run one agent turn: (re)build the in-process engine, start a per-turn
     /// loopback serve, then drive `engine.run_turn` on a background task that
     /// streams text/tool-steps and permission requests back as `RuntimeEvent`s.
-    async fn spawn_agent_turn(&mut self, input: String) {
+    async fn spawn_agent_turn(&mut self, input: String, attachments: Vec<MessageAttachment>) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
 
         // The agent works in the real launch directory — NOT chat's sandbox
@@ -680,6 +687,28 @@ impl ChatTuiApp {
         // The model's catalog effort levels, so the engine's disable path only sends
         // a level the provider accepts (e.g. `aivo/starter` has no `none`).
         let reasoning_efforts = self.model_reasoning_efforts.clone();
+        // Build the multimodal message up front so an encoding error surfaces here, not
+        // inside the spawned turn. Empty unless the agent-vision path was chosen.
+        let multimodal: Option<serde_json::Value> = if attachments.is_empty() {
+            None
+        } else {
+            let msg = ChatMessage {
+                role: "user".to_string(),
+                content: input.clone(),
+                reasoning_content: None,
+                attachments,
+            };
+            match crate::commands::chat_request_builder::build_openai_message(&msg) {
+                Ok(v) => v.get("content").cloned(),
+                Err(e) => {
+                    self.notice = Some((ERROR, format!("couldn't attach image: {e}")));
+                    self.sending = false;
+                    self.request_started_at = None;
+                    self.pending_submit = None;
+                    return;
+                }
+            }
+        };
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -704,7 +733,14 @@ impl ChatTuiApp {
                 engine.set_reasoning_effort(effort);
             }
             // run_turn ends by calling ui.footer → AgentFinished commits the turn.
-            engine.run_turn(&ctx, &mut ui, input).await;
+            match multimodal {
+                Some(content) => {
+                    engine
+                        .run_turn_with_content(&ctx, &mut ui, content, input)
+                        .await
+                }
+                None => engine.run_turn(&ctx, &mut ui, input).await,
+            }
         }));
     }
 
@@ -815,7 +851,7 @@ impl ChatTuiApp {
             let started = Instant::now();
             let mut engine = engine.lock().await;
             engine
-                .compact_now(&ctx, &mut ui, started.elapsed().as_millis() as u64)
+                .compact_now(&ctx, &mut ui, started.elapsed().as_secs())
                 .await;
         }));
     }

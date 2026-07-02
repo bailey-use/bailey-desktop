@@ -396,8 +396,6 @@ impl ChatCommand {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         model: Option<String>,

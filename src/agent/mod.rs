@@ -12,6 +12,7 @@ pub mod notes;
 pub mod plan;
 pub mod protocol;
 pub mod sandbox;
+pub mod secrets_guard;
 pub mod serve_client;
 pub mod skills;
 pub mod subagents;

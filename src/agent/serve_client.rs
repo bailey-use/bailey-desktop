@@ -21,6 +21,32 @@ pub enum StreamDelta<'a> {
     Reasoning(&'a str),
 }
 
+/// A failed provider call. The status and `Retry-After` let the engine decide
+/// retryability from the code (not prose) and honor the server's backoff.
+#[derive(Debug)]
+pub struct ServeError {
+    pub message: String,
+    /// `None` for a transport failure (no response) or a mid-stream drop.
+    pub status: Option<u16>,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl ServeError {
+    fn transport(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status: None,
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ServeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// POST `request` to `{base_url}/v1/chat/completions` (the loopback serve),
 /// stream the SSE response, and return the assembled assistant message.
 pub async fn complete(
@@ -31,7 +57,7 @@ pub async fn complete(
     // `+ Send` so the chat TUI can run the engine (and this call) on a spawned task.
     // Fires per content/reasoning delta for live rendering.
     on_delta: &mut (dyn FnMut(StreamDelta) + Send),
-) -> Result<AssistantMessage, String> {
+) -> Result<AssistantMessage, ServeError> {
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
     let mut body = json!({
         "model": request.model,
@@ -56,11 +82,22 @@ pub async fn complete(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| ServeError::transport(format!("request failed: {e}")))?;
     let status = resp.status();
     if !status.is_success() {
+        // `Retry-After` is seconds (the only form providers send).
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("upstream {status}: {}", text.trim()));
+        return Err(ServeError {
+            message: format!("upstream {status}: {}", text.trim()),
+            status: Some(status.as_u16()),
+            retry_after,
+        });
     }
 
     let mut content = String::new();
@@ -83,7 +120,7 @@ pub async fn complete(
             // mid-assembly its arguments may be truncated, so bail rather than
             // risk executing a malformed call.
             Err(_) if !content.is_empty() && tools.is_empty() => break,
-            Err(e) => return Err(format!("stream error: {e}")),
+            Err(e) => return Err(ServeError::transport(format!("stream error: {e}"))),
         };
         buf.extend_from_slice(&bytes);
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -498,7 +535,8 @@ data: [DONE]\n\n";
         )
         .await
         .unwrap_err();
-        assert!(err.contains("401"));
+        assert!(err.message.contains("401"));
+        assert_eq!(err.status, Some(401));
     }
 
     /// A mid-stream drop after a text-only partial reply keeps what streamed

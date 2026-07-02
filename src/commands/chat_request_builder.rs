@@ -110,7 +110,7 @@ fn require_inline(attachment: &MessageAttachment) -> Result<&str> {
     }
 }
 
-fn build_openai_message(message: &ChatMessage) -> Result<serde_json::Value> {
+pub(crate) fn build_openai_message(message: &ChatMessage) -> Result<serde_json::Value> {
     if message.attachments.is_empty() {
         return Ok(serde_json::json!({
             "role": message.role,

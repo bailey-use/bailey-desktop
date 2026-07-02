@@ -868,7 +868,11 @@ impl ExternalTools for McpClient {
                     {
                         Err(text)
                     } else {
-                        Ok(text)
+                        // Frame external MCP output as untrusted (prompt-injection).
+                        Ok(crate::agent::tools::wrap_untrusted(
+                            &format!("mcp:{name}"),
+                            &text,
+                        ))
                     }
                 }
                 // The server answered, just with an error — it's healthy, so leave

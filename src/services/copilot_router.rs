@@ -236,7 +236,7 @@ fn explain_copilot_error(resp_body: &str) -> String {
     if nested_code == Some("model_max_prompt_tokens_exceeded") {
         let detail = nested_message.unwrap_or("prompt token count exceeds the model limit");
         return format!(
-            "GitHub Copilot rejected the Claude Code request because the prompt is too large for the selected model ({detail}). Claude Code includes a large built-in system and tool prompt, so this can fail even on a short message like \"hi\". Use a provider/model with a larger context window, or use `aivo chat`/`aivo codex` instead of Claude Code for Copilot-backed sessions."
+            "GitHub Copilot rejected the Claude Code request because the prompt is too large for the selected model ({detail}). Claude Code includes a large built-in system and tool prompt, so this can fail even on a short message like \"hi\". Use a provider/model with a larger context window, or use `aivo code`/`aivo codex` instead of Claude Code for Copilot-backed sessions."
         );
     }
 

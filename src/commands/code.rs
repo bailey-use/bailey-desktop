@@ -1,5 +1,5 @@
-//! ChatCommand handler. Interactive sessions launch the full-screen TUI
-//! (chat_tui). One-shot queries (-x flag) stream directly to stdout using
+//! CodeCommand handler. Interactive sessions launch the full-screen TUI
+//! (code_tui). One-shot queries (-x flag) stream directly to stdout using
 //! OpenAI-compatible /v1/chat/completions, falling back through the shared
 //! protocol router when the upstream rejects that wire format.
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -40,11 +40,11 @@ use crate::services::session_store::{
 use crate::services::stdin_io::read_stdin_if_piped;
 use crate::style;
 
-use super::chat_request_builder::{
+use super::code_request_builder::{
     build_anthropic_request, build_google_request, build_openai_chat_request,
     build_responses_request,
 };
-use super::chat_response_parser::{
+use super::code_response_parser::{
     ChatResponseChunk, ChatTurnResult, capture_model, extract_anthropic_usage,
     extract_google_message, extract_google_model, extract_google_usage, extract_openai_message,
     extract_openai_usage, extract_response_model, extract_responses_message,
@@ -55,18 +55,18 @@ use super::chat_response_parser::{
     parse_sse_chunk,
 };
 
-// Re-export for submodules (chat_tui_format uses TokenUsage)
-pub(crate) use super::chat_response_parser::TokenUsage;
-pub(crate) use chat_tui_format::format_time_ago_short;
+// Re-export for submodules (code_tui_format uses TokenUsage)
+pub(crate) use super::code_response_parser::TokenUsage;
+pub(crate) use code_tui_format::format_time_ago_short;
 
-#[path = "chat_tui.rs"]
-mod chat_tui;
-// `chat_tui_format` is now declared at the parent (`commands/mod.rs`) so other
+#[path = "code_tui.rs"]
+mod code_tui;
+// `code_tui_format` is now declared at the parent (`commands/mod.rs`) so other
 // commands (notably `aivo context` / `--context`) can reuse its time/text
 // formatters. Re-export at this scope so the chat module still references it
 // without `super::`.
-use super::chat_agent_oneshot;
-use super::chat_tui_format;
+use super::code_agent_oneshot;
+use super::code_tui_format;
 
 /// Max entries in the composer's per-directory recall view (the up-arrow list
 /// for the current launch dir). Recall is cwd-filtered like Claude Code's
@@ -173,7 +173,7 @@ fn persisted_chat_protocol(key: &ApiKey, raw_model: &str) -> Option<ProviderProt
     if raw_model.trim().is_empty() {
         return None;
     }
-    let routes = key.routes_for_tool("chat");
+    let routes = key.routes_for_tool("code");
     let model = canonical_model(raw_model);
     routes
         .get(&model)
@@ -196,7 +196,7 @@ fn chat_route_to_persist(
     let route = PersistedRoute::from_route(chat_format_protocol(format), PathVariant::Default);
     // Compare packed bytes so a default variant ("" vs "default") isn't a false diff.
     if key
-        .routes_for_tool("chat")
+        .routes_for_tool("code")
         .get(&model)
         .and_then(PersistedRoute::to_byte)
         == route.to_byte()
@@ -206,13 +206,13 @@ fn chat_route_to_persist(
     Some((model, route))
 }
 
-/// ChatCommand provides an interactive REPL for chatting with AI models
-pub struct ChatCommand {
+/// CodeCommand provides an interactive REPL for chatting with AI models
+pub struct CodeCommand {
     session_store: SessionStore,
     cache: ModelsCache,
 }
 
-impl ChatCommand {
+impl CodeCommand {
     pub fn new(session_store: SessionStore, cache: ModelsCache) -> Self {
         Self {
             session_store,
@@ -232,14 +232,14 @@ impl ChatCommand {
             Some(ref m) if m.is_empty() => Ok(None),
             // --model <value> → use it and save
             Some(model) => {
-                let current = self.session_store.get_chat_model(&key.id).await?;
+                let current = self.session_store.get_code_model(&key.id).await?;
                 if current.as_deref() != Some(&model) {
-                    self.session_store.set_chat_model(&key.id, &model).await?;
+                    self.session_store.set_code_model(&key.id, &model).await?;
                 }
                 Ok(Some(model))
             }
             None => {
-                if let Some(m) = self.session_store.get_chat_model(&key.id).await? {
+                if let Some(m) = self.session_store.get_code_model(&key.id).await? {
                     if self.starter_model_valid(key, &m).await {
                         return Ok(Some(m));
                     }
@@ -282,11 +282,11 @@ impl ChatCommand {
         model_names::transform_model_for_provider(None, base_url, model)
     }
 
-    /// Read-only preview for `aivo chat --dry-run`: resolves the key, model,
+    /// Read-only preview for `aivo code --dry-run`: resolves the key, model,
     /// endpoint, sandbox dir, and mode the way a real launch would — but performs
     /// no HTTP, persistence, model picker, or server spawn. HF refs show a
     /// placeholder endpoint (llama-server is not started).
-    async fn print_chat_dry_run(
+    async fn print_code_dry_run(
         &self,
         model_input: Option<String>,
         attachments: &[String],
@@ -299,7 +299,7 @@ impl ChatCommand {
             huggingface::is_hf_or_local_gguf(m) || huggingface::is_bare_hf_picker_trigger(m)
         });
 
-        println!("{}", style::bold("Dry run — aivo chat would start with:"));
+        println!("{}", style::bold("Dry run — aivo code would start with:"));
         println!();
 
         if hf {
@@ -338,7 +338,7 @@ impl ChatCommand {
                     if let Some(k) = &key {
                         m = self
                             .session_store
-                            .get_chat_model(&k.id)
+                            .get_code_model(&k.id)
                             .await
                             .ok()
                             .flatten();
@@ -467,7 +467,7 @@ impl ChatCommand {
         // Placed first so it also skips the over-broad-workspace prompt below.
         if dry_run {
             return self
-                .print_chat_dry_run(
+                .print_code_dry_run(
                     model_flag,
                     &attachments,
                     key_override,
@@ -522,13 +522,13 @@ impl ChatCommand {
         };
 
         // OAuth keys target subscription backends only the native CLIs can
-        // speak; reject them for `aivo chat`.
+        // speak; reject them for `aivo code`.
         if !hf_active && key.is_any_oauth() {
             key = match crate::commands::keys::swap_incompatible_key(
                 &self.session_store,
                 &key,
                 crate::services::key_compat::KeyCompatContext::Chat,
-                "aivo chat",
+                "aivo code",
             )
             .await?
             {
@@ -538,7 +538,7 @@ impl ChatCommand {
         }
 
         let client = crate::services::http_utils::router_http_client();
-        // `aivo chat` always runs in an isolated sandbox dir so backends
+        // `aivo code` always runs in an isolated sandbox dir so backends
         // that accept a `cwd` (cursor ACP today) can't auto-pull
         // surrounding project files into the conversation. Chat is a
         // pure conversation surface; if you need project access, use
@@ -586,7 +586,7 @@ impl ChatCommand {
                 ) {
                     Some(selected) => {
                         self.session_store
-                            .set_chat_model(&key.id, &selected)
+                            .set_code_model(&key.id, &selected)
                             .await?;
                         selected
                     }
@@ -597,12 +597,12 @@ impl ChatCommand {
 
         // chat is a first-class coding agent like the native tools, so it
         // records itself as the last tool (the native launch does the same in
-        // run.rs). A later bare `aivo run` then recalls "chat". Skipped for HF —
+        // run.rs). A later bare `aivo run` then recalls "code". Skipped for HF —
         // its synthetic key is ephemeral and shouldn't be remembered.
         if !hf_active {
             let _ = self
                 .session_store
-                .set_last_selection(&key, "chat", Some(&raw_model))
+                .set_last_selection(&key, "code", Some(&raw_model))
                 .await;
         }
 
@@ -637,7 +637,7 @@ impl ChatCommand {
             };
             // -e runs the agent (text-only, serve-reachable keys); -p falls through to plain.
             if agent_mode {
-                if !chat_agent_oneshot::key_is_agent_capable(&key) {
+                if !code_agent_oneshot::key_is_agent_capable(&key) {
                     anyhow::bail!(
                         "-e/--exec needs a standard API key; this key can't run the in-process agent"
                     );
@@ -646,16 +646,16 @@ impl ChatCommand {
                     anyhow::bail!("-e/--exec is text-only — drop --attach");
                 }
                 self.session_store
-                    .record_selection(&key.id, "chat", Some(&raw_model))
+                    .record_selection(&key.id, "code", Some(&raw_model))
                     .await?;
-                return chat_agent_oneshot::run_one_shot_agent(
+                return code_agent_oneshot::run_one_shot_agent(
                     &self.session_store,
                     &self.cache,
                     &key,
                     &raw_model,
                     one_shot_input,
                     max_context,
-                    chat_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
+                    code_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
                 )
                 .await;
             }
@@ -669,7 +669,7 @@ impl ChatCommand {
             }];
             let mut format = seeded_chat_format(&key, &raw_model);
             self.session_store
-                .record_selection(&key.id, "chat", Some(&raw_model))
+                .record_selection(&key.id, "code", Some(&raw_model))
                 .await?;
             let (spinning, spinner_handle) = style::start_spinner(None);
             let mut current_section: Option<&'static str> = None;
@@ -766,7 +766,7 @@ impl ChatCommand {
                     {
                         let _ = self
                             .session_store
-                            .merge_routes(&key.id, "chat", &[(model_key, route)])
+                            .merge_routes(&key.id, "code", &[(model_key, route)])
                             .await;
                     }
                     let prompt_text: String = history.iter().map(|m| m.content.as_str()).collect();
@@ -776,7 +776,7 @@ impl ChatCommand {
                     self.session_store
                         .record_tokens(
                             &key.id,
-                            Some("chat"),
+                            Some("code"),
                             Some(stats_model),
                             usage.prompt_tokens,
                             usage.completion_tokens,
@@ -784,7 +784,7 @@ impl ChatCommand {
                             usage.cache_creation_input_tokens,
                         )
                         .await?;
-                    let chat_session_id = new_chat_session_id();
+                    let chat_session_id = new_code_session_id();
                     let _ = log_chat_turn(
                         &self.session_store,
                         &key,
@@ -811,7 +811,7 @@ impl ChatCommand {
                     };
                     let _ = self
                         .session_store
-                        .save_chat_session_with_id(
+                        .save_code_session_with_id(
                             &key.id,
                             &key.base_url,
                             &cwd,
@@ -842,7 +842,7 @@ impl ChatCommand {
 
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             anyhow::bail!(
-                "Interactive chat now uses a full-screen TUI. Run it in a terminal, or use -p/--prompt for non-interactive mode."
+                "The interactive coding agent uses a full-screen TUI. Run it in a terminal, or use -p/--prompt for non-interactive mode."
             );
         }
 
@@ -851,16 +851,16 @@ impl ChatCommand {
             return Err(crate::commands::share::not_linked_error());
         }
 
-        let initial_session = new_chat_session_id();
+        let initial_session = new_code_session_id();
         let initial_history = Vec::new();
 
         let startup_notice = attachment_notice(&pending_attachments);
 
         self.session_store
-            .record_selection(&key.id, "chat", Some(&raw_model))
+            .record_selection(&key.id, "code", Some(&raw_model))
             .await?;
 
-        chat_tui::run_chat_tui(chat_tui::ChatTuiParams {
+        code_tui::run_chat_tui(code_tui::CodeTuiParams {
             session_store: self.session_store.clone(),
             cache: self.cache.clone(),
             client,
@@ -884,17 +884,17 @@ impl ChatCommand {
 
     pub fn print_help() {
         println!(
-            "{} aivo chat [REF] [--model <model>] [-p [prompt]] [--attach <path> ...]",
+            "{} aivo code [REF] [--model <model>] [-p [prompt]] [--attach <path> ...]",
             style::bold("Usage:")
         );
         println!();
         println!(
             "{}",
-            style::dim("Interactive chat TUI, or one prompt with -p (plain) / -e (agent).")
+            style::dim("Interactive coding agent TUI, or one prompt with -p (plain) / -e (agent).")
         );
         println!(
             "{}",
-            style::dim("Type /help inside chat for slash commands and keybindings.")
+            style::dim("Type /help inside the TUI for slash commands and keybindings.")
         );
         println!();
         println!("{}", style::bold("Options:"));
@@ -916,8 +916,11 @@ impl ChatCommand {
             "One prompt, run the agent, exit (tools)",
         );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
-        print_opt("--resume [last|id]", "Resume a saved chat (bare/last/id)");
-        print_opt("--share", "Share this chat live (needs `aivo login`)");
+        print_opt(
+            "--resume [last|id]",
+            "Resume a saved session (bare/last/id)",
+        );
+        print_opt("--share", "Share this session live (needs `aivo login`)");
         print_opt("--attach <path>", "Attach a file or image to the message");
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
@@ -936,11 +939,11 @@ impl ChatCommand {
         println!("{}", style::bold("Examples:"));
         println!(
             "  {}",
-            style::dim("aivo chat -p \"Explain Rust lifetimes\"")
+            style::dim("aivo code -p \"Explain Rust lifetimes\"")
         );
         println!(
             "  {}",
-            style::dim("aivo chat -e \"make the failing test pass\"")
+            style::dim("aivo code -e \"make the failing test pass\"")
         );
     }
 }
@@ -1357,7 +1360,7 @@ async fn materialize_attachment(attachment: &MessageAttachment) -> Result<Messag
 /// Returns `(stored_messages, title, preview)` for a completed one-shot
 /// turn. The session_id is generated by the caller and threaded through both
 /// `log_chat_turn` (so logs.db rows carry the session linkage that
-/// `aivo logs share <event-id>` needs) and `save_chat_session_with_id`.
+/// `aivo logs share <event-id>` needs) and `save_code_session_with_id`.
 fn build_one_shot_persist_inputs(
     user_history: &[ChatMessage],
     assistant_content: String,
@@ -1372,8 +1375,8 @@ fn build_one_shot_persist_inputs(
         attachments: vec![],
     });
     let stored = to_stored_messages(&full_history);
-    let title = chat_tui::session_title_from_messages(&full_history, raw_model);
-    let preview = chat_tui::session_preview_text_from_messages(&full_history, raw_model);
+    let title = code_tui::session_title_from_messages(&full_history, raw_model);
+    let preview = code_tui::session_preview_text_from_messages(&full_history, raw_model);
     (stored, title, preview)
 }
 
@@ -1384,14 +1387,14 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
             role: message.role.clone(),
             content: message.content.clone(),
             reasoning_content: message.reasoning_content.clone(),
-            id: Some(new_chat_session_id()),
+            id: Some(new_code_session_id()),
             timestamp: Some(Utc::now().to_rfc3339()),
             attachments: (!message.attachments.is_empty()).then(|| message.attachments.clone()),
         })
         .collect()
 }
 
-fn new_chat_session_id() -> String {
+fn new_code_session_id() -> String {
     use rand::Rng;
     let bytes: [u8; 16] = rand::thread_rng().r#gen();
     format!(
@@ -1454,12 +1457,12 @@ async fn log_chat_turn(
     session_store
         .logs()
         .append(crate::services::log_store::LogEvent {
-            source: "chat".to_string(),
-            kind: "chat_turn".to_string(),
+            source: "code".to_string(),
+            kind: "code_turn".to_string(),
             key_id: Some(key.id.clone()),
             key_name: Some(key.display_name().to_string()),
             base_url: Some(key.base_url.clone()),
-            tool: Some("chat".to_string()),
+            tool: Some("code".to_string()),
             model: Some(raw_model.to_string()),
             cwd: cwd.map(str::to_string),
             session_id: session_id.map(str::to_string),
@@ -1472,7 +1475,7 @@ async fn log_chat_turn(
             // the real input, e.g. `/baidu-search 歌曲`) and keep the full
             // expanded body in the searchable body_text for debugging.
             title: Some(log_title(
-                &chat_tui::skill_invocation_label(&user_message.content)
+                &code_tui::skill_invocation_label(&user_message.content)
                     .unwrap_or_else(|| user_message.content.clone()),
             )),
             body_text: Some(format!(
@@ -1500,7 +1503,7 @@ fn log_title(text: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
-        .unwrap_or("(empty chat turn)");
+        .unwrap_or("(empty turn)");
     let mut truncated = line.chars().take(120).collect::<String>();
     if line.chars().count() > 120 {
         truncated.push_str("...");
@@ -3172,7 +3175,7 @@ data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"tex
                 path_variant: String::new(),
             },
         );
-        key.protocol_routes.insert("chat".to_string(), tool);
+        key.protocol_routes.insert("code".to_string(), tool);
         key
     }
 

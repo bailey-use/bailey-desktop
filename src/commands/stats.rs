@@ -91,7 +91,7 @@ impl StatsCommand {
         // guards the rare plugin-shadows-a-builtin case (the scan owns those).
         let mut probe_targets: Vec<String> = Vec::new();
         for (tool, &count) in &aivo_tool_counts {
-            if tool.as_str() != "chat"
+            if tool.as_str() != "code"
                 && count > 0
                 && !global_stats::is_native_tool(tool)
                 && crate::plugin::stats::probes_stats(tool)
@@ -151,7 +151,7 @@ impl StatsCommand {
         let pending: Vec<(&String, u64)> = aivo_tool_counts
             .iter()
             .filter(|&(tool, &count)| {
-                tool != "chat"
+                tool != "code"
                     && count > 0
                     && tool_tokens.get(tool).is_none_or(|t| t.total_tokens() == 0)
             })
@@ -266,7 +266,7 @@ impl StatsCommand {
         let chat_tokens = chat_tokens_for_summary(&stats, &key_ids, cutoff, &chat_window);
         if chat_tokens.total_tokens() > 0 || chat_sessions > 0 {
             tool_tokens.insert(
-                "chat".to_string(),
+                "code".to_string(),
                 ToolTokenSummary {
                     sessions: chat_sessions,
                     ..chat_tokens
@@ -451,7 +451,7 @@ impl StatsCommand {
         let tool = tool.to_lowercase();
         let plugins = crate::plugin::coding_agent_plugin_names();
         if !is_valid_tool(&tool, &plugins) {
-            let mut valid: Vec<String> = ["claude", "codex", "gemini", "opencode", "pi", "chat"]
+            let mut valid: Vec<String> = ["claude", "codex", "gemini", "opencode", "pi", "code"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -1096,7 +1096,7 @@ fn chat_tokens_for_summary(
             cache_write: total.cache_write_tokens,
         };
     }
-    tool_token_totals(stats, "chat", key_ids)
+    tool_token_totals(stats, "code", key_ids)
 }
 
 /// Per-model usage from aivo-tracked counters, scoped to the requested
@@ -1124,7 +1124,13 @@ fn tool_token_totals(stats: &UsageStats, tool: &str, key_ids: &HashSet<&str>) ->
         if !key_ids.contains(key_id.as_str()) {
             continue;
         }
-        if entry.per_tool.get(tool).copied().unwrap_or(0) == 0 {
+        // Canonical match so the `code` total also folds the pre-rename `chat`
+        // per-tool bucket (see `canonical_stats_tool`).
+        if !entry
+            .per_tool
+            .iter()
+            .any(|(t, c)| *c > 0 && canonical_stats_tool(t) == tool)
+        {
             continue;
         }
         input += entry.prompt_tokens;
@@ -1556,7 +1562,7 @@ fn render_since_footer(since: Option<&str>, omitted_sources: &[&str]) {
 /// Native (Claude Code, Codex, Gemini, OpenCode, Pi) and aivo-proxy data
 /// overlap for any model launched through aivo. To avoid double-counting,
 /// native wins when both have an entry for the same model name; aivo-only
-/// models (e.g. usage that only flowed through `aivo chat` or a non-native
+/// models (e.g. usage that only flowed through `aivo code` or a non-native
 /// integration) are added on top so they show up in the overview rather than
 /// being dropped whenever any native data exists.
 fn combine_model_tokens(
@@ -1683,7 +1689,8 @@ fn aggregate_model_usage(
 }
 
 fn is_valid_tool(tool: &str, plugins: &HashSet<String>) -> bool {
-    AIToolType::parse(tool).is_some() || tool == "chat" || plugins.contains(tool)
+    // `chat` accepted as the pre-rename alias of the built-in agent (`code`).
+    AIToolType::parse(tool).is_some() || tool == "code" || tool == "chat" || plugins.contains(tool)
 }
 
 /// Collapse `codex-app` into `codex` for stats. Codex Desktop App's shadow
@@ -1695,6 +1702,9 @@ fn is_valid_tool(tool: &str, plugins: &HashSet<String>) -> bool {
 fn canonical_stats_tool(tool: &str) -> &str {
     match tool {
         "codex-app" => "codex",
+        // Pre-rename built-in agent bucket folds into `code` so historical
+        // token/launch counts stay attributed after the `chat`→`code` rename.
+        "chat" => "code",
         other => other,
     }
 }

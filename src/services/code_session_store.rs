@@ -5,12 +5,12 @@ use std::path::PathBuf;
 use crate::services::atomic_write::atomic_write_secure;
 use crate::services::session_crypto::encrypt;
 use crate::services::session_store::{
-    ChatSessionState, ChatTokenWindow, ConfigContext, ConfigLockGuard, SessionIndex,
+    ChatTokenWindow, CodeSessionState, ConfigContext, ConfigLockGuard, SessionIndex,
     SessionIndexEntry, SessionTokens, StoredChatMessage,
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct ChatSessionStore {
+pub(crate) struct CodeSessionStore {
     pub(crate) ctx: ConfigContext,
 }
 
@@ -67,7 +67,7 @@ fn first_non_empty_line(text: &str) -> String {
         .to_string()
 }
 
-impl ChatSessionStore {
+impl CodeSessionStore {
     pub(crate) fn sessions_dir(&self) -> PathBuf {
         self.ctx.config_dir.join("sessions")
     }
@@ -111,7 +111,7 @@ impl ChatSessionStore {
         atomic_write_secure(&self.index_path(), data.into_bytes()).await
     }
 
-    async fn load_session_file(&self, session_id: &str) -> Result<ChatSessionState> {
+    async fn load_session_file(&self, session_id: &str) -> Result<CodeSessionState> {
         let path = self.session_file_path(session_id);
         let data = tokio::fs::read_to_string(&path)
             .await
@@ -119,7 +119,7 @@ impl ChatSessionStore {
         serde_json::from_str(&data).context("Failed to parse session file")
     }
 
-    async fn save_session_file(&self, state: &ChatSessionState) -> Result<()> {
+    async fn save_session_file(&self, state: &CodeSessionState) -> Result<()> {
         let sessions_dir = self.sessions_dir();
         tokio::fs::create_dir_all(&sessions_dir)
             .await
@@ -134,7 +134,7 @@ impl ChatSessionStore {
         let written = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("verify-after-write: re-read failed for {:?}", path))?;
-        let parsed: ChatSessionState = serde_json::from_str(&written)
+        let parsed: CodeSessionState = serde_json::from_str(&written)
             .context("verify-after-write: written session did not round-trip (parse)")?;
         if parsed.session_id != state.session_id || parsed.messages != state.messages {
             anyhow::bail!(
@@ -337,10 +337,10 @@ impl ChatSessionStore {
 
     // ── Public methods ────────────────────────────────────────────────────
 
-    pub(crate) async fn get_chat_session(
+    pub(crate) async fn get_code_session(
         &self,
         session_id: &str,
-    ) -> Result<Option<ChatSessionState>> {
+    ) -> Result<Option<CodeSessionState>> {
         self.migrate_sessions_if_needed().await?;
         let path = self.session_file_path(session_id);
         if !path.exists() {
@@ -466,7 +466,7 @@ impl ChatSessionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn save_chat_session_with_id(
+    pub(crate) async fn save_code_session_with_id(
         &self,
         key_id: &str,
         base_url: &str,
@@ -496,7 +496,7 @@ impl ChatSessionStore {
         // so a per-turn or heartbeat persist can't wipe it; `save_agent_messages`
         // refreshes it after a turn (when the engine is lockable).
         let engine_messages = existing.and_then(|s| s.engine_messages);
-        let state = ChatSessionState {
+        let state = CodeSessionState {
             session_id: session_id.to_string(),
             key_id: key_id.to_string(),
             base_url: base_url.to_string(),
@@ -687,10 +687,10 @@ mod tests {
     use crate::services::session_store::{ApiKey, ConfigContext, StoredChatMessage, StoredConfig};
     use tempfile::TempDir;
 
-    fn make_store(temp_dir: &TempDir) -> ChatSessionStore {
+    fn make_store(temp_dir: &TempDir) -> CodeSessionStore {
         let config_path = temp_dir.path().join("config.json");
         let config_dir = temp_dir.path().to_path_buf();
-        ChatSessionStore {
+        CodeSessionStore {
             ctx: ConfigContext {
                 config_path,
                 config_dir,
@@ -698,7 +698,7 @@ mod tests {
         }
     }
 
-    async fn setup_store_with_key(temp_dir: &TempDir) -> (ChatSessionStore, String) {
+    async fn setup_store_with_key(temp_dir: &TempDir) -> (CodeSessionStore, String) {
         let store = make_store(temp_dir);
         let key_id = "abc".to_string();
         let base_url = "http://localhost".to_string();
@@ -738,7 +738,7 @@ mod tests {
     async fn get_nonexistent_session_returns_none() {
         let temp_dir = TempDir::new().unwrap();
         let store = make_store(&temp_dir);
-        let result = store.get_chat_session("nonexistent").await.unwrap();
+        let result = store.get_code_session("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
@@ -748,7 +748,7 @@ mod tests {
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
 
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -763,7 +763,7 @@ mod tests {
             .await
             .unwrap();
 
-        let session = store.get_chat_session("sess1").await.unwrap().unwrap();
+        let session = store.get_code_session("sess1").await.unwrap().unwrap();
         assert_eq!(session.session_id, "sess1");
         assert_eq!(session.model, "gpt-4o");
         assert_eq!(session.key_id, key_id);
@@ -782,9 +782,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
 
-        let text_save = |store: ChatSessionStore, key_id: String| async move {
+        let text_save = |store: CodeSessionStore, key_id: String| async move {
             store
-                .save_chat_session_with_id(
+                .save_code_session_with_id(
                     &key_id,
                     "http://localhost",
                     "/tmp/t",
@@ -804,7 +804,7 @@ mod tests {
         text_save(store.clone(), key_id.clone()).await;
         assert!(
             store
-                .get_chat_session("s1")
+                .get_code_session("s1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -826,7 +826,7 @@ mod tests {
         store.save_agent_messages("s1", &convo).await.unwrap();
 
         let restored = store
-            .get_chat_session("s1")
+            .get_code_session("s1")
             .await
             .unwrap()
             .unwrap()
@@ -840,7 +840,7 @@ mod tests {
         // A later text-only (heartbeat) save must NOT wipe the transcript.
         text_save(store.clone(), key_id.clone()).await;
         let after = store
-            .get_chat_session("s1")
+            .get_code_session("s1")
             .await
             .unwrap()
             .unwrap()
@@ -857,7 +857,7 @@ mod tests {
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
 
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -876,7 +876,7 @@ mod tests {
         assert!(deleted);
 
         // Session should be gone
-        let session = store.get_chat_session("sess1").await.unwrap();
+        let session = store.get_code_session("sess1").await.unwrap();
         assert!(session.is_none());
 
         // Deleting again returns false
@@ -892,7 +892,7 @@ mod tests {
         // Create two sessions for same key
         for sid in &["sess1", "sess2"] {
             store
-                .save_chat_session_with_id(
+                .save_code_session_with_id(
                     &key_id,
                     "http://localhost",
                     "/tmp/test",
@@ -911,8 +911,8 @@ mod tests {
         store.remove_sessions_for_key(&key_id).await.unwrap();
 
         // Both should be gone
-        assert!(store.get_chat_session("sess1").await.unwrap().is_none());
-        assert!(store.get_chat_session("sess2").await.unwrap().is_none());
+        assert!(store.get_code_session("sess1").await.unwrap().is_none());
+        assert!(store.get_code_session("sess2").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -922,7 +922,7 @@ mod tests {
 
         // Save session in /tmp/a
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/a",
@@ -939,7 +939,7 @@ mod tests {
 
         // Save session in /tmp/b
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/b",
@@ -970,7 +970,7 @@ mod tests {
         // Two sessions in /tmp/x with distinct updated_at; one in /tmp/y
         // (must not be returned even when its mtime is closer to the probe).
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/x",
@@ -986,7 +986,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/x",
@@ -1001,7 +1001,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/y",
@@ -1040,7 +1040,7 @@ mod tests {
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
 
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -1055,13 +1055,13 @@ mod tests {
             .await
             .unwrap();
 
-        let first = store.get_chat_session("sess1").await.unwrap().unwrap();
+        let first = store.get_code_session("sess1").await.unwrap().unwrap();
         let original_created = first.created_at.clone();
 
         // Save again (update)
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -1076,7 +1076,7 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = store.get_chat_session("sess1").await.unwrap().unwrap();
+        let updated = store.get_code_session("sess1").await.unwrap().unwrap();
         assert_eq!(updated.created_at, original_created);
         // updated_at should be different (or at least not earlier)
         assert!(updated.updated_at >= original_created);
@@ -1089,7 +1089,7 @@ mod tests {
 
         // Save a session (creates index + file)
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -1414,7 +1414,7 @@ mod tests {
         let (store, key_id) = setup_store_with_key(&temp_dir).await;
 
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",
@@ -1445,7 +1445,7 @@ mod tests {
 
         // Heartbeat-style save without a fresh billed_model preserves it.
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &key_id,
                 "http://localhost",
                 "/tmp/test",

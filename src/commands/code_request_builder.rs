@@ -2,11 +2,11 @@
 //! Anthropic chat completion APIs, including multimodal attachment encoding.
 use anyhow::Result;
 
-use crate::commands::chat::is_document_mime;
+use crate::commands::code::is_document_mime;
 use crate::services::anthropic_route_pipeline::inject_cache_control_on_last_block;
 use crate::services::session_store::{AttachmentStorage, MessageAttachment};
 
-use super::chat::ChatMessage;
+use super::code::ChatMessage;
 
 /// Lowest `reasoning_effort` to send when thinking is off, or `None` for a
 /// non-reasoning model that 400s on the field. Catalog-first: the gpt-5 family

@@ -1,4 +1,4 @@
-//! Global HTTP debug logger for `aivo run` / `aivo chat`.
+//! Global HTTP debug logger for `aivo run` / `aivo code`.
 //!
 //! When initialized, captures every reqwest request/response pair as a JSONL
 //! entry. When uninitialized, every helper is a fast no-op.

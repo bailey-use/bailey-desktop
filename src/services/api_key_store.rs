@@ -48,7 +48,7 @@ pub(crate) struct ApiKeyStore {
 }
 
 fn remove_runtime_state_for_key(config: &mut StoredConfig, key_id: &str) {
-    config.chat_models.remove(key_id);
+    config.code_models.remove(key_id);
     for tools in config.directory_starts.values_mut() {
         tools.retain(|_, record| record.key_id != key_id);
     }
@@ -700,16 +700,16 @@ impl ApiKeyStore {
         }
     }
 
-    pub(crate) async fn get_chat_model(&self, key_id: &str) -> Result<Option<String>> {
+    pub(crate) async fn get_code_model(&self, key_id: &str) -> Result<Option<String>> {
         let config = self.ctx.load().await?;
-        Ok(config.chat_models.get(key_id).cloned())
+        Ok(config.code_models.get(key_id).cloned())
     }
 
-    pub(crate) async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
+    pub(crate) async fn set_code_model(&self, key_id: &str, model: &str) -> Result<()> {
         let _lock = self.ctx.acquire_config_lock()?;
         let mut config = self.ctx.load().await?;
         config
-            .chat_models
+            .code_models
             .insert(key_id.to_string(), model.to_string());
         self.ctx.save_raw(&config).await
     }
@@ -853,17 +853,17 @@ mod tests {
         let store = make_store(&temp_dir);
 
         // No model set initially
-        let model = store.get_chat_model("key1").await.unwrap();
+        let model = store.get_code_model("key1").await.unwrap();
         assert!(model.is_none());
 
         // Set and retrieve
-        store.set_chat_model("key1", "gpt-4o").await.unwrap();
-        let model = store.get_chat_model("key1").await.unwrap();
+        store.set_code_model("key1", "gpt-4o").await.unwrap();
+        let model = store.get_code_model("key1").await.unwrap();
         assert_eq!(model.as_deref(), Some("gpt-4o"));
 
         // Overwrite
-        store.set_chat_model("key1", "claude-sonnet").await.unwrap();
-        let model = store.get_chat_model("key1").await.unwrap();
+        store.set_code_model("key1", "claude-sonnet").await.unwrap();
+        let model = store.get_code_model("key1").await.unwrap();
         assert_eq!(model.as_deref(), Some("claude-sonnet"));
     }
 
@@ -906,7 +906,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_key_clears_chat_models() {
+    async fn delete_key_clears_code_models() {
         let temp_dir = TempDir::new().unwrap();
         let store = make_store(&temp_dir);
 
@@ -914,11 +914,11 @@ mod tests {
             .add_key_with_protocol("test", "http://localhost", None, "sk-test")
             .await
             .unwrap();
-        store.set_chat_model(&id, "gpt-4o").await.unwrap();
+        store.set_code_model(&id, "gpt-4o").await.unwrap();
 
         store.delete_key(&id).await.unwrap();
 
-        let model = store.get_chat_model(&id).await.unwrap();
+        let model = store.get_code_model(&id).await.unwrap();
         assert!(model.is_none());
     }
 

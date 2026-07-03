@@ -1,4 +1,4 @@
-//! In-process live share for `aivo chat --share` / `/share`: reuses the
+//! In-process live share for `aivo code --share` / `/share`: reuses the
 //! `aivo logs share` server + tunnel but returns the URL instead of printing
 //! it. The refresher follows the on-disk session, so the viewer tracks the
 //! conversation as `persist_history` writes each turn.

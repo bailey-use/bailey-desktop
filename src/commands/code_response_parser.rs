@@ -80,7 +80,7 @@ pub(crate) struct ChatTurnResult {
     /// — same key claude-code records.
     pub model: Option<String>,
     /// Raw upstream response body, populated for non-streaming handlers.
-    /// Surfaced by `aivo chat --json` so scripts can consume the
+    /// Surfaced by `aivo code --json` so scripts can consume the
     /// provider-native shape.
     pub raw_body: Option<serde_json::Value>,
 }

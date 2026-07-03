@@ -2,7 +2,7 @@ use super::*;
 use std::collections::HashMap;
 
 /// Every resumable chat session, newest first, across ALL keys and working
-/// dirs. Not cwd-scoped: `aivo chat` runs in an ephemeral per-pid sandbox, so a
+/// dirs. Not cwd-scoped: `aivo code` runs in an ephemeral per-pid sandbox, so a
 /// cwd filter would hide every prior session — `/resume` is a global history
 /// browser (searchable in the picker). Sessions whose key was removed are
 /// dropped (no key to load them with).
@@ -35,10 +35,10 @@ pub(super) async fn load_resume_session(
     preview: &SessionPreview,
 ) -> std::result::Result<LoadedSession, String> {
     let session = session_store
-        .get_chat_session(&preview.session_id)
+        .get_code_session(&preview.session_id)
         .await
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| "Saved chat is no longer available".to_string())?;
+        .ok_or_else(|| "Saved session is no longer available".to_string())?;
 
     LoadedSession::from_state(session).map_err(|err| err.to_string())
 }

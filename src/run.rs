@@ -8,13 +8,13 @@ use std::process;
 use clap::{Command, CommandFactory, Parser};
 use serde_json::{Map, Value, json};
 
-use crate::cli::{AccountSubcommand, ChatArgs, Cli, Commands};
+use crate::cli::{AccountSubcommand, Cli, CodeArgs, Commands};
 use crate::cli_args::{
     extract_aivo_flags, lift_context_suffix, needs_bundle_lookup, parse_context_token,
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AccountCommand, AliasCommand, ChatCommand, InfoCommand, KeysCommand, LoginCommand,
+    self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
     LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
     ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
 };
@@ -71,13 +71,13 @@ fn is_hf_takeover(model: Option<&str>) -> bool {
     }
 }
 
-/// `aivo chat <REF>`'s positional is HF-only, but a non-HF positional is the
+/// `aivo code <REF>`'s positional is HF-only, but a non-HF positional is the
 /// user's one-shot prompt — the same way the top-level `aivo "..."` rewrites to
-/// `aivo chat -p "..."`. Without this, `aivo chat "hello world"` would dead-end
+/// `aivo code -p "..."`. Without this, `aivo code "hello world"` would dead-end
 /// on a "ref only" error. Lift such a positional into `prompt` (an explicit
 /// `-p` still wins) and clear the ref slot so it never reaches the
 /// model-ref/HF path.
-fn lift_chat_positional_to_prompt(args: &mut ChatArgs) {
+fn lift_code_positional_to_prompt(args: &mut CodeArgs) {
     if let Some(raw) = args.reference.clone()
         && !is_hf_takeover(Some(raw.as_str()))
     {
@@ -193,7 +193,7 @@ pub async fn run() -> ! {
             }
             Commands::Login(_) => LoginCommand::print_help(),
             Commands::Logout(_) => LogoutCommand::print_help(),
-            Commands::Chat(_) => ChatCommand::print_help(),
+            Commands::Code(_) => CodeCommand::print_help(),
             Commands::Models(_) => ModelsCommand::print_help(),
             Commands::Serve(_) => ServeCommand::print_help(),
             Commands::Alias(_) => AliasCommand::print_help(),
@@ -266,15 +266,15 @@ pub async fn run() -> ! {
             command.execute(logout_args).await
         }
 
-        Commands::Chat(mut chat_args) => {
-            maybe_init_http_debug(&chat_args.debug).await;
-            let key_explicit = chat_args.key.is_some();
-            lift_chat_positional_to_prompt(&mut chat_args);
+        Commands::Code(mut code_args) => {
+            maybe_init_http_debug(&code_args.debug).await;
+            let key_explicit = code_args.key.is_some();
+            lift_code_positional_to_prompt(&mut code_args);
             // Positional lifts into model; explicit -m still wins.
-            let model_input = chat_args
+            let model_input = code_args
                 .model
                 .clone()
-                .or_else(|| chat_args.reference.clone());
+                .or_else(|| code_args.reference.clone());
             let have_model_input = model_input.is_some();
             // Expand alias before the HF check so `-m <alias-to-hf-ref>`
             // takes the HF path. `run`'s flow does the same.
@@ -285,7 +285,7 @@ pub async fn run() -> ! {
                 key_or_exit(
                     resolve_key_override(
                         &session_store,
-                        chat_args.key.as_deref(),
+                        code_args.key.as_deref(),
                         KeyLookupMode::RequireActiveOrPrompt,
                         KeyCompatContext::Chat,
                     )
@@ -302,28 +302,28 @@ pub async fn run() -> ! {
                 None
             };
             // -e runs the agent (auto-approved tools); -p a plain completion (clap-exclusive).
-            let agent_mode = chat_args.exec.is_some();
-            let one_shot = chat_args.exec.take().or_else(|| chat_args.prompt.take());
-            let command = ChatCommand::new(session_store, models_cache.clone());
+            let agent_mode = code_args.exec.is_some();
+            let one_shot = code_args.exec.take().or_else(|| code_args.prompt.take());
+            let command = CodeCommand::new(session_store, models_cache.clone());
             command
                 .execute(
                     model,
                     one_shot,
-                    chat_args.attachments,
-                    chat_args.refresh,
+                    code_args.attachments,
+                    code_args.refresh,
                     key_override,
-                    chat_args.json,
-                    chat_args.resume,
+                    code_args.json,
+                    code_args.resume,
                     // `--1m`/`--2m` shorthands collapse into max_context, same
                     // as the `run` path; chat takes it as a raw window size.
-                    chat_args
+                    code_args
                         .max_context
-                        .or_else(|| chat_args.one_m.then(|| "1m".to_string()))
-                        .or_else(|| chat_args.two_m.then(|| "2m".to_string())),
-                    chat_args.dry_run,
-                    chat_args.share,
+                        .or_else(|| code_args.one_m.then(|| "1m".to_string()))
+                        .or_else(|| code_args.two_m.then(|| "2m".to_string())),
+                    code_args.dry_run,
+                    code_args.share,
                     agent_mode,
-                    chat_args.output_format,
+                    code_args.output_format,
                 )
                 .await
         }
@@ -431,22 +431,23 @@ pub async fn run() -> ! {
             let env_strings = extracted.env_strings;
             let remaining_args = extracted.remaining_args;
 
-            // Bare `aivo run` opens the `start` tool picker; `aivo run chat`
+            // Bare `aivo run` opens the `start` tool picker; `aivo run code`
             // names aivo's own in-process agent. Both route through the start
-            // flow — `chat` isn't an external `AIToolType`, so it can't take the
-            // launcher pipeline below; the picker dispatches it to `aivo chat`.
-            let chat_selected = run_args.tool.as_deref() == Some("chat");
-            if run_args.tool.is_none() || chat_selected {
+            // flow — `code` isn't an external `AIToolType`, so it can't take the
+            // launcher pipeline below; the picker dispatches it to `aivo code`.
+            // `chat` stays accepted as the pre-rename alias.
+            let code_selected = matches!(run_args.tool.as_deref(), Some("code") | Some("chat"));
+            if run_args.tool.is_none() || code_selected {
                 if !remaining_args.is_empty() {
-                    if chat_selected {
+                    if code_selected {
                         eprintln!(
-                            "{} `aivo run chat` does not accept passthrough args",
+                            "{} `aivo run code` does not accept passthrough args",
                             style::red("Error:")
                         );
                         eprintln!(
                             "  {}",
                             style::dim(
-                                "Use `aivo chat \"<prompt>\"` for a one-shot message, or `aivo chat` for the TUI."
+                                "Use `aivo code \"<prompt>\"` for a one-shot message, or `aivo code` for the TUI."
                             )
                         );
                     } else {
@@ -553,7 +554,7 @@ pub async fn run() -> ! {
                                     .map(|keys| keys.len() == 1)
                                     .unwrap_or(false)
                             {
-                                session_store.get_chat_model(&k.id).await.ok().flatten()
+                                session_store.get_code_model(&k.id).await.ok().flatten()
                             } else {
                                 None
                             }
@@ -887,12 +888,12 @@ fn print_help() {
         "account",
         "Manage your account (info, usage, login, logout)",
     );
-    print_cmd("chat", "Start the interactive chat TUI");
+    print_cmd("code", "Start the interactive coding agent");
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
     print_cmd("hf", "Manage cached HuggingFace GGUF files");
-    print_cmd("logs", "Show recent local logs from chat, run, and serve");
+    print_cmd("logs", "Show recent local logs from code, run, and serve");
     print_cmd("stats", "Show usage statistics");
     print_cmd("plugins", "Install, list, or remove plugins");
     print_cmd("update", "Update to the latest version");
@@ -902,7 +903,7 @@ fn print_help() {
     let shortcuts: &[(&str, &str, &str)] = &[
         ("use", "keys use", "aivo keys use --help"),
         ("share", "logs share", "aivo logs share --help"),
-        ("hf:/url", "chat <ref>", "open chat with a local HF model"),
+        ("hf:/url", "code <ref>", "open code with a local HF model"),
         (
             "<tool>",
             "run <tool>",
@@ -1033,10 +1034,10 @@ fn print_help_json() {
             { "alias": "use", "expands_to": ["keys", "use"] },
             { "alias": "ping", "expands_to": ["keys", "ping"] },
             { "alias": "share", "expands_to": ["logs", "share"] },
-            { "alias": "-p", "expands_to": ["chat", "-p"] },
-            { "alias": "-x", "expands_to": ["chat", "-x"], "deprecated": true, "replaced_by": "-p" },
-            { "alias": "<text>", "expands_to": ["chat", "-p", "<text>"], "note": "Top-level arg that can't be a command name (whitespace, uppercase, punctuation, non-ASCII) → one-shot chat prompt; bare [a-z0-9-] words fall through as subcommands" },
-            { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["chat", "<ref>"], "note": "Top-level HF/URL arg → chat with that model" },
+            { "alias": "-p", "expands_to": ["code", "-p"] },
+            { "alias": "-x", "expands_to": ["code", "-x"], "deprecated": true, "replaced_by": "-p" },
+            { "alias": "<text>", "expands_to": ["code", "-p", "<text>"], "note": "Top-level arg that can't be a command name (whitespace, uppercase, punctuation, non-ASCII) → one-shot code prompt; bare [a-z0-9-] words fall through as subcommands" },
+            { "alias": "hf:<ref> | http(s)://<url>", "expands_to": ["code", "<ref>"], "note": "Top-level HF/URL arg → code with that model" },
             { "alias": "claude", "expands_to": ["run", "claude"] },
             { "alias": "codex", "expands_to": ["run", "codex"] },
             { "alias": "codex-app", "expands_to": ["run", "codex-app"] },
@@ -1045,11 +1046,11 @@ fn print_help_json() {
             { "alias": "pi", "expands_to": ["run", "pi"] }
         ],
         "environment": [
-            { "name": "AIVO_REDUCE_MOTION", "desc": "Disable chat TUI motion effects (=1)" },
+            { "name": "AIVO_REDUCE_MOTION", "desc": "Disable code TUI motion effects (=1)" },
             { "name": "AIVO_PREVIEW", "desc": "Force-disable (=0) or force-enable (=1) terminal image preview" },
-            { "name": "AIVO_CHAT_DISABLE_MOUSE", "desc": "Disable mouse capture in chat TUI (=1; auto-off under Termux, =0 re-enables)" },
-            { "name": "AIVO_CHAT_SCROLL_SPEED", "desc": "Lines scrolled per wheel tick in chat TUI (default 3)" },
-            { "name": "AIVO_CHAT_SWIPE_SCROLL", "desc": "Up/Down arrows scroll the transcript instead of draft history (=1; auto-on under Termux for touch swipes, =0 disables)" },
+            { "name": "AIVO_CODE_DISABLE_MOUSE", "desc": "Disable mouse capture in code TUI (=1; auto-off under Termux, =0 re-enables; legacy AIVO_CHAT_DISABLE_MOUSE still honored)" },
+            { "name": "AIVO_CODE_SCROLL_SPEED", "desc": "Lines scrolled per wheel tick in code TUI (default 3; legacy AIVO_CHAT_SCROLL_SPEED still honored)" },
+            { "name": "AIVO_CODE_SWIPE_SCROLL", "desc": "Up/Down arrows scroll the transcript instead of draft history (=1; auto-on under Termux for touch swipes, =0 disables; legacy AIVO_CHAT_SWIPE_SCROLL still honored)" },
             { "name": "AIVO_PATH", "desc": "Override the install path detected by `aivo update`" },
             { "name": "AIVO_SHARE_BASE_URL", "desc": "Override the public tunnel endpoint used by `aivo logs share`" },
             { "name": "AIVO_DEBUG", "desc": "Surface upstream HTTP request/response detail in some flows (=1)" }
@@ -1152,19 +1153,19 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn chat_args(argv: &[&str]) -> ChatArgs {
+    fn code_args(argv: &[&str]) -> CodeArgs {
         match Cli::try_parse_from(argv).unwrap().command {
-            Some(Commands::Chat(a)) => a,
+            Some(Commands::Code(a)) => a,
             other => panic!("expected chat args, got {other:?}"),
         }
     }
 
     #[test]
     fn non_hf_positional_becomes_one_shot_prompt() {
-        // The reported bug: `aivo chat "hello world"` dead-ended on a "ref only"
+        // The reported bug: `aivo code "hello world"` dead-ended on a "ref only"
         // error. It must become a one-shot prompt instead.
-        let mut a = chat_args(&["aivo", "chat", "hello world"]);
-        lift_chat_positional_to_prompt(&mut a);
+        let mut a = code_args(&["aivo", "chat", "hello world"]);
+        lift_code_positional_to_prompt(&mut a);
         assert_eq!(a.prompt.as_deref(), Some("hello world"));
         assert_eq!(a.reference, None);
     }
@@ -1173,16 +1174,16 @@ mod tests {
     fn bare_word_positional_becomes_prompt() {
         // A single bare word is ambiguous at the top level (falls through as a
         // subcommand), but after an explicit `chat` it's unambiguously a prompt.
-        let mut a = chat_args(&["aivo", "chat", "hello"]);
-        lift_chat_positional_to_prompt(&mut a);
+        let mut a = code_args(&["aivo", "chat", "hello"]);
+        lift_code_positional_to_prompt(&mut a);
         assert_eq!(a.prompt.as_deref(), Some("hello"));
         assert_eq!(a.reference, None);
     }
 
     #[test]
     fn hf_positional_stays_a_model_ref() {
-        let mut a = chat_args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]);
-        lift_chat_positional_to_prompt(&mut a);
+        let mut a = code_args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]);
+        lift_code_positional_to_prompt(&mut a);
         assert_eq!(
             a.reference.as_deref(),
             Some("hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF")
@@ -1192,8 +1193,8 @@ mod tests {
 
     #[test]
     fn explicit_prompt_wins_over_positional() {
-        let mut a = chat_args(&["aivo", "chat", "POS", "-p", "PFLAG"]);
-        lift_chat_positional_to_prompt(&mut a);
+        let mut a = code_args(&["aivo", "chat", "POS", "-p", "PFLAG"]);
+        lift_code_positional_to_prompt(&mut a);
         assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
         assert_eq!(a.reference, None);
     }

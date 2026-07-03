@@ -889,7 +889,7 @@ fn shim_is_stale(content: &str) -> bool {
 /// `npm install -g` (Windows only). The old `bin/aivo.js` can't replace itself —
 /// npm can't overwrite the in-use file — and bare `aivo update` never reaches
 /// this binary, so it loops through npm forever. But every OTHER command
-/// (`aivo update --force`, `aivo --version`, `aivo chat`, …) DOES run this
+/// (`aivo update --force`, `aivo --version`, `aivo code`, …) DOES run this
 /// binary, so we rewrite the stale shim to the clean one from here. Best-effort
 /// and silent: any failure just leaves `aivo update --force` as the escape hatch.
 #[cfg(windows)]

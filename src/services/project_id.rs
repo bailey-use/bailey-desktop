@@ -15,9 +15,9 @@ pub const DEFAULT_THREAD_MAX_AGE_DAYS: i64 = 14;
 /// user "topic" and a last assistant "last_response". In-memory only.
 #[derive(Debug, Clone)]
 pub struct Thread {
-    /// Which CLI produced the session: "claude" | "codex" | "chat" | ...
+    /// Which CLI produced the session: "claude" | "codex" | "code" | ...
     pub cli: String,
-    /// Native session id (Claude UUID, Codex rollout id, aivo chat session id).
+    /// Native session id (Claude UUID, Codex rollout id, aivo code session id).
     pub session_id: String,
     /// Provenance: JSONL path or `log://<session_id>` for chat-from-logs.
     pub source_path: String,

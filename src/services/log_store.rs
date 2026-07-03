@@ -216,7 +216,7 @@ impl LogStore {
     /// Every distinct `session_id` referenced by a chat event in logs.db.
     /// Used by `aivo logs prune` to spot chat sessions whose underlying
     /// file has been deleted (orphan logs.db entries).
-    pub async fn distinct_chat_session_ids(&self) -> Result<std::collections::HashSet<String>> {
+    pub async fn distinct_code_session_ids(&self) -> Result<std::collections::HashSet<String>> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<String>> {
             if !path.exists() {
@@ -225,7 +225,7 @@ impl LogStore {
             let conn = open_read_connection(&path)?;
             let mut stmt = conn.prepare(
                 "select distinct session_id from events \
-                 where source = 'chat' and session_id is not null",
+                 where source in ('chat','code') and session_id is not null",
             )?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut out = std::collections::HashSet::new();
@@ -297,7 +297,7 @@ impl LogStore {
     /// Delete every chat event whose `session_id` is in `ids`. Used by
     /// `aivo logs prune` to clean up orphan rows. Returns the number of
     /// events removed.
-    pub async fn delete_chat_events_by_session_ids(&self, ids: &[String]) -> Result<u64> {
+    pub async fn delete_code_events_by_session_ids(&self, ids: &[String]) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -313,7 +313,7 @@ impl LogStore {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "delete from events where source = 'chat' and session_id in ({placeholders})"
+                "delete from events where source in ('chat','code') and session_id in ({placeholders})"
             );
             let params: Vec<&dyn rusqlite::ToSql> =
                 ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
@@ -600,9 +600,16 @@ fn build_list_query(query: &LogQuery, include_run_phase_fields: bool) -> (String
     let mut params: Vec<SqlValue> = Vec::new();
 
     if let Some(by) = normalize_text_filter(query.by.clone()) {
-        sql.push_str(" and (source = ? or lower(coalesce(tool, '')) like ?)");
-        params.push(SqlValue::Text(by.clone()));
-        params.push(SqlValue::Text(format!("%{by}%")));
+        if by == "code" {
+            // The built-in agent's rows: post-rename `code` plus pre-rename
+            // `chat`. Exact source match (no `tool like`) so it can't grab the
+            // `codex`/`opencode` tools, whose names contain "code".
+            sql.push_str(" and source in ('chat','code')");
+        } else {
+            sql.push_str(" and (source = ? or lower(coalesce(tool, '')) like ?)");
+            params.push(SqlValue::Text(by.clone()));
+            params.push(SqlValue::Text(format!("%{by}%")));
+        }
     }
     if let Some(model) = normalize_text_filter(query.model.clone()) {
         sql.push_str(" and lower(coalesce(model, '')) like ?");

@@ -1,7 +1,7 @@
 //! Key-compatibility rules for the interactive key picker.
 //!
 //! Different commands accept different key types: `aivo run claude` can use
-//! Claude Code OAuth credentials but not Codex/Gemini OAuth, while `aivo chat`
+//! Claude Code OAuth credentials but not Codex/Gemini OAuth, while `aivo code`
 //! can't use any OAuth credential. `KeyCompatContext` lets the picker annotate
 //! incompatible keys with a short reason instead of hiding them, so the user
 //! sees *why* a key isn't available and can pick another without leaving the
@@ -19,7 +19,7 @@ pub enum KeyCompatContext {
     /// `aivo run <tool>` — only the matching OAuth type is allowed; other
     /// OAuth keys are incompatible.
     Tool(AIToolType),
-    /// `aivo chat` — all OAuth keys are incompatible.
+    /// `aivo code` — all OAuth keys are incompatible.
     Chat,
     /// A plugin handoff — aivo serves the key over a loopback proxy (the
     /// `endpoint` cap). OAuth keys are native-agent-only. Cursor is available

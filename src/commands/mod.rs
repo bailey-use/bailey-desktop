@@ -82,11 +82,11 @@ pub(crate) fn starter_provider_label(
 
 pub mod account;
 pub mod alias;
-pub mod chat;
-pub(crate) mod chat_agent_oneshot;
-pub(crate) mod chat_request_builder;
-pub(crate) mod chat_response_parser;
-pub(crate) mod chat_tui_format;
+pub mod code;
+pub(crate) mod code_agent_oneshot;
+pub(crate) mod code_request_builder;
+pub(crate) mod code_response_parser;
+pub(crate) mod code_tui_format;
 pub mod guide;
 pub mod hf;
 pub mod info;
@@ -105,7 +105,7 @@ pub mod update;
 
 pub use account::AccountCommand;
 pub use alias::AliasCommand;
-pub use chat::ChatCommand;
+pub use code::CodeCommand;
 pub use info::InfoCommand;
 pub use keys::KeysCommand;
 pub use login::{LoginCommand, LogoutCommand};

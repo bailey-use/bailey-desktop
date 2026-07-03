@@ -632,7 +632,9 @@ mod tests {
 
     #[test]
     fn builtins_tools_and_flags_are_never_plugins() {
-        for name in ["keys", "chat", "serve", "logs", "help", "image", "audio"] {
+        for name in [
+            "keys", "code", "chat", "serve", "logs", "help", "image", "audio",
+        ] {
             assert!(
                 resolve_invocation(&args(&["aivo", name]), &no_bundles()).is_none(),
                 "{name} must not dispatch as a plugin"
@@ -697,7 +699,9 @@ mod tests {
 
     #[test]
     fn reserved_names_are_rejected() {
-        for n in ["keys", "chat", "run", "claude", "image", "help", "plugins"] {
+        for n in [
+            "keys", "code", "chat", "run", "claude", "image", "help", "plugins",
+        ] {
             assert!(is_reserved_plugin_name(n), "{n} should be reserved");
         }
         assert!(!is_reserved_plugin_name("amp"));

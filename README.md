@@ -127,16 +127,16 @@ aivo models -s sonnet                        # filter by substring
 aivo models --json | jq '.models[].id'
 ```
 
-## chat
+## code
 
-`aivo chat` is the built-in coding agent in your terminal.
+`aivo code` is the built-in coding agent in your terminal.
 
 ![aivo](https://getaivo.dev/aivo-chat.webp)
 
 ```bash
-aivo chat                                    # full-screen agent TUI
-aivo chat -m gpt-4o                          # pick a model (remembered per key)
-aivo chat --attach README.md                 # attach a file for the agent to read
+aivo code                                    # full-screen agent TUI
+aivo code -m gpt-4o                          # pick a model (remembered per key)
+aivo code --attach README.md                 # attach a file for the agent to read
 ```
 
 One-shot mode with `-p`:
@@ -153,13 +153,13 @@ cat error.log | aivo -p                      # stdin alone becomes the prompt
 Run open-weight GGUF models locally, it fetches and caches them from HuggingFace repositories.
 
 ```bash
-aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
+aivo code hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
 aivo https://huggingface.co/allenai/Olmo-3-1025-7B              # full URL also works
-aivo chat hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M        # pin a specific quant
+aivo code hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M        # pin a specific quant
 aivo pi -m hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF                   # any tool that accepts -m
 ```
 
-The `hf:` form is accepted anywhere a model is — `-m`, chat's positional `REF`, and as a bare top-level arg (which rewrites to `aivo chat hf:...`). Full HuggingFace URLs (`https://huggingface.co/...`) work the same way.
+The `hf:` form is accepted anywhere a model is — `-m`, code's positional `REF`, and as a bare top-level arg (which rewrites to `aivo code hf:...`). Full HuggingFace URLs (`https://huggingface.co/...`) work the same way.
 
 The local `llama-server` is configured from the model, no setup required: it runs at the model's real context window (capped at 65536), and if the repo ships an `mmproj-*.gguf` projector or a `*-MTP.gguf` draft model, those are pulled and wired up automatically — enabling image input and speculative decoding respectively. Tune or opt out with environment variables:
 
@@ -215,7 +215,7 @@ Names that collide with built-in subcommands or tool names are rejected.
 
 ## logs
 
-Unified activity feed across aivo's own events (`chat`, `run`, `serve`) and native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`). Defaults to the current project's cwd; use `-a` for every project.
+Unified activity feed across aivo's own events (`code`, `run`, `serve`) and native CLI sessions (`claude`, `codex`, `gemini`, `pi`, `opencode`). Defaults to the current project's cwd; use `-a` for every project.
 
 ```bash
 aivo logs                                    # current cwd, newest first
@@ -237,7 +237,7 @@ aivo logs share <id>                         # share by id prefix
 
 ## stats
 
-Aggregates token counts from aivo chat, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files.
+Aggregates token counts from aivo code, Claude Code, Codex, Gemini, OpenCode, and Pi by reading each tool's native data files.
 
 
 ```bash

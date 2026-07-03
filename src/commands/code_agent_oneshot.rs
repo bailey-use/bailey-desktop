@@ -1,4 +1,4 @@
-//! Headless one-shot agent: `aivo chat -e "<task>"` runs the real `AgentEngine`
+//! Headless one-shot agent: `aivo code -e "<task>"` runs the real `AgentEngine`
 //! (tools + multi-step loop) to completion and exits. Auto-approves mutations;
 //! catastrophic commands and remote side effects (deploy/publish/DELETE) fail closed.
 //!
@@ -112,7 +112,7 @@ pub(crate) async fn run_one_shot_agent(
             std::collections::HashMap::new(),
         );
         let router = ServeRouter::new(config, key.clone(), session_store.logs())
-            .with_usage_accounting(session_store.clone(), "chat".to_string())
+            .with_usage_accounting(session_store.clone(), "code".to_string())
             .quiet(true);
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
         (
@@ -241,12 +241,12 @@ async fn log_oneshot_turn(
     let _ = session_store
         .logs()
         .append(crate::services::log_store::LogEvent {
-            source: "chat".to_string(),
-            kind: "chat_turn".to_string(),
+            source: "code".to_string(),
+            kind: "code_turn".to_string(),
             key_id: Some(key.id.clone()),
             key_name: Some(key.display_name().to_string()),
             base_url: Some(key.base_url.clone()),
-            tool: Some("chat".to_string()),
+            tool: Some("code".to_string()),
             model: Some(model.to_string()),
             cwd: Some(cwd.to_string()),
             exit_code: Some(i64::from(exit.code())),

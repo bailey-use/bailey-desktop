@@ -1,4 +1,4 @@
-//! aivo's native agent, driven by `aivo chat`. The tool-using loop runs
+//! aivo's native agent, driven by `aivo code`. The tool-using loop runs
 //! in-process in `engine`: it composes OpenAI chat requests, calls the model
 //! through the loopback serve (the sole network egress), executes `tools`
 //! locally, and renders through an `AgentUi` (the chat TUI). `protocol` holds

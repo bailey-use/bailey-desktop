@@ -1,7 +1,7 @@
 use super::*;
 use crate::commands::models::fetch_models_for_select;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) fn open_model_picker(
         &mut self,
         query: Option<String>,
@@ -181,7 +181,7 @@ impl ChatTuiApp {
         self.persist_model_selection(&raw_model).await?;
 
         self.raw_model = raw_model.clone();
-        self.model = ChatCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
         self.refresh_context_window().await;
         // Routes are per-model — re-seed the format for the new model.
         self.format = seeded_chat_format(&self.key, &raw_model);
@@ -262,7 +262,7 @@ is preserved."
     ) -> Result<()> {
         self.key = key;
         self.raw_model = raw_model.clone();
-        self.model = ChatCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
+        self.model = CodeCommand::transform_model_for_provider(&self.key.base_url, &raw_model);
         self.billed_model = None;
         self.copilot_tm = copilot_token_manager_for_key(&self.key);
         self.persist_model_selection(&raw_model).await?;
@@ -287,7 +287,7 @@ is preserved."
 
     pub(super) async fn begin_key_switch(&mut self, mut key: ApiKey) -> Result<()> {
         SessionStore::decrypt_key_secret(&mut key)?;
-        if let Some(raw_model) = self.session_store.get_chat_model(&key.id).await? {
+        if let Some(raw_model) = self.session_store.get_code_model(&key.id).await? {
             self.complete_key_switch(key, raw_model).await?;
         } else {
             self.overlay = Overlay::None;
@@ -346,7 +346,7 @@ is preserved."
             };
             match pick {
                 Some(snapshot) => self.begin_resume_load(snapshot.clone()),
-                None => self.notice = Some((MUTED, "No saved chat to resume".to_string())),
+                None => self.notice = Some((MUTED, "No saved session to resume".to_string())),
             }
             return Ok(());
         }
@@ -907,6 +907,8 @@ is preserved."
                 })
                 .collect();
         sort_mcp_rows(&mut items);
+        // Refresh the welcome chip's MCP count — every add/remove reopens here.
+        self.mcp_configured_count = items.iter().filter(|i| i.enabled).count();
         self.overlay = Overlay::Mcp(McpOverlay {
             items,
             selected: 0,
@@ -1184,6 +1186,10 @@ is preserved."
         // their connection and status — only the toggled one changes — instead of
         // tearing down and reconnecting the whole set.
         self.reconnect_mcp_preserving_for_overlay();
+        // Toggle doesn't reopen the overlay, so refresh the welcome chip count here.
+        if let Overlay::Mcp(state) = &self.overlay {
+            self.mcp_configured_count = state.items.iter().filter(|i| i.enabled).count();
+        }
         Ok(())
     }
 
@@ -1479,7 +1485,7 @@ is preserved."
             .delete_chat_session(&session.session_id)
             .await?;
         if !removed {
-            self.notice = Some((ERROR, "Saved chat no longer exists".to_string()));
+            self.notice = Some((ERROR, "Saved session no longer exists".to_string()));
             return Ok(false);
         }
 
@@ -1496,14 +1502,14 @@ is preserved."
             let filtered_len = picker.filtered_items().len();
             if filtered_len == 0 {
                 self.overlay = Overlay::None;
-                self.notice = Some((MUTED, "Saved chat deleted".to_string()));
+                self.notice = Some((MUTED, "Saved session deleted".to_string()));
                 return Ok(false);
             }
 
             picker.selected = picker.selected.min(filtered_len.saturating_sub(1));
         }
 
-        self.notice = Some((MUTED, "Saved chat deleted".to_string()));
+        self.notice = Some((MUTED, "Saved session deleted".to_string()));
         Ok(false)
     }
 
@@ -1551,7 +1557,7 @@ is preserved."
         // folds in the provider-measured split); the index entry stores the total
         // so `aivo stats --since` can attribute windowed chat usage per model.
         self.session_store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &self.key.id,
                 &self.key.base_url,
                 self.persist_cwd(),
@@ -1623,7 +1629,9 @@ is preserved."
                 .session_store
                 .get_key_by_id(&session.key_id)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("Saved key for this chat is no longer available"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Saved key for this session is no longer available")
+                })?;
             self.key = key;
             self.copilot_tm = copilot_token_manager_for_key(&self.key);
         }
@@ -1667,7 +1675,7 @@ is preserved."
         self.transcript_scroll = 0;
         self.raw_model = session.raw_model.clone();
         self.model =
-            ChatCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
+            CodeCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
         self.billed_model = None;
         self.refresh_context_window().await;
         self.persist_model_selection(&session.raw_model).await?;
@@ -1676,10 +1684,10 @@ is preserved."
 
     async fn persist_model_selection(&self, raw_model: &str) -> Result<()> {
         self.session_store
-            .set_chat_model(&self.key.id, raw_model)
+            .set_code_model(&self.key.id, raw_model)
             .await?;
         self.session_store
-            .record_selection(&self.key.id, "chat", Some(raw_model))
+            .record_selection(&self.key.id, "code", Some(raw_model))
             .await?;
         self.update_last_selection(raw_model).await;
         Ok(())
@@ -1691,7 +1699,7 @@ is preserved."
     /// actually using — not just the key/model it launched with.
     ///
     /// Preserves the existing launchable tool (so `aivo run` with no tool still
-    /// recalls the last *launchable* tool, not "chat"), skips the ephemeral HF
+    /// recalls the last *launchable* tool, not "code"), skips the ephemeral HF
     /// synthetic key, and writes the *stored* key's canonical `base_url`: the
     /// live `self.key` may carry a sentinel resolved to a real URL (ollama,
     /// aivo-starter), and a resolved URL would fail `get_last_selection`'s
@@ -1715,7 +1723,7 @@ is preserved."
             .session_store
             .set_last_selection(
                 &stored_key,
-                existing_tool.as_deref().unwrap_or("chat"),
+                existing_tool.as_deref().unwrap_or("code"),
                 Some(raw_model),
             )
             .await;

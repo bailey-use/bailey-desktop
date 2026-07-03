@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::services::context_ingest::paths_match;
 use crate::services::device_fingerprint::hex_sha256;
 use crate::services::session_store::{
-    AttachmentStorage, ChatSessionState, MessageAttachment, StoredChatMessage,
+    AttachmentStorage, CodeSessionState, MessageAttachment, StoredChatMessage,
 };
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -210,13 +210,13 @@ fn stringify_block_text(v: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// aivo chat extractor
+// aivo code extractor
 // ---------------------------------------------------------------------------
 
-/// Map a persisted `aivo chat` session onto the share schema; surfaces the
+/// Map a persisted `aivo code` session onto the share schema; surfaces the
 /// decryption error rather than producing an empty share.
 pub fn extract_chat_full(
-    state: &ChatSessionState,
+    state: &CodeSessionState,
     project_root: Option<&str>,
 ) -> Result<SharePayload> {
     let messages = state
@@ -256,7 +256,7 @@ pub fn extract_chat_full(
 
     Ok(SharePayload {
         schema_version: SHARE_SCHEMA_VERSION.to_string(),
-        source_cli: "chat".to_string(),
+        source_cli: "code".to_string(),
         session_id: state.session_id.clone(),
         project,
         model: Some(state.model.clone()).filter(|s| !s.is_empty()),
@@ -288,7 +288,7 @@ fn map_chat_message(m: StoredChatMessage, timestamp: Option<DateTime<Utc>>) -> S
     ShareMessage {
         role: m.role,
         timestamp,
-        // aivo chat stores model at the session level only, never per-turn.
+        // aivo code stores model at the session level only, never per-turn.
         model: None,
         reasoning: m.reasoning_content,
         content,
@@ -1280,7 +1280,7 @@ mod tests {
         ];
         let encrypted = encrypt(&serde_json::to_string(&messages).unwrap()).unwrap();
 
-        let state = ChatSessionState {
+        let state = CodeSessionState {
             session_id: "chat-abc".into(),
             key_id: "k1".into(),
             base_url: "https://api.example.com".into(),
@@ -1293,7 +1293,7 @@ mod tests {
         };
 
         let payload = extract_chat_full(&state, None).unwrap();
-        assert_eq!(payload.source_cli, "chat");
+        assert_eq!(payload.source_cli, "code");
         assert_eq!(payload.session_id, "chat-abc");
         assert_eq!(payload.model.as_deref(), Some("gpt-4o"));
         assert_eq!(payload.project.name.as_deref(), Some("aivo"));
@@ -1346,7 +1346,7 @@ mod tests {
                 },
             ]),
         }];
-        let state = ChatSessionState {
+        let state = CodeSessionState {
             session_id: "s".into(),
             key_id: "k".into(),
             base_url: "u".into(),
@@ -1443,7 +1443,7 @@ mod tests {
                 attachments: None,
             },
         ];
-        let state = ChatSessionState {
+        let state = CodeSessionState {
             session_id: "s".into(),
             key_id: "k".into(),
             base_url: "u".into(),
@@ -1490,7 +1490,7 @@ mod tests {
 
     #[test]
     fn extract_chat_full_surfaces_decryption_error() {
-        let state = ChatSessionState {
+        let state = CodeSessionState {
             session_id: "s".into(),
             key_id: "k".into(),
             base_url: "u".into(),

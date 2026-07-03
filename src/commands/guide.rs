@@ -1,4 +1,4 @@
-//! `aivo guide` — prints the embedded usage guide, so the `aivo chat` agent (and users)
+//! `aivo guide` — prints the embedded usage guide, so the `aivo code` agent (and users)
 //! can answer aivo how-to questions offline instead of fetching docs from the web.
 
 pub const GUIDE: &str = include_str!("aivo_guide.md");
@@ -22,7 +22,7 @@ mod tests {
         for needle in [
             "aivo keys add",
             "aivo models",
-            "aivo chat",
+            "aivo code",
             "/model",
             "/effort",
         ] {

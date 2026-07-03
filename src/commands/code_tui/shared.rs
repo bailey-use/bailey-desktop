@@ -30,7 +30,7 @@ pub(super) const LIVE_NOTICE_PREFIX: &str = "● Sharing: ";
 /// Footer badge shown while sharing.
 pub(super) const LIVE_BADGE: &str = "● sharing";
 /// Footer badge shown when `/config` "Agent tools" is off (plain-chat mode).
-pub(super) const PLAIN_CHAT_BADGE: &str = "plain chat";
+pub(super) const PLAIN_CODE_BADGE: &str = "plain chat";
 // Inline-diff palette for the compact edit preview under a tool call. The
 // changed line gets a subtle dark tint (not a saturated terminal-diff fill) that
 // fills the full row width (see `fill_trailing_background`) so a wrapped line
@@ -48,9 +48,29 @@ pub(super) const DIFF_ADD_HL_BG: Color = Color::Rgb(33, 84, 50);
 pub(super) const DIFF_DEL_HL_BG: Color = Color::Rgb(92, 38, 38);
 pub(super) const EMPTY_STATE_TOP_GAP: u16 = 1;
 // No bottom padding: the composer already reserves its own blank spacing row
-// above the divider, so the welcome screen's "Ready" line keeps the same single
+// above the divider, so the welcome screen's last line keeps the same single
 // blank gap above the prompt as a live conversation does (not a doubled gap).
 pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
+/// Rotating welcome-banner hints. Keep each terse; name a real affordance.
+pub(super) const WELCOME_TIPS: &[&str] = &[
+    "start a line with ! to run a shell command",
+    "Shift+Tab toggles auto-approve for the agent's tools",
+    "drag an image into the terminal to attach it",
+    "/rewind undoes the agent's file edits",
+    "/goal <task> keeps working on its own until it's done",
+    "Ctrl+R reopens a past session",
+    "/share creates a live web link to this session",
+    "/effort changes how hard the model thinks",
+    "/skills and /mcp manage the agent's extra tools",
+    "/compact summarizes older turns to free up context",
+    "/plan investigates read-only without changing files",
+    "/model switches models without losing the thread",
+    "/config toggles thinking and tool auto-approve",
+    "/copy grabs a past reply to your clipboard",
+    "Ctrl+O pages through long shell output",
+    "type while the agent works to queue your next message",
+    "/new starts a fresh session, keeping your keys",
+];
 pub(super) const COMPOSER_PREFIX_WIDTH: u16 = 2;
 pub(super) const DEFAULT_CHAT_SCROLL_SPEED: usize = 3;
 pub(super) const MAX_CHAT_SCROLL_SPEED: usize = 50;
@@ -63,6 +83,8 @@ pub(super) const SELECTION_FLASH_DURATION: Duration = Duration::from_millis(550)
 pub(super) const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 /// Minimum delay between auto-scroll steps while dragging at an edge.
 pub(super) const DRAG_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
+/// How long each welcome-screen tip stays up before rotating (see `tick_welcome_tip`).
+pub(super) const WELCOME_TIP_ROTATE_INTERVAL: Duration = Duration::from_secs(12);
 // Tight repaint cadence while animating; slower when idle to cut wakeups.
 pub(super) const ANIMATING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(super) const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -130,19 +152,19 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "new",
         help_label: "/new",
-        description: "start a fresh chat",
+        description: "start a fresh session",
         takes_argument: false,
     },
     SlashCommandSpec {
         name: "exit",
         help_label: "/exit",
-        description: "leave chat",
+        description: "leave the session",
         takes_argument: false,
     },
     SlashCommandSpec {
         name: "resume",
         help_label: "/resume [query]",
-        description: "resume a saved chat",
+        description: "resume a saved session",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -214,7 +236,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "config",
         help_label: "/config",
-        description: "toggle chat settings (thinking, auto-approve)",
+        description: "toggle session settings (thinking, auto-approve)",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -232,7 +254,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "share",
         help_label: "/share [stop]",
-        description: "share this chat to a viewer URL (stop to end)",
+        description: "share this session to a viewer URL (stop to end)",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -294,7 +316,7 @@ pub(super) fn freed_notice(freed: usize, kind: &str) -> (Color, String) {
     }
 }
 
-pub(crate) struct ChatTuiParams {
+pub(crate) struct CodeTuiParams {
     pub session_store: SessionStore,
     pub cache: ModelsCache,
     pub client: Client,
@@ -329,7 +351,7 @@ pub(super) struct SessionPreview {
 }
 
 pub(super) fn decrypt_to_chat_messages(
-    state: &crate::services::session_store::ChatSessionState,
+    state: &crate::services::session_store::CodeSessionState,
 ) -> Result<Vec<ChatMessage>> {
     let messages = state
         .decrypt_messages()?
@@ -388,7 +410,7 @@ pub(super) struct LoadedSession {
 
 impl LoadedSession {
     pub(super) fn from_state(
-        state: crate::services::session_store::ChatSessionState,
+        state: crate::services::session_store::CodeSessionState,
     ) -> Result<Self> {
         let messages = decrypt_to_chat_messages(&state)?;
         let engine_messages = state.decrypt_engine_messages();
@@ -917,7 +939,7 @@ pub(super) enum CommandMenuPlacement {
 }
 
 impl ResumeRestoreState {
-    pub(super) fn capture(app: &ChatTuiApp) -> Self {
+    pub(super) fn capture(app: &CodeTuiApp) -> Self {
         Self {
             key: app.key.clone(),
             copilot_tm: app.copilot_tm.clone(),
@@ -1507,7 +1529,7 @@ pub(super) struct DraftHistoryEntry {
     pub(super) text: String,
 }
 
-pub(super) struct ChatTuiApp {
+pub(super) struct CodeTuiApp {
     pub(super) session_store: SessionStore,
     pub(super) cache: ModelsCache,
     pub(super) client: Client,
@@ -1540,8 +1562,15 @@ pub(super) struct ChatTuiApp {
     /// Discovered skills offered as user-typeable slash commands (`/repo-study`).
     /// Refreshed from `discover_skills` (minus the `/skills` disabled set) at
     /// startup and after any skill mutation; read by the `/` menu and command
-    /// resolver. Empty when no skills are available.
+    /// resolver. Empty when none; its length feeds the welcome chip.
     pub(super) skill_commands: Vec<SkillCommand>,
+    /// Enabled MCP servers for the welcome chip; refreshed on `/mcp` changes.
+    pub(super) mcp_configured_count: usize,
+    /// The [`WELCOME_TIPS`] entry showing now; advanced by `tick_welcome_tip`.
+    pub(super) welcome_tip_index: usize,
+    /// When the current tip was shown; `None` off the welcome screen so it restarts
+    /// with a full interval on return.
+    pub(super) welcome_tip_rotated_at: Option<Instant>,
     /// Up-arrow recall list for the current launch dir — the cwd-filtered view
     /// of `draft_history_all` that `history_prev`/`history_next` walk.
     pub(super) draft_history: Vec<String>,
@@ -1555,7 +1584,7 @@ pub(super) struct ChatTuiApp {
     pub(super) notice: Option<(Color, String)>,
     pub(super) pending_response: String,
     /// Stream text received but not yet revealed by the typewriter. Deltas land
-    /// here; [`tick_typewriter`](ChatTuiApp::tick_typewriter) drips it into
+    /// here; [`tick_typewriter`](CodeTuiApp::tick_typewriter) drips it into
     /// `pending_response` (the displayed reply) over successive frames.
     pub(super) incoming_buffer: String,
     /// A turn-finish event held back until the typewriter has revealed the whole

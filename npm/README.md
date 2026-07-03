@@ -27,5 +27,5 @@ npm install -g @yuanchuan/aivo@latest
 
 ```bash
 aivo --version
-aivo chat
+aivo code
 ```

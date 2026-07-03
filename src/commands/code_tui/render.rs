@@ -407,7 +407,7 @@ pub(super) fn push_block(
 /// under any monospace font.
 pub(super) const BRAND_WORDMARK: [&str; 2] = ["▄▀█ █ █░█ █▀█", "█▀█ █ ▀▄▀ █▄█"];
 /// Welcome-screen tagline shown under the wordmark in the empty state.
-pub(super) const BRAND_TAGLINE: &str = "chat · ask anything";
+pub(super) const BRAND_TAGLINE: &str = "your terminal coding agent";
 
 /// The brand wordmark as styled lines, painted in the accent color. Single
 /// source of truth for the empty state and the transcript-top intro so both

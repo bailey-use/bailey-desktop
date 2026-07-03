@@ -106,7 +106,7 @@ pub(crate) fn skill_invocation_label(content: &str) -> Option<String> {
     })
 }
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) async fn submit_draft(&mut self) -> Result<bool> {
         let action = match self.prepare_submit_action() {
             Ok(action) => action,
@@ -517,9 +517,9 @@ impl ChatTuiApp {
         let protocol =
             crate::services::provider_profile::provider_profile_for_key(&self.key).default_protocol;
         let cache = std::sync::Arc::new(crate::services::route_cache::RouteCache::new(
-            "chat",
+            "code",
             protocol,
-            self.key.routes_for_tool("chat"),
+            self.key.routes_for_tool("code"),
         ));
         self.agent_route_cache = Some((self.key.id.clone(), cache.clone()));
         cache
@@ -713,7 +713,7 @@ impl ChatTuiApp {
                 reasoning_content: None,
                 attachments,
             };
-            match crate::commands::chat_request_builder::build_openai_message(&msg) {
+            match crate::commands::code_request_builder::build_openai_message(&msg) {
                 Ok(v) => v.get("content").cloned(),
                 Err(e) => {
                     self.notice = Some((ERROR, format!("couldn't attach image: {e}")));
@@ -767,7 +767,7 @@ impl ChatTuiApp {
         }
     }
 
-    /// Start this turn's loopback serve (sole egress, usage under "chat"); sets
+    /// Start this turn's loopback serve (sole egress, usage under "code"); sets
     /// `self.agent_serve`, returns `(base, auth)`. Shared by run/compact turns.
     async fn start_agent_serve(&mut self) -> Result<(String, String)> {
         use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
@@ -783,7 +783,7 @@ impl ChatTuiApp {
         // `.quiet` keeps router stderr off the raw-mode prompt.
         let router = ServeRouter::new(config, self.key.clone(), self.session_store.logs())
             .with_route_cache(self.agent_route_cache())
-            .with_usage_accounting(self.session_store.clone(), "chat".to_string())
+            .with_usage_accounting(self.session_store.clone(), "code".to_string())
             .quiet(true);
         let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
         self.agent_serve = Some((handle, shutdown));
@@ -1726,7 +1726,7 @@ impl ChatTuiApp {
         self.pending_submit = None;
         self.sending = false;
         self.request_started_at = None;
-        self.session_id = new_chat_session_id();
+        self.session_id = new_code_session_id();
         self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
         self.context_tokens = 0;
@@ -2245,10 +2245,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 .send(RuntimeEvent::AgentSwitchModel { model, reply })
                 .is_err()
             {
-                return Err("chat session is no longer running".to_string());
+                return Err("session is no longer running".to_string());
             }
             rx.await
-                .unwrap_or_else(|_| Err("chat session is no longer running".to_string()))
+                .unwrap_or_else(|_| Err("session is no longer running".to_string()))
         })
     }
 
@@ -2264,10 +2264,10 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 .send(RuntimeEvent::AgentSetEffort { level, reply })
                 .is_err()
             {
-                return Err("chat session is no longer running".to_string());
+                return Err("session is no longer running".to_string());
             }
             rx.await
-                .unwrap_or_else(|_| Err("chat session is no longer running".to_string()))
+                .unwrap_or_else(|_| Err("session is no longer running".to_string()))
         })
     }
 }

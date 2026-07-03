@@ -61,8 +61,9 @@ pub enum Commands {
     /// List available models from the active provider
     Models(ModelsArgs),
 
-    /// Start the interactive chat TUI
-    Chat(ChatArgs),
+    /// Start the interactive coding agent (TUI)
+    #[command(alias = "chat")]
+    Code(CodeArgs),
 
     /// Serve an OpenAI-compatible API that proxies to the active provider
     Serve(ServeArgs),
@@ -74,7 +75,7 @@ pub enum Commands {
     #[command(alias = "ls", hide = true)]
     Info(InfoArgs),
 
-    /// Show recent local logs from chat, run, and serve
+    /// Show recent local logs from code, run, and serve
     Logs(LogsArgs),
 
     /// Show usage statistics (tokens, requests, breakdowns)
@@ -94,7 +95,7 @@ pub enum Commands {
     /// Both forms accept the same flags.
     Share(ShareArgs),
 
-    /// Print a concise guide to using aivo (also read by the built-in chat agent)
+    /// Print a concise guide to using aivo (also read by the built-in code agent)
     Guide,
 }
 
@@ -168,7 +169,7 @@ pub struct AccountUsageArgs {
 /// Arguments for `aivo logs share` (and the hidden top-level `aivo share` alias).
 #[derive(Args, Debug, Clone)]
 pub struct ShareArgs {
-    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / chat).
+    /// Session id from `aivo logs` (claude / codex / gemini / pi / opencode / code).
     #[arg(value_name = "SESSION_ID")]
     pub session_id: Option<String>,
 
@@ -646,7 +647,7 @@ pub struct ServeArgs {
 /// Arguments for the stats command
 #[derive(Args, Debug, Clone)]
 pub struct StatsArgs {
-    /// Filter to one tool: claude, codex, gemini, opencode, pi, chat, or an
+    /// Filter to one tool: claude, codex, gemini, opencode, pi, code, or an
     /// installed coding-agent plugin (e.g. omp). Mirrors `aivo logs --by`.
     #[arg(long, value_name = "NAME", value_parser = non_empty())]
     pub by: Option<String>,
@@ -737,7 +738,7 @@ pub struct LogsArgs {
     #[arg(short = 's', long, value_name = "QUERY", value_parser = non_empty())]
     pub search: Option<String>,
 
-    /// Filter by activity: aivo subcommand (chat, run, serve) or launched tool (claude, codex, ...)
+    /// Filter by activity: aivo subcommand (code, run, serve) or launched tool (claude, codex, ...)
     #[arg(long, value_name = "NAME", value_parser = non_empty())]
     pub by: Option<String>,
 
@@ -789,9 +790,9 @@ pub struct LogsArgs {
     pub force: bool,
 }
 
-/// Arguments for the chat command
+/// Arguments for the code command
 #[derive(Args, Debug, Clone)]
-pub struct ChatArgs {
+pub struct CodeArgs {
     /// Optional positional: `hf:<owner>/<repo>[:<quant>]` short ref or
     /// `https://huggingface.co/...` URL. Equivalent to `-m <REF>` with
     /// the local llama-server lifecycle wired up.
@@ -816,9 +817,9 @@ pub struct ChatArgs {
     #[arg(short = 'r', long)]
     pub refresh: bool,
 
-    /// Resume a saved chat: bare opens the session picker, `last` reopens the
-    /// most recent chat, or pass a session id to jump straight to it (same as
-    /// the in-chat `/resume [query]`).
+    /// Resume a saved session: bare opens the session picker, `last` reopens the
+    /// most recent session, or pass a session id to jump straight to it (same as
+    /// the in-session `/resume [query]`).
     #[arg(long, value_name = "last|SESSION_ID", num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
 
@@ -862,7 +863,7 @@ pub struct ChatArgs {
     )]
     pub output_format: Option<String>,
 
-    /// Attach a file or image to the next chat message (repeatable)
+    /// Attach a file or image to the next message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]
     pub attachments: Vec<String>,
 
@@ -890,8 +891,8 @@ pub struct ChatArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Publish a live, redacted view of this chat to a viewer URL (shown in the
-    /// TUI). Needs a linked account (`aivo login`); toggle in-chat with `/share`.
+    /// Publish a live, redacted view of this session to a viewer URL (shown in the
+    /// TUI). Needs a linked account (`aivo login`); toggle in-session with `/share`.
     #[arg(long)]
     pub share: bool,
 }
@@ -1280,7 +1281,7 @@ mod tests {
     #[test]
     fn test_chat_command_no_model() {
         let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.model, None);
         } else {
             panic!("Expected Chat command");
@@ -1290,7 +1291,7 @@ mod tests {
     #[test]
     fn test_chat_command_with_model() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--model", "gpt-4o"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1301,7 +1302,7 @@ mod tests {
     fn test_chat_command_model_no_value() {
         // --model with no value → triggers picker (Some(""))
         let cli = Cli::try_parse_from(["aivo", "chat", "--model"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.model, Some("".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1311,7 +1312,7 @@ mod tests {
     #[test]
     fn test_chat_command_with_short_model() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-m", "claude-sonnet-4-5"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.model, Some("claude-sonnet-4-5".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1322,21 +1323,21 @@ mod tests {
     fn test_chat_command_resume_variants() {
         // No flag → None (fresh chat).
         let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
-        let Some(Commands::Chat(args)) = cli.command else {
+        let Some(Commands::Code(args)) = cli.command else {
             panic!("Expected Chat command");
         };
         assert_eq!(args.resume, None);
 
         // Bare --resume → Some("") (opens the session picker).
         let cli = Cli::try_parse_from(["aivo", "chat", "--resume"]).unwrap();
-        let Some(Commands::Chat(args)) = cli.command else {
+        let Some(Commands::Code(args)) = cli.command else {
             panic!("Expected Chat command");
         };
         assert_eq!(args.resume, Some(String::new()));
 
         // --resume <id> → Some(id) (jumps to that session).
         let cli = Cli::try_parse_from(["aivo", "chat", "--resume", "abc123"]).unwrap();
-        let Some(Commands::Chat(args)) = cli.command else {
+        let Some(Commands::Code(args)) = cli.command else {
             panic!("Expected Chat command");
         };
         assert_eq!(args.resume, Some("abc123".to_string()));
@@ -1385,7 +1386,7 @@ mod tests {
     #[test]
     fn test_chat_args_key_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--key", "my-key"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1395,7 +1396,7 @@ mod tests {
     #[test]
     fn test_chat_args_key_short_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k", "a1b2"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("a1b2".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1425,7 +1426,7 @@ mod tests {
     #[test]
     fn test_chat_args_key_no_value() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some(String::new()));
         } else {
             panic!("Expected Chat command");
@@ -1435,7 +1436,7 @@ mod tests {
     #[test]
     fn test_chat_args_key_with_model() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
         } else {
@@ -1446,7 +1447,7 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_short_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hello"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1456,7 +1457,7 @@ mod tests {
     #[test]
     fn test_chat_args_dry_run_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--dry-run"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert!(chat_args.dry_run);
         } else {
             panic!("Expected Chat command");
@@ -1466,7 +1467,7 @@ mod tests {
     #[test]
     fn test_chat_args_dry_run_defaults_off() {
         let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert!(!chat_args.dry_run);
         } else {
             panic!("Expected Chat command");
@@ -1476,7 +1477,7 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_no_value() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-p"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some(String::new()));
         } else {
             panic!("Expected Chat command");
@@ -1486,7 +1487,7 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_long_flag() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--prompt", "hello world"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello world".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1496,7 +1497,7 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_legacy_short_alias_x() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1506,7 +1507,7 @@ mod tests {
     #[test]
     fn test_chat_args_prompt_legacy_long_alias_execute() {
         let cli = Cli::try_parse_from(["aivo", "chat", "--execute", "hello world"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.prompt, Some("hello world".to_string()));
         } else {
             panic!("Expected Chat command");
@@ -1517,7 +1518,7 @@ mod tests {
     fn test_chat_args_prompt_with_model_and_key() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-p", "hi"])
             .unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some("my-key".to_string()));
             assert_eq!(chat_args.model, Some("gpt-4o".to_string()));
             assert_eq!(chat_args.prompt, Some("hi".to_string()));
@@ -1529,7 +1530,7 @@ mod tests {
     #[test]
     fn test_chat_args_empty_key_and_model_force_pickers() {
         let cli = Cli::try_parse_from(["aivo", "chat", "-k", "-m"]).unwrap();
-        if let Some(Commands::Chat(chat_args)) = cli.command {
+        if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.key, Some(String::new()));
             assert_eq!(chat_args.model, Some(String::new()));
         } else {

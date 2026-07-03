@@ -1,5 +1,5 @@
 //! Deterministic scripted "model" for eval/CI. When `AIVO_AGENT_FAKE_SSE` points
-//! at a script file, `aivo chat -e` talks to this loopback server instead of a real
+//! at a script file, `aivo code -e` talks to this loopback server instead of a real
 //! provider, so the *real* agent loop and *real* tool execution run against a fixed
 //! sequence of model turns — no tokens, no flakiness, gate-able in CI.
 //!

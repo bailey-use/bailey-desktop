@@ -5,7 +5,7 @@
 //! Skills location (`<project>/.agents/skills`, `~/.agents/skills`) that the
 //! ecosystem shares (agentskills.io; Gemini CLI and Vercel's `skills` CLI
 //! populate it), AND Claude Code's `.claude/skills` (project + user) — so an
-//! existing library of `~/.claude/skills/*/SKILL.md` works in `aivo chat`
+//! existing library of `~/.claude/skills/*/SKILL.md` works in `aivo code`
 //! unchanged. Only the names + (first-sentence) descriptions go in the system
 //! prompt; the `skill` tool loads a body on demand (progressive disclosure), and
 //! the model reads bundled files in the dir via its file tools.

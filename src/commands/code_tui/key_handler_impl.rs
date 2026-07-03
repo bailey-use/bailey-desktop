@@ -16,7 +16,7 @@ enum OverlayKeyAction {
     ToggleConfigSetting(usize),
 }
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.exit_confirm_pending {

@@ -20,8 +20,8 @@ Global options: `-h/--help`, `--help-json` (full command tree as JSON), `-v/--ve
 | Shortcut | Expands to | Notes |
 | --- | --- | --- |
 | `aivo <tool>` | `aivo run <tool>` | `claude`, `codex`, `gemini`, `opencode`, `pi`, `grok`, … |
-| `aivo <prompt>` | `aivo chat -p <prompt>` | a bare string / piped stdin runs a one-shot chat |
-| `aivo hf:… ` / `aivo https://…` | `aivo chat <ref>` | open chat on a local HuggingFace GGUF |
+| `aivo <prompt>` | `aivo code -p <prompt>` | a bare string / piped stdin runs a one-shot prompt |
+| `aivo hf:… ` / `aivo https://…` | `aivo code <ref>` | open code on a local HuggingFace GGUF |
 | `aivo use` | `aivo keys use` | switch active key |
 | `aivo ping` | `aivo keys ping` | health-check keys |
 | `aivo share` | `aivo logs share` | share a session |
@@ -128,20 +128,20 @@ aivo codex -k openrouter                     # a specific saved key
 aivo pi --dry-run                            # preview the command + env, don't launch
 ```
 
-## The built-in agent — `aivo chat`
+## The built-in agent — `aivo code`
 
-`aivo chat` is aivo's own coding agent in your terminal (full-screen TUI). It reads/edits your
+`aivo code` is aivo's own coding agent in your terminal (full-screen TUI). It reads/edits your
 project and runs shell commands, prompting for risky actions.
 
 ```
-aivo chat                     # interactive agent TUI
+aivo code                     # interactive agent TUI
 -m, --model <model>           pick a model (remembered per key; bare = picker)
 -k, --key <id|name>           API key by id/name (bare = picker)
 -p, --prompt [prompt]         one prompt, plain reply, exit (no tools)
 -e, --exec   [prompt]         one prompt, run the full agent (tools), exit
 -r, --refresh                 refresh the model list (skip cache)
---resume [last|id]            resume a saved chat
---share                       share this chat live (needs `aivo login`)
+--resume [last|id]            resume a saved session
+--share                       share this session live (needs `aivo login`)
 --attach <path>               attach a file or image
 --json                        raw provider JSON (with -p)
 --max-context <size>          override the context window (e.g. 200k)
@@ -151,10 +151,10 @@ aivo chat                     # interactive agent TUI
 ```bash
 aivo -p "Summarize this repo"                # bare string → one-shot plain reply
 git diff | aivo -p "Write a commit message"  # piped stdin appended as context
-aivo chat -e "make the failing test pass"    # one-shot agent run
+aivo code -e "make the failing test pass"    # one-shot agent run
 ```
 
-### Inside the chat TUI
+### Inside the code TUI
 
 Type `/help` for the full list. Slash commands:
 
@@ -177,13 +177,13 @@ no tools). The agent can also change the live model/effort itself when you ask (
 ## Local models — `hf:` and `aivo hf`
 
 Run open-weight GGUF models locally — fetched/cached from HuggingFace and served by a local
-`llama-server`, zero setup. The `hf:` form works anywhere a model is accepted (`-m`, chat's
+`llama-server`, zero setup. The `hf:` form works anywhere a model is accepted (`-m`, code's
 positional ref, or a bare top-level arg); full `https://huggingface.co/…` URLs work too.
 
 ```bash
-aivo chat hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
+aivo code hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF
 aivo https://huggingface.co/allenai/Olmo-3-1025-7B
-aivo chat hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M   # pin a quant
+aivo code hf:bartowski/Llama-3.2-3B-Instruct-GGUF:Q5_K_M   # pin a quant
 aivo pi -m hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF              # any tool that accepts -m
 ```
 
@@ -223,7 +223,7 @@ aivo serve hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF   # serve a local model
 
 ## Logs & sharing — `aivo logs`
 
-Unified session list across aivo chat + native CLI sessions (claude, codex, gemini, pi,
+Unified session list across aivo code + native CLI sessions (claude, codex, gemini, pi,
 opencode); `--by run`/`--by serve` show launch events. Defaults to the current project's cwd.
 
 ```
@@ -242,12 +242,12 @@ skip); `--all` picks from every project, `--open` opens the browser.
 
 ## Usage stats — `aivo stats`
 
-Aggregates token/request counts from aivo chat and every launched agent by reading each tool's
+Aggregates token/request counts from aivo code and every launched agent by reading each tool's
 native data files.
 
 ```
 aivo stats                     # totals + top models
---by <name>                    one tool or plugin (claude, chat, omp, …)
+--by <name>                    one tool or plugin (claude, code, omp, …)
 --since <7d|24h|30m|2w>        recent window
 -s, --search <query>           filter by key / model / tool
 -d, --detailed                 per-model input/output/cached/total

@@ -4,7 +4,7 @@
 
 use super::*;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     /// `/share [stop]`: bare/`start` opens a share (re-showing the URL if already
     /// live); `stop` ends it.
     pub(super) async fn run_share_command(&mut self, arg: Option<String>) {

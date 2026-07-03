@@ -1,6 +1,6 @@
 use super::*;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) fn cursor_left(&mut self) {
         if self.cursor == 0 {
             return;

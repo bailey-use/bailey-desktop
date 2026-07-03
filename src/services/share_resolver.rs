@@ -1,6 +1,6 @@
 //! Find which source owns a given session id and produce its `SharePayload`.
 //!
-//! aivo can see six distinct conversation sources (aivo chat,
+//! aivo can see six distinct conversation sources (aivo code,
 //! claude / codex / gemini / pi / opencode). The user passes a single session
 //! id to `aivo logs share`; this resolver fans out across the sources to figure
 //! out which one it belongs to, then runs the source-specific extractor.
@@ -144,7 +144,9 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     }
     if let Some(entry) = logs_hits.into_iter().next() {
         match entry.source.as_str() {
-            "chat" => {
+            // `code` is the built-in agent post-rename; `chat` is the pre-rename
+            // source still on disk in existing users' logs.db.
+            "chat" | "code" => {
                 // Old chat rows (written before LogEvent.session_id existed)
                 // have no stored linkage. Recover it the same way `aivo logs
                 // show` displays it: closest chat session by cwd + key_id +
@@ -155,7 +157,7 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
                 };
                 let state = ctx
                     .session_store
-                    .get_chat_session(&chat_id)
+                    .get_code_session(&chat_id)
                     .await?
                     .ok_or_else(|| {
                         anyhow!(
@@ -240,10 +242,10 @@ pub async fn resolve_session(session_id: &str, ctx: &ResolverContext) -> Result<
     // show the *session's* project rather than the user's terminal cwd.
     let p_root = ctx.project_root.to_str();
     let payload = match hit.source {
-        "chat" => {
+        "code" => {
             let state = ctx
                 .session_store
-                .get_chat_session(&hit.full_id)
+                .get_code_session(&hit.full_id)
                 .await?
                 .ok_or_else(|| anyhow!("chat session '{}' vanished during resolve", hit.full_id))?;
             extract_chat_full(&state, p_root)?
@@ -341,12 +343,12 @@ fn id_prefix_matches(candidate: &str, user_input: &str) -> bool {
 }
 
 async fn find_chat(store: &SessionStore, chat_dir: &Path, session_id: &str) -> Result<Vec<Match>> {
-    // Two paths: an exact id is cheap to probe via `get_chat_session`; a
+    // Two paths: an exact id is cheap to probe via `get_code_session`; a
     // prefix needs a directory scan because the SessionStore index is
     // keyed by full session id.
-    if let Some(_state) = store.get_chat_session(session_id).await? {
+    if let Some(_state) = store.get_code_session(session_id).await? {
         return Ok(vec![Match {
-            source: "chat",
+            source: "code",
             full_id: session_id.to_string(),
         }]);
     }
@@ -360,7 +362,7 @@ async fn find_chat(store: &SessionStore, chat_dir: &Path, session_id: &str) -> R
                 return None;
             }
             Some(Match {
-                source: "chat",
+                source: "code",
                 full_id: stem.to_string(),
             })
         })
@@ -865,7 +867,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let ctx = ctx_with_tempdirs(&temp, temp.path().to_path_buf());
 
-        // Persist one chat session via the SessionStore so get_chat_session finds it.
+        // Persist one chat session via the SessionStore so get_code_session finds it.
         let messages = vec![StoredChatMessage {
             role: "user".into(),
             content: "hi".into(),
@@ -877,9 +879,9 @@ mod tests {
         let encrypted = encrypt(&serde_json::to_string(&messages).unwrap()).unwrap();
         let _ = encrypted; // sanity: ensures crypto module is importable
 
-        // SessionStore exposes save_chat_session_with_id for the same purpose.
+        // SessionStore exposes save_code_session_with_id for the same purpose.
         ctx.session_store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 "kid",
                 "https://api.example.com",
                 "/tmp",
@@ -895,7 +897,7 @@ mod tests {
             .unwrap();
 
         let resolved = resolve_session("chat-xyz", &ctx).await.unwrap();
-        assert_eq!(resolved.payload.source_cli, "chat");
+        assert_eq!(resolved.payload.source_cli, "code");
         assert_eq!(resolved.payload.session_id, "chat-xyz");
     }
 
@@ -916,7 +918,7 @@ mod tests {
             attachments: None,
         }];
         ctx.session_store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 "kid",
                 "https://api.example.com",
                 "/tmp/proj",
@@ -953,7 +955,7 @@ mod tests {
             .unwrap();
 
         let resolved = resolve_session(&event_id, &ctx).await.unwrap();
-        assert_eq!(resolved.payload.source_cli, "chat");
+        assert_eq!(resolved.payload.source_cli, "code");
         assert_eq!(resolved.payload.session_id, "chat-orphan");
     }
 

@@ -30,7 +30,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::style::spinner_frame;
 use crate::tui::matches_fuzzy;
 
-use super::chat_tui_format::{
+use super::code_tui_format::{
     build_footer_text, display_width, estimate_context_tokens, footer_host_label,
     format_picker_match_count, format_request_elapsed, format_session_group_label,
     format_session_match_count, format_session_time, format_time_ago_short, format_token_count,
@@ -38,57 +38,55 @@ use super::chat_tui_format::{
 };
 use super::*;
 
-#[path = "chat_tui/menu.rs"]
+#[path = "code_tui/menu.rs"]
 mod menu;
-#[path = "chat_tui/overlay_render_impl.rs"]
+#[path = "code_tui/overlay_render_impl.rs"]
 mod overlay_render_impl;
-#[path = "chat_tui/render.rs"]
+#[path = "code_tui/render.rs"]
 mod render;
-#[path = "chat_tui/render_impl.rs"]
+#[path = "code_tui/render_impl.rs"]
 mod render_impl;
-#[path = "chat_tui/storage.rs"]
+#[path = "code_tui/storage.rs"]
 mod storage;
-#[path = "chat_tui/system.rs"]
+#[path = "code_tui/system.rs"]
 mod system;
 
-#[path = "chat_tui/shared.rs"]
+#[path = "code_tui/shared.rs"]
 mod shared;
 
-#[path = "chat_tui/app_state_impl.rs"]
+#[path = "code_tui/app_state_impl.rs"]
 mod app_state_impl;
-#[path = "chat_tui/event_loop_impl.rs"]
+#[path = "code_tui/event_loop_impl.rs"]
 mod event_loop_impl;
-#[path = "chat_tui/input_impl.rs"]
+#[path = "code_tui/input_impl.rs"]
 mod input_impl;
-#[path = "chat_tui/key_handler_impl.rs"]
+#[path = "code_tui/key_handler_impl.rs"]
 mod key_handler_impl;
-#[path = "chat_tui/live_impl.rs"]
+#[path = "code_tui/live_impl.rs"]
 mod live_impl;
-#[path = "chat_tui/runtime_impl.rs"]
+#[path = "code_tui/runtime_impl.rs"]
 mod runtime_impl;
-#[path = "chat_tui/session_impl.rs"]
+#[path = "code_tui/session_impl.rs"]
 mod session_impl;
 
 use self::menu::*;
 use self::render::*;
 pub(crate) use self::runtime_impl::skill_invocation_label;
-pub(crate) use self::shared::ChatTuiParams;
+pub(crate) use self::shared::CodeTuiParams;
 use self::shared::*;
 use self::storage::*;
 pub(crate) use self::storage::{session_preview_text_from_messages, session_title_from_messages};
 use self::system::*;
 
-impl ChatTuiApp {
-    async fn new(params: ChatTuiParams) -> Result<Self> {
+impl CodeTuiApp {
+    async fn new(params: CodeTuiParams) -> Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let startup_notice = params
-            .startup_notice
-            .map(|message| (MUTED, message))
-            .or(Some((MUTED, "Ready".to_string())));
+        // No "Ready" filler — the welcome chip + tip cover the empty state.
+        let startup_notice = params.startup_notice.map(|message| (MUTED, message));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
         // Remembered across sessions (the user picked "remember last choice");
-        // both toggles come from one read of chat-prefs.json. auto_approve
+        // both toggles come from one read of code-prefs.json. auto_approve
         // defaults off (safe); thinking_enabled defaults on (high-signal).
         let crate::services::session_store::ChatToggles {
             auto_approve,
@@ -98,7 +96,7 @@ impl ChatTuiApp {
         } = params.session_store.get_chat_toggles().await;
         // Move any pre-existing `/skills` + `/mcp` opt-outs out of config.json (where
         // a routine key/route/selection write — or an older aivo binary — can drop
-        // them) into chat-prefs.json, before the chat flow writes config.json.
+        // them) into code-prefs.json, before the chat flow writes config.json.
         params.session_store.migrate_disabled_toggles().await;
         // The launch dir keys the recall view; the persisted file stays global.
         let real_cwd = std::env::current_dir()
@@ -106,6 +104,24 @@ impl ChatTuiApp {
             .unwrap_or_default();
         let draft_history_all = load_persisted_draft_history();
         let draft_history = draft_history_view(&draft_history_all, &real_cwd);
+        // Enabled MCP servers for the welcome chip (skills counted live elsewhere).
+        let mcp_cwd = if real_cwd.is_empty() { "." } else { &real_cwd };
+        let disabled_mcp: std::collections::HashSet<String> = params
+            .session_store
+            .get_disabled_mcp_servers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let mcp_configured_count = crate::agent::mcp::configured_servers(Path::new(mcp_cwd))
+            .into_iter()
+            .filter(|server| !disabled_mcp.contains(&server.name))
+            .count();
+        // Seed the rotating tip from the wall clock so it varies between launches.
+        let welcome_tip_index = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as usize % WELCOME_TIPS.len())
+            .unwrap_or(0);
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,
@@ -126,6 +142,9 @@ impl ChatTuiApp {
             cursor: 0,
             command_menu: CommandMenuState::default(),
             skill_commands: Vec::new(),
+            mcp_configured_count,
+            welcome_tip_index,
+            welcome_tip_rotated_at: None,
             draft_history,
             draft_history_all,
             draft_history_index: None,
@@ -238,7 +257,7 @@ impl ChatTuiApp {
     }
 }
 
-pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
+pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -253,7 +272,7 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
     }));
     let initial_resume = params.initial_resume.clone();
     let share = params.share;
-    let mut app = ChatTuiApp::new(params).await?;
+    let mut app = CodeTuiApp::new(params).await?;
     app.refresh_context_window().await;
     // Surface discovered skills as `/`-typeable slash commands (e.g. `/repo-study`)
     // before the first keystroke, so the command menu suggests them right away.
@@ -304,7 +323,7 @@ pub(super) async fn run_chat_tui(params: ChatTuiParams) -> Result<()> {
         println!(
             "{}  {}",
             crate::style::dim("Resume this chat:"),
-            crate::style::cyan(format!("aivo chat --resume {id}")),
+            crate::style::cyan(format!("aivo code --resume {id}")),
         );
     }
     result
@@ -343,9 +362,16 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     Ok(())
 }
 
-fn chat_scroll_speed() -> usize {
-    env::var("AIVO_CHAT_SCROLL_SPEED")
+/// Read an `AIVO_CODE_<suffix>` var, falling back to the pre-rename
+/// `AIVO_CHAT_<suffix>` so existing users' shell configs keep working.
+fn code_env(suffix: &str) -> Option<String> {
+    env::var(format!("AIVO_CODE_{suffix}"))
+        .or_else(|_| env::var(format!("AIVO_CHAT_{suffix}")))
         .ok()
+}
+
+fn chat_scroll_speed() -> usize {
+    code_env("SCROLL_SPEED")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_CHAT_SCROLL_SPEED)
         .clamp(1, MAX_CHAT_SCROLL_SPEED)
@@ -353,7 +379,7 @@ fn chat_scroll_speed() -> usize {
 
 fn chat_mouse_enabled() -> bool {
     chat_mouse_enabled_for(
-        env::var("AIVO_CHAT_DISABLE_MOUSE").ok().as_deref(),
+        code_env("DISABLE_MOUSE").as_deref(),
         crate::services::termux_exec::is_termux(),
     )
 }
@@ -370,7 +396,7 @@ fn chat_mouse_enabled_for(disable_override: Option<&str>, is_termux: bool) -> bo
 
 fn chat_swipe_scroll_enabled() -> bool {
     chat_swipe_scroll_enabled_for(
-        env::var("AIVO_CHAT_SWIPE_SCROLL").ok().as_deref(),
+        code_env("SWIPE_SCROLL").as_deref(),
         crate::services::termux_exec::is_termux(),
     )
 }
@@ -385,5 +411,5 @@ fn chat_swipe_scroll_enabled_for(override_val: Option<&str>, is_termux: bool) ->
 }
 
 #[cfg(test)]
-#[path = "chat_tui/tests.rs"]
+#[path = "code_tui/tests.rs"]
 mod tests;

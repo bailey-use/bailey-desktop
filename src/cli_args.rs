@@ -46,7 +46,7 @@ pub(crate) fn rewrite_cli_args(
     }
 
     if matches!(raw_args[1].as_str(), "-p" | "--prompt" | "-x" | "--execute") {
-        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
+        let mut rewritten = vec![raw_args[0].clone(), "code".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
     }
@@ -72,11 +72,11 @@ pub(crate) fn rewrite_cli_args(
     }
 
     // Bare-prompt shortcut. After tool/subcommand/bundle/plugin matches have
-    // failed, a top-level non-flag arg is interpreted as input to `chat`:
-    //   `aivo hf:Qwen/...` / `aivo https://...`      → `aivo chat <ref>`
-    //     (chat's positional REF; opens TUI with that model)
-    //   `aivo "tell me a story"` / `aivo 你好` / `aivo hi?` → `aivo chat -p <text>`
-    //     (one-shot prompt; trailing args pass through to chat)
+    // failed, a top-level non-flag arg is interpreted as input to `code`:
+    //   `aivo hf:Qwen/...` / `aivo https://...`      → `aivo code <ref>`
+    //     (code's positional REF; opens TUI with that model)
+    //   `aivo "tell me a story"` / `aivo 你好` / `aivo hi?` → `aivo code -p <text>`
+    //     (one-shot prompt; trailing args pass through to code)
     // A bare `[a-z0-9-]` word is never a prompt: it falls through to clap's
     // "unrecognized subcommand" with did-you-mean (this also keeps reserved
     // names and clap's built-in `help` reachable — all are shaped). The shell
@@ -89,11 +89,11 @@ pub(crate) fn rewrite_cli_args(
         return raw_args;
     }
     if first.starts_with("hf:") || first.starts_with("http://") || first.starts_with("https://") {
-        let mut rewritten = vec![raw_args[0].clone(), "chat".to_string()];
+        let mut rewritten = vec![raw_args[0].clone(), "code".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
         return rewritten;
     }
-    let mut rewritten = vec![raw_args[0].clone(), "chat".to_string(), "-p".to_string()];
+    let mut rewritten = vec![raw_args[0].clone(), "code".to_string(), "-p".to_string()];
     rewritten.extend_from_slice(&raw_args[1..]);
     rewritten
 }
@@ -1320,34 +1320,34 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_injects_chat_for_top_level_prompt() {
+    fn rewrite_injects_code_for_top_level_prompt() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "-p", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "-p", "hello"])
+            args(&["aivo", "code", "-p", "hello"])
         );
     }
 
     #[test]
-    fn rewrite_injects_chat_for_long_prompt() {
+    fn rewrite_injects_code_for_long_prompt() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "--prompt", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "--prompt", "hello"])
+            args(&["aivo", "code", "--prompt", "hello"])
         );
     }
 
     #[test]
-    fn rewrite_injects_chat_for_legacy_x_alias() {
+    fn rewrite_injects_code_for_legacy_x_alias() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "-x", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "-x", "hello"])
+            args(&["aivo", "code", "-x", "hello"])
         );
     }
 
     #[test]
-    fn rewrite_injects_chat_for_legacy_execute_alias() {
+    fn rewrite_injects_code_for_legacy_execute_alias() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "--execute", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "--execute", "hello"])
+            args(&["aivo", "code", "--execute", "hello"])
         );
     }
 
@@ -1355,7 +1355,7 @@ mod tests {
     fn rewrite_treats_multiword_top_level_arg_as_prompt() {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "hello world"]), &no_bundles()),
-            args(&["aivo", "chat", "-p", "hello world"])
+            args(&["aivo", "code", "-p", "hello world"])
         );
     }
 
@@ -1367,33 +1367,33 @@ mod tests {
                 args(&["aivo", "hi there", "--model", "gpt-4o"]),
                 &no_bundles()
             ),
-            args(&["aivo", "chat", "-p", "hi there", "--model", "gpt-4o"])
+            args(&["aivo", "code", "-p", "hi there", "--model", "gpt-4o"])
         );
     }
 
     #[test]
-    fn rewrite_treats_hf_ref_as_chat_positional() {
+    fn rewrite_treats_hf_ref_as_code_positional() {
         assert_eq!(
             rewrite_cli_args(
                 args(&["aivo", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"]),
                 &no_bundles()
             ),
-            args(&["aivo", "chat", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"])
+            args(&["aivo", "code", "hf:Qwen/Qwen2.5-0.5B-Instruct-GGUF"])
         );
     }
 
     #[test]
-    fn rewrite_treats_http_url_as_chat_positional() {
+    fn rewrite_treats_http_url_as_code_positional() {
         assert_eq!(
             rewrite_cli_args(
                 args(&["aivo", "https://huggingface.co/foo/bar"]),
                 &no_bundles()
             ),
-            args(&["aivo", "chat", "https://huggingface.co/foo/bar"])
+            args(&["aivo", "code", "https://huggingface.co/foo/bar"])
         );
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "http://example.com/m"]), &no_bundles()),
-            args(&["aivo", "chat", "http://example.com/m"])
+            args(&["aivo", "code", "http://example.com/m"])
         );
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn rewrite_leaves_reserved_subcommand_unchanged() {
-        // `aivo chat`, `aivo keys`, etc. must reach clap as real subcommands,
+        // `aivo code`, `aivo keys`, etc. must reach clap as real subcommands,
         // not get rewritten to `chat -p chat`. All reserved names are
         // `[a-z0-9-]`, so the bare-word gate covers them.
         assert_eq!(
@@ -1461,7 +1461,7 @@ mod tests {
         // never fires when the user is explicit about intent.
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "-p", "a"]), &no_bundles()),
-            args(&["aivo", "chat", "-p", "a"]),
+            args(&["aivo", "code", "-p", "a"]),
         );
     }
 
@@ -1473,7 +1473,7 @@ mod tests {
         for s in ["你", "你好", "こんにちは", "안녕", "привет", "🎉", "1你"] {
             assert_eq!(
                 rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
-                args(&["aivo", "chat", "-p", s]),
+                args(&["aivo", "code", "-p", s]),
                 "expected `aivo {s}` to be treated as a prompt",
             );
         }
@@ -1498,17 +1498,17 @@ mod tests {
         for s in ["hi?", "Hello", "Hi", "1+1"] {
             assert_eq!(
                 rewrite_cli_args(args(&["aivo", s]), &no_bundles()),
-                args(&["aivo", "chat", "-p", s]),
+                args(&["aivo", "code", "-p", s]),
                 "expected `aivo {s}` to be treated as a prompt",
             );
         }
     }
 
     #[test]
-    fn rewrite_keeps_explicit_chat() {
+    fn rewrite_keeps_explicit_code() {
         assert_eq!(
-            rewrite_cli_args(args(&["aivo", "chat", "-x", "hello"]), &no_bundles()),
-            args(&["aivo", "chat", "-x", "hello"])
+            rewrite_cli_args(args(&["aivo", "code", "-x", "hello"]), &no_bundles()),
+            args(&["aivo", "code", "-x", "hello"])
         );
     }
 

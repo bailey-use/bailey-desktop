@@ -122,12 +122,12 @@ pub struct ServeRouter {
     /// same point as `usage_sink`; `None` for plain `aivo serve`.
     run_tally: Option<Arc<RunTokenTally>>,
     /// Suppress the router's progress lines (protocol auto-switch, failover) on
-    /// stderr. `aivo chat` runs this router in-process behind a raw-mode TUI, so
+    /// stderr. `aivo code` runs this router in-process behind a raw-mode TUI, so
     /// stray `eprintln!`s would corrupt the screen / land in the prompt box.
     quiet: bool,
     /// Caller-owned route cache for the primary upstream. When set, the serve
     /// learns into it instead of a throwaway one, so the owner can seed a known
-    /// protocol and read confirmed routes back. `aivo chat` shares one across its
+    /// protocol and read confirmed routes back. `aivo code` shares one across its
     /// per-turn serves.
     seed_route_cache: Option<Arc<RouteCache>>,
 }
@@ -179,7 +179,7 @@ impl ServeRouter {
     }
 
     /// Use a caller-owned route cache so the learned protocol can be seeded and
-    /// read back. Used by `aivo chat` to share one across its per-turn serves.
+    /// read back. Used by `aivo code` to share one across its per-turn serves.
     pub fn with_route_cache(mut self, cache: Arc<RouteCache>) -> Self {
         self.seed_route_cache = Some(cache);
         self
@@ -191,7 +191,7 @@ impl ServeRouter {
     }
 
     /// Silence the router's stderr progress lines (protocol auto-switch,
-    /// failover). Set by `aivo chat`, whose TUI owns the terminal.
+    /// failover). Set by `aivo code`, whose TUI owns the terminal.
     pub fn quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
         self
@@ -270,7 +270,7 @@ impl ServeRouter {
 
         let initial_protocol = self.config.upstream_protocol;
         let timeout = self.config.timeout;
-        // A caller-owned cache (shared across `aivo chat` turns) wins; otherwise
+        // A caller-owned cache (shared across `aivo code` turns) wins; otherwise
         // each run gets a fresh throwaway cache seeded at the upstream protocol.
         let route_cache = self.seed_route_cache.unwrap_or_else(|| {
             Arc::new(RouteCache::new(

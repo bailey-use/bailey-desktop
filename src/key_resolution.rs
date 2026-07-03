@@ -344,7 +344,7 @@ mod tests {
         assert!(is_new);
 
         // Verify chat model was pre-set
-        let model = store.get_chat_model(&key.id).await.unwrap();
+        let model = store.get_code_model(&key.id).await.unwrap();
         assert_eq!(
             model,
             Some(crate::constants::AIVO_STARTER_MODEL.to_string())

@@ -1,6 +1,6 @@
 use super::*;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) fn persist_draft_history(&self) {
         let _ = save_persisted_draft_history(&self.draft_history_all);
     }
@@ -28,6 +28,34 @@ impl ChatTuiApp {
             || self.toast.is_some()
             || self.drag_autoscroll.is_some()
             || self.selection_flash_until.is_some()
+    }
+
+    /// Advance the welcome-screen tip once its interval elapses; returns `true`
+    /// when it changed (the cue to repaint). Only runs on the untouched welcome
+    /// screen — an overlay, a draft, or any message pauses it and resets the clock,
+    /// so the tip that reappears gets a full interval.
+    pub(super) fn tick_welcome_tip(&mut self) -> bool {
+        let composing = !self.draft.is_empty() || !self.draft_attachments.is_empty();
+        let visible =
+            self.is_transcript_empty() && matches!(self.overlay, Overlay::None) && !composing;
+        if !visible {
+            self.welcome_tip_rotated_at = None;
+            return false;
+        }
+        let now = Instant::now();
+        match self.welcome_tip_rotated_at {
+            // Start the clock on the first frame; don't swap yet.
+            None => {
+                self.welcome_tip_rotated_at = Some(now);
+                false
+            }
+            Some(shown_at) if now.duration_since(shown_at) >= WELCOME_TIP_ROTATE_INTERVAL => {
+                self.welcome_tip_index = self.welcome_tip_index.wrapping_add(1);
+                self.welcome_tip_rotated_at = Some(now);
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// At the next user turn, drop a plan card that's fully completed (done marker)

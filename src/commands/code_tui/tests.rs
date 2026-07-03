@@ -862,8 +862,8 @@ fn test_render_command_menu_rows_aligns_description_column() {
     let lines = render_command_menu_rows(&menu, 48);
     let first = plain_text_from_spans(&lines[0].spans);
     let second = plain_text_from_spans(&lines[1].spans);
-    let first_desc = first.find("start a fresh chat").unwrap();
-    let second_desc = second.find("resume a saved chat").unwrap();
+    let first_desc = first.find("start a fresh session").unwrap();
+    let second_desc = second.find("resume a saved session").unwrap();
     assert_eq!(first_desc, second_desc);
 }
 
@@ -1065,8 +1065,8 @@ async fn test_ctrl_c_pending_resets_on_other_key() {
 fn make_test_app(
     tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
-) -> ChatTuiApp {
-    ChatTuiApp {
+) -> CodeTuiApp {
+    CodeTuiApp {
         // A unique throwaway store — NEVER the real `~/.config/aivo` (which
         // `SessionStore::new()` points at). Tests that drive a save (persist /
         // flush / turn-finish) would otherwise pollute the user's real config.
@@ -1101,6 +1101,9 @@ fn make_test_app(
         cursor: 0,
         command_menu: CommandMenuState::default(),
         skill_commands: Vec::new(),
+        mcp_configured_count: 0,
+        welcome_tip_index: 0,
+        welcome_tip_rotated_at: None,
         draft_history: Vec::new(),
         draft_history_all: Vec::new(),
         draft_history_index: None,
@@ -1227,7 +1230,7 @@ fn test_resumable_session_id_skips_empty_history() {
     assert_eq!(app.resumable_session_id(), Some("abc-123"));
 }
 
-fn seed_two_exchanges(app: &mut ChatTuiApp) {
+fn seed_two_exchanges(app: &mut CodeTuiApp) {
     for (role, content) in [
         ("user", "first question"),
         ("assistant", "first answer"),
@@ -1908,6 +1911,24 @@ fn test_footer_status_label_is_token_count_without_window() {
 }
 
 #[test]
+fn test_footer_status_label_shows_window_on_pristine_session() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.context_window = 1_000_000;
+    app.context_tokens = 0; // no turn yet → no fill to gauge
+
+    // The welcome screen shows the window size, not an empty `0 / 1M · 0%` meter.
+    let (label, color) = app.footer_status_label();
+    assert_eq!(label, "1M context");
+    assert_eq!(color, MUTED);
+
+    // The first tokens flip it to the live gauge.
+    app.context_tokens = 50_000;
+    app.context_is_estimate = false;
+    assert_eq!(app.footer_status_label().0, "50k / 1M · 5%");
+}
+
+#[test]
 fn test_footer_status_label_shows_context_utilization() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -1963,7 +1984,7 @@ fn test_footer_shows_plain_chat_badge_when_agent_tools_off() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn footer_text(app: &ChatTuiApp) -> String {
+    fn footer_text(app: &CodeTuiApp) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 1)).unwrap();
         terminal
             .draw(|frame| app.render_footer(frame, frame.area()))
@@ -2513,7 +2534,7 @@ fn test_intro_column_stable_from_empty_to_message() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn aivo_col(app: &mut ChatTuiApp) -> u16 {
+    fn aivo_col(app: &mut CodeTuiApp) -> u16 {
         let mut terminal = Terminal::new(TestBackend::new(48, 16)).unwrap();
         terminal
             .draw(|frame| {
@@ -2569,9 +2590,109 @@ fn test_transcript_intro_is_brand_only() {
         vec![
             "▄▀█ █ █░█ █▀█".to_string(),
             "█▀█ █ ▀▄▀ █▄█".to_string(),
-            "chat · ask anything".to_string(),
+            "your terminal coding agent".to_string(),
         ]
     );
+}
+
+#[test]
+fn test_welcome_shows_capability_chip_and_tip() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.skill_commands = vec![
+        skill_command("repo-study", "Study a repo"),
+        skill_command("release", "Cut a release"),
+    ];
+    app.mcp_configured_count = 1;
+    app.welcome_tip_index = 0; // "start a line with ! to run a shell command"
+
+    let (screen, _) = render_full_screen(&mut app, 90, 24);
+    assert!(
+        screen.contains("2 skills · 1 MCP"),
+        "missing chip:\n{screen}"
+    );
+    assert!(
+        screen.contains("✶ Tip"),
+        "missing tip label + glyph:\n{screen}"
+    );
+    assert!(
+        screen.contains(WELCOME_TIPS[0]),
+        "missing tip text:\n{screen}"
+    );
+    // The bare "Ready" filler is gone.
+    assert!(!screen.contains("Ready"), "stale Ready line:\n{screen}");
+}
+
+#[test]
+fn test_welcome_tip_rotates_on_interval_only_while_visible() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx); // empty transcript, no overlay
+    app.welcome_tip_index = 0;
+
+    // First frame just starts the clock — no swap yet.
+    assert!(!app.tick_welcome_tip(), "swapped on the first frame");
+    assert_eq!(app.welcome_tip_index, 0);
+    assert!(app.welcome_tip_rotated_at.is_some(), "clock not started");
+
+    // Before the interval elapses, still no swap.
+    assert!(!app.tick_welcome_tip());
+    assert_eq!(app.welcome_tip_index, 0);
+
+    // Backdate past the interval → the next tick advances and re-clocks.
+    app.welcome_tip_rotated_at =
+        Some(std::time::Instant::now() - WELCOME_TIP_ROTATE_INTERVAL - Duration::from_secs(1));
+    assert!(app.tick_welcome_tip(), "no swap after the interval");
+    assert_eq!(app.welcome_tip_index, 1);
+
+    // An overlay pauses rotation and resets the clock.
+    app.overlay = Overlay::Help { scroll: 0 };
+    app.welcome_tip_rotated_at =
+        Some(std::time::Instant::now() - WELCOME_TIP_ROTATE_INTERVAL - Duration::from_secs(1));
+    assert!(!app.tick_welcome_tip(), "must not rotate under an overlay");
+    assert_eq!(app.welcome_tip_index, 1, "index frozen while covered");
+    assert!(
+        app.welcome_tip_rotated_at.is_none(),
+        "clock reset while covered"
+    );
+
+    // A draft pauses it too; clearing it restarts the clock.
+    app.overlay = Overlay::None;
+    app.draft = "hello".to_string();
+    app.welcome_tip_rotated_at =
+        Some(std::time::Instant::now() - WELCOME_TIP_ROTATE_INTERVAL - Duration::from_secs(1));
+    assert!(!app.tick_welcome_tip(), "must not rotate while composing");
+    assert_eq!(app.welcome_tip_index, 1, "index frozen while composing");
+    assert!(
+        app.welcome_tip_rotated_at.is_none(),
+        "clock reset while composing"
+    );
+    app.draft.clear();
+    assert!(
+        !app.tick_welcome_tip(),
+        "cleared draft restarts the clock, no swap"
+    );
+    assert!(
+        app.welcome_tip_rotated_at.is_some(),
+        "clock restarted after clear"
+    );
+}
+
+#[test]
+fn test_welcome_chip_omits_zero_and_pluralizes() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // Nothing configured → no chip, but the tip still shows.
+    assert_eq!(app.welcome_capabilities_label(), None);
+
+    // One skill, no MCP → singular, MCP segment omitted.
+    app.skill_commands = vec![skill_command("repo-study", "Study a repo")];
+    assert_eq!(app.welcome_capabilities_label().as_deref(), Some("1 skill"));
+
+    // MCP only → skills segment omitted.
+    app.skill_commands.clear();
+    app.mcp_configured_count = 3;
+    assert_eq!(app.welcome_capabilities_label().as_deref(), Some("3 MCP"));
 }
 
 #[test]
@@ -3081,7 +3202,7 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
     });
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-    let draw = |app: &mut ChatTuiApp, terminal: &mut Terminal<TestBackend>| {
+    let draw = |app: &mut CodeTuiApp, terminal: &mut Terminal<TestBackend>| {
         terminal
             .draw(|frame| {
                 app.render_main(frame, frame.area());
@@ -3121,7 +3242,7 @@ fn test_transcript_cache_reuses_across_frames_until_content_changes() {
 // Render the whole screen (transcript + composer + any card/overlay) to a plain
 // string plus the per-row strings, for layout assertions.
 #[cfg(test)]
-fn render_full_screen(app: &mut ChatTuiApp, w: u16, h: u16) -> (String, Vec<String>) {
+fn render_full_screen(app: &mut CodeTuiApp, w: u16, h: u16) -> (String, Vec<String>) {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -3254,7 +3375,7 @@ fn test_spinner_animation_does_not_invalidate_transcript_cache() {
     app.sending = true;
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-    let render_screen = |app: &mut ChatTuiApp, terminal: &mut Terminal<TestBackend>| -> String {
+    let render_screen = |app: &mut CodeTuiApp, terminal: &mut Terminal<TestBackend>| -> String {
         terminal
             .draw(|frame| {
                 app.render_main(frame, frame.area());
@@ -3304,7 +3425,7 @@ fn test_streaming_tokens_do_not_invalidate_history_body_cache() {
     app.pending_response = "Stream".to_string();
 
     let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
-    let render_screen = |app: &mut ChatTuiApp, terminal: &mut Terminal<TestBackend>| -> String {
+    let render_screen = |app: &mut CodeTuiApp, terminal: &mut Terminal<TestBackend>| -> String {
         terminal
             .draw(|frame| {
                 app.render_main(frame, frame.area());
@@ -3458,7 +3579,7 @@ fn output_block_expands_inline_on_click() {
 
     // The transcript rows the click handler resolves against — built exactly as the
     // real render does (wrap the body, then seed the hitbox).
-    let refresh = |app: &mut ChatTuiApp| -> Vec<String> {
+    let refresh = |app: &mut CodeTuiApp| -> Vec<String> {
         let body = app.build_transcript_history_body(80);
         let wrapped = wrap_transcript(&body.lines, &body.bar_colors, 80);
         app.transcript_hitbox = Some(TranscriptHitbox {
@@ -3743,7 +3864,7 @@ fn test_hint_bar_reflects_state() {
     use ratatui::backend::TestBackend;
 
     // Render the app, returning just the bottom row (the hint bar).
-    fn bottom_row(configure: impl Fn(&mut ChatTuiApp)) -> String {
+    fn bottom_row(configure: impl Fn(&mut CodeTuiApp)) -> String {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
         // A long transcript so the footer fills to the terminal's bottom row.
@@ -3773,7 +3894,7 @@ fn test_hint_bar_reflects_state() {
 
     // The whole rendered screen as one string, for state shown outside the bottom
     // hint-bar row (e.g. the composer-rule mode badge).
-    fn full_screen(configure: impl Fn(&mut ChatTuiApp)) -> String {
+    fn full_screen(configure: impl Fn(&mut CodeTuiApp)) -> String {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = make_test_app(tx, rx);
         configure(&mut app);
@@ -4637,7 +4758,7 @@ fn test_plan_renders_in_pinned_panel_not_inline() {
     assert!(screen.contains('✔') && screen.contains('▸') && screen.contains('○'));
 }
 
-fn render_screen(app: &mut ChatTuiApp, w: u16, h: u16) -> String {
+fn render_screen(app: &mut CodeTuiApp, w: u16, h: u16) -> String {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -4725,7 +4846,7 @@ fn test_long_plan_windows_to_five_with_more_marker() {
 fn test_completed_plan_clears_on_next_user_message() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    let plan_count = |a: &ChatTuiApp| a.history.iter().filter(|m| m.role == "plan").count();
+    let plan_count = |a: &CodeTuiApp| a.history.iter().filter(|m| m.role == "plan").count();
 
     // A finished plan is recorded and stays pinned (nothing clears it on its own).
     app.apply_agent_plan(serde_json::json!([{"step": "a", "status": "completed"}]));
@@ -4940,7 +5061,7 @@ fn test_maybe_apply_mcp_rebuild_drops_engine_when_pending() {
 fn test_apply_agent_plan_keeps_single_card() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    let count_plans = |app: &ChatTuiApp| app.history.iter().filter(|m| m.role == "plan").count();
+    let count_plans = |app: &CodeTuiApp| app.history.iter().filter(|m| m.role == "plan").count();
 
     // Two updates with nothing between → one card, updated in place.
     app.apply_agent_plan(serde_json::json!([{"step": "a", "status": "pending"}]));
@@ -5195,7 +5316,7 @@ fn test_selection_highlight_preserves_rendered_text_and_foreground() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn rendered_cells(app: &mut ChatTuiApp) -> Vec<(String, Color)> {
+    fn rendered_cells(app: &mut CodeTuiApp) -> Vec<(String, Color)> {
         let backend = TestBackend::new(48, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -5498,7 +5619,7 @@ async fn jump_to_bottom_pill_shows_when_scrolled_up_and_clicks_to_latest() {
         });
     }
 
-    let render = |app: &mut ChatTuiApp| {
+    let render = |app: &mut CodeTuiApp| {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
     };
@@ -7662,7 +7783,7 @@ async fn test_mcp_overlay_wheel_scrolls_like_arrows() {
 fn test_composer_command_hint() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    let set = |app: &mut ChatTuiApp, draft: &str| {
+    let set = |app: &mut CodeTuiApp, draft: &str| {
         app.draft = draft.to_string();
         app.cursor = app.draft.len();
     };
@@ -7855,7 +7976,7 @@ async fn test_mcp_progress_flips_only_resolved_row() {
         .unwrap();
     app.handle_runtime_events().await.unwrap();
 
-    let row = |app: &ChatTuiApp, name: &str| -> (String, McpHealth) {
+    let row = |app: &CodeTuiApp, name: &str| -> (String, McpHealth) {
         match &app.overlay {
             Overlay::Mcp(s) => s
                 .items
@@ -7922,6 +8043,27 @@ async fn test_toggle_mcp_server_persists_and_resets() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Toggling a server refreshes the welcome chip's MCP count instead of freezing
+/// it at the startup value.
+#[tokio::test]
+async fn test_toggle_mcp_server_updates_welcome_count() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Mcp(mcp_overlay_fixture()); // filesystem on, github off
+    app.mcp_configured_count = 42; // stale value the fix must overwrite
+
+    // Disable the one enabled server → 0 enabled.
+    app.toggle_mcp_server(0).await.unwrap();
+    assert_eq!(
+        app.mcp_configured_count, 0,
+        "count not refreshed on disable"
+    );
+
+    // Re-enable it → back to 1.
+    app.toggle_mcp_server(0).await.unwrap();
+    assert_eq!(app.mcp_configured_count, 1, "count not refreshed on enable");
 }
 
 /// Toggling a server keeps the live client (rather than nulling it) so the
@@ -8201,7 +8343,7 @@ async fn test_skill_drill_in_scrolls_long_body() {
     overlay.viewing = Some(0);
     app.overlay = Overlay::Skills(overlay);
 
-    let render_screen = |app: &mut ChatTuiApp| -> String {
+    let render_screen = |app: &mut CodeTuiApp| -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -8640,7 +8782,7 @@ fn test_render_main_local_command_no_clip() {
 /// finishes (the Windows ConPTY hang this guards against) fails the test instead of
 /// hanging the runner forever.
 #[cfg(any(unix, windows))]
-async fn run_local_command_to_completion(app: &mut ChatTuiApp) {
+async fn run_local_command_to_completion(app: &mut CodeTuiApp) {
     for _ in 0..5000 {
         app.handle_runtime_events().await.unwrap();
         if app.local_command.is_none() {
@@ -9298,7 +9440,7 @@ fn one_user_message(content: &str) -> Vec<crate::services::session_store::Stored
 
 #[tokio::test]
 async fn test_empty_chat_persists_no_session_on_exit() {
-    // Opening `aivo chat` and leaving without saying anything must NOT create a
+    // Opening `aivo code` and leaving without saying anything must NOT create a
     // session — `flush_for_exit` only persists a non-empty history, so an
     // untouched chat leaves the resume list untouched.
     let temp_dir = TempDir::new().unwrap();
@@ -9323,7 +9465,7 @@ async fn test_empty_chat_persists_no_session_on_exit() {
     assert_eq!(store.count_chat_sessions().await, 0);
     assert!(
         store
-            .get_chat_session("untouched-sess")
+            .get_code_session("untouched-sess")
             .await
             .unwrap()
             .is_none()
@@ -9334,7 +9476,7 @@ async fn test_empty_chat_persists_no_session_on_exit() {
 
 #[tokio::test]
 async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
-    // `aivo chat --resume last` from a fresh process (empty history) reopens the
+    // `aivo code --resume last` from a fresh process (empty history) reopens the
     // most recent saved chat directly — the exit hint's round-trip.
     let temp_dir = TempDir::new().unwrap();
     let store = SessionStore::with_path(temp_dir.path().join("config.json"));
@@ -9345,7 +9487,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
     let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
 
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             &key.base_url,
             "/tmp/demo",
@@ -9362,7 +9504,7 @@ async fn test_resume_last_jumps_to_newest_from_fresh_launch() {
     // Guarantee a strictly-later updated_at for the second save.
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             &key.base_url,
             "/tmp/demo",
@@ -9411,7 +9553,7 @@ async fn test_resume_last_in_session_skips_current_chat() {
     let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
 
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             &key.base_url,
             "/tmp/demo",
@@ -9494,7 +9636,7 @@ async fn test_open_resume_picker_saves_current_unsaved_session() {
     );
 
     let saved = store
-        .get_chat_session("fresh-session")
+        .get_code_session("fresh-session")
         .await
         .unwrap()
         .unwrap();
@@ -9510,7 +9652,7 @@ async fn test_delete_picker_selection_removes_saved_chat() {
         .await
         .unwrap();
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             "https://api.example.com",
             "/tmp/demo",
@@ -9573,11 +9715,11 @@ async fn test_delete_picker_selection_removes_saved_chat() {
     assert!(matches!(app.overlay, Overlay::None));
     assert_eq!(
         app.notice.as_ref().map(|(_, text)| text.as_str()),
-        Some("Saved chat deleted")
+        Some("Saved session deleted")
     );
     let saved = app
         .session_store
-        .get_chat_session("session-1234")
+        .get_code_session("session-1234")
         .await
         .unwrap();
     assert!(saved.is_none());
@@ -9592,7 +9734,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
         .await
         .unwrap();
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             "https://api.example.com",
             "/tmp/demo",
@@ -9646,7 +9788,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
 
     let saved = app
         .session_store
-        .get_chat_session("session-1234")
+        .get_code_session("session-1234")
         .await
         .unwrap();
     assert!(saved.is_some());
@@ -9661,7 +9803,7 @@ async fn test_ctrl_d_requires_confirmation_before_delete() {
 
     let saved = app
         .session_store
-        .get_chat_session("session-1234")
+        .get_code_session("session-1234")
         .await
         .unwrap();
     assert!(saved.is_none());
@@ -9780,7 +9922,7 @@ async fn test_resume_lists_sessions_regardless_of_cwd() {
 
     // One session under an old ephemeral sandbox path (saved directly).
     store
-        .save_chat_session_with_id(
+        .save_code_session_with_id(
             &key_id,
             &key.base_url,
             "/tmp/aivo-chat-old",
@@ -9928,7 +10070,7 @@ async fn test_log_agent_turn_records_under_real_cwd() {
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].kind, "chat_turn");
+    assert_eq!(rows[0].kind, "code_turn");
     assert_eq!(rows[0].session_id.as_deref(), Some("agent-sess"));
     assert_eq!(rows[0].output_tokens, Some(1234));
 }
@@ -9962,7 +10104,7 @@ async fn test_flush_for_exit_persists_partial_response_when_streaming() {
     app.flush_for_exit().await;
 
     let saved = store
-        .get_chat_session("exit-session")
+        .get_code_session("exit-session")
         .await
         .unwrap()
         .expect("session should be persisted on exit");
@@ -10001,7 +10143,7 @@ async fn test_flush_for_exit_persists_user_only_history() {
     app.flush_for_exit().await;
 
     let saved = store
-        .get_chat_session("user-only-session")
+        .get_code_session("user-only-session")
         .await
         .unwrap()
         .expect("session with only a user message should still persist on exit");
@@ -10031,7 +10173,7 @@ async fn test_flush_for_exit_skips_persist_for_empty_history() {
 
     app.flush_for_exit().await;
 
-    let saved = store.get_chat_session("empty-session").await.unwrap();
+    let saved = store.get_code_session("empty-session").await.unwrap();
     assert!(
         saved.is_none(),
         "empty history should not produce a session"
@@ -10048,7 +10190,7 @@ async fn test_apply_model_updates_last_selection_preserving_tool() {
         .unwrap();
     let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
     // Seed a prior launchable selection so we can assert the tool is preserved
-    // (a `/model` switch must not overwrite it with "chat").
+    // (a `/model` switch must not overwrite it with "code").
     store
         .set_last_selection(&key, "claude", Some("old-model"))
         .await

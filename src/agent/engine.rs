@@ -134,14 +134,14 @@ pub trait AgentUi: Send {
         _model: &'a str,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async {
-            Err("Switching model is only available in interactive `aivo chat`.".to_string())
+            Err("Switching model is only available in interactive `aivo code`.".to_string())
         })
     }
     /// The `set_effort` tool. Default declines — only the chat TUI drives it.
     fn set_chat_effort<'a>(&'a mut self, _level: &'a str) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async {
             Err(
-                "Changing reasoning effort is only available in interactive `aivo chat`."
+                "Changing reasoning effort is only available in interactive `aivo code`."
                     .to_string(),
             )
         })
@@ -302,7 +302,7 @@ pub struct AgentEngine {
     lsp: Option<crate::agent::lsp::LspManager>,
 }
 
-/// Live `aivo chat` session facts injected into the system prompt so the agent can answer
+/// Live `aivo code` session facts injected into the system prompt so the agent can answer
 /// "what model am I on?" and knows how to change model/effort/key. `model_label` is the
 /// user-facing `raw_model` (safe under first-party branding); `provider_label` is the key name.
 pub struct ChatSessionContext {
@@ -480,7 +480,7 @@ impl AgentEngine {
             )
         };
         let block = format!(
-            "This is an interactive `aivo chat` session (not a plain shell). Live setup — model: \
+            "This is an interactive `aivo code` session (not a plain shell). Live setup — model: \
 `{model}`, provider: `{provider}`{effort_clause}. When the user asks what model, provider, or \
 effort they're on, answer from these facts directly. The user can change them live with the \
 slash commands `/model [name]`, `/key [name]` (switches provider/key — starts a fresh chat), \
@@ -1924,7 +1924,7 @@ use its role instead of a generic sub-agent.",
 fn switch_model_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "switch_model".to_string(),
-        description: "Switch the model powering THIS aivo chat session when the user asks for a \
+        description: "Switch the model powering THIS aivo code session when the user asks for a \
 different one. Pass the model id or a distinctive part of it (e.g. \"opus\", \"gpt-5\"). The switch \
 takes effect on the user's next message and the conversation is preserved. If the name is \
 ambiguous or unavailable you'll get candidates back — relay them or suggest `/model`."
@@ -1944,7 +1944,7 @@ fn set_effort_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "set_effort".to_string(),
         description:
-            "Set the reasoning-effort level for THIS aivo chat session (e.g. low, medium, \
+            "Set the reasoning-effort level for THIS aivo code session (e.g. low, medium, \
 high) when the user asks. Only valid for models that expose effort levels — you'll get the valid \
 options back if the level or the current model doesn't support it."
                 .to_string(),
@@ -5017,7 +5017,7 @@ mod tests {
     #[test]
     fn chat_session_context_injects_facts_and_tools() {
         let mut e = AgentEngine::new("/tmp", "gpt-5", "", &[], &[], 0, 0);
-        assert!(!system_content(&e).contains("interactive `aivo chat` session"));
+        assert!(!system_content(&e).contains("interactive `aivo code` session"));
         assert!(!tool_names(&e).contains(&"switch_model".to_string()));
 
         e.set_chat_session_context(ChatSessionContext {
@@ -5027,7 +5027,7 @@ mod tests {
             effort_levels: vec!["low".into(), "medium".into(), "high".into()],
         });
         let p = system_content(&e);
-        assert!(p.contains("interactive `aivo chat` session"));
+        assert!(p.contains("interactive `aivo code` session"));
         assert!(p.contains("gpt-5") && p.contains("openrouter") && p.contains("high"));
         assert!(p.contains("/model") && p.contains("switch_model") && p.contains("/key"));
         let names = tool_names(&e);

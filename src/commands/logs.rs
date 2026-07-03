@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use crate::cli::LogsArgs;
-use crate::commands::chat::format_time_ago_short;
+use crate::commands::code::format_time_ago_short;
 use crate::constants::KNOWN_TOOLS;
 use crate::errors::ExitCode;
 use crate::services::SessionStore;
@@ -42,7 +42,7 @@ impl UnifiedRow {
         }
     }
 
-    /// `"chat" | "run" | "serve" | "claude" | …`. Matches what `aivo
+    /// `"code" | "run" | "serve" | "claude" | …`. Matches what `aivo
     /// logs` displays in the bracket column.
     pub(crate) fn source_label(&self) -> &str {
         match self {
@@ -58,7 +58,7 @@ impl UnifiedRow {
     /// share attempts with a friendlier error.
     pub(crate) fn is_orphan_chat(&self, orphan_chat_ids: &HashSet<String>) -> bool {
         match self {
-            UnifiedRow::Log(e) if e.source == "chat" => e
+            UnifiedRow::Log(e) if is_code_source(&e.source) => e
                 .session_id
                 .as_deref()
                 .is_some_and(|sid| orphan_chat_ids.contains(sid)),
@@ -167,12 +167,21 @@ fn is_plugin_run(entry: &LogEntry) -> bool {
             .is_some_and(|t| !KNOWN_TOOLS.contains(&t))
 }
 
+/// The built-in agent's logs.db source. `"code"` is written post-rename;
+/// `"chat"` is the pre-rename value still on disk in existing users' logs.db.
+pub(crate) fn is_code_source(source: &str) -> bool {
+    matches!(source, "code" | "chat")
+}
+
 /// Bracket-column label for a logs.db row. Plugin coding-agent runs use their
-/// tool name (`[omp]`) so they read like native agents; everything else uses
-/// its source (`[chat]`, `[run]`, `[serve]`).
+/// tool name (`[omp]`) so they read like native agents; the built-in agent
+/// normalizes to `[code]` (legacy `chat` rows included); everything else uses
+/// its source (`[run]`, `[serve]`).
 fn log_bracket_label(entry: &LogEntry) -> &str {
     if is_plugin_run(entry) {
         entry.tool.as_deref().unwrap_or("run")
+    } else if is_code_source(&entry.source) {
+        "code"
     } else {
         entry.source.as_str()
     }
@@ -183,8 +192,8 @@ fn log_bracket_label(entry: &LogEntry) -> &str {
 /// picker labels stay in sync with `aivo logs` printing.
 fn log_row_detail(entry: &LogEntry) -> String {
     match entry.source.as_str() {
-        "chat" => {
-            let title = entry.title.clone().unwrap_or_else(|| "(chat)".to_string());
+        "chat" | "code" => {
+            let title = entry.title.clone().unwrap_or_else(|| "(code)".to_string());
             let suffix = format_token_summary(entry);
             if suffix.is_empty() {
                 title
@@ -275,7 +284,7 @@ impl LogsCommand {
     /// `aivo logs prune` — delete chat events in logs.db whose session file
     /// has been removed. Confirms unless `--force` is set.
     async fn prune_orphans(&self, args: &LogsArgs) -> Result<ExitCode> {
-        let orphan_ids = compute_orphan_chat_ids(&self.session_store).await;
+        let orphan_ids = compute_orphan_code_ids(&self.session_store).await;
         if orphan_ids.is_empty() {
             println!("{} No orphan chat events found.", style::green("✓"));
             return Ok(ExitCode::Success);
@@ -303,7 +312,7 @@ impl LogsCommand {
         let deleted = self
             .session_store
             .logs()
-            .delete_chat_events_by_session_ids(&ids)
+            .delete_code_events_by_session_ids(&ids)
             .await?;
         println!(
             "{} Deleted {} chat event(s) from logs.db.",
@@ -440,7 +449,7 @@ impl LogsCommand {
             return Ok(ExitCode::Success);
         }
 
-        let orphan_chat_ids = compute_orphan_chat_ids(&self.session_store).await;
+        let orphan_chat_ids = compute_orphan_code_ids(&self.session_store).await;
         render_unified_rows(&rows, &orphan_chat_ids, &run_meta);
         Ok(ExitCode::Success)
     }
@@ -473,7 +482,7 @@ impl LogsCommand {
                     style::dim("(Ctrl+C to stop)")
                 );
                 println!();
-                let orphan_chat_ids = compute_orphan_chat_ids(&self.session_store).await;
+                let orphan_chat_ids = compute_orphan_code_ids(&self.session_store).await;
                 render_unified_rows(&rows, &orphan_chat_ids, &run_meta);
                 io::stdout().flush()?;
             }
@@ -514,7 +523,7 @@ fn print_help_overview() {
     println!(
         "{}",
         style::dim(
-            "Unified session list — aivo chat + native CLI sessions (claude, codex, gemini, pi, opencode). Use --by run / --by serve for launch events."
+            "Unified session list — aivo code + native CLI sessions (claude, codex, gemini, pi, opencode). Use --by run / --by serve for launch events."
         )
     );
     println!();
@@ -820,8 +829,8 @@ fn print_summary(entry: &LogEntry, id_width: usize, detail_width: usize, is_orph
     // so `is_control()`-based whitespace collapse can't strip ANSI escape
     // bytes out of the suffix and leave bare `[2m…[0m` literals on screen.
     let (text, dim_suffix): (String, String) = match entry.source.as_str() {
-        "chat" => (
-            entry.title.clone().unwrap_or_else(|| "(chat)".to_string()),
+        "chat" | "code" => (
+            entry.title.clone().unwrap_or_else(|| "(code)".to_string()),
             format_token_summary(entry),
         ),
         "run" => {
@@ -1001,7 +1010,7 @@ fn display_id(entry: &LogEntry) -> &str {
     // `aivo share`'s resolver expects and what the chat picker / session
     // files use. Falls back to the logs.db row id for legacy events that
     // pre-date the `session_id` linkage column.
-    if entry.source == "chat"
+    if is_code_source(&entry.source)
         && let Some(sid) = entry.session_id.as_deref()
     {
         return sid;
@@ -1125,7 +1134,7 @@ async fn print_entry(entry: &LogEntry, store: &SessionStore) {
 /// sessions are persisted within ~1s of the log row, so the match is reliable
 /// when both still exist on disk.
 async fn inferred_chat_session(entry: &LogEntry, store: &SessionStore) -> Option<String> {
-    if entry.source != "chat" {
+    if !is_code_source(&entry.source) {
         return None;
     }
     let cwd = entry.cwd.as_deref()?;
@@ -1230,11 +1239,11 @@ async fn fetch_logs_rows(
     let mut entries = collapse_chat_sessions(entries);
 
     // Sessions whose every turn was cancelled/interrupted never log a `chat_turn`
-    // row; pull them off disk so the listing matches `aivo chat --resume`.
-    if plan.includes_chat() && !args.errors {
+    // row; pull them off disk so the listing matches `aivo code --resume`.
+    if plan.includes_code() && !args.errors {
         let logged: HashSet<String> = entries
             .iter()
-            .filter(|e| e.source == "chat")
+            .filter(|e| is_code_source(&e.source))
             .filter_map(|e| e.session_id.clone())
             .collect();
         let extra = fetch_unlogged_chat_rows(store, args, cwd_filter.as_deref(), &logged).await;
@@ -1285,18 +1294,18 @@ async fn fetch_unlogged_chat_rows(
         .collect()
 }
 
-/// Project a `SessionIndexEntry` onto a `source="chat"` `LogEntry` so it renders
-/// and merges like a logged chat turn (id = session UUID; cumulative tokens).
+/// Project a `SessionIndexEntry` onto a `source="code"` `LogEntry` so it renders
+/// and merges like a logged code turn (id = session UUID; cumulative tokens).
 fn synthesize_chat_log_entry(e: SessionIndexEntry, key_name: Option<String>) -> LogEntry {
     LogEntry {
         id: e.session_id.clone(),
         ts_utc: e.updated_at,
-        source: "chat".to_string(),
-        kind: "chat_session".to_string(),
+        source: "code".to_string(),
+        kind: "code_session".to_string(),
         key_id: Some(e.key_id),
         key_name,
         base_url: Some(e.base_url),
-        tool: Some("chat".to_string()),
+        tool: Some("code".to_string()),
         model: Some(e.model),
         cwd: Some(e.cwd),
         session_id: Some(e.session_id),
@@ -1387,7 +1396,7 @@ fn collapse_chat_sessions(entries: Vec<LogEntry>) -> Vec<LogEntry> {
     let mut seen = HashSet::new();
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
-        if entry.source == "chat"
+        if is_code_source(&entry.source)
             && let Some(sid) = entry.session_id.as_deref()
             && !seen.insert(sid.to_string())
         {
@@ -1445,15 +1454,15 @@ async fn fetch_native_rows(
 /// longer have a session file on disk. Used to tag stale rows in the
 /// listing and to refuse `aivo logs share` with a useful pointer. Returns
 /// an empty set on any error — orphan tagging is decoration, not safety.
-pub(crate) async fn compute_orphan_chat_ids(store: &SessionStore) -> HashSet<String> {
-    let log_ids = match store.logs().distinct_chat_session_ids().await {
+pub(crate) async fn compute_orphan_code_ids(store: &SessionStore) -> HashSet<String> {
+    let log_ids = match store.logs().distinct_code_session_ids().await {
         Ok(ids) => ids,
         Err(_) => return HashSet::new(),
     };
     if log_ids.is_empty() {
         return HashSet::new();
     }
-    let disk_ids = store.chat_session_ids_on_disk().await;
+    let disk_ids = store.code_session_ids_on_disk().await;
     log_ids
         .into_iter()
         .filter(|id| !disk_ids.contains(id))
@@ -1565,9 +1574,9 @@ struct SourcePlan {
     logs: bool,
     /// Effective `LogQuery.by` when `logs` is true. `None` = no SQL-level
     /// source filter; `Some(s)` = restrict to that source/tool. Default
-    /// is `Some("chat")` so the unified view shows chat *sessions* but
-    /// not run/serve events (those have their own views via explicit
-    /// `--by run` / `--by serve`).
+    /// is `Some("code")` so the unified view shows the built-in agent's
+    /// *sessions* (legacy `chat`-sourced rows included) but not run/serve
+    /// events (those have their own views via explicit `--by run` / `--by serve`).
     logs_by: Option<String>,
     native: bool,
     /// Include `[run]` rows for plugin (non-native) tools in the unified view.
@@ -1592,8 +1601,17 @@ impl SourcePlan {
         let native;
         let plugin_runs;
         match by {
+            // The built-in agent. `chat` is the pre-rename alias; normalize it
+            // to `code` so the query shim (`source in ('chat','code')`) picks up
+            // both old and new rows either way.
+            Some("code") | Some("chat") => {
+                logs = true;
+                logs_by = Some("code".to_string());
+                native = false;
+                plugin_runs = false;
+            }
             // Explicit logs.db source.
-            Some(name @ ("chat" | "run" | "serve")) => {
+            Some(name @ ("run" | "serve")) => {
                 logs = true;
                 logs_by = Some(name.to_string());
                 native = false;
@@ -1642,7 +1660,7 @@ impl SourcePlan {
                 logs_by = if strict_logs {
                     None
                 } else {
-                    Some("chat".to_string())
+                    Some("code".to_string())
                 };
                 native = !strict_logs;
                 plugin_runs = !strict_logs;
@@ -1666,11 +1684,11 @@ impl SourcePlan {
     fn include_native(&self) -> bool {
         self.native
     }
-    /// Chat rows in scope: the default view (`Some("chat")`) or a strict-logs
-    /// audit opened to every source (`None`). Run/serve/cli/plugin plans exclude
-    /// chat. Gates whether on-disk-only sessions get synthesized in.
-    fn includes_chat(&self) -> bool {
-        self.logs && matches!(self.logs_by.as_deref(), None | Some("chat"))
+    /// Code-agent rows in scope: the default view (`Some("code")`) or a
+    /// strict-logs audit opened to every source (`None`). Run/serve/cli/plugin
+    /// plans exclude them. Gates whether on-disk-only sessions get synthesized in.
+    fn includes_code(&self) -> bool {
+        self.logs && matches!(self.logs_by.as_deref(), None | Some("code"))
     }
 }
 
@@ -2146,10 +2164,10 @@ mod tests {
     fn synthesized_chat_row_renders_like_a_logged_one() {
         let entry = chat_entry("a3476c91-uuid", "/repo", "fugu", "cpg");
         let row = synthesize_chat_log_entry(entry, Some("sakana".to_string()));
-        assert_eq!(row.source, "chat");
+        assert_eq!(row.source, "code");
         // display_id keys on the session UUID, not the row id.
         assert_eq!(display_id(&row), "a3476c91-uuid");
-        assert_eq!(log_bracket_label(&row), "chat");
+        assert_eq!(log_bracket_label(&row), "code");
         assert_eq!(format_token_summary(&row), "(0\u{2192}3057 tokens)");
         assert!(log_row_detail(&row).starts_with("investigate cancel bug"));
     }
@@ -2206,15 +2224,15 @@ mod tests {
 
     #[test]
     fn source_plan_includes_chat_only_for_chat_scoped_plans() {
-        assert!(SourcePlan::from_args(&base_args()).includes_chat());
-        assert!(SourcePlan::from_args(&logs_args_by(Some("chat"))).includes_chat());
+        assert!(SourcePlan::from_args(&base_args()).includes_code());
+        assert!(SourcePlan::from_args(&logs_args_by(Some("chat"))).includes_code());
         // Strict-logs (audit) reopens logs.db to every source, chat included.
         let mut args = base_args();
         args.model = Some("fugu".to_string());
-        assert!(SourcePlan::from_args(&args).includes_chat());
-        assert!(!SourcePlan::from_args(&logs_args_by(Some("run"))).includes_chat());
-        assert!(!SourcePlan::from_args(&logs_args_by(Some("serve"))).includes_chat());
-        assert!(!SourcePlan::from_args(&logs_args_by(Some("claude"))).includes_chat());
+        assert!(SourcePlan::from_args(&args).includes_code());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("run"))).includes_code());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("serve"))).includes_code());
+        assert!(!SourcePlan::from_args(&logs_args_by(Some("claude"))).includes_code());
     }
 
     #[test]
@@ -2379,7 +2397,7 @@ mod tests {
         // No --by: chat sessions + native + plugin runs, the unchanged default.
         let plan = SourcePlan::from_args(&logs_args_by(None));
         assert!(plan.include_logs());
-        assert_eq!(plan.logs_by().as_deref(), Some("chat"));
+        assert_eq!(plan.logs_by().as_deref(), Some("code"));
         assert!(plan.include_native());
         assert!(plan.plugin_runs);
     }

@@ -53,7 +53,7 @@ fn render_jump_to_bottom(frame: &mut Frame<'_>, area: Rect) -> Option<Rect> {
     Some(rect)
 }
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) fn is_transcript_empty(&self) -> bool {
         self.history.is_empty()
             && self.pending_response.is_empty()
@@ -1561,7 +1561,7 @@ impl ChatTuiApp {
         let content_width = width.saturating_sub(1).max(1);
         let mut height = if let Some(loading) = &self.loading_resume {
             let mut rows = vec![
-                "Loading saved chat…".to_string(),
+                "Loading saved session…".to_string(),
                 loading.preview.title.clone(),
                 plain_text_from_spans(&resume_metadata_spans(
                     &loading.preview,
@@ -1573,6 +1573,12 @@ impl ChatTuiApp {
             wrap_plain_lines(&rows, content_width).len() as u16
         } else {
             let mut rows = self.transcript_intro_lines();
+            // Reserve the chip + tip height too, matching `render_empty_state`.
+            rows.extend(
+                self.welcome_status_lines()
+                    .iter()
+                    .map(|line| plain_text_from_spans(&line.spans)),
+            );
             rows.extend(self.notice_plain_lines(content_width));
             wrap_plain_lines(&rows, content_width).len() as u16
         };
@@ -1747,7 +1753,7 @@ impl ChatTuiApp {
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " saved chat…",
+                        " saved session…",
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -1776,6 +1782,10 @@ impl ChatTuiApp {
         };
 
         let mut lines = lines;
+        // Chip + tip on the fresh welcome only, never the resume-loading screen.
+        if self.loading_resume.is_none() {
+            lines.extend(self.welcome_status_lines());
+        }
         if let Some(spans) = notice_spans(self.notice.as_ref()) {
             lines.push(Line::from(""));
             lines.push(Line::from(spans));
@@ -1785,6 +1795,37 @@ impl ChatTuiApp {
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
             content_area,
         );
+    }
+
+    /// The `N skills · M MCP` capability chip, or `None` when neither is configured.
+    pub(super) fn welcome_capabilities_label(&self) -> Option<String> {
+        let skills = self.skill_commands.len();
+        let mcp = self.mcp_configured_count;
+        let mut parts: Vec<String> = Vec::new();
+        if skills > 0 {
+            let noun = if skills == 1 { "skill" } else { "skills" };
+            parts.push(format!("{skills} {noun}"));
+        }
+        if mcp > 0 {
+            parts.push(format!("{mcp} MCP"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
+    /// Blank spacer, optional capability chip, then the rotating tip. Must stay in
+    /// lockstep with `empty_state_height`, which measures the same lines.
+    fn welcome_status_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from("")];
+        if let Some(chip) = self.welcome_capabilities_label() {
+            lines.push(Line::from(Span::styled(chip, Style::default().fg(MUTED))));
+        }
+        let tip = WELCOME_TIPS[self.welcome_tip_index % WELCOME_TIPS.len()];
+        lines.push(Line::from(vec![
+            // MUTED hint (up from FAINT) so the tip reads on dim terminals.
+            Span::styled("✶ Tip  ", Style::default().fg(ACCENT)),
+            Span::styled(tip.to_string(), Style::default().fg(MUTED)),
+        ]));
+        lines
     }
 
     pub(super) fn render_composer_text(&self) -> Text<'static> {
@@ -1912,7 +1953,7 @@ impl ChatTuiApp {
         } else {
             0
         } + if plain_chat {
-            display_width(PLAIN_CHAT_BADGE) as u16 + glue
+            display_width(PLAIN_CODE_BADGE) as u16 + glue
         } else {
             0
         };
@@ -1944,7 +1985,7 @@ impl ChatTuiApp {
                 }
                 if plain_chat {
                     spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-                    spans.push(Span::styled(PLAIN_CHAT_BADGE, Style::default().fg(USER)));
+                    spans.push(Span::styled(PLAIN_CODE_BADGE, Style::default().fg(USER)));
                 }
             }
         }
@@ -2106,6 +2147,13 @@ impl ChatTuiApp {
                 self.last_usage
             };
             return (format_token_count(used, usage), MUTED);
+        }
+        // Fresh session: show the window size, not an empty `0 / 1M · 0%` meter.
+        if used == 0 {
+            return (
+                format!("{} context", format_token_count_value(self.context_window)),
+                MUTED,
+            );
         }
         let pct = (used.saturating_mul(100) / self.context_window).min(100);
         // Mark estimate-only figures (cursor ACP / agents without reported usage):

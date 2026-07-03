@@ -1,6 +1,6 @@
 use super::*;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     pub(super) fn render_command_menu(
         &self,
         frame: &mut Frame<'_>,
@@ -317,7 +317,7 @@ impl ChatTuiApp {
 
         // Intro — what the surface is, in one line (the footer already notes Esc).
         lines.push(Line::from(Span::styled(
-            "Chat with the model, or type a command. Enter sends.",
+            "Message the model, or type a command. Enter sends.",
             Style::default().fg(TEXT),
         )));
 
@@ -576,7 +576,7 @@ impl ChatTuiApp {
             .filter(|i| self.config_setting_enabled(i.setting))
             .count();
         let input_line = Line::from(Span::styled(
-            "Chat settings — remembered across sessions",
+            "Settings — remembered across sessions",
             Style::default().fg(MUTED),
         ));
 
@@ -1258,7 +1258,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
     (
         "Session",
         &[
-            ("Ctrl+R", "resume a saved chat"),
+            ("Ctrl+R", "resume a saved session"),
             ("Shift+Tab", "toggle agent auto-approve"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),

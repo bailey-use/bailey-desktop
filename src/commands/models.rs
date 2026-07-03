@@ -825,7 +825,7 @@ fn models_from_cache(ids: Vec<String>, metadata: HashMap<String, ModelMetadata>)
 
 /// Best-effort warm of the per-model metadata cache (context window, pricing)
 /// for a key's full catalog, so `model_metadata::resolve_limits` can answer
-/// from cache without a picker/`aivo models` run first. Used by `aivo chat` to
+/// from cache without a picker/`aivo models` run first. Used by `aivo code` to
 /// populate the footer context-utilization stat on the `-m <model>` path, which
 /// otherwise never fetches the catalog. Silently no-ops on fetch failure.
 pub(crate) async fn warm_full_catalog_metadata(client: &Client, key: &ApiKey, cache: &ModelsCache) {

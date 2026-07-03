@@ -47,7 +47,7 @@ src/main.rs → SessionStore → EnvironmentInjector → AILauncher → Command 
 ```
 
 - **`src/`**: Entry point, CLI parsing, error handling, TUI components, styling
-- **`src/commands/`**: `run` (launch tools), `start` (interactive picker), `chat` (chat TUI + one-shot), `keys`, `serve`, `info`, `models`, `alias`, `logs`, `stats`, `update`
+- **`src/commands/`**: `run` (launch tools), `start` (interactive picker), `code` (coding-agent TUI + one-shot), `keys`, `serve`, `info`, `models`, `alias`, `logs`, `stats`, `update`
 - **`src/services/`**: Session/key/stats storage, AI process launching, provider routing/bridging (Anthropic, OpenAI, Gemini, Copilot, Ollama), model name transforms, HTTP utilities
 
 **Data model**: `ApiKey` (`id`, `name`, `base_url`, `key`, `created_at`) stored AES-256-GCM encrypted in `~/.config/aivo/config.json`. Sentinel `base_url` values `"copilot"` and `"ollama"` identify special provider types.

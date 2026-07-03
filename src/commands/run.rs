@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use reqwest::Client;
 
-use crate::commands::chat_tui_format::format_time_ago_short_dt;
+use crate::commands::code_tui_format::format_time_ago_short_dt;
 use crate::commands::models::resolve_model_placeholder;
 use crate::commands::{print_launch_preview, trim_to_one_line};
 use crate::errors::ExitCode;

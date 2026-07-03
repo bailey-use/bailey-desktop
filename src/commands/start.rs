@@ -4,7 +4,7 @@ use anyhow::Result;
 use console::{Key, Term};
 
 use crate::cli::parse_env_vars;
-use crate::commands::ChatCommand;
+use crate::commands::CodeCommand;
 use crate::commands::keys::prompt_pick_key_without_activation;
 use crate::commands::models::{model_display_label, resolve_model_placeholder};
 use crate::commands::print_launch_preview;
@@ -37,7 +37,7 @@ struct Resolved<T> {
 /// plugin dispatch).
 enum StartTool {
     Native(AIToolType),
-    Chat,
+    Code,
     Plugin(String),
 }
 
@@ -45,7 +45,7 @@ impl StartTool {
     fn name(&self) -> &str {
         match self {
             StartTool::Native(tool) => tool.as_str(),
-            StartTool::Chat => "chat",
+            StartTool::Code => "code",
             StartTool::Plugin(name) => name,
         }
     }
@@ -98,7 +98,7 @@ impl StartCommand {
             StartTool::Plugin(name) => return self.dispatch_plugin(&name, &args).await,
             // The in-process chat agent owns its model picker, sandbox, and
             // conversation loop — hand off the resolved key + model flags.
-            StartTool::Chat => return self.dispatch_chat(&args).await,
+            StartTool::Code => return self.dispatch_code(&args).await,
             StartTool::Native(t) => Resolved {
                 value: t,
                 interactive: tool.interactive,
@@ -337,8 +337,8 @@ impl StartCommand {
     ) -> Result<Resolved<StartTool>> {
         let plugins = crate::plugin::launchable_coding_agents();
         let parse = |name: &str| -> Option<StartTool> {
-            if name.eq_ignore_ascii_case("chat") {
-                Some(StartTool::Chat)
+            if name.eq_ignore_ascii_case("code") || name.eq_ignore_ascii_case("chat") {
+                Some(StartTool::Code)
             } else if let Some(tool) = AIToolType::parse(name) {
                 Some(StartTool::Native(tool))
             } else if plugins.iter().any(|p| p == name) {
@@ -427,9 +427,9 @@ impl StartCommand {
 
     /// Launch aivo's in-process chat agent. Resolves the key the same way the
     /// native launch flow does (honoring `-k`, the last selection, then the
-    /// active key) and forwards the model; `aivo chat` owns its own model
+    /// active key) and forwards the model; `aivo code` owns its own model
     /// picker, sandbox, and conversation loop from there.
-    async fn dispatch_chat(&self, args: &StartFlowArgs) -> Result<ExitCode> {
+    async fn dispatch_code(&self, args: &StartFlowArgs) -> Result<ExitCode> {
         // An `hf:`/local-gguf model runs against a synthetic local key, so the
         // real key store is irrelevant — skip resolution (which would otherwise
         // error for a user with no keys yet) and let chat spawn llama-server.
@@ -455,7 +455,7 @@ impl StartCommand {
             None if args.key.is_some() => Some(String::new()),
             None => None,
         };
-        let command = ChatCommand::new(self.session_store.clone(), self.cache.clone());
+        let command = CodeCommand::new(self.session_store.clone(), self.cache.clone());
         Ok(command
             .execute(
                 model,
@@ -595,8 +595,8 @@ impl StartCommand {
 /// unit-tested.
 fn builtin_tool_entries() -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = vec![(
-        "chat".to_string(),
-        "aivo's built-in chat agent (no install needed).".to_string(),
+        "code".to_string(),
+        "aivo's built-in coding agent (no install needed).".to_string(),
     )];
     entries.extend(
         AIToolType::all()
@@ -697,11 +697,11 @@ mod tests {
     }
 
     #[test]
-    fn chat_leads_the_builtin_picker_rows() {
+    fn code_leads_the_builtin_picker_rows() {
         let entries = super::builtin_tool_entries();
         // aivo's own agent is the headline row, ahead of the native tools.
-        assert_eq!(entries[0].0, "chat");
-        assert!(!entries[0].1.is_empty(), "chat row carries a description");
+        assert_eq!(entries[0].0, "code");
+        assert!(!entries[0].1.is_empty(), "code row carries a description");
         // The native tools still follow it.
         assert!(entries.iter().any(|(name, _)| name == "claude"));
         assert!(entries.iter().any(|(name, _)| name == "codex"));

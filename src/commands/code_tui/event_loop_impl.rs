@@ -1,7 +1,7 @@
 use super::*;
 use crate::services::route_cache::PersistedRoute;
 
-impl ChatTuiApp {
+impl CodeTuiApp {
     /// Drains queued runtime events; `true` if any were handled (caller repaints).
     pub(super) async fn handle_runtime_events(&mut self) -> Result<bool> {
         let mut handled = false;
@@ -894,7 +894,7 @@ impl ChatTuiApp {
     /// Persist the plain-chat turn's learned route, if new/changed.
     async fn persist_chat_route(&mut self) {
         if let Some(route) = chat_route_to_persist(&self.key, &self.raw_model, &self.format) {
-            self.apply_chat_routes("chat", vec![route]).await;
+            self.apply_chat_routes("code", vec![route]).await;
         }
     }
 
@@ -960,7 +960,7 @@ impl ChatTuiApp {
         self.session_store
             .record_tokens(
                 &self.key.id,
-                Some("chat"),
+                Some("code"),
                 Some(stats_model),
                 usage.prompt_tokens,
                 usage.completion_tokens,
@@ -1174,6 +1174,11 @@ impl ChatTuiApp {
             }
 
             self.tick_status_throttle();
+
+            // Rotate the welcome tip on its interval (cheap at the idle cadence).
+            if self.tick_welcome_tip() {
+                needs_redraw = true;
+            }
 
             // Animations repaint without input.
             if self.is_animating() {

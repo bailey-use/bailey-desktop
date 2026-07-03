@@ -158,54 +158,65 @@ fn keys_add_with_all_flags() {
 
 #[test]
 fn chat_prompt_short_flag() {
-    let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hello world"]).unwrap();
-    if let Some(Commands::Chat(args)) = cli.command {
+    let cli = Cli::try_parse_from(["aivo", "code", "-p", "hello world"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
         assert_eq!(args.prompt, Some("hello world".to_string()));
     } else {
-        panic!("Expected Chat command");
+        panic!("Expected Code command");
+    }
+}
+
+#[test]
+fn chat_is_hidden_alias_for_code() {
+    // The pre-rename `aivo chat` verb still resolves to the `code` command.
+    let cli = Cli::try_parse_from(["aivo", "chat", "-p", "hi"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
+        assert_eq!(args.prompt, Some("hi".to_string()));
+    } else {
+        panic!("Expected `chat` to alias the Code command");
     }
 }
 
 #[test]
 fn chat_prompt_legacy_x_alias() {
-    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hello world"]).unwrap();
-    if let Some(Commands::Chat(args)) = cli.command {
+    let cli = Cli::try_parse_from(["aivo", "code", "-x", "hello world"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
         assert_eq!(args.prompt, Some("hello world".to_string()));
     } else {
-        panic!("Expected Chat command");
+        panic!("Expected Code command");
     }
 }
 
 #[test]
 fn chat_model_key_and_prompt() {
     let cli =
-        Cli::try_parse_from(["aivo", "chat", "-k", "my-key", "-m", "gpt-4o", "-p", "hi"]).unwrap();
-    if let Some(Commands::Chat(args)) = cli.command {
+        Cli::try_parse_from(["aivo", "code", "-k", "my-key", "-m", "gpt-4o", "-p", "hi"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
         assert_eq!(args.key, Some("my-key".to_string()));
         assert_eq!(args.model, Some("gpt-4o".to_string()));
         assert_eq!(args.prompt, Some("hi".to_string()));
     } else {
-        panic!("Expected Chat command");
+        panic!("Expected Code command");
     }
 }
 
 #[test]
 fn chat_empty_model_triggers_picker() {
-    let cli = Cli::try_parse_from(["aivo", "chat", "--model"]).unwrap();
-    if let Some(Commands::Chat(args)) = cli.command {
+    let cli = Cli::try_parse_from(["aivo", "code", "--model"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
         assert_eq!(args.model, Some(String::new()));
     } else {
-        panic!("Expected Chat command");
+        panic!("Expected Code command");
     }
 }
 
 #[test]
 fn chat_json_flag_parses() {
-    let cli = Cli::try_parse_from(["aivo", "chat", "-x", "hi", "--json"]).unwrap();
-    if let Some(Commands::Chat(args)) = cli.command {
+    let cli = Cli::try_parse_from(["aivo", "code", "-x", "hi", "--json"]).unwrap();
+    if let Some(Commands::Code(args)) = cli.command {
         assert!(args.json);
     } else {
-        panic!("Expected Chat command");
+        panic!("Expected Code command");
     }
 }
 

@@ -895,7 +895,7 @@ fn plugin_serve(key: &ApiKey) -> PluginServe {
 /// The remembered model for `key`, preferring the shared `last_selection` (the
 /// per-key model native `aivo run` writes — so a coding-agent plugin and a native
 /// tool agree on the model for a key) and falling back to the per-key `chat_model`
-/// (`aivo chat` and an explicit plugin `-m` also write it). The `__default__`
+/// (`aivo code` and an explicit plugin `-m` also write it). The `__default__`
 /// sentinel — a native "let the tool choose" pin — isn't a concrete model a plugin
 /// can run, so it's skipped in favor of the fallback.
 async fn remembered_plugin_model(store: &SessionStore, key: &ApiKey) -> Option<String> {
@@ -907,7 +907,7 @@ async fn remembered_plugin_model(store: &SessionStore, key: &ApiKey) -> Option<S
     {
         return Some(m);
     }
-    store.get_chat_model(&key.id).await.ok().flatten()
+    store.get_code_model(&key.id).await.ok().flatten()
 }
 
 /// Resolve the model for a coding-agent plugin. Unlike native tools (which fall
@@ -916,7 +916,7 @@ async fn remembered_plugin_model(store: &SessionStore, key: &ApiKey) -> Option<S
 /// reuses the key's remembered model (see `remembered_plugin_model`); otherwise
 /// the picker opens — delegating to the shared `resolve_model_outcome`. The picked
 /// model is persisted by `dispatch`'s shared last-selection write (plus the
-/// `chat_model` written here for `aivo chat` interop / fallback). `None` only when
+/// `chat_model` written here for `aivo code` interop / fallback). `None` only when
 /// nothing resolves (bare launch, nothing saved, no picker) — the plugin then asks
 /// the user to pass `-m`. Under `dry_run` nothing is persisted and the picker never
 /// opens: a saved model is reused, else `None` (the preview shows `(needs -m)`).
@@ -934,7 +934,7 @@ async fn resolve_plugin_model(
     // --dry-run, which must not mutate saved state.
     if let Some(m) = model_flag.as_deref().filter(|s| !s.is_empty()) {
         if !dry_run {
-            let _ = store.set_chat_model(&key.id, m).await;
+            let _ = store.set_code_model(&key.id, m).await;
         }
         return Some(m.to_string());
     }
@@ -967,7 +967,7 @@ async fn resolve_plugin_model(
     .await
     {
         Ok(ModelOutcome::Model(m)) => {
-            let _ = store.set_chat_model(&key.id, &m).await;
+            let _ = store.set_code_model(&key.id, &m).await;
             Some(m)
         }
         // Picker cancelled — don't launch (parity with `aivo run`).
@@ -1641,7 +1641,7 @@ mod tests {
         let k = store.get_key_by_id_info(&id).await.unwrap().unwrap();
 
         // chat_model only → it's the fallback.
-        store.set_chat_model(&id, "chat-pinned").await.unwrap();
+        store.set_code_model(&id, "chat-pinned").await.unwrap();
         assert_eq!(
             super::remembered_plugin_model(&store, &k).await.as_deref(),
             Some("chat-pinned"),

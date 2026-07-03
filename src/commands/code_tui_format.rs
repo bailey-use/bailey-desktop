@@ -6,8 +6,8 @@ use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::commands::chat::ChatMessage;
-use crate::commands::chat_response_parser::TokenUsage;
+use crate::commands::code::ChatMessage;
+use crate::commands::code_response_parser::TokenUsage;
 
 /// Formats a live elapsed clock for the in-stream status line, scaling the
 /// units up as the wait grows so a long turn reads `12m 50s` / `1h 23m` /
@@ -336,7 +336,7 @@ mod tests {
         format_time_ago_short, format_token_count, format_token_count_value, git_branch_for,
         truncate_for_display_width, truncate_for_width, wrapped_text_line_count,
     };
-    use crate::commands::chat::TokenUsage;
+    use crate::commands::code::TokenUsage;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
 

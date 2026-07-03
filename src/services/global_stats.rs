@@ -1062,7 +1062,8 @@ pub fn tool_display_name(tool: &str) -> &str {
         "gemini" => "Gemini",
         "opencode" => "OpenCode",
         "pi" => "Pi",
-        "chat" => "Chat",
+        // `chat` is the pre-rename bucket; both render as the built-in agent.
+        "chat" | "code" => "Code",
         _ => tool,
     }
 }
@@ -1480,7 +1481,9 @@ mod tests {
         assert_eq!(tool_display_name("codex"), "Codex");
         assert_eq!(tool_display_name("gemini"), "Gemini");
         assert_eq!(tool_display_name("pi"), "Pi");
-        assert_eq!(tool_display_name("chat"), "Chat");
+        assert_eq!(tool_display_name("code"), "Code");
+        // Pre-rename bucket still renders as the built-in agent.
+        assert_eq!(tool_display_name("chat"), "Code");
         assert_eq!(tool_display_name("unknown"), "unknown");
     }
 

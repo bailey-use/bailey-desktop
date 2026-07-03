@@ -41,6 +41,7 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "keys",
     "account",
     "usage",
+    "code",
     "chat",
     "image",
     "video",

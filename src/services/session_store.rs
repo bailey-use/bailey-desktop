@@ -12,7 +12,7 @@ use crate::services::system_env;
 
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::atomic_write::atomic_write_secure;
-use crate::services::chat_session_store::ChatSessionStore;
+use crate::services::code_session_store::CodeSessionStore;
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::route_cache::PersistedRoute;
@@ -228,8 +228,19 @@ impl ApiKey {
     }
 
     /// Persisted routes for one tool, for seeding that router's `RouteCache`.
+    /// The built-in agent's routes were keyed under `"chat"` before the rename;
+    /// when asked for `"code"` and no `"code"` entry exists yet, fall back to the
+    /// legacy `"chat"` entry so a returning user keeps their learned routes.
     pub fn routes_for_tool(&self, tool: &str) -> BTreeMap<String, PersistedRoute> {
-        self.protocol_routes.get(tool).cloned().unwrap_or_default()
+        if let Some(routes) = self.protocol_routes.get(tool) {
+            return routes.clone();
+        }
+        if tool == "code"
+            && let Some(legacy) = self.protocol_routes.get("chat")
+        {
+            return legacy.clone();
+        }
+        BTreeMap::new()
     }
 
     pub fn short_id(&self) -> &str {
@@ -723,7 +734,7 @@ pub struct MessageAttachment {
     pub storage: AttachmentStorage,
 }
 
-/// The persisted `aivo chat` toggles, read together at startup (see
+/// The persisted `aivo code` toggles, read together at startup (see
 /// [`SessionStore::get_chat_toggles`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatToggles {
@@ -758,7 +769,7 @@ pub struct StoredChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ChatSessionState {
+pub struct CodeSessionState {
     #[serde(rename = "sessionId", default = "default_chat_session_id")]
     pub session_id: String,
     #[serde(rename = "keyId")]
@@ -774,7 +785,7 @@ pub struct ChatSessionState {
     /// conversation (assistant `tool_calls` + `tool` results with ids), for exact
     /// resume. Absent for non-agent chats and pre-feature sessions; a decrypt/parse
     /// failure is treated as absent (resume falls back to the lossy text seed).
-    /// Call [`ChatSessionState::decrypt_engine_messages`].
+    /// Call [`CodeSessionState::decrypt_engine_messages`].
     #[serde(
         rename = "engineMessages",
         default,
@@ -813,7 +824,7 @@ where
     }
 }
 
-impl ChatSessionState {
+impl CodeSessionState {
     /// Returns the number of messages. Returns 0 if empty or on decryption error.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn message_count(&self) -> usize {
@@ -983,12 +994,15 @@ pub struct StoredConfig {
     pub api_keys: Vec<ApiKey>,
     #[serde(rename = "active_key_id")]
     pub active_key_id: Option<String>,
+    // `alias` reads the pre-rename `chat_models` key so a config written by an
+    // older `aivo code` build still loads; new writes use `code_models`.
     #[serde(
-        rename = "chat_models",
+        rename = "code_models",
+        alias = "chat_models",
         default,
         skip_serializing_if = "HashMap::is_empty"
     )]
-    pub chat_models: HashMap<String, String>,
+    pub code_models: HashMap<String, String>,
     /// Legacy field — read from old configs but never written back.
     /// Replaced by `last_selection` (global single record).
     #[serde(
@@ -1022,12 +1036,12 @@ pub struct StoredConfig {
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
     #[serde(rename = "chat_sessions", default, skip_serializing)]
-    pub chat_sessions: HashMap<String, ChatSessionState>,
+    pub chat_sessions: HashMap<String, CodeSessionState>,
     /// Set to true when the user manually removes the aivo-starter key.
     /// Prevents auto-recreation until the user explicitly re-adds it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub starter_key_dismissed: bool,
-    /// Legacy seed for the `/skills` opt-outs. Storage moved to chat-prefs.json
+    /// Legacy seed for the `/skills` opt-outs. Storage moved to code-prefs.json
     /// (`disabledSkills`) so the high-frequency config.json writers (`run`/`start`/
     /// `serve`, key edits, route learning) — and any older aivo binary that predates
     /// the field — can't drop it on a cross-version round trip. `migrate_disabled_
@@ -1035,7 +1049,7 @@ pub struct StoredConfig {
     /// read fallback until then, but chat-prefs is authoritative once present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_skills: Vec<String>,
-    /// Legacy seed for the `/mcp` opt-outs. Moved to chat-prefs.json
+    /// Legacy seed for the `/mcp` opt-outs. Moved to code-prefs.json
     /// (`disabledMcpServers`) for the same reason as `disabled_skills`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_mcp_servers: Vec<String>,
@@ -1137,7 +1151,7 @@ impl StoredConfig {
         Self {
             api_keys: Vec::new(),
             active_key_id: None,
-            chat_models: HashMap::new(),
+            code_models: HashMap::new(),
             directory_starts: HashMap::new(),
             stats: UsageStats::default(),
             aliases: HashMap::new(),
@@ -1313,7 +1327,7 @@ fn json_str_array(arr: &[serde_json::Value]) -> Vec<String> {
 pub struct SessionStore {
     ctx: ConfigContext,
     api_keys: ApiKeyStore,
-    sessions: ChatSessionStore,
+    sessions: CodeSessionStore,
     stats: UsageStatsStore,
     last_sel: LastSelectionStore,
     logs: LogStore,
@@ -1347,7 +1361,7 @@ impl SessionStore {
     fn from_ctx(ctx: ConfigContext) -> Self {
         Self {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
-            sessions: ChatSessionStore { ctx: ctx.clone() },
+            sessions: CodeSessionStore { ctx: ctx.clone() },
             stats: UsageStatsStore::new(ctx.clone()),
             last_sel: LastSelectionStore { ctx: ctx.clone() },
             logs: LogStore::new(ctx.config_dir.clone()),
@@ -1636,7 +1650,7 @@ impl SessionStore {
             )
             .await
             .ok()?;
-        let _ = self.set_chat_model(&id, AIVO_STARTER_MODEL).await;
+        let _ = self.set_code_model(&id, AIVO_STARTER_MODEL).await;
         let key = self.get_key_by_id(&id).await.ok().flatten()?;
         Some((key, is_new_user))
     }
@@ -1649,7 +1663,7 @@ impl SessionStore {
         self.api_keys.ctx.save_raw(&config).await
     }
 
-    /// Skill names the user has turned off in `/skills`. Backed by chat-prefs.json
+    /// Skill names the user has turned off in `/skills`. Backed by code-prefs.json
     /// (`disabledSkills`) — see [`Self::get_disabled_list`].
     pub async fn get_disabled_skills(&self) -> Result<Vec<String>> {
         Ok(self.get_disabled_list("disabledSkills").await)
@@ -1662,7 +1676,7 @@ impl SessionStore {
             .await
     }
 
-    /// MCP server names the user has turned off in `/mcp`. Backed by chat-prefs.json
+    /// MCP server names the user has turned off in `/mcp`. Backed by code-prefs.json
     /// (`disabledMcpServers`) — see [`Self::get_disabled_list`].
     pub async fn get_disabled_mcp_servers(&self) -> Result<Vec<String>> {
         Ok(self.get_disabled_list("disabledMcpServers").await)
@@ -1675,7 +1689,7 @@ impl SessionStore {
             .await
     }
 
-    /// A "disabled names" list (skills or MCP servers) read from chat-prefs.json by
+    /// A "disabled names" list (skills or MCP servers) read from code-prefs.json by
     /// `key`. chat-prefs is an opaque JSON map that round-trips verbatim through any
     /// build (even an older chat that doesn't know the key), so — unlike the typed
     /// config.json — these can't be dropped on a cross-version write. Falls back to
@@ -1684,7 +1698,7 @@ impl SessionStore {
     /// field is ignored (and dropped on the next config write — it's `skip_serializing`).
     async fn get_disabled_list(&self, key: &str) -> Vec<String> {
         match self
-            .read_chat_prefs()
+            .read_code_prefs()
             .await
             .get(key)
             .and_then(serde_json::Value::as_array)
@@ -1696,9 +1710,9 @@ impl SessionStore {
 
     /// Toggle one `name` in the chat-prefs `key` list (idempotent), seeding from the
     /// legacy config.json field on the first write so no earlier opt-out is lost.
-    /// Writes only chat-prefs.json, leaving config.json (and the key store) untouched.
+    /// Writes only code-prefs.json, leaving config.json (and the key store) untouched.
     async fn set_disabled_list(&self, key: &str, name: &str, enabled: bool) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         let mut names = match prefs.get(key).and_then(serde_json::Value::as_array) {
             Some(arr) => json_str_array(arr),
             None => self.legacy_disabled(key).await,
@@ -1711,7 +1725,7 @@ impl SessionStore {
             key.to_string(),
             serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
         );
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
     /// The pre-migration value of a `disabled*` list still living in config.json.
@@ -1728,14 +1742,14 @@ impl SessionStore {
     }
 
     /// One-time move of the `/skills` + `/mcp` opt-outs from the legacy config.json
-    /// fields into chat-prefs.json. Run once at chat startup so an existing opt-out
+    /// fields into code-prefs.json. Run once at chat startup so an existing opt-out
     /// reaches the clobber-proof store promptly — before an older aivo binary (which
     /// drops the unknown config.json field) gets a chance to wipe it. Idempotent:
     /// a chat-prefs key that already exists wins and is never overwritten, and a
     /// legacy field that's empty/absent is skipped, so there's nothing to do on the
     /// common path. Best-effort; a write failure just defers to the read fallback.
     pub async fn migrate_disabled_toggles(&self) {
-        let prefs = self.read_chat_prefs().await;
+        let prefs = self.read_code_prefs().await;
         let need_skills = !prefs.contains_key("disabledSkills");
         let need_mcp = !prefs.contains_key("disabledMcpServers");
         if !need_skills && !need_mcp {
@@ -1762,7 +1776,7 @@ impl SessionStore {
                 to_json(config.disabled_mcp_servers),
             );
         }
-        let _ = self.write_chat_prefs(&prefs).await;
+        let _ = self.write_code_prefs(&prefs).await;
     }
 
     /// Gets all keys and the active key ID without decrypting secrets.
@@ -1776,20 +1790,20 @@ impl SessionStore {
     }
 
     /// Gets the persisted chat model for a specific API key
-    pub async fn get_chat_model(&self, key_id: &str) -> Result<Option<String>> {
-        self.api_keys.get_chat_model(key_id).await
+    pub async fn get_code_model(&self, key_id: &str) -> Result<Option<String>> {
+        self.api_keys.get_code_model(key_id).await
     }
 
     /// Saves the chat model for a specific API key
-    pub async fn set_chat_model(&self, key_id: &str, model: &str) -> Result<()> {
-        self.api_keys.set_chat_model(key_id, model).await
+    pub async fn set_code_model(&self, key_id: &str, model: &str) -> Result<()> {
+        self.api_keys.set_code_model(key_id, model).await
     }
 
-    /// Read a single boolean from chat-prefs.json, falling back to `default` when
+    /// Read a single boolean from code-prefs.json, falling back to `default` when
     /// the file or key is missing/unreadable. Shares the read+parse with
-    /// `read_chat_prefs` so each bool getter is one line and they can't drift.
+    /// `read_code_prefs` so each bool getter is one line and they can't drift.
     async fn get_chat_pref_bool(&self, key: &str, default: bool) -> bool {
-        self.read_chat_prefs()
+        self.read_code_prefs()
             .await
             .get(key)
             .and_then(serde_json::Value::as_bool)
@@ -1807,18 +1821,18 @@ impl SessionStore {
     /// (e.g. the project-MCP allow-list). Best-effort; written atomically via a
     /// temp file + rename so a crash can't truncate it.
     pub async fn set_chat_auto_approve(&self, on: bool) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         prefs.insert("autoApprove".into(), serde_json::Value::Bool(on));
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
-    /// The persisted thinking on/off toggle (remembered across `aivo chat`
-    /// sessions, set in the `/config` overlay). Shares chat-prefs.json with the
+    /// The persisted thinking on/off toggle (remembered across `aivo code`
+    /// sessions, set in the `/config` overlay). Shares code-prefs.json with the
     /// auto-approve flag. Defaults to ON — reasoning is high-signal feedback
     /// during the silent gaps before tool calls. Falls back to the legacy
     /// `showThinking` key so a pre-rename preference still applies.
     pub async fn get_chat_thinking_enabled(&self) -> bool {
-        let prefs = self.read_chat_prefs().await;
+        let prefs = self.read_code_prefs().await;
         prefs
             .get("thinkingEnabled")
             .or_else(|| prefs.get("showThinking"))
@@ -1829,31 +1843,31 @@ impl SessionStore {
     /// Persist the thinking toggle, preserving any sibling prefs. Best-effort,
     /// written atomically (same path/permissions as the auto-approve flag).
     pub async fn set_chat_thinking_enabled(&self, on: bool) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         prefs.insert("thinkingEnabled".into(), serde_json::Value::Bool(on));
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
     /// Persist the web_search toggle, preserving sibling prefs (atomic write).
     pub async fn set_chat_web_search_enabled(&self, on: bool) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         prefs.insert("useWebSearch".into(), serde_json::Value::Bool(on));
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
     pub async fn set_chat_agent_tools_enabled(&self, on: bool) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         prefs.insert("agentTools".into(), serde_json::Value::Bool(on));
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
     /// The persisted `/effort` reasoning level for `model` (remembered across
-    /// `aivo chat` sessions). Effort levels are model-specific, so they're stored
-    /// per-model under `reasoningEffort: {<model>: <level>}` in chat-prefs.json.
+    /// `aivo code` sessions). Effort levels are model-specific, so they're stored
+    /// per-model under `reasoningEffort: {<model>: <level>}` in code-prefs.json.
     /// `None` when unset — the engine then uses the model default. The caller
     /// still re-validates against the model's current level list.
     pub async fn get_chat_reasoning_effort(&self, model: &str) -> Option<String> {
-        self.read_chat_prefs()
+        self.read_code_prefs()
             .await
             .get("reasoningEffort")
             .and_then(|v| v.get(model))
@@ -1864,7 +1878,7 @@ impl SessionStore {
     /// Persist `model`'s `/effort` level (or clear it with `None`), preserving
     /// other models' levels and sibling prefs. Best-effort, written atomically.
     pub async fn set_chat_reasoning_effort(&self, model: &str, level: Option<&str>) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         let entry = prefs
             .entry("reasoningEffort")
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -1881,13 +1895,13 @@ impl SessionStore {
                 map.remove(model);
             }
         }
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
-    /// Both `aivo chat` toggles in a single read of chat-prefs.json, so startup
+    /// Both `aivo code` toggles in a single read of code-prefs.json, so startup
     /// doesn't open+parse the same file twice.
     pub async fn get_chat_toggles(&self) -> ChatToggles {
-        let prefs = self.read_chat_prefs().await;
+        let prefs = self.read_code_prefs().await;
         let bool_or = |key: &str, default: bool| {
             prefs
                 .get(key)
@@ -1909,27 +1923,36 @@ impl SessionStore {
         }
     }
 
-    /// chat-prefs.json as a JSON object (empty when absent/unparseable), for a
+    /// code-prefs.json as a JSON object (empty when absent/unparseable), for a
     /// read-modify-write that preserves keys other than the one being changed.
-    async fn read_chat_prefs(&self) -> serde_json::Map<String, serde_json::Value> {
-        let path = self.config_dir().join("chat-prefs.json");
-        tokio::fs::read(&path)
+    /// Falls back to the pre-rename `chat-prefs.json` so existing users keep
+    /// their toggles/allow-lists on first launch after the `chat`→`code` rename.
+    async fn read_code_prefs(&self) -> serde_json::Map<String, serde_json::Value> {
+        let dir = self.config_dir();
+        let read_obj = |path: std::path::PathBuf| async move {
+            tokio::fs::read(&path)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v.as_object().cloned())
+        };
+        if let Some(obj) = read_obj(dir.join("code-prefs.json")).await {
+            return obj;
+        }
+        read_obj(dir.join("chat-prefs.json"))
             .await
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.as_object().cloned())
             .unwrap_or_default()
     }
 
-    async fn write_chat_prefs(
+    async fn write_code_prefs(
         &self,
         prefs: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         let dir = self.config_dir();
         tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join("chat-prefs.json");
+        let path = dir.join("code-prefs.json");
         let data = serde_json::to_vec_pretty(prefs)?;
-        // chat-prefs holds the project-MCP allow-list and the auto-approve flag —
+        // code-prefs holds the project-MCP allow-list and the auto-approve flag —
         // security-relevant, so write it 0600 (and via a random-suffix temp that
         // leaves no orphan on a crash), like every other config write. A plain
         // `tokio::fs::write` would land at the process umask (typically 0644).
@@ -1942,11 +1965,11 @@ impl SessionStore {
     /// so they're gated until the user opts in once — and the approval is bound to
     /// the server content, so a later `.mcp.json` change (e.g. a `git pull` that
     /// swaps in a different command) no longer matches and re-prompts. Stored in
-    /// chat-prefs.json (non-secret, never the encrypted key store). Missing → false.
+    /// code-prefs.json (non-secret, never the encrypted key store). Missing → false.
     /// Legacy bare-string entries (dir only, no digest) never match — they expire
     /// to one re-approval rather than silently honoring a changed config.
     pub async fn get_project_mcp_approved(&self, dir_key: &str, digest: &str) -> bool {
-        self.read_chat_prefs()
+        self.read_code_prefs()
             .await
             .get("approvedProjectMcpDirs")
             .and_then(|v| v.as_array())
@@ -1962,7 +1985,7 @@ impl SessionStore {
     /// `digest`. Replaces any prior approval for the same dir so a re-approval
     /// after a config change supersedes (rather than accumulates) the old digest.
     pub async fn set_project_mcp_approved(&self, dir_key: &str, digest: &str) -> Result<()> {
-        let mut prefs = self.read_chat_prefs().await;
+        let mut prefs = self.read_code_prefs().await;
         let arr = prefs
             .entry("approvedProjectMcpDirs")
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
@@ -1970,7 +1993,7 @@ impl SessionStore {
             list.retain(|d| d.get("dir").and_then(|x| x.as_str()) != Some(dir_key));
             list.push(serde_json::json!({ "dir": dir_key, "sha256": digest }));
         }
-        self.write_chat_prefs(&prefs).await
+        self.write_code_prefs(&prefs).await
     }
 
     // ── Last selection (delegated to LastSelectionStore) ───────────────────
@@ -2035,15 +2058,15 @@ impl SessionStore {
             .await
     }
 
-    // ── Chat sessions (delegated to ChatSessionStore) ─────────────────────
+    // ── Chat sessions (delegated to CodeSessionStore) ─────────────────────
 
     #[allow(dead_code)]
     pub fn session_file_path(&self, session_id: &str) -> PathBuf {
         self.sessions.session_file_path(session_id)
     }
 
-    pub async fn get_chat_session(&self, session_id: &str) -> Result<Option<ChatSessionState>> {
-        self.sessions.get_chat_session(session_id).await
+    pub async fn get_code_session(&self, session_id: &str) -> Result<Option<CodeSessionState>> {
+        self.sessions.get_code_session(session_id).await
     }
 
     pub async fn list_chat_sessions(
@@ -2069,7 +2092,7 @@ impl SessionStore {
             .await
     }
 
-    pub async fn chat_session_ids_on_disk(&self) -> std::collections::HashSet<String> {
+    pub async fn code_session_ids_on_disk(&self) -> std::collections::HashSet<String> {
         self.sessions.session_ids_on_disk().await
     }
 
@@ -2085,7 +2108,7 @@ impl SessionStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn save_chat_session_with_id(
+    pub async fn save_code_session_with_id(
         &self,
         key_id: &str,
         base_url: &str,
@@ -2099,7 +2122,7 @@ impl SessionStore {
         tokens: SessionTokens,
     ) -> Result<()> {
         self.sessions
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 key_id,
                 base_url,
                 cwd,
@@ -2356,7 +2379,7 @@ mod tests {
         assert!(config.active_key_id.is_none());
     }
 
-    /// The per-repo project-MCP allow-list round-trips and shares chat-prefs.json
+    /// The per-repo project-MCP allow-list round-trips and shares code-prefs.json
     /// with the auto-approve toggle without either write clobbering the other.
     #[tokio::test]
     async fn project_mcp_approval_persists_and_coexists_with_auto_approve() {
@@ -2710,7 +2733,7 @@ mod tests {
         store.set_chat_agent_tools_enabled(false).await.unwrap();
         assert!(!store.get_chat_toggles().await.agent_tools_enabled);
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
                 .await
                 .unwrap(),
         )
@@ -2732,7 +2755,7 @@ mod tests {
         // new key is written.
         let dir = store.config_dir();
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("chat-prefs.json"), br#"{"showThinking": false}"#)
+        tokio::fs::write(dir.join("code-prefs.json"), br#"{"showThinking": false}"#)
             .await
             .unwrap();
         assert!(!store.get_chat_thinking_enabled().await);
@@ -2740,6 +2763,26 @@ mod tests {
 
         // Writing the new key takes precedence on the next read.
         store.set_chat_thinking_enabled(true).await.unwrap();
+        assert!(store.get_chat_thinking_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn code_prefs_fall_back_to_legacy_chat_prefs_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        // Only the pre-rename `chat-prefs.json` exists (no `code-prefs.json`);
+        // the reader must still pick up the user's toggles.
+        let dir = store.config_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("chat-prefs.json"), br#"{"showThinking": false}"#)
+            .await
+            .unwrap();
+        assert!(!store.get_chat_thinking_enabled().await);
+
+        // The first write lands in the new `code-prefs.json`.
+        store.set_chat_thinking_enabled(true).await.unwrap();
+        assert!(dir.join("code-prefs.json").exists());
         assert!(store.get_chat_thinking_enabled().await);
     }
 
@@ -2759,9 +2802,9 @@ mod tests {
         );
         assert_eq!(store.get_disabled_mcp_servers().await.unwrap(), vec!["fs"]);
 
-        // They live in chat-prefs.json, never the (key-bearing) config.json.
+        // They live in code-prefs.json, never the (key-bearing) config.json.
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
                 .await
                 .unwrap(),
         )
@@ -2780,7 +2823,7 @@ mod tests {
 
     /// The original bug: toggles lived in config.json, so any other config writer
     /// (here `set_active_key`) that round-tripped the file would drop them. Now
-    /// they live in chat-prefs.json, so a config rewrite leaves them intact.
+    /// they live in code-prefs.json, so a config rewrite leaves them intact.
     #[tokio::test]
     async fn config_rewrite_does_not_clobber_disabled_toggles() {
         let temp_dir = TempDir::new().unwrap();
@@ -2804,7 +2847,7 @@ mod tests {
 
     /// A config.json written by an older binary still carries `disabled_skills`
     /// inline; the first read honors it and the first toggle migrates the whole
-    /// set into chat-prefs.json without losing the pre-existing opt-out.
+    /// set into code-prefs.json without losing the pre-existing opt-out.
     #[tokio::test]
     async fn legacy_config_disabled_skills_migrate_on_first_toggle() {
         let temp_dir = TempDir::new().unwrap();
@@ -2832,7 +2875,7 @@ mod tests {
     }
 
     /// `migrate_disabled_toggles` (run at chat startup) copies the legacy config.json
-    /// opt-outs into chat-prefs.json so a later config rewrite can't drop them, even
+    /// opt-outs into code-prefs.json so a later config rewrite can't drop them, even
     /// if the user never toggles. Idempotent and non-destructive to existing prefs.
     #[tokio::test]
     async fn eager_migration_moves_legacy_toggles_to_chat_prefs() {
@@ -2849,7 +2892,7 @@ mod tests {
         store.migrate_disabled_toggles().await;
 
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("chat-prefs.json"))
+            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
                 .await
                 .unwrap(),
         )
@@ -2938,7 +2981,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &id,
                 "http://localhost",
                 "/tmp/demo",
@@ -2970,12 +3013,12 @@ mod tests {
             Some(15)
         );
 
-        let session = store.get_chat_session("legacy").await.unwrap().unwrap();
+        let session = store.get_code_session("legacy").await.unwrap().unwrap();
         assert_eq!(session.message_count(), 1);
         assert_eq!(session.session_id, "legacy");
 
         store
-            .save_chat_session_with_id(
+            .save_code_session_with_id(
                 &id,
                 "http://localhost",
                 "/tmp/demo",
@@ -3180,7 +3223,7 @@ mod tests {
             "updatedAt": "2024-01-01T00:00:00Z"
         }"#;
 
-        let session: ChatSessionState =
+        let session: CodeSessionState =
             serde_json::from_str(json).expect("should migrate legacy array");
 
         // After migration the field should be an encrypted string
@@ -3228,7 +3271,7 @@ mod tests {
             serde_json::to_string(&encrypted).unwrap()
         );
 
-        let session: ChatSessionState = serde_json::from_str(&session_json).unwrap();
+        let session: CodeSessionState = serde_json::from_str(&session_json).unwrap();
         let decoded = session.decrypt_messages().unwrap();
         assert_eq!(decoded, msgs);
     }
@@ -3238,7 +3281,7 @@ mod tests {
     /// resume — never panic or brick the session. A valid blob still round-trips.
     #[test]
     fn test_decrypt_engine_messages_degrades_not_bricks() {
-        let make = |engine: Option<&str>| -> ChatSessionState {
+        let make = |engine: Option<&str>| -> CodeSessionState {
             let mut v = serde_json::json!({
                 "sessionId": "s", "keyId": "k", "baseUrl": "u",
                 "cwd": "/", "model": "m", "messages": "",
@@ -3431,10 +3474,10 @@ mod tests {
 
         // Chat models preserved
         assert_eq!(
-            config.chat_models.get("a1b2c3").unwrap(),
+            config.code_models.get("a1b2c3").unwrap(),
             "claude-sonnet-4-6"
         );
-        assert_eq!(config.chat_models.get("d4e5f6").unwrap(), "gpt-4o");
+        assert_eq!(config.code_models.get("d4e5f6").unwrap(), "gpt-4o");
 
         // Legacy flat directory_starts migrated to nested format
         let tools = config.directory_starts.get("/home/user/project").unwrap();
@@ -3584,7 +3627,7 @@ mod tests {
         let config: StoredConfig = serde_json::from_str(json).unwrap();
         assert!(config.api_keys.is_empty());
         assert!(config.active_key_id.is_none());
-        assert!(config.chat_models.is_empty());
+        assert!(config.code_models.is_empty());
         assert!(config.aliases.is_empty());
         assert!(config.last_selection.is_none());
         assert!(!config.starter_key_dismissed);

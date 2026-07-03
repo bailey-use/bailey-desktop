@@ -2640,7 +2640,7 @@ impl KeysCommand {
             &starter.id,
             display_name,
             "Provider: aivo starter (free)",
-            Some(("aivo chat", "(start chatting)")),
+            Some(("aivo code", "(start coding)")),
         )
         .await?;
         Ok(ExitCode::Success)
@@ -2663,7 +2663,7 @@ impl KeysCommand {
             style::yellow("Note:"),
             style::cyan(&existing.name),
             style::dim(&existing.id),
-            style::cyan("aivo chat"),
+            style::cyan("aivo code"),
         );
         Ok(Some(ExitCode::Success))
     }
@@ -2986,7 +2986,7 @@ impl KeysCommand {
                 &starter.id,
                 &name,
                 "Provider: aivo starter (free)",
-                Some(("aivo chat", "(start chatting)")),
+                Some(("aivo code", "(start coding)")),
             )
             .await?;
 
@@ -3484,7 +3484,7 @@ pub(crate) async fn prompt_select_key(
 /// Offers a picker of compatible keys when `bad_key` is an OAuth credential
 /// the current command can't use. OAuth keys stay visible but are disabled
 /// with an inline reason. `context_phrase` is the user-visible command name
-/// inserted into messages (e.g. `"aivo chat"` or `"aivo run codex"`).
+/// inserted into messages (e.g. `"aivo code"` or `"aivo run codex"`).
 ///
 /// Returns `Ok(Some(new_key))` when the user picks a replacement; `Ok(None)`
 /// when there's no TTY, no eligible key, or the user cancelled — callers

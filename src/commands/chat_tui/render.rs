@@ -1655,11 +1655,22 @@ pub(super) fn edit_diffs(name: &str, args: &serde_json::Value) -> Vec<EditDiff> 
     }
 }
 
+/// Expand tabs to 4 spaces so a raw `\t` (unicode-width 1) can't desync the
+/// terminal's cell grid and leave stale ghost cells.
+pub(super) fn expand_tabs(s: &str) -> Cow<'_, str> {
+    if s.contains('\t') {
+        Cow::Owned(s.replace('\t', "    "))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// Diff `old`→`new` into display rows: trim to changed lines ±`context` (git's
 /// `-U`), collapse longer gaps to `⋯`, number kept rows from `start`, and refine
 /// paired del/ins lines into word segments. Empty when nothing changed.
 fn build_hunk(old: &str, new: &str, start: Option<usize>, context: usize) -> Vec<DiffRow> {
-    let ops = diff_lines(old, new);
+    let (old, new) = (expand_tabs(old), expand_tabs(new));
+    let ops = diff_lines(&old, &new);
     if !ops.iter().any(|(t, _)| *t != DiffTag::Equal) {
         return Vec::new();
     }
@@ -3075,7 +3086,39 @@ pub(super) fn compact_lines_and_bars(lines: &mut Vec<StyledLine>, bars: &mut Vec
 
 #[cfg(test)]
 mod render_tests {
-    use super::{condense_subagent_task, strip_ansi_and_controls, tool_result_summary};
+    use super::{
+        condense_subagent_task, render_edit_diff, strip_ansi_and_controls, tool_result_summary,
+    };
+
+    #[test]
+    fn edit_diff_expands_tabs() {
+        let args = serde_json::json!({
+            "path": "main.go",
+            "old_string": "\tif len(step, hours) > 12 {\n\t\tstep = 4\n\t}",
+            "new_string": "\tif len(hours) > 12 {\n\t\tstep = 4\n\t}",
+        });
+        let mut lines = Vec::new();
+        render_edit_diff(&mut lines, "edit_file", &args, &[None]);
+        assert!(!lines.is_empty());
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            texts.iter().all(|t| !t.contains('\t')),
+            "raw tab leaked into diff spans: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("    if len(hours) > 12 {")),
+            "expanded indent missing: {texts:?}"
+        );
+    }
 
     #[test]
     fn condense_subagent_task_strips_instruction_preamble() {

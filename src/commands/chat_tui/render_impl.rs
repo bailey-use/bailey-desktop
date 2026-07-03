@@ -7,6 +7,17 @@ fn table_layout_width(area_width: u16) -> u16 {
     area_width.saturating_sub(ACCENT_GUTTER_WIDTH)
 }
 
+/// Replace every control-char cell (tab, ESC, …) with a space, keeping its
+/// style — a raw `\t` (unicode-width 1) desyncs the terminal's cell grid. Run on
+/// the finished frame so no widget can poison the grid, whatever its source.
+fn scrub_control_cells(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        if cell.symbol().chars().any(char::is_control) {
+            cell.set_symbol(" ");
+        }
+    }
+}
+
 /// The inner content rect of a centered overlay — mirrors the `Margin` every
 /// overlay insets its body by, so the screen selection can be confined to it.
 fn overlay_content_rect(area: Rect) -> Rect {
@@ -856,6 +867,7 @@ impl ChatTuiApp {
         self.render_screen_selection_highlight(frame);
 
         self.render_toast(frame, outer);
+        scrub_control_cells(frame.buffer_mut());
     }
 
     /// Captures the rendered screen into `screen_surface` for full-screen drag-copy.
@@ -1066,10 +1078,16 @@ impl ChatTuiApp {
         // the keys line is always the last thing the user sees.
         let chrome = 5 + usize::from(destructive);
         let preview_budget = usize::from(max_total).saturating_sub(chrome);
-        let preview: Vec<&str> = pending
+        // Expand tabs up front so width sizing and the cell grid agree.
+        let preview: Vec<String> = pending
             .preview
             .as_deref()
-            .map(|p| p.lines().take(12).collect())
+            .map(|p| {
+                p.lines()
+                    .take(12)
+                    .map(|l| expand_tabs(l).into_owned())
+                    .collect()
+            })
             .unwrap_or_default();
         let preview_take = if preview.is_empty() {
             0
@@ -1091,7 +1109,7 @@ impl ChatTuiApp {
         if let Some(flag) = flag_line {
             content_w = content_w.max(display_width(flag));
         }
-        for &raw in preview.iter().take(preview_take) {
+        for raw in preview.iter().take(preview_take) {
             content_w = content_w.max(display_width(raw));
         }
         let max_width = composer_area.width.min(frame_area.width).max(1);
@@ -1104,7 +1122,7 @@ impl ChatTuiApp {
         ))];
         if preview_take > 0 {
             lines.push(Line::from(""));
-            for &raw in preview.iter().take(preview_take) {
+            for raw in preview.iter().take(preview_take) {
                 let trimmed = raw.trim_start();
                 let style = if trimmed.starts_with("+ ") {
                     Style::default().fg(ASSISTANT)
@@ -2227,4 +2245,26 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
         keycap("n", ERROR),
         label(" deny"),
     ])
+}
+
+#[cfg(test)]
+mod render_impl_tests {
+    use super::scrub_control_cells;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn scrub_replaces_control_cells_with_spaces() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("a");
+        buf.cell_mut((1, 0)).unwrap().set_symbol("\t");
+        buf.cell_mut((2, 0)).unwrap().set_symbol("\u{1b}");
+        buf.cell_mut((3, 0)).unwrap().set_symbol("界");
+        scrub_control_cells(&mut buf);
+        assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "a");
+        assert_eq!(buf.cell((1, 0)).unwrap().symbol(), " ");
+        assert_eq!(buf.cell((2, 0)).unwrap().symbol(), " ");
+        // Non-control symbols (incl. wide chars) are untouched.
+        assert_eq!(buf.cell((3, 0)).unwrap().symbol(), "界");
+    }
 }

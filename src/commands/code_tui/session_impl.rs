@@ -1437,7 +1437,10 @@ is preserved."
 
         match (kind, value) {
             (PickerKind::Model { target, .. }, PickerValue::Model(model)) => match target {
-                ModelSelectionTarget::CurrentChat => self.apply_model(model).await?,
+                ModelSelectionTarget::CurrentChat => {
+                    self.apply_model(model.clone()).await?;
+                    self.notice = Some((MUTED, format!("Now using {model}")));
+                }
                 ModelSelectionTarget::KeySwitch(key) => {
                     self.complete_key_switch(key, model).await?
                 }

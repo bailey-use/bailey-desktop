@@ -1678,7 +1678,8 @@ is preserved."
             CodeCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
         self.billed_model = None;
         self.refresh_context_window().await;
-        self.persist_model_selection(&session.raw_model).await?;
+        // Session-local: no persist, so viewing an old chat can't reset the key's
+        // default model. Only explicit `/model` and `/key` persist.
         Ok(())
     }
 
@@ -1693,10 +1694,9 @@ is preserved."
         Ok(())
     }
 
-    /// Mirror launch-time behavior: keep the global "selected key & model" in
-    /// sync when the user switches key/model mid-session (`/key`, `/model`,
-    /// resume) so `aivo run`/`aivo start`/`aivo info` recall what chat is
-    /// actually using — not just the key/model it launched with.
+    /// Keep the global "selected key & model" in sync on explicit `/key` / `/model`
+    /// so `aivo run`/`start`/`info` recall what chat is using. Resume is excluded
+    /// (session-local — see `apply_loaded_session`).
     ///
     /// Preserves the existing launchable tool (so `aivo run` with no tool still
     /// recalls the last *launchable* tool, not "code"), skips the ephemeral HF

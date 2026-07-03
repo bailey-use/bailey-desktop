@@ -55,7 +55,6 @@ pub(super) const EMPTY_STATE_BOTTOM_GAP: u16 = 0;
 pub(super) const WELCOME_TIPS: &[&str] = &[
     "start a line with ! to run a shell command",
     "Shift+Tab toggles auto-approve for the agent's tools",
-    "drag an image into the terminal to attach it",
     "/rewind undoes the agent's file edits",
     "/goal <task> keeps working on its own until it's done",
     "Ctrl+R reopens a past session",

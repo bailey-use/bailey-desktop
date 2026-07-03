@@ -9908,6 +9908,61 @@ async fn test_resume_resets_agent_engine() {
 }
 
 #[tokio::test]
+async fn test_resume_does_not_overwrite_persisted_default_model() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+    store.set_code_model(&key_id, "aivo/starter").await.unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store;
+    app.key = key.clone();
+    app.raw_model = "aivo/starter".to_string();
+
+    let session = LoadedSession {
+        key_id: key.id.clone(),
+        session_id: "resumed".to_string(),
+        raw_model: "google/gemma-4-31b-it".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: "earlier turn".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }],
+        engine_messages: None,
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert_eq!(
+        app.raw_model, "google/gemma-4-31b-it",
+        "the resumed conversation adopts its own model in memory"
+    );
+    assert_eq!(
+        app.session_store
+            .get_code_model(&key_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("aivo/starter"),
+        "resume must NOT rewrite the persisted per-key default"
+    );
+    assert!(
+        app.session_store
+            .get_last_selection()
+            .await
+            .unwrap()
+            .and_then(|sel| sel.model)
+            .is_none(),
+        "resume must NOT write the global last-selection model"
+    );
+}
+
+#[tokio::test]
 async fn test_resume_lists_sessions_regardless_of_cwd() {
     // Sessions persist under the stable launch dir (for logs), but /resume is
     // global — it must surface sessions saved under ANY cwd, including the dead

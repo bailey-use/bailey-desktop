@@ -418,10 +418,10 @@ impl CodeTuiApp {
         })
     }
 
-    /// True when the current key can drive the in-process agent: a plain API key
-    /// reachable through serve (not OAuth, cursor, or copilot).
+    /// True when the current key can drive the in-process agent: anything serve
+    /// can proxy (incl. Copilot). OAuth and cursor have their own paths.
     pub(super) fn agent_capable(&self) -> bool {
-        !self.key.is_any_oauth() && !self.key.is_cursor_acp() && !self.key.is_copilot()
+        !self.key.is_any_oauth() && !self.key.is_cursor_acp()
     }
 
     /// Refresh the cached git branch for `display_cwd`, throttled so the footer's
@@ -443,9 +443,8 @@ impl CodeTuiApp {
     }
 
     /// Directory shown in the header/footer: the real launch dir for any chat
-    /// that actually runs there (the in-process agent *and* the cursor ACP
-    /// backend, where files are edited — a safety signal), else chat's sandbox
-    /// (the plain OAuth/copilot relay).
+    /// that actually runs there (the in-process agent and the cursor ACP backend,
+    /// where files are edited — a safety signal), else chat's sandbox (OAuth relay).
     pub(super) fn display_cwd(&self) -> &str {
         if (self.agent_capable() || self.key.is_cursor_acp()) && !self.real_cwd.is_empty() {
             &self.real_cwd
@@ -1514,7 +1513,7 @@ impl CodeTuiApp {
                 if !self.agent_capable() {
                     self.notice = Some((
                         ERROR,
-                        "Goal mode needs the native agent (a plain API key — not OAuth, cursor, or copilot)"
+                        "Goal mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
                             .to_string(),
                     ));
                     return;
@@ -1655,7 +1654,7 @@ impl CodeTuiApp {
                 if !self.agent_capable() {
                     self.notice = Some((
                         ERROR,
-                        "Plan mode needs the native agent (a plain API key — not OAuth, cursor, or copilot)"
+                        "Plan mode needs the native agent (an API key or Copilot — not OAuth or cursor)"
                             .to_string(),
                     ));
                     return;

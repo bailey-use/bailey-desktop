@@ -21,6 +21,9 @@ use crate::services::openai_gemini_bridge::{
     build_google_stream_generate_content_url, convert_gemini_to_openai_chat_response,
     convert_openai_chat_to_gemini_request,
 };
+use crate::services::responses_chat_conversion::{
+    convert_chat_to_responses_request, convert_responses_json_to_chat,
+};
 use crate::services::serve_responses::OpenAIToResponsesStreamConverter;
 use crate::services::serve_stream_converters::{
     AnthropicToOpenAIStreamConverter, GeminiToOpenAIStreamConverter,
@@ -199,6 +202,69 @@ pub(crate) async fn send_openai_chat(
         .send_logged()
         .await?;
     finalize_openai_response(response, client_wants_stream).await
+}
+
+/// True when a Copilot `/chat/completions` error demands the Responses API.
+pub(crate) fn copilot_requires_responses_api(body: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(body).to_lowercase();
+    s.contains("unsupported_api_for_model")
+        || (s.contains("/responses") && s.contains("chat/completions"))
+}
+
+/// Sends a Copilot chat request as a non-streamed `/responses` call, converting
+/// the result back to Chat Completions (re-emitting SSE when a stream was asked).
+/// Self-contained: normalizes the model itself, so callers may pass a raw body.
+pub(crate) async fn send_copilot_responses(
+    chat_body: &Value,
+    client_wants_stream: bool,
+    context: &UpstreamRequestContext,
+) -> Result<RouterResponse> {
+    let mut chat_body = chat_body.clone();
+    normalize_openai_request_model(&mut chat_body, false, true);
+    strip_non_function_tools(&mut chat_body);
+    let responses_body = convert_chat_to_responses_request(&chat_body);
+    // Bare path, not a URL: Copilot's endpoint comes from the token exchange, and
+    // a URL built from the "copilot" sentinel base wouldn't parse to `/responses`.
+    let initiator = http_utils::copilot_initiator_from_openai(&chat_body);
+    let req = http_utils::authorized_openai_post(
+        &context.client,
+        "/v1/responses",
+        context.upstream_api_key.as_str(),
+        context.copilot_tokens.as_deref(),
+        Some(initiator),
+    )
+    .await?;
+
+    let response = context
+        .with_device_headers(req)
+        .json(&responses_body)
+        .send_logged()
+        .await?;
+    let status = response.status().as_u16();
+    let content_type = http_utils::response_content_type(&response);
+    let text = response.text().await?;
+    if status != 200 {
+        return Ok(RouterResponse::buffered(
+            status,
+            &content_type,
+            text.into_bytes(),
+        ));
+    }
+
+    let responses_json: Value = serde_json::from_str(&text)?;
+    let chat_json = convert_responses_json_to_chat(&responses_json);
+    if client_wants_stream {
+        return Ok(RouterResponse::buffered(
+            200,
+            "text/event-stream",
+            convert_openai_chat_response_to_sse(&chat_json)?.into_bytes(),
+        ));
+    }
+    Ok(RouterResponse::buffered(
+        200,
+        CONTENT_TYPE_JSON,
+        serde_json::to_vec(&chat_json)?,
+    ))
 }
 
 pub(crate) async fn send_openai_embeddings(
@@ -494,6 +560,21 @@ mod tests {
             .body(body.into())
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn copilot_requires_responses_api_detects_gpt5_and_codex_redirects() {
+        // Exact gpt-5.4 tools + reasoning_effort rejection from Copilot.
+        let gpt5 = br#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-5.4 in /v1/chat/completions. Please use /v1/responses instead.","code":"invalid_request_body"}}"#;
+        assert!(copilot_requires_responses_api(gpt5));
+        // Codex-family "not accessible" / unsupported_api_for_model.
+        let codex = br#"{"error":{"message":"model 'gpt-5.3-codex' is not accessible via the /chat/completions endpoint","code":"unsupported_api_for_model"}}"#;
+        assert!(copilot_requires_responses_api(codex));
+        // Unrelated 400s must not trigger the fallback.
+        assert!(!copilot_requires_responses_api(
+            br#"{"error":{"message":"invalid request: missing model"}}"#
+        ));
+        assert!(!copilot_requires_responses_api(b"model not found"));
     }
 
     fn sample_openai_chat_response() -> String {

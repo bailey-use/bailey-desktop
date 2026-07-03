@@ -7076,8 +7076,8 @@ async fn test_goal_command_status_stop_and_guards() {
     assert!(app.notice.as_ref().unwrap().1.contains("Wait"));
     app.sending = false;
 
-    // A non-agent key (copilot) is refused (no send).
-    app.key.base_url = "copilot".to_string();
+    // A non-agent key (OAuth) is refused (no send).
+    app.key.base_url = "claude-oauth".to_string();
     app.run_goal_command(Some("do it".to_string())).await;
     assert!(app.goal_mode.is_none());
     assert!(app.notice.as_ref().unwrap().1.contains("native agent"));
@@ -7089,8 +7089,8 @@ async fn test_goal_command_status_stop_and_guards() {
 async fn test_goal_machine_text_never_enters_draft_history() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
-    // Non-agent key keeps the send on the lightweight plain-chat path.
-    app.key.base_url = "copilot".to_string();
+    // Non-agent key (OAuth) keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "claude-oauth".to_string();
 
     app.dispatch_user_message("[Goal mode] preamble".to_string(), None)
         .await

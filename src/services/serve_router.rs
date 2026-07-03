@@ -33,8 +33,9 @@ use crate::services::serve_responses::{
     convert_chat_sse_to_responses_sse,
 };
 use crate::services::serve_upstream::{
-    RouterResponse, StreamingBody, UpstreamRequestContext, send_anthropic_chat, send_gemini_chat,
-    send_openai_chat, send_openai_embeddings,
+    RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
+    send_anthropic_chat, send_copilot_responses, send_gemini_chat, send_openai_chat,
+    send_openai_embeddings,
 };
 use crate::services::session_store::{ApiKey, SessionStore};
 use crate::services::usage_stats_store::RunTokenTally;
@@ -1019,8 +1020,33 @@ async fn handle_chat_body(body: Value, state: &ServeState) -> Result<RouterRespo
         .unwrap_or(false);
     let slot = resolve_slot(&body, state);
 
-    // Skip fallback for copilot/openrouter — these have fixed protocols
-    if state.config.is_copilot || state.config.is_openrouter {
+    // Copilot has a fixed OpenAI protocol, but its reasoning models (gpt-5.x)
+    // reject tools + reasoning_effort on /chat/completions and require /responses.
+    // Pin that switch once it's observed so later turns skip the wasted 400.
+    if state.config.is_copilot {
+        let mut body = body;
+        let (protocol, variant) = slot.current();
+        let ctx = upstream_context(state);
+        if protocol == ProviderProtocol::ResponsesApi {
+            return send_copilot_responses(&body, client_wants_stream, &ctx).await;
+        }
+        let result = handle_chat_openai(&mut body, client_wants_stream, state).await?;
+        let redirected = matches!(&result, RouterResponse::Buffered { status: 400, body: e, .. }
+            if copilot_requires_responses_api(e));
+        if redirected {
+            commit_protocol_switch(
+                slot.route_atom(),
+                ProviderProtocol::ResponsesApi,
+                variant,
+                1,
+            );
+            return send_copilot_responses(&body, client_wants_stream, &ctx).await;
+        }
+        return Ok(result);
+    }
+
+    // Skip fallback for openrouter — fixed protocol.
+    if state.config.is_openrouter {
         let mut body = body;
         return match slot.current().0 {
             ProviderProtocol::Anthropic => {

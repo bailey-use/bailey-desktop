@@ -850,6 +850,18 @@ pub struct ChatArgs {
     #[arg(long, requires = "prompt")]
     pub json: bool,
 
+    /// Machine-readable output for `-e`/`--exec`: `text` (default, human prose) or
+    /// `stream-json` (one schema-versioned JSON event per line on stdout —
+    /// run_start, text, tool_call, tool_result, usage, final, run_end).
+    /// Secret-redacted; for editors and automation driving the agent.
+    #[arg(
+        long = "output-format",
+        value_name = "FORMAT",
+        requires = "exec",
+        value_parser = ["text", "stream-json"]
+    )]
+    pub output_format: Option<String>,
+
     /// Attach a file or image to the next chat message (repeatable)
     #[arg(long = "attach", value_name = "PATH", value_parser = non_empty())]
     pub attachments: Vec<String>,

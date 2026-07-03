@@ -1,0 +1,469 @@
+//! Context compaction for the agent engine: token-budget measurement, the
+//! prune-then-summarize reclamation, calibration from measured/overflow usage,
+//! the pinned working-set fold, and the deterministic hard-fit backstop.
+
+use serde_json::{Map, Value, json};
+
+use crate::agent::engine::{AgentEngine, AgentUi, DEFAULT_CONTEXT_WINDOW, TurnCtx};
+use crate::agent::plan;
+use crate::agent::protocol::ChatRequest;
+use crate::agent::request::{role, serialize_transcript, truncate_str};
+use crate::agent::retry::parse_overflow_actual;
+use crate::agent::serve_client;
+use crate::agent::tokens::{
+    CALIBRATION_MIN_SAMPLE, MAX_CALIBRATION, calibration_ratio, estimate_str_tokens,
+    estimate_tokens, keep_recent_tokens, usage_tokens,
+};
+
+/// Tokens held back from the window for the response + tool schemas.
+pub(crate) const COMPACT_RESERVE: usize = 16_000;
+/// A `tool` result longer than this (chars) is eligible for clearing once it ages
+/// out of the recent window; smaller results aren't worth the churn.
+const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
+/// Stub for a cleared tool result. Below [`TOOL_RESULT_CLEAR_MIN`] so clearing is
+/// idempotent; the message + `tool_call_id` stay so assistant↔tool pairing holds.
+pub(crate) const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
+pub(crate) const SUMMARY_SYSTEM_PROMPT: &str = "You are compressing a coding-agent conversation to free up \
+context. Write a concise but complete summary under these exact headings:\n\
+## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n\
+## Key Decisions\n## Next Steps\n## Critical Context\n\n\
+Preserve specifics: file paths, function/identifier names, exact values, commands run. Drop \
+chit-chat. Output only the summary.";
+/// Carry-forward variant: feeds the current running summary + only the NEW events
+/// and asks for an in-place update, avoiding lossy drift from re-summarizing a blob.
+pub(crate) const SUMMARY_UPDATE_SYSTEM_PROMPT: &str = "You are MAINTAINING a running summary of an ongoing \
+coding-agent session. Below is the CURRENT summary, then the NEW events since it was written. \
+Produce the UPDATED summary under these exact headings:\n\
+## Goal\n## Constraints & Preferences\n## Progress (Done / In Progress / Blocked)\n\
+## Key Decisions\n## Next Steps\n## Critical Context\n\n\
+Preserve every still-relevant fact from the current summary verbatim (file paths, \
+function/identifier names, exact values, commands run); merge in the new events; drop a fact \
+only when the new events explicitly supersede it. Output only the updated summary.";
+/// Ceiling (chars/4 tokens) on the pinned working-set block folded into a compaction;
+/// plan kept whole, touched-files trimmed oldest-first so pinning can't re-overflow.
+pub(crate) const PINNED_MAX_TOKENS: usize = 2_000;
+
+impl AgentEngine {
+    /// The window `maybe_compact` budgets against: the real one, or [`DEFAULT_CONTEXT_WINDOW`] if unknown (0).
+    pub(crate) fn compaction_window(&self) -> usize {
+        if self.context_window == 0 {
+            DEFAULT_CONTEXT_WINDOW
+        } else {
+            self.context_window as usize
+        }
+    }
+
+    /// Compaction budget in chars/4-estimate space: `(window - reserve) / calibration`,
+    /// so `estimate <= budget` implies the calibrated real size fits.
+    pub(crate) fn compaction_budget_estimate(&self) -> usize {
+        let real = self.compaction_window().saturating_sub(COMPACT_RESERVE);
+        ((real as f64) / self.token_calibration).floor() as usize
+    }
+
+    /// Fold a `(sent estimate, measured total)` sample into the calibration (measured
+    /// total dodges cache-accounting quirks). Rises at once on undershoot, eases down slowly.
+    pub(crate) fn update_calibration(&mut self, sent_estimate: usize, measured_total: u64) {
+        if sent_estimate < CALIBRATION_MIN_SAMPLE || measured_total == 0 {
+            return;
+        }
+        let ratio = calibration_ratio(measured_total, sent_estimate);
+        // both operands >= 1.0, so the blend needs no floor
+        self.token_calibration = if ratio > self.token_calibration {
+            ratio
+        } else {
+            0.8 * self.token_calibration + 0.2 * ratio
+        };
+    }
+
+    /// Raise the calibration from an overflow rejection: use the cited token count if present, else nudge up.
+    pub(crate) fn recalibrate_from_overflow(&mut self, err: &str) {
+        let estimate = estimate_tokens(&self.messages);
+        match parse_overflow_actual(err) {
+            Some(actual) if estimate >= CALIBRATION_MIN_SAMPLE => {
+                // rise-only on overflow, unlike update_calibration's EMA
+                self.token_calibration = self
+                    .token_calibration
+                    .max(calibration_ratio(actual, estimate));
+            }
+            _ => self.token_calibration = (self.token_calibration * 1.2).min(MAX_CALIBRATION),
+        }
+    }
+
+    /// Deterministic recovery: fit the calibrated budget without a model call (a summary
+    /// round-trip could itself overflow mid-recovery). Clears stale tool output, then hard-trims.
+    pub(crate) fn force_fit_budget(&mut self) {
+        let budget = self.compaction_budget_estimate();
+        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        // Single long turn (resume) has no interior user boundary → fall back so `enforce_budget` doesn't drop it to `[system, user]`.
+        if cut <= 1 {
+            cut = find_cut(&self.messages, 0);
+        }
+        self.clear_stale_tool_results(cut);
+        // No summary round-trip is safe mid-overflow; fold a model-free marker.
+        if cut > 1 && self.messages.get(cut).map(role) == Some("user") {
+            let note = self.mechanical_summary();
+            self.apply_compaction(cut, &note);
+        }
+        self.enforce_budget(budget);
+    }
+
+    /// If the history would overflow, summarize the older messages (quiet `complete`)
+    /// and replace them. Cuts only at user boundaries so tool-call/result pairs stay
+    /// intact. Returns tokens the summarization consumed (counted toward the turn, not a step).
+    pub(crate) async fn maybe_compact(&mut self, ctx: &TurnCtx<'_>, ui: &mut dyn AgentUi) -> u64 {
+        let budget = self.compaction_budget_estimate();
+        let total = estimate_tokens(&self.messages);
+        if total <= budget {
+            return 0;
+        }
+        let mut cut = find_cut(&self.messages, keep_recent_tokens());
+        // Single long turn (resume) has no interior user boundary → summarize into the latest user turn.
+        if cut <= 1 {
+            cut = find_cut(&self.messages, 0);
+        }
+
+        // Cheap pass first: if clearing OLD tool output alone brings us under budget,
+        // do that and skip the LLM summary. Only when it alone suffices, so the summary path still sees full content.
+        let savings = self.stale_tool_result_savings(cut);
+        if savings > 0 && total.saturating_sub(savings) <= budget {
+            ui.notify("freed context — cleared older tool output");
+            self.clear_stale_tool_results(cut);
+            return 0;
+        }
+
+        let tokens = self.summarize_range(ctx, ui, cut).await;
+        // Backstop: guarantee the next request fits. A single summary pass can fall
+        // short (huge recent tail, or `cut <= 1`). Trim deterministically so a turn is always sendable.
+        self.enforce_budget(budget);
+        tokens
+    }
+
+    /// Summarize `messages[1..cut]` and fold it in (no-op when `cut <= 1`); on empty
+    /// output or failure folds a mechanical note. Returns tokens the call consumed.
+    pub(crate) async fn summarize_range(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        cut: usize,
+    ) -> u64 {
+        if cut <= 1 {
+            return 0;
+        }
+        let transcript = serialize_transcript(&self.messages[1..cut]);
+        let request = self.build_summary_request(&transcript);
+        ui.notify("compacting context…");
+        match serve_client::complete(ctx.client, ctx.serve_base, ctx.auth, &request, &mut |_| {})
+            .await
+        {
+            Ok(m) => {
+                let summary = m.content.unwrap_or_default();
+                if summary.trim().is_empty() {
+                    let note = self.mechanical_summary();
+                    self.apply_compaction(cut, &note);
+                } else {
+                    self.apply_compaction(cut, &summary);
+                    // Carry forward so the next compaction updates it in place (anti-drift).
+                    self.last_summary = Some(summary);
+                }
+                usage_tokens(&m.usage)
+            }
+            Err(_) => {
+                // Don't re-send an overflowed request (not retryable → bricks the turn); drop mechanically.
+                ui.notify("compaction summary unavailable — trimming older context");
+                let note = self.mechanical_summary();
+                self.apply_compaction(cut, &note);
+                0
+            }
+        }
+    }
+
+    /// Calibrated estimate of the current context fill (the footer's pre-measurement value).
+    pub fn estimated_context_tokens(&self) -> u64 {
+        (self.estimated_prompt_tokens() as f64 * self.token_calibration) as u64
+    }
+
+    /// Whether a compaction could fold/clear anything — lets `/compact` skip a pointless round-trip.
+    pub fn has_compactable_history(&self) -> bool {
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        cut > 1 || self.stale_tool_result_savings(cut) > 0
+    }
+
+    /// Manual `/compact`: summarize older turns regardless of budget (or clear stale output), then `footer`.
+    pub async fn compact_now(
+        &mut self,
+        ctx: &TurnCtx<'_>,
+        ui: &mut dyn AgentUi,
+        elapsed_secs: u64,
+    ) {
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        let tokens = if cut > 1 {
+            self.summarize_range(ctx, ui, cut).await
+        } else {
+            self.clear_stale_tool_results(cut);
+            0
+        };
+        // Footer carries the reduced fill; the chat layer reports the freed delta.
+        ui.footer(
+            None,
+            0,
+            tokens,
+            self.estimated_context_tokens(),
+            elapsed_secs,
+        );
+    }
+
+    /// `/compact fast`: clear stale tool output, no model call. Returns `(before, after)` calibrated estimate.
+    pub fn compact_now_local(&mut self) -> (u64, u64) {
+        let before = self.estimated_context_tokens();
+        let cut = find_cut(&self.messages, keep_recent_tokens());
+        self.clear_stale_tool_results(cut);
+        (before, self.estimated_context_tokens())
+    }
+
+    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD
+    /// `tool` message over the threshold, the bytes dropped when stubbed.
+    pub(crate) fn stale_tool_result_savings(&self, cut: usize) -> usize {
+        self.messages
+            .get(1..cut)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|m| role(m) == "tool")
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .filter(|s| s.len() > TOOL_RESULT_CLEAR_MIN)
+            .map(|s| s.len().saturating_sub(TOOL_RESULT_CLEARED.len()) / 4)
+            .sum()
+    }
+
+    /// Replace bulky OLD `tool` output with [`TOOL_RESULT_CLEARED`], reclaiming
+    /// context without a model call; message + `tool_call_id` stay (pairing intact). Idempotent.
+    pub(crate) fn clear_stale_tool_results(&mut self, cut: usize) {
+        let Some(old) = self.messages.get_mut(1..cut) else {
+            return;
+        };
+        for m in old {
+            if role(m) != "tool" {
+                continue;
+            }
+            let len = m
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map_or(0, str::len);
+            if len > TOOL_RESULT_CLEAR_MIN {
+                m["content"] = json!(TOOL_RESULT_CLEARED);
+            }
+        }
+    }
+
+    /// Model-free stand-in for a failed/empty summary; preserves any running summary so the thread isn't lost.
+    pub(crate) fn mechanical_summary(&self) -> String {
+        match &self.last_summary {
+            Some(prev) => {
+                format!("{prev}\n\n[Additional earlier turns omitted — summarization unavailable.]")
+            }
+            None => "[Earlier conversation omitted — summarization unavailable.]".to_string(),
+        }
+    }
+
+    /// Last-resort, model-free trim to fit `budget`: drop whole oldest turns at user
+    /// boundaries, then shorten the biggest string left (a `content` or a tool-call
+    /// `arguments` blob). Always terminates; keeps the system prompt and call↔result pairing.
+    pub(crate) fn enforce_budget(&mut self, budget: usize) {
+        while estimate_tokens(&self.messages) > budget {
+            let cut = find_cut(&self.messages, 0);
+            if cut <= 1 {
+                break; // only [system, last user turn] left — no boundary to drop
+            }
+            self.messages.drain(1..cut);
+            self.rebase_checkpoints(cut, cut - 1);
+        }
+        // Shrink the largest string left, incl. tool-call `arguments`: a big call with
+        // empty `content` in the irreducible recent turn is otherwise unreducible; truncated args stay paired with their id.
+        while estimate_tokens(&self.messages) > budget {
+            // loc: None = content; Some(j) = tool_calls[j] arguments.
+            let pick = self
+                .messages
+                .iter()
+                .enumerate()
+                .skip(1)
+                .flat_map(|(i, m)| {
+                    let content = m
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| (i, None, s.chars().count()));
+                    let args = m
+                        .get("tool_calls")
+                        .and_then(|c| c.as_array())
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .filter_map(move |(j, tc)| {
+                            tc.get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(|a| a.as_str())
+                                .map(|s| (i, Some(j), s.chars().count()))
+                        });
+                    content.into_iter().chain(args)
+                })
+                .filter(|&(_, _, n)| n > 256)
+                .max_by_key(|&(_, _, n)| n);
+            let Some((idx, loc, n)) = pick else { break };
+            let slot: &mut Value = match loc {
+                None => &mut self.messages[idx]["content"],
+                Some(j) => &mut self.messages[idx]["tool_calls"][j]["function"]["arguments"],
+            };
+            let cur = slot.as_str().unwrap_or("").to_string();
+            let shortened = truncate_str(&cur, n / 2);
+            if shortened.len() >= cur.len() {
+                break;
+            }
+            *slot = json!(shortened);
+        }
+    }
+
+    /// Build the throwaway system + user summarization request. First compaction
+    /// summarizes fresh; later ones feed the prior summary back for an in-place update.
+    /// Never folded into `self.messages`, so it can't affect role alternation.
+    pub(crate) fn build_summary_request(&self, transcript: &str) -> ChatRequest {
+        let (system, user) = match &self.last_summary {
+            Some(prev) => (
+                SUMMARY_UPDATE_SYSTEM_PROMPT,
+                format!(
+                    "## Current running summary\n{prev}\n\n## New events since then\n{transcript}"
+                ),
+            ),
+            None => (SUMMARY_SYSTEM_PROMPT, transcript.to_string()),
+        };
+        ChatRequest {
+            model: self.model.clone(),
+            messages: vec![
+                json!({"role": "system", "content": system}),
+                json!({"role": "user", "content": user}),
+            ],
+            tools: vec![],
+            extra: Map::new(),
+        }
+    }
+
+    /// The pinned working set (plan + touched files) rendered for a compaction fold,
+    /// trimmed to `PINNED_MAX_TOKENS` (plan kept whole, files trimmed oldest-first). Empty when nothing to pin.
+    pub(crate) fn render_pinned_block(&self) -> String {
+        let plan_block = plan::pinned_block(&self.plan);
+        let mut notes: &[String] = &self.notes;
+        let mut files: &[String] = &self.touched_files;
+        loop {
+            let block = compose_pinned(&plan_block, notes, files);
+            if block.is_empty() || estimate_str_tokens(&block) <= PINNED_MAX_TOKENS {
+                return block;
+            }
+            // Keep the plan whole; trim files first, then notes (more valuable) — oldest-first. Bail at plan-only for progress.
+            if !files.is_empty() {
+                files = &files[1..];
+            } else if !notes.is_empty() {
+                notes = &notes[1..];
+            } else {
+                return block;
+            }
+        }
+    }
+
+    /// Replace `messages[1..cut]` with the summary, folding it INTO the first kept
+    /// turn (a user message) rather than a standalone message before it — a standalone
+    /// summary would be two consecutive users, which Anthropic 400s on (non-retryable → bricks after compaction).
+    pub(crate) fn apply_compaction(&mut self, cut: usize, summary: &str) {
+        let mut folded = format!("[Summary of earlier conversation]\n{summary}");
+        // Pin plan + touched-files into the SAME fold so they never become a standalone same-role message.
+        let pinned = self.render_pinned_block();
+        if !pinned.is_empty() {
+            folded.push_str("\n\n");
+            folded.push_str(&pinned);
+        }
+        let summary = folded;
+        if self.messages.get(cut).map(role) == Some("user") {
+            let original = self.messages[cut]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            self.messages[cut]["content"] = if original.is_empty() {
+                json!(summary)
+            } else {
+                json!(format!("{summary}\n\n{original}"))
+            };
+            self.messages.drain(1..cut);
+            self.rebase_checkpoints(cut, cut - 1); // drain removes cut-1 messages
+        } else {
+            // Defensive (find_cut should land on a user turn): keep a standalone summary rather than drop it.
+            self.messages.splice(
+                1..cut,
+                std::iter::once(json!({"role": "user", "content": summary})),
+            );
+            self.rebase_checkpoints(cut, cut.saturating_sub(2)); // splice: -cut+1, +1
+        }
+    }
+
+    /// Keep `/rewind` checkpoints valid after a trim/compaction removed `removed`
+    /// messages over `[1..cut]`: drop folded-away checkpoints (`msg_index < cut`),
+    /// shift survivors down. Else `rewind_to` truncates at a stale index.
+    pub(crate) fn rebase_checkpoints(&mut self, cut: usize, removed: usize) {
+        self.checkpoints.retain_mut(|cp| {
+            if cp.msg_index >= cut {
+                cp.msg_index -= removed;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Render the pinned working set for a compaction: `## Pinned Plan`, `## Notes`,
+/// `## Files touched`. Each section omitted when empty; "" when all are.
+pub(crate) fn compose_pinned(plan_block: &str, notes: &[String], files: &[String]) -> String {
+    let mut out = String::new();
+    if !plan_block.is_empty() {
+        out.push_str("## Pinned Plan\n");
+        out.push_str(plan_block);
+    }
+    if !notes.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Notes\n");
+        for n in notes {
+            out.push_str("- ");
+            out.push_str(n);
+            out.push('\n');
+        }
+        out = out.trim_end().to_string();
+    }
+    if !files.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("## Files touched\n");
+        for f in files {
+            out.push_str("- ");
+            out.push_str(f);
+            out.push('\n');
+        }
+        out = out.trim_end().to_string();
+    }
+    out
+}
+
+/// Index `cut` such that `messages[cut..]` is kept — chosen at a user-turn
+/// boundary nearest to `keep_recent_tokens` of recent history.
+pub(crate) fn find_cut(messages: &[Value], keep_recent_tokens: usize) -> usize {
+    let mut acc = 0usize;
+    let mut cut = messages.len();
+    for i in (1..messages.len()).rev() {
+        acc += estimate_tokens(&messages[i..=i]);
+        if role(&messages[i]) == "user" {
+            cut = i;
+            if acc >= keep_recent_tokens {
+                break;
+            }
+        }
+    }
+    cut
+}

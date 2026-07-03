@@ -21,7 +21,7 @@ const MAX_OUTPUT_LINES: usize = 2_000;
 /// Default / hard cap on `read_file` lines when no limit is given.
 const DEFAULT_READ_LIMIT: usize = 2_000;
 /// Cap on bytes slurped by `read_file` so a giant log can't exhaust memory.
-const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
 /// Max paths returned from `glob`.
 const GLOB_CAP: usize = 500;
 const BASH_DEFAULT_TIMEOUT: u64 = 120;

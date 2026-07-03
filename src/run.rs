@@ -323,6 +323,7 @@ pub async fn run() -> ! {
                     chat_args.dry_run,
                     chat_args.share,
                     agent_mode,
+                    chat_args.output_format,
                 )
                 .await
         }

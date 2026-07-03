@@ -6,15 +6,25 @@
 
 pub mod apply_patch;
 pub mod checkpoint;
+pub mod compaction;
 pub mod engine;
+pub mod file_tracker;
+pub mod grant_store;
+pub mod guards;
+pub mod lsp;
 pub mod mcp;
 pub mod notes;
 pub mod plan;
 pub mod protocol;
+pub mod request;
+pub mod retry;
 pub mod sandbox;
 pub mod secrets_guard;
 pub mod serve_client;
 pub mod skills;
 pub mod subagents;
+pub mod system_prompt;
+pub mod tokens;
 pub mod tool_repair;
 pub mod tools;
+pub mod verify;

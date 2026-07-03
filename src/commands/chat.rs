@@ -409,6 +409,7 @@ impl ChatCommand {
         dry_run: bool,
         share: bool,
         agent_mode: bool,
+        output_format: Option<String>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -423,6 +424,7 @@ impl ChatCommand {
                 dry_run,
                 share,
                 agent_mode,
+                output_format,
             )
             .await
         {
@@ -448,6 +450,7 @@ impl ChatCommand {
         dry_run: bool,
         share: bool,
         agent_mode: bool,
+        output_format: Option<String>,
     ) -> Result<ExitCode> {
         // Validate `--max-context` up front so a malformed value fails fast.
         let max_context: Option<u64> = match max_context.as_deref() {
@@ -652,6 +655,7 @@ impl ChatCommand {
                     &raw_model,
                     one_shot_input,
                     max_context,
+                    chat_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
                 )
                 .await;
             }
@@ -916,6 +920,10 @@ impl ChatCommand {
         print_opt("--share", "Share this chat live (needs `aivo login`)");
         print_opt("--attach <path>", "Attach a file or image to the message");
         print_opt("--json", "Raw provider JSON (with -p)");
+        print_opt(
+            "--output-format <fmt>",
+            "-e output: text (default) or stream-json",
+        );
         print_opt(
             "--max-context <size>",
             "Override context window (e.g. 200k)",

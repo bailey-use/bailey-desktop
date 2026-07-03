@@ -560,8 +560,9 @@ impl ChatTuiApp {
                     None
                 };
             let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let guides =
-                crate::agent::engine::discover_project_guides(std::path::Path::new(&real_cwd));
+            let guides = crate::agent::system_prompt::discover_project_guides(
+                std::path::Path::new(&real_cwd),
+            );
             let mut skills = crate::agent::skills::discover_skills(std::path::Path::new(&real_cwd));
             // Drop skills the user turned off in `/skills`.
             if let Ok(disabled) = self.session_store.get_disabled_skills().await {
@@ -621,6 +622,10 @@ impl ChatTuiApp {
             let subagents =
                 crate::agent::subagents::discover_subagents(self.session_store.config_dir());
             engine.set_subagents(&subagents);
+            // Persistent grant store so "always allow"s survive across sessions.
+            engine.set_grants_path(self.session_store.config_dir());
+            // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
+            engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
             // Carry prior conversation in, best fidelity first: a resumed session's
             // durable transcript, else the outgoing engine's messages on a model
             // switch (both verbatim), else the lossy text seed of display history.

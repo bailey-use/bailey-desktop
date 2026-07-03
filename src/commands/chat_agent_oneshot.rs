@@ -1,16 +1,22 @@
 //! Headless one-shot agent: `aivo chat -e "<task>"` runs the real `AgentEngine`
-//! (tools + multi-step loop) to completion and exits. Answer → stdout, tool/step
-//! activity → stderr. Auto-approves mutations; catastrophic commands and remote
-//! side effects (deploy/publish/DELETE) fail closed.
+//! (tools + multi-step loop) to completion and exits. Auto-approves mutations;
+//! catastrophic commands and remote side effects (deploy/publish/DELETE) fail closed.
+//!
+//! Output is `--output-format`-selected ([`OutputFormat`]):
+//! - `text` (default): answer → stdout, tool/step activity → stderr (human prose).
+//! - `stream-json`: one secret-redacted JSON event per line on stdout for
+//!   editors/automation — each carries `{schemaVersion, type, runId}` plus type-specific
+//!   fields (see the `stream_event` call sites for the per-type payloads).
 
 use std::io::Write;
 use std::path::Path;
 
 use futures::future::BoxFuture;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx, discover_project_guides};
+use crate::agent::engine::{AgentEngine, AgentUi, TurnCtx};
 use crate::agent::protocol::Decision;
+use crate::agent::system_prompt::discover_project_guides;
 use crate::errors::ExitCode;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, SessionStore};
@@ -38,6 +44,7 @@ pub(crate) async fn run_one_shot_agent(
     model: &str,
     prompt: String,
     context_window_override: Option<u64>,
+    format: OutputFormat,
 ) -> anyhow::Result<ExitCode> {
     // Real launch dir (like the TUI's real_cwd), not chat's sandbox.
     let cwd = std::env::current_dir()
@@ -70,38 +77,63 @@ pub(crate) async fn run_one_shot_agent(
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
+    // Unattended run: don't accept an answer that admits it isn't done — nudge to continue.
+    engine.set_require_completion();
+    // Opt-in: run the project's validator on a declared-done turn and self-correct failures.
+    if env_or("AIVO_AGENT_SELF_CORRECT", 0u8) != 0 {
+        engine.set_self_correct();
+    }
     if crate::services::provider_profile::is_aivo_starter_base(&key.base_url) {
         engine.set_first_party();
     }
     let subagents = crate::agent::subagents::discover_subagents(session_store.config_dir());
     engine.set_subagents(&subagents);
+    // Persistent grant store: remembered "always allow"s survive across runs.
+    engine.set_grants_path(session_store.config_dir());
+    // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
+    engine.maybe_enable_lsp(Path::new(&cwd));
 
-    use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
-    let auth = random_auth_token();
-    let config = ServeRouterConfig::from_key(
-        key,
-        false,
-        300,
-        Some(auth.clone()),
-        std::collections::HashMap::new(),
-    );
-    let router = ServeRouter::new(config, key.clone(), session_store.logs())
-        .with_usage_accounting(session_store.clone(), "chat".to_string())
-        .quiet(true);
-    let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
-    let base = format!("http://127.0.0.1:{port}");
+    // Eval/CI hook: AIVO_AGENT_FAKE_SSE=<script> swaps the provider for a scripted
+    // loopback model, so the real loop + real tool execution run deterministically.
+    let (base, auth_opt, router_cleanup) = if let Ok(script) = std::env::var("AIVO_AGENT_FAKE_SSE")
+    {
+        let bodies =
+            crate::services::fake_model::load_script(&script).map_err(|e| anyhow::anyhow!(e))?;
+        let port = crate::services::fake_model::start(bodies)?;
+        (format!("http://127.0.0.1:{port}"), None, None)
+    } else {
+        use crate::services::serve_router::{ServeRouter, ServeRouterConfig, random_auth_token};
+        let auth = random_auth_token();
+        let config = ServeRouterConfig::from_key(
+            key,
+            false,
+            300,
+            Some(auth.clone()),
+            std::collections::HashMap::new(),
+        );
+        let router = ServeRouter::new(config, key.clone(), session_store.logs())
+            .with_usage_accounting(session_store.clone(), "chat".to_string())
+            .quiet(true);
+        let (handle, shutdown, port) = router.start_background_with_addr("127.0.0.1", 0).await?;
+        (
+            format!("http://127.0.0.1:{port}"),
+            Some(auth),
+            Some((handle, shutdown)),
+        )
+    };
 
     // Loopback-only: bypass any env proxy, which can't reach the serve port (hangs).
     let client = crate::services::http_utils::router_http_client_loopback();
     let ctx = TurnCtx {
         client: &client,
         serve_base: &base,
-        auth: Some(&auth),
+        auth: auth_opt.as_deref(),
         cwd: Path::new(&cwd),
         yes: true,
         auto_approve: None,
     };
-    let mut ui = HeadlessAgentUi::new();
+    let mut ui = HeadlessAgentUi::new(format);
+    ui.run_start(model, &cwd);
     let prompt_for_log = prompt.clone();
     let started = std::time::Instant::now();
     let completed = tokio::select! {
@@ -119,6 +151,9 @@ pub(crate) async fn run_one_shot_agent(
             None => ExitCode::Success,
         }
     };
+    // Always close the stream so a machine consumer sees a terminal event (an error
+    // event is followed by run_end, never left dangling).
+    ui.run_end(i64::from(exit.code()));
 
     // No session written — one-shots aren't resumable by design; just log the turn.
     if completed {
@@ -137,8 +172,10 @@ pub(crate) async fn run_one_shot_agent(
         .await;
     }
 
-    shutdown.notify_one();
-    handle.abort();
+    if let Some((handle, shutdown)) = router_cleanup {
+        shutdown.notify_one();
+        handle.abort();
+    }
     Ok(exit)
 }
 
@@ -225,20 +262,87 @@ async fn log_oneshot_turn(
         .await;
 }
 
-/// Answer → stdout (buffered per step so a stripped tool-call-as-text can't leak);
-/// tool/step activity → stderr.
+/// Headless output format for `-e`. `Text` = human prose (answer → stdout, activity
+/// → stderr). `StreamJson` = one schema-versioned JSON event per line on stdout,
+/// secret-redacted — a stable protocol for editors/automation driving the agent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    Text,
+    StreamJson,
+}
+
+impl OutputFormat {
+    /// Parse the `--output-format` value (clap already limits it to the known set).
+    pub(crate) fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("stream-json") => Self::StreamJson,
+            _ => Self::Text,
+        }
+    }
+}
+
+/// Bumped on any incompatible change to the event shape below, so a consumer can
+/// reject a protocol it doesn't understand.
+const STREAM_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// Build one protocol event object: the common envelope (`schemaVersion`, `type`,
+/// `runId`) merged with the event-specific `fields`.
+fn stream_event(run_id: &str, ev_type: &str, fields: Value) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("schemaVersion".into(), json!(STREAM_JSON_SCHEMA_VERSION));
+    obj.insert("type".into(), json!(ev_type));
+    obj.insert("runId".into(), json!(run_id));
+    if let Value::Object(m) = fields {
+        obj.extend(m);
+    }
+    Value::Object(obj)
+}
+
+/// A per-run id so a consumer can correlate this run's lines (one run per `-e`).
+fn new_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("run_{nanos:x}_{:x}", std::process::id())
+}
+
+/// Redact secret-shaped substrings from a model/tool string before it goes on the wire.
+fn redact(s: &str) -> String {
+    crate::agent::secrets_guard::redact_for_model(s).0
+}
+
+/// Redact secrets inside tool args while keeping them structured; falls back to the
+/// redacted string if the redaction breaks JSON (it normally doesn't).
+fn redact_args(args: &Value) -> Value {
+    let (red, n) = crate::agent::secrets_guard::redact_for_model(&args.to_string());
+    if n == 0 {
+        return args.clone();
+    }
+    serde_json::from_str(&red).unwrap_or(Value::String(red))
+}
+
+/// Text mode: answer → stdout (buffered per step so a stripped tool-call-as-text can't
+/// leak), tool/step activity → stderr. Stream-json mode: every callback is a redacted
+/// JSON event line on stdout.
 struct HeadlessAgentUi {
+    format: OutputFormat,
+    run_id: String,
     seg: String,
     wrote_answer: bool,
-    /// Full answer text (flushed segments), kept for the `aivo logs` row.
+    /// Full answer text (flushed segments), kept for the `aivo logs` row and the
+    /// stream-json `final` event.
     answer: String,
     /// The last terminal error the engine reported, for exit-code classification.
     last_error: Option<String>,
 }
 
 impl HeadlessAgentUi {
-    fn new() -> Self {
+    fn new(format: OutputFormat) -> Self {
         Self {
+            format,
+            run_id: new_run_id(),
             seg: String::new(),
             wrote_answer: false,
             answer: String::new(),
@@ -246,12 +350,39 @@ impl HeadlessAgentUi {
         }
     }
 
+    /// Write one JSON event line to stdout (stream-json mode only).
+    fn emit(&self, ev_type: &str, fields: Value) {
+        println!("{}", stream_event(&self.run_id, ev_type, fields));
+        let _ = std::io::stdout().flush();
+    }
+
+    /// First line of the stream: the run's identity. No-op in text mode.
+    fn run_start(&self, model: &str, cwd: &str) {
+        if self.format == OutputFormat::StreamJson {
+            self.emit("run_start", json!({ "model": model, "cwd": cwd }));
+        }
+    }
+
+    /// Terminal line of the stream, always emitted (even after an error). No-op in text mode.
+    fn run_end(&self, exit_code: i64) {
+        if self.format == OutputFormat::StreamJson {
+            self.emit("run_end", json!({ "exit": exit_code }));
+        }
+    }
+
     fn flush_seg(&mut self) {
         if self.seg.is_empty() {
             return;
         }
-        print!("{}", self.seg);
-        let _ = std::io::stdout().flush();
+        match self.format {
+            OutputFormat::Text => {
+                print!("{}", self.seg);
+                let _ = std::io::stdout().flush();
+            }
+            OutputFormat::StreamJson => {
+                self.emit("text", json!({ "text": redact(&self.seg) }));
+            }
+        }
         self.wrote_answer = true;
         self.answer.push_str(&self.seg);
         self.seg.clear();
@@ -270,20 +401,43 @@ impl AgentUi for HeadlessAgentUi {
     }
     fn tool_start(&mut self, name: &str, args: &Value) {
         self.flush_seg();
-        eprintln!("⏺ {name} {}", one_line(&args.to_string()));
+        match self.format {
+            OutputFormat::Text => eprintln!("⏺ {name} {}", one_line(&args.to_string())),
+            OutputFormat::StreamJson => {
+                self.emit(
+                    "tool_call",
+                    json!({ "tool": name, "args": redact_args(args) }),
+                );
+            }
+        }
     }
-    fn tool_result(&mut self, _name: &str, result: &Result<String, String>) {
-        match result {
-            Ok(s) => eprintln!("  ⎿ {}", one_line(s)),
-            Err(e) => eprintln!("  ✗ {}", one_line(e)),
+    fn tool_result(&mut self, name: &str, result: &Result<String, String>) {
+        match self.format {
+            OutputFormat::Text => match result {
+                Ok(s) => eprintln!("  ⎿ {}", one_line(s)),
+                Err(e) => eprintln!("  ✗ {}", one_line(e)),
+            },
+            OutputFormat::StreamJson => {
+                let ev = match result {
+                    Ok(s) => json!({ "tool": name, "ok": true, "output": redact(s) }),
+                    Err(e) => json!({ "tool": name, "ok": false, "error": redact(e) }),
+                };
+                self.emit("tool_result", ev);
+            }
         }
     }
     fn notify(&mut self, text: &str) {
-        eprintln!("{text}");
+        match self.format {
+            OutputFormat::Text => eprintln!("{text}"),
+            OutputFormat::StreamJson => self.emit("notice", json!({ "text": redact(text) })),
+        }
     }
     fn notify_error(&mut self, text: &str) {
         self.last_error = Some(text.to_string());
-        eprintln!("{text}");
+        match self.format {
+            OutputFormat::Text => eprintln!("{text}"),
+            OutputFormat::StreamJson => self.emit("error", json!({ "text": redact(text) })),
+        }
     }
     fn footer(
         &mut self,
@@ -294,10 +448,21 @@ impl AgentUi for HeadlessAgentUi {
         elapsed_secs: u64,
     ) {
         self.flush_seg();
-        if self.wrote_answer {
-            println!();
+        match self.format {
+            OutputFormat::Text => {
+                if self.wrote_answer {
+                    println!();
+                }
+                eprintln!("[{steps} step(s) · {tokens} tok · {elapsed_secs}s]");
+            }
+            OutputFormat::StreamJson => {
+                self.emit(
+                    "usage",
+                    json!({ "steps": steps, "tokens": tokens, "elapsedSecs": elapsed_secs }),
+                );
+                self.emit("final", json!({ "text": redact(&self.answer) }));
+            }
         }
-        eprintln!("[{steps} step(s) · {tokens} tok · {elapsed_secs}s]");
     }
     fn ask_permission<'a>(
         &'a mut self,
@@ -356,5 +521,41 @@ mod tests {
     fn parse_upstream_status_extracts_code() {
         assert_eq!(parse_upstream_status("x upstream 429: y"), Some(429));
         assert_eq!(parse_upstream_status("no status here"), None);
+    }
+
+    #[test]
+    fn output_format_parses_known_values() {
+        assert!(matches!(
+            OutputFormat::parse(Some("stream-json")),
+            OutputFormat::StreamJson
+        ));
+        assert!(matches!(
+            OutputFormat::parse(Some("text")),
+            OutputFormat::Text
+        ));
+        assert!(matches!(OutputFormat::parse(None), OutputFormat::Text));
+    }
+
+    #[test]
+    fn stream_event_carries_the_common_envelope_and_merges_fields() {
+        let ev = stream_event("run_abc", "tool_call", json!({ "tool": "edit_file" }));
+        assert_eq!(ev["schemaVersion"], json!(STREAM_JSON_SCHEMA_VERSION));
+        assert_eq!(ev["type"], json!("tool_call"));
+        assert_eq!(ev["runId"], json!("run_abc"));
+        assert_eq!(ev["tool"], json!("edit_file"));
+        // One object per line: serializing must not contain a newline.
+        assert!(!ev.to_string().contains('\n'));
+    }
+
+    #[test]
+    fn redact_args_keeps_clean_args_structured_and_scrubs_secrets() {
+        // No secret → returned structurally unchanged.
+        let clean = json!({ "path": "src/main.rs" });
+        assert_eq!(redact_args(&clean), clean);
+        // A secret-shaped value is scrubbed but the result stays valid JSON.
+        let secret = json!({ "command": "export TOKEN=sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" });
+        let red = redact_args(&secret);
+        assert!(red.is_object() || red.is_string());
+        assert!(!red.to_string().contains("sk-ant-api03-AAAA"));
     }
 }

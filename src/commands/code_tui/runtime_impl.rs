@@ -683,6 +683,7 @@ impl CodeTuiApp {
         // Clone the shared LIVE flag (not a snapshot) so a mid-turn Shift+Tab
         // toggle takes effect on this running turn's permission gate.
         let auto_approve = self.auto_approve_flag.clone();
+        let review_edits = self.review_edits_flag.clone();
         // The context window may have resolved AFTER the engine was built (a model
         // only known via the background catalog warm). Carry the latest value in
         // so the engine can fill a still-missing window and start compacting,
@@ -732,6 +733,7 @@ impl CodeTuiApp {
                 cwd: std::path::Path::new(&cwd),
                 yes: false,
                 auto_approve: Some(&auto_approve),
+                review_edits: Some(&review_edits),
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -857,6 +859,7 @@ impl CodeTuiApp {
                 cwd: std::path::Path::new(&cwd),
                 yes: false,
                 auto_approve: None,
+                review_edits: None,
             };
             let mut ui = ChatAgentUi {
                 tx,
@@ -1747,6 +1750,7 @@ impl CodeTuiApp {
         self.pending_agent_messages = None;
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.stop_agent_serve();
     }
 
@@ -1775,6 +1779,7 @@ impl CodeTuiApp {
         self.stop_agent_serve();
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.queued_messages.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
@@ -1844,6 +1849,7 @@ impl CodeTuiApp {
         self.stop_agent_serve();
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.queued_messages.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
@@ -2278,6 +2284,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
         question: &'a str,
         options: &'a [crate::agent::ask::AskOption],
         allow_free_text: bool,
+        multi_select: bool,
     ) -> futures::future::BoxFuture<'a, Result<String, String>> {
         let tx = self.tx.clone();
         let question = question.to_string();
@@ -2289,6 +2296,7 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                     question,
                     options,
                     allow_free_text,
+                    multi_select,
                     reply,
                 })
                 .is_err()
@@ -2298,6 +2306,26 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
             // A dropped card (interrupt / session end) reads as a dismissal.
             rx.await
                 .unwrap_or_else(|_| Err(crate::agent::ask::DISMISSED_DIRECTIVE.to_string()))
+        })
+    }
+
+    fn review_edits<'a>(
+        &'a mut self,
+        items: &'a [crate::agent::review::ReviewItem],
+    ) -> futures::future::BoxFuture<'a, crate::agent::review::ReviewDecision> {
+        let tx = self.tx.clone();
+        let items = items.to_vec();
+        Box::pin(async move {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(RuntimeEvent::AgentReviewEdits { items, reply })
+                .is_err()
+            {
+                return crate::agent::review::ReviewDecision::Reject;
+            }
+            // A dropped card (interrupt / session end) reads as a rejection (fail-closed).
+            rx.await
+                .unwrap_or(crate::agent::review::ReviewDecision::Reject)
         })
     }
 }

@@ -90,6 +90,7 @@ impl CodeTuiApp {
         // defaults off (safe); thinking_enabled defaults on (high-signal).
         let crate::services::session_store::ChatToggles {
             auto_approve,
+            review_edits,
             thinking_enabled,
             web_search_enabled,
             agent_tools_enabled,
@@ -224,9 +225,14 @@ impl CodeTuiApp {
             agent_serve: None,
             agent_permission: None,
             agent_ask: None,
+            agent_review: None,
             agent_auto_approve: auto_approve,
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 auto_approve,
+            )),
+            agent_review_edits: review_edits,
+            review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                review_edits,
             )),
             thinking_enabled,
             web_search_enabled,
@@ -313,6 +319,10 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     // Remember the auto-approve toggle for next time (best-effort).
     app.session_store
         .set_chat_auto_approve(app.agent_auto_approve)
+        .await
+        .ok();
+    app.session_store
+        .set_chat_review_edits(app.agent_review_edits)
         .await
         .ok();
     // After a clean exit, point the user back to this exact conversation by id

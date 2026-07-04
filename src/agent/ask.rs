@@ -25,8 +25,10 @@ pub fn ask_user_tool_spec() -> ToolSpec {
 than answering in prose. Reach for this whenever you would otherwise stop and ask a question with a \
 small set of likely answers — a yes/no, a this-or-that, a plan approval, or a choice among a few \
 paths. Provide 2–8 concrete `options`; the user picks one (or types their own, unless you set \
-`allow_free_text` to false). The chosen answer comes back as the tool result, so do NOT also pose \
-the question in your text — just call the tool and wait for the result. Skip it when the answer is \
+`allow_free_text` to false). Set `multi_select` to true when several options can apply at once — \
+the user checks any number and the answer comes back as their picks joined by commas (free text is \
+off in that mode). The chosen answer comes back as the tool result, so do NOT also pose the \
+question in your text — just call the tool and wait for the result. Skip it when the answer is \
 open-ended (ask in prose instead) or when you could find the answer yourself with your other tools."
             .to_string(),
         parameters: json!({
@@ -50,7 +52,11 @@ open-ended (ask in prose instead) or when you could find the answer yourself wit
                 },
                 "allow_free_text": {
                     "type": "boolean",
-                    "description": "Whether the user may type their own answer instead of picking one (default true). Set false only when a listed option is truly required."
+                    "description": "Whether the user may type their own answer instead of picking one (default true). Set false only when a listed option is truly required. Ignored when multi_select is true."
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "Whether the user may check several options instead of picking one (default false). When true, free text is disabled and the answer is the checked labels joined by commas."
                 }
             },
             "required": ["question", "options"]
@@ -58,10 +64,11 @@ open-ended (ask in prose instead) or when you could find the answer yourself wit
     }
 }
 
-/// Parse into `(question, options, allow_free_text)`. Lenient: an option may be a
-/// bare string or a `{label, description}` object; blanks dropped; capped at
-/// [`MAX_OPTIONS`]; `allow_free_text` defaults to `true`.
-pub fn parse_ask(args: &Value) -> Result<(String, Vec<AskOption>, bool), String> {
+/// Parse into `(question, options, allow_free_text, multi_select)`. Lenient: an
+/// option may be a bare string or a `{label, description}` object; blanks dropped;
+/// capped at [`MAX_OPTIONS`]; `allow_free_text` defaults to `true` but is forced off
+/// in multi-select; `multi_select` defaults to `false`.
+pub fn parse_ask(args: &Value) -> Result<(String, Vec<AskOption>, bool, bool), String> {
     let question = args
         .get("question")
         .and_then(|v| v.as_str())
@@ -106,11 +113,17 @@ pub fn parse_ask(args: &Value) -> Result<(String, Vec<AskOption>, bool), String>
     if options.is_empty() {
         return Err("ask_user: `options` must contain at least one non-empty choice".to_string());
     }
-    let allow_free_text = args
-        .get("allow_free_text")
+    let multi_select = args
+        .get("multi_select")
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    Ok((question, options, allow_free_text))
+        .unwrap_or(false);
+    // Free text is meaningless when the user is toggling a set of boxes.
+    let allow_free_text = !multi_select
+        && args
+            .get("allow_free_text")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+    Ok((question, options, allow_free_text, multi_select))
 }
 
 /// The tool result echoing the user's answer back to the model.
@@ -131,7 +144,7 @@ mod tests {
 
     #[test]
     fn parses_question_options_and_default_free_text() {
-        let (q, opts, free) = parse_ask(&json!({
+        let (q, opts, free, multi) = parse_ask(&json!({
             "question": "  Add release notes now?  ",
             "options": [
                 {"label": "Yes, I'll write them"},
@@ -145,11 +158,12 @@ mod tests {
         assert_eq!(opts[1].description.as_deref(), Some("Draft from the diff"));
         assert_eq!(opts[2].label, "No, auto-generate"); // bare string → label
         assert!(free); // defaults on
+        assert!(!multi); // defaults off
     }
 
     #[test]
     fn bare_string_option_becomes_label() {
-        let (_q, opts, _) = parse_ask(&json!({
+        let (_q, opts, _, _) = parse_ask(&json!({
             "question": "Pick one",
             "options": ["a", "b"]
         }))
@@ -163,14 +177,14 @@ mod tests {
         let many: Vec<Value> = (0..20)
             .map(|i| json!({"label": format!("opt {i}")}))
             .collect();
-        let (_q, opts, _) = parse_ask(&json!({
+        let (_q, opts, _, _) = parse_ask(&json!({
             "question": "q",
             "options": many
         }))
         .unwrap();
         assert_eq!(opts.len(), MAX_OPTIONS);
 
-        let (_q, opts, _) = parse_ask(&json!({
+        let (_q, opts, _, _) = parse_ask(&json!({
             "question": "q",
             "options": [{"label": "  "}, {"label": "real"}]
         }))
@@ -181,13 +195,26 @@ mod tests {
 
     #[test]
     fn allow_free_text_can_be_disabled() {
-        let (_q, _opts, free) = parse_ask(&json!({
+        let (_q, _opts, free, _) = parse_ask(&json!({
             "question": "q",
             "options": ["a"],
             "allow_free_text": false
         }))
         .unwrap();
         assert!(!free);
+    }
+
+    #[test]
+    fn multi_select_forces_free_text_off() {
+        let (_q, _opts, free, multi) = parse_ask(&json!({
+            "question": "q",
+            "options": ["a", "b", "c"],
+            "multi_select": true,
+            "allow_free_text": true // ignored in multi-select
+        }))
+        .unwrap();
+        assert!(multi);
+        assert!(!free); // forced off despite the explicit true
     }
 
     #[test]

@@ -1183,8 +1183,11 @@ fn make_test_app(
         agent_serve: None,
         agent_permission: None,
         agent_ask: None,
+        agent_review: None,
         agent_auto_approve: false,
         auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        agent_review_edits: false,
+        review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         thinking_enabled: true,
         web_search_enabled: true,
         agent_tools_enabled: true,
@@ -10631,6 +10634,8 @@ async fn test_ask_card_arrow_then_enter_selects_option() {
         question: "Add release notes now?".to_string(),
         options: ask_options(&["Yes, I'll write them", "You add them", "No, auto-generate"]),
         allow_free_text: true,
+        multi_select: false,
+        checked: Vec::new(),
         selected: 0,
         reply,
     });
@@ -10656,6 +10661,8 @@ async fn test_ask_card_digit_picks_option() {
         question: "Pick one".to_string(),
         options: ask_options(&["alpha", "beta", "gamma"]),
         allow_free_text: true,
+        multi_select: false,
+        checked: Vec::new(),
         selected: 0,
         reply,
     });
@@ -10679,6 +10686,8 @@ async fn test_ask_card_free_text_answer() {
         question: "Which version?".to_string(),
         options: ask_options(&["patch", "minor"]),
         allow_free_text: true,
+        multi_select: false,
+        checked: Vec::new(),
         selected: 0,
         reply,
     });
@@ -10705,6 +10714,8 @@ async fn test_ask_card_esc_dismisses() {
         question: "Proceed?".to_string(),
         options: ask_options(&["Yes", "No"]),
         allow_free_text: false,
+        multi_select: false,
+        checked: Vec::new(),
         selected: 0,
         reply,
     });
@@ -10727,6 +10738,8 @@ fn test_ask_card_renders_question_and_options() {
         question: "Add release notes now?".to_string(),
         options: ask_options(&["You add them", "Auto-generate"]),
         allow_free_text: true,
+        multi_select: false,
+        checked: Vec::new(),
         selected: 0,
         reply,
     });
@@ -10737,6 +10750,191 @@ fn test_ask_card_renders_question_and_options() {
     );
     assert!(screen.contains("You add them"), "option missing:\n{screen}");
     assert!(screen.contains("select"), "nav hint missing:\n{screen}");
+}
+
+/// Multi-select: `space` toggles the highlighted box, arrows move, and Enter
+/// returns the checked labels joined by ", " (not just the highlighted one).
+#[tokio::test]
+async fn test_ask_card_multi_select_space_toggles_and_enter_joins() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Which checks?".to_string(),
+        options: ask_options(&["fmt", "clippy", "test"]),
+        allow_free_text: false,
+        multi_select: true,
+        checked: vec![false; 3],
+        selected: 0,
+        reply,
+    });
+
+    // Check fmt via space, move down twice, check test.
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(app.agent_ask.is_some(), "space toggles without confirming");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+
+    assert!(
+        app.agent_ask.is_none(),
+        "Enter resolves the multi-select card"
+    );
+    assert_eq!(answer_rx.await.unwrap(), Ok("fmt, test".to_string()));
+}
+
+/// Multi-select renders checkboxes and the "toggle" hint, and a digit toggles the
+/// matching box rather than immediately submitting.
+#[tokio::test]
+async fn test_ask_card_multi_select_digit_toggles_box() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, answer_rx) = tokio::sync::oneshot::channel::<std::result::Result<String, String>>();
+    app.agent_ask = Some(PendingAskUser {
+        question: "Which checks?".to_string(),
+        options: ask_options(&["fmt", "clippy", "test"]),
+        allow_free_text: false,
+        multi_select: true,
+        checked: vec![false; 3],
+        selected: 0,
+        reply,
+    });
+
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(screen.contains("[ ]"), "unchecked boxes render:\n{screen}");
+    assert!(
+        screen.contains("toggle"),
+        "multi-select hint missing:\n{screen}"
+    );
+
+    // Digit 2 toggles clippy on but does not submit.
+    app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        app.agent_ask.is_some(),
+        "a digit toggles, it does not submit"
+    );
+    let (screen, _rows) = render_full_screen(&mut app, 70, 20);
+    assert!(
+        screen.contains("[x]"),
+        "the toggled box shows checked:\n{screen}"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(answer_rx.await.unwrap(), Ok("clippy".to_string()));
+}
+
+/// The edit-review card renders the heading, the per-file diff, and the y/n keys.
+#[test]
+fn test_review_card_renders_diff_and_keys() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::review::ReviewDecision>();
+    let items = vec![crate::agent::review::review_item(
+        0,
+        "edit_file",
+        &serde_json::json!({
+            "path": "src/lib.rs",
+            "old_string": "let x = 1;",
+            "new_string": "let x = 2;",
+        }),
+    )];
+    let body = super::render::review_body_lines(&items, std::path::Path::new("."));
+    app.agent_review = Some(PendingReview {
+        count: 1,
+        body,
+        scroll: 0,
+        reply,
+    });
+    let (screen, _rows) = render_full_screen(&mut app, 80, 24);
+    assert!(
+        screen.contains("review 1 edit"),
+        "heading missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("src/lib.rs"),
+        "file header missing:\n{screen}"
+    );
+    assert!(
+        screen.contains("approve") && screen.contains("reject"),
+        "y/n hints missing:\n{screen}"
+    );
+}
+
+/// `y`/Enter approve the batch, `n`/Esc reject it — each resolves the card and
+/// sends the verdict to the waiting engine task.
+#[tokio::test]
+async fn test_review_card_keys_resolve_decision() {
+    use crate::agent::review::ReviewDecision;
+    let cases: [(KeyCode, ReviewDecision); 4] = [
+        (KeyCode::Char('y'), ReviewDecision::ApproveAll),
+        (KeyCode::Enter, ReviewDecision::ApproveAll),
+        (KeyCode::Char('n'), ReviewDecision::Reject),
+        (KeyCode::Esc, ReviewDecision::Reject),
+    ];
+    for (code, expected) in cases {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = make_test_app(tx, rx);
+        let (reply, decision_rx) = tokio::sync::oneshot::channel::<ReviewDecision>();
+        app.agent_review = Some(PendingReview {
+            count: 1,
+            body: vec![ratatui::text::Line::from("diff")],
+            scroll: 0,
+            reply,
+        });
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.agent_review.is_none(), "{code:?} resolves the card");
+        assert_eq!(decision_rx.await.unwrap(), expected, "{code:?}");
+    }
+}
+
+/// Arrow keys scroll the review body without resolving the card.
+#[tokio::test]
+async fn test_review_card_arrows_scroll() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::review::ReviewDecision>();
+    let body: Vec<ratatui::text::Line> = (0..10)
+        .map(|i| ratatui::text::Line::from(format!("line {i}")))
+        .collect();
+    app.agent_review = Some(PendingReview {
+        count: 1,
+        body,
+        scroll: 0,
+        reply,
+    });
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(app.agent_review.as_ref().unwrap().scroll, 2, "down scrolls");
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert_eq!(
+        app.agent_review.as_ref().unwrap().scroll,
+        1,
+        "up scrolls back"
+    );
+    assert!(app.agent_review.is_some(), "scrolling does not resolve");
 }
 
 /// Messages submitted while a turn is in flight queue in order — a second one

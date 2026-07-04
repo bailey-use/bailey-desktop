@@ -19,6 +19,7 @@ pub mod plan;
 pub mod protocol;
 pub mod request;
 pub mod retry;
+pub mod review;
 pub mod sandbox;
 pub mod secrets_guard;
 pub mod serve_client;

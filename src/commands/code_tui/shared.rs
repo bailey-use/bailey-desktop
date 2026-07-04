@@ -607,6 +607,8 @@ pub(super) enum ConfigSetting {
     Thinking,
     /// Run the agent's tools without asking (mirrors the Shift+Tab toggle).
     AutoApprove,
+    /// Show an edit-review card before edits are written (opt-in).
+    ReviewEdits,
     /// Whether the agent may use aivo's hosted web_search (`/v1/search`).
     UseWebSearch,
     AgentTools,
@@ -1449,7 +1451,13 @@ pub(super) enum RuntimeEvent {
         question: String,
         options: Vec<crate::agent::ask::AskOption>,
         allow_free_text: bool,
+        multi_select: bool,
         reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    /// The agent's edit-review gate: show the pending edits, reply with the verdict.
+    AgentReviewEdits {
+        items: Vec<crate::agent::review::ReviewItem>,
+        reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
     },
     /// Live context-window fill from the agent engine mid-turn: `measured` true =
     /// a provider step total (exact), false = a chars/4 request estimate. Moves
@@ -1525,8 +1533,21 @@ pub(super) struct PendingAskUser {
     pub(super) question: String,
     pub(super) options: Vec<crate::agent::ask::AskOption>,
     pub(super) allow_free_text: bool,
+    /// Multi-select (free text off): `checked` is the per-option state, `Enter`
+    /// returns the checked labels joined by ", ".
+    pub(super) multi_select: bool,
+    pub(super) checked: Vec<bool>,
     pub(super) selected: usize,
     pub(super) reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+}
+
+/// A pending edit-review card: `count` edits as precomputed scrollable `body` diff
+/// lines and `reply` for the verdict. Dropping it unreplied resolves to `Reject`.
+pub(super) struct PendingReview {
+    pub(super) count: usize,
+    pub(super) body: Vec<ratatui::text::Line<'static>>,
+    pub(super) scroll: u16,
+    pub(super) reply: tokio::sync::oneshot::Sender<crate::agent::review::ReviewDecision>,
 }
 
 /// Active `/goal` autonomous loop: after each agent turn the app auto-continues
@@ -1781,6 +1802,8 @@ pub(super) struct CodeTuiApp {
     pub(super) agent_permission: Option<PendingPermission>,
     /// Pending `ask_user` question card, while the agent waits for the user's pick.
     pub(super) agent_ask: Option<PendingAskUser>,
+    /// Pending edit-review card, while the agent waits for approve/reject.
+    pub(super) agent_review: Option<PendingReview>,
     /// Session decision on spawning a repo's project `.mcp.json` stdio servers.
     pub(super) project_mcp_consent: ProjectMcpConsent,
     /// Pending consent card for project MCP servers (held back until decided).
@@ -1794,6 +1817,11 @@ pub(super) struct CodeTuiApp {
     /// cursor-agent ACP session reads it on each out-of-process
     /// `request_permission`. Kept in lockstep with `agent_auto_approve`.
     pub(super) auto_approve_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Session-wide edit review (`/config`): when on, an edit batch pauses for a
+    /// diff-review card before writing. Off by default (opt-in).
+    pub(super) agent_review_edits: bool,
+    /// The same state as a shared atomic, read LIVE per batch by the running turn.
+    pub(super) review_edits_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether the model reasons before answering. On (default): engine requests
     /// reasoning at the effective effort; off: engine sends the family's "off"
     /// floor, which the loopback bridge maps to `thinking:{type:"disabled"}` for

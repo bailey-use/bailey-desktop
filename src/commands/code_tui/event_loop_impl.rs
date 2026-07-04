@@ -144,13 +144,32 @@ impl CodeTuiApp {
                 question,
                 options,
                 allow_free_text,
+                multi_select,
                 reply,
             } => {
+                let checked = vec![false; options.len()];
                 self.agent_ask = Some(PendingAskUser {
                     question,
                     options,
                     allow_free_text,
+                    multi_select,
+                    checked,
                     selected: 0,
+                    reply,
+                });
+            }
+            RuntimeEvent::AgentReviewEdits { items, reply } => {
+                // Precompute the diff body now (has the live cwd) so rendering stays pure.
+                let cwd = if self.real_cwd.is_empty() {
+                    self.cwd.clone()
+                } else {
+                    self.real_cwd.clone()
+                };
+                let body = super::render::review_body_lines(&items, std::path::Path::new(&cwd));
+                self.agent_review = Some(PendingReview {
+                    count: items.len(),
+                    body,
+                    scroll: 0,
                     reply,
                 });
             }
@@ -626,6 +645,7 @@ impl CodeTuiApp {
         self.pending_submit = None;
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.stop_agent_serve();
         // Adopt + persist the protocol the serve negotiated this turn.
         self.persist_agent_route().await;
@@ -843,6 +863,7 @@ impl CodeTuiApp {
         self.pending_submit = None;
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.queued_messages.clear();
         self.stop_agent_serve();
         self.follow_output = true;

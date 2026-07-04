@@ -131,6 +131,7 @@ pub(crate) async fn run_one_shot_agent(
         cwd: Path::new(&cwd),
         yes: true,
         auto_approve: None,
+        review_edits: None,
     };
     let mut ui = HeadlessAgentUi::new(format);
     ui.run_start(model, &cwd);

@@ -403,6 +403,11 @@ is preserved."
                 description: "run write/edit/bash without asking (Shift+Tab)",
             },
             ConfigToggle {
+                setting: ConfigSetting::ReviewEdits,
+                label: "Review edits",
+                description: "show edits for approval before they're written",
+            },
+            ConfigToggle {
                 setting: ConfigSetting::UseWebSearch,
                 label: "aivo web search",
                 description: "let the agent search the web via aivo (daily quota)",
@@ -422,6 +427,7 @@ is preserved."
         match setting {
             ConfigSetting::Thinking => self.thinking_enabled,
             ConfigSetting::AutoApprove => self.agent_auto_approve,
+            ConfigSetting::ReviewEdits => self.agent_review_edits,
             ConfigSetting::UseWebSearch => self.web_search_enabled,
             ConfigSetting::AgentTools => self.agent_tools_enabled,
         }
@@ -441,6 +447,7 @@ is preserved."
             ConfigSetting::Thinking => self.set_thinking_enabled(!self.thinking_enabled).await,
             // Reuse the shared setter so the live atomic + toast stay in lockstep.
             ConfigSetting::AutoApprove => self.set_auto_approve(!self.agent_auto_approve),
+            ConfigSetting::ReviewEdits => self.set_review_edits(!self.agent_review_edits),
             ConfigSetting::UseWebSearch => {
                 self.set_web_search_enabled(!self.web_search_enabled).await
             }
@@ -1647,6 +1654,7 @@ is preserved."
         self.agent_engine = None;
         self.agent_permission = None;
         self.agent_ask = None;
+        self.agent_review = None;
         self.stop_agent_serve();
         self.session_id = session.session_id;
         // Re-seed the running token total from the stored entry so further turns

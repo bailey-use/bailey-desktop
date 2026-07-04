@@ -155,6 +155,7 @@ pub trait AgentUi: Send {
         _question: &'a str,
         _options: &'a [crate::agent::ask::AskOption],
         _allow_free_text: bool,
+        _multi_select: bool,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async {
             Err(
@@ -162,6 +163,14 @@ pub trait AgentUi: Send {
                     .to_string(),
             )
         })
+    }
+    /// Show the pending edits and return the user's verdict. Only reached with the
+    /// live toggle on; the default fails closed to `Reject` like `ask_permission`.
+    fn review_edits<'a>(
+        &'a mut self,
+        _items: &'a [crate::agent::review::ReviewItem],
+    ) -> BoxFuture<'a, crate::agent::review::ReviewDecision> {
+        Box::pin(async { crate::agent::review::ReviewDecision::Reject })
     }
 }
 
@@ -195,6 +204,9 @@ pub struct TurnCtx<'a> {
     /// tool call so flipping it mid-turn takes effect on the *running* turn,
     /// unlike the `yes` snapshot. `None` outside the chat TUI.
     pub auto_approve: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Live edit-review toggle (chat `/config`), read fresh per batch. `None`
+    /// outside the chat TUI — headless / `-y` / sub-agents never gate.
+    pub review_edits: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 impl TurnCtx<'_> {
@@ -204,6 +216,12 @@ impl TurnCtx<'_> {
             || self
                 .auto_approve
                 .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// True when edits should pause for review — the live toggle only (no `-y`).
+    pub fn review_edits_enabled(&self) -> bool {
+        self.review_edits
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -1514,6 +1532,38 @@ Investigate with read-only tools and write the implementation plan instead."
             sequential_idx.retain(|i| !subagent_idx.contains(i));
         }
 
+        // Opt-in edit-review gate: pause an edit-bearing batch for approval before
+        // any write. Reject drops the reviewed calls (a sibling `run_bash` still runs).
+        if ctx.review_edits_enabled() {
+            let reviewed: Vec<usize> = sequential_idx
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let c = &tool_calls[i];
+                    let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
+                    crate::agent::review::is_edit_tool(n)
+                })
+                .collect();
+            if !reviewed.is_empty() {
+                let items: Vec<crate::agent::review::ReviewItem> = reviewed
+                    .iter()
+                    .map(|&i| {
+                        let c = &tool_calls[i];
+                        let n = subagents::normalize_tool_name(&c.name).unwrap_or(&c.name);
+                        crate::agent::review::review_item(i, n, &c.arguments)
+                    })
+                    .collect();
+                if ui.review_edits(&items).await == crate::agent::review::ReviewDecision::Reject {
+                    for &i in &reviewed {
+                        outcomes[i] = Some(Err(
+                            crate::agent::review::REVIEW_REJECTED_DIRECTIVE.to_string()
+                        ));
+                    }
+                    sequential_idx.retain(|i| !reviewed.contains(i));
+                }
+            }
+        }
+
         // Run the ordered calls one at a time — they mutate the engine or workspace, so concurrency is unsafe.
         for &i in &sequential_idx {
             let call = &tool_calls[i];
@@ -1577,8 +1627,8 @@ Investigate with read-only tools and write the implementation plan instead."
                 }
             } else if n == "ask_user" {
                 match ask::parse_ask(&call.arguments) {
-                    Ok((question, options, allow_free_text)) => ui
-                        .ask_user(&question, &options, allow_free_text)
+                    Ok((question, options, allow_free_text, multi_select)) => ui
+                        .ask_user(&question, &options, allow_free_text, multi_select)
                         .await
                         .map(|answer| ask::confirmation(&answer)),
                     Err(e) => Err(e),
@@ -2170,20 +2220,20 @@ interactive session: before you BUILD something substantial — scaffolding a ne
 adding a whole feature, or making a large multi-file change — don't dive straight into \
 creating or editing files. You may first investigate read-only (`read_file`, `grep`, `glob`, \
 `list_dir`) to ground the plan, then reply with a short plan — the approach and a numbered \
-list of the steps you'd take — and ask the user to confirm or adjust it. Do NOT create or \
-modify files, or run build/scaffold/state-changing commands, until they approve; end your \
-turn after asking. Wait for a clear go-ahead before you build. A reply that only asks for a \
-change or states a preference — e.g. \"use a light theme\", \"add auth\", \"drop the export \
-step\", \"make it Postgres\" — is a plan REVISION, not approval: fold it in, show the updated \
-plan, and ask again. Start building only when the user clearly signals to proceed with no \
-further changes (\"go\", \"yes, build it\", \"proceed\", \"lgtm\"). If one message both \
-requests a change and says go (\"use a light theme, then go\"), apply the change and build. \
-When it's unclear whether a reply means \"proceed\" or \"also change this\", ask rather than \
-assuming. This is ONLY for \
-sizeable, multi-step build work — for quick fixes, small single-file edits, answering \
-questions, and read-only exploration, keep acting directly rather than making the user \
-approve trivial work. And if the user has already told you to proceed, handed you a plan to \
-implement, or asked you to work autonomously, skip the confirmation and just build.";
+list of the steps you'd take. Do NOT create or modify files, or run build/scaffold/\
+state-changing commands, until the user approves; end your turn after presenting the plan. To \
+get the go-ahead, call `ask_user` with the plan's decision as the options — e.g. `Approve` and \
+`Cancel` — and leave free text on, so the user can pick or type a tweak. Picking `Approve` (or \
+a plain \"go\"/\"proceed\"/\"lgtm\" typed in the composer) is your signal to build. A free-text \
+answer that only asks for a change or states a preference — e.g. \"use a light theme\", \"add \
+auth\", \"drop the export step\", \"make it Postgres\" — is a plan REVISION, not approval: fold \
+it in, show the updated plan, and ask again with `ask_user`. If one message both requests a \
+change and says go (\"use a light theme, then go\"), apply the change and build. Picking \
+`Cancel` or dismissing the card ends the turn — stop and let the user say how to proceed. This \
+is ONLY for sizeable, multi-step build work — for quick fixes, small single-file edits, \
+answering questions, and read-only exploration, keep acting directly rather than making the \
+user approve trivial work. And if the user has already told you to proceed, handed you a plan \
+to implement, or asked you to work autonomously, skip the confirmation and just build.";
 
 const FIRST_PARTY_IDENTITY: &str = "You are aivo's own assistant. If the user asks what model you \
 are, who built you, or which provider or company is behind you, present yourself as aivo's \
@@ -2450,6 +2500,7 @@ mod tests {
             cwd,
             yes: true,
             auto_approve: None,
+            review_edits: None,
         }
     }
 
@@ -2469,6 +2520,7 @@ mod tests {
             cwd,
             yes,
             auto_approve: flag,
+            review_edits: None,
         };
         assert!(ctx(true, None).auto_approve_enabled());
         assert!(!ctx(false, None).auto_approve_enabled());
@@ -2929,6 +2981,7 @@ mod tests {
             cwd: dir.as_path(),
             yes: false,
             auto_approve: None,
+            review_edits: None,
         };
         let mut ui = CapturingUi {
             deny: true,
@@ -3089,6 +3142,7 @@ mod tests {
             cwd: &dir,
             yes: false,
             auto_approve: None,
+            review_edits: None,
         };
         let mut ui = CapturingUi {
             deny: true,
@@ -3138,6 +3192,7 @@ mod tests {
             cwd: &dir,
             yes: false,
             auto_approve: None,
+            review_edits: None,
         };
         let mut ui = CapturingUi {
             always_allow: true,
@@ -5100,7 +5155,7 @@ mod tests {
         struct SwitchUi {
             switched: Vec<String>,
             efforts: Vec<String>,
-            asked: Vec<(String, Vec<String>, bool)>,
+            asked: Vec<(String, Vec<String>, bool, bool)>,
         }
         impl AgentUi for SwitchUi {
             fn assistant_text(&mut self, _: &str) {}
@@ -5134,11 +5189,13 @@ mod tests {
                 question: &'a str,
                 options: &'a [crate::agent::ask::AskOption],
                 allow_free_text: bool,
+                multi_select: bool,
             ) -> BoxFuture<'a, Result<String, String>> {
                 self.asked.push((
                     question.to_string(),
                     options.iter().map(|o| o.label.clone()).collect(),
                     allow_free_text,
+                    multi_select,
                 ));
                 let answer = options.first().map(|o| o.label.clone()).unwrap_or_default();
                 Box::pin(async move { Ok(answer) })
@@ -5179,7 +5236,8 @@ mod tests {
             vec![(
                 "Add release notes now?".to_string(),
                 vec!["You add them".to_string(), "Auto-generate".to_string()],
-                false
+                false, // allow_free_text
+                false, // multi_select
             )]
         );
 
@@ -5187,6 +5245,199 @@ mod tests {
         let mut plain = CapturingUi::default();
         let declined = plain.switch_chat_model("opus").await.unwrap_err();
         assert!(declined.contains("interactive"));
+    }
+
+    /// A fake UI for the edit-review gate: records the card firings and returns a preset verdict.
+    #[derive(Default)]
+    struct ReviewUi {
+        reject: bool,
+        review_calls: usize,
+        reviewed_paths: Vec<String>,
+    }
+    impl AgentUi for ReviewUi {
+        fn assistant_text(&mut self, _: &str) {}
+        fn tool_start(&mut self, _: &str, _: &Value) {}
+        fn tool_result(&mut self, _: &str, _: &Result<String, String>) {}
+        fn notify(&mut self, _: &str) {}
+        fn footer(&mut self, _: Option<&str>, _: usize, _: u64, _: u64, _: u64) {}
+        fn ask_permission<'a>(
+            &'a mut self,
+            _: &'a str,
+            _: Option<&'a str>,
+        ) -> BoxFuture<'a, Decision> {
+            Box::pin(async { Decision::Allow })
+        }
+        fn review_edits<'a>(
+            &'a mut self,
+            items: &'a [crate::agent::review::ReviewItem],
+        ) -> BoxFuture<'a, crate::agent::review::ReviewDecision> {
+            self.review_calls += 1;
+            for it in items {
+                self.reviewed_paths.extend(it.paths.clone());
+            }
+            let reject = self.reject;
+            Box::pin(async move {
+                if reject {
+                    crate::agent::review::ReviewDecision::Reject
+                } else {
+                    crate::agent::review::ReviewDecision::ApproveAll
+                }
+            })
+        }
+    }
+
+    fn write_and_note_calls() -> Vec<ToolCall> {
+        vec![
+            ToolCall {
+                id: "1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "out.txt", "content": "new\n"}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "take_note".into(),
+                arguments: json!({"note": "remember"}),
+            },
+        ]
+    }
+
+    /// Reject: the edit's outcome is the directive and the file is untouched, while a non-edit sibling still runs.
+    #[tokio::test]
+    async fn review_gate_reject_skips_write_but_runs_sibling() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp();
+        std::fs::write(dir.join("out.txt"), "old\n").unwrap();
+        let client = reqwest::Client::new();
+        let flag = AtomicBool::new(true);
+        let ctx = TurnCtx {
+            client: &client,
+            serve_base: "",
+            auth: None,
+            cwd: dir.as_path(),
+            yes: true, // auto-approve on, so no permission card competes with review
+            auto_approve: None,
+            review_edits: Some(&flag),
+        };
+        let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = ReviewUi {
+            reject: true,
+            ..Default::default()
+        };
+        let (_t, failures) = e
+            .execute_tool_batch(&ctx, &mut ui, &write_and_note_calls())
+            .await;
+        assert_eq!(ui.review_calls, 1, "the batch is reviewed exactly once");
+        assert_eq!(ui.reviewed_paths, vec!["out.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "old\n",
+            "a rejected edit leaves the file untouched"
+        );
+        assert!(
+            failures.iter().any(|(t, msg)| t == "write_file"
+                && msg == crate::agent::review::REVIEW_REJECTED_DIRECTIVE),
+            "write_file reports the review-rejected directive: {failures:?}"
+        );
+        assert!(
+            !failures.iter().any(|(t, _)| t == "take_note"),
+            "the non-edit sibling still ran"
+        );
+    }
+
+    /// Review ON + ApproveAll: the edit is written.
+    #[tokio::test]
+    async fn review_gate_approve_writes_the_edit() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp();
+        std::fs::write(dir.join("out.txt"), "old\n").unwrap();
+        let client = reqwest::Client::new();
+        let flag = AtomicBool::new(true);
+        let ctx = TurnCtx {
+            client: &client,
+            serve_base: "",
+            auth: None,
+            cwd: dir.as_path(),
+            yes: true,
+            auto_approve: None,
+            review_edits: Some(&flag),
+        };
+        let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = ReviewUi::default();
+        let (_t, failures) = e
+            .execute_tool_batch(&ctx, &mut ui, &write_and_note_calls())
+            .await;
+        assert_eq!(ui.review_calls, 1);
+        assert!(
+            failures.is_empty(),
+            "approve lets the edit succeed: {failures:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "new\n",
+            "an approved edit is written"
+        );
+    }
+
+    /// Flag `None` (headless): the gate is skipped — `review_edits` is never called.
+    #[tokio::test]
+    async fn review_gate_none_skips_the_card() {
+        let dir = tmp();
+        std::fs::write(dir.join("out.txt"), "old\n").unwrap();
+        let client = reqwest::Client::new();
+        let ctx = TurnCtx {
+            client: &client,
+            serve_base: "",
+            auth: None,
+            cwd: dir.as_path(),
+            yes: true,
+            auto_approve: None,
+            review_edits: None,
+        };
+        let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = ReviewUi {
+            reject: true, // would reject if consulted — proves it isn't
+            ..Default::default()
+        };
+        let (_t, failures) = e
+            .execute_tool_batch(&ctx, &mut ui, &write_and_note_calls())
+            .await;
+        assert_eq!(ui.review_calls, 0, "the gate never fires without the flag");
+        assert!(failures.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    /// With the flag on but no edit tools in the batch, the card doesn't fire.
+    #[tokio::test]
+    async fn review_gate_skips_when_no_edits() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tmp();
+        let client = reqwest::Client::new();
+        let flag = AtomicBool::new(true);
+        let ctx = TurnCtx {
+            client: &client,
+            serve_base: "",
+            auth: None,
+            cwd: dir.as_path(),
+            yes: true,
+            auto_approve: None,
+            review_edits: Some(&flag),
+        };
+        let mut e = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = ReviewUi {
+            reject: true,
+            ..Default::default()
+        };
+        let calls = vec![ToolCall {
+            id: "1".into(),
+            name: "take_note".into(),
+            arguments: json!({"note": "just a note"}),
+        }];
+        let (_t, failures) = e.execute_tool_batch(&ctx, &mut ui, &calls).await;
+        assert_eq!(ui.review_calls, 0, "no edit tools → no review card");
+        assert!(failures.is_empty());
     }
 
     /// With no subagents the tool stays generic — no `agent` field, no listing.

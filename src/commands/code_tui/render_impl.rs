@@ -859,6 +859,8 @@ impl CodeTuiApp {
             self.render_permission_card(frame, composer_area, outer);
         } else if self.agent_ask.is_some() {
             self.render_ask_user_card(frame, composer_area, outer);
+        } else if self.agent_review.is_some() {
+            self.render_review_card(frame, composer_area, outer);
         }
 
         // Snapshot the finished screen so a drag can copy from anywhere on it,
@@ -1198,18 +1200,20 @@ impl CodeTuiApp {
             .collect();
 
         // Size to the widest visible line (question / option+marker / keys).
-        let keys = ask_user_keys_line(ask.allow_free_text);
+        let keys = ask_user_keys_line(ask.allow_free_text, ask.multi_select);
         let keys_w: usize = keys
             .spans
             .iter()
             .map(|s| display_width(s.content.as_ref()))
             .sum();
+        // Multi-select prefixes each option with a "[x] " checkbox.
+        let box_w = if ask.multi_select { 4 } else { 0 };
         let mut content_w = keys_w;
         for l in &q_lines {
             content_w = content_w.max(display_width(l));
         }
         for s in &opt_plain {
-            content_w = content_w.max(display_width(s) + 2);
+            content_w = content_w.max(display_width(s) + 2 + box_w);
         }
         let width = (content_w as u16).saturating_add(4).clamp(1, max_width);
         let inner_width = usize::from(width.saturating_sub(4)).max(1);
@@ -1242,13 +1246,30 @@ impl CodeTuiApp {
             } else {
                 Style::default().fg(TEXT)
             };
-            let mut spans = vec![
-                Span::styled(if selected { "❯ " } else { "  " }, marker_style),
-                Span::styled(format!("{}. ", i + 1), Style::default().fg(MUTED)),
-            ];
+            let mut spans = vec![Span::styled(
+                if selected { "❯ " } else { "  " },
+                marker_style,
+            )];
+            if ask.multi_select {
+                let checked = ask.checked.get(i).copied().unwrap_or(false);
+                let box_style = if checked {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(FAINT)
+                };
+                spans.push(Span::styled(
+                    if checked { "[x] " } else { "[ ] " },
+                    box_style,
+                ));
+            }
+            spans.push(Span::styled(
+                format!("{}. ", i + 1),
+                Style::default().fg(MUTED),
+            ));
             // The description (FAINT) only shows if it still fits after the label.
-            let label = truncate_for_display_width(&opt.label, inner_width.saturating_sub(3));
-            let used = display_width(&label) + 3;
+            let label =
+                truncate_for_display_width(&opt.label, inner_width.saturating_sub(3 + box_w));
+            let used = display_width(&label) + 3 + box_w;
             spans.push(Span::styled(label, label_style));
             if let Some(desc) = opt
                 .description
@@ -1286,6 +1307,73 @@ impl CodeTuiApp {
             .border_style(Style::default().fg(ACCENT))
             .title(Span::styled(
                 " question ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(card).inner(ratatui::layout::Margin {
+            vertical: 0,
+            horizontal: 1,
+        });
+        frame.render_widget(block, card);
+        frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    }
+
+    /// The edit-review card: heading, the scrollable precomputed diff, and y/n keys.
+    /// Floats above the composer like the `ask_user` card.
+    fn render_review_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
+        let Some(review) = self.agent_review.as_ref() else {
+            return;
+        };
+        let anchor = composer_area.y.saturating_sub(1);
+        let max_total = anchor.saturating_sub(frame_area.y).max(1);
+        let max_width = composer_area.width.min(frame_area.width).max(1);
+        let inner_width = usize::from(max_width.saturating_sub(4)).max(1);
+
+        let heading = format!(
+            "review {} edit{} before writing",
+            review.count,
+            if review.count == 1 { "" } else { "s" }
+        );
+        let keys = review_keys_line();
+
+        // heading + blank + keys + 2 borders; the rest is the scrollable diff window.
+        let chrome = 5u16;
+        let body_budget = usize::from(max_total.saturating_sub(chrome)).max(1);
+        let scroll = usize::from(review.scroll).min(review.body.len().saturating_sub(1));
+        let visible = review.body.len().saturating_sub(scroll).min(body_budget);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            truncate_for_display_width(&heading, inner_width),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        for line in review.body.iter().skip(scroll).take(visible) {
+            lines.push(line.clone());
+        }
+        let remaining = review.body.len().saturating_sub(scroll + visible);
+        if remaining > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{remaining} more (↑↓ scroll)"),
+                Style::default().fg(FAINT),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(keys);
+
+        let height = (lines.len() as u16 + 2).min(max_total);
+        let y = anchor.saturating_sub(height).max(frame_area.y);
+        let card = Rect {
+            x: composer_area.x,
+            y,
+            width: max_width,
+            height,
+        };
+        frame.render_widget(Clear, card);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(
+                " review edits ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(card).inner(ratatui::layout::Margin {
@@ -2150,8 +2238,14 @@ impl CodeTuiApp {
             vec![("y", "run"), ("a", "always"), ("n", "deny")]
         } else if self.agent_permission.is_some() {
             vec![("y", "allow"), ("n", "deny"), ("a", "always")]
-        } else if self.agent_ask.is_some() {
-            vec![("↑↓", "move"), ("↵", "select"), ("esc", "dismiss")]
+        } else if let Some(ask) = self.agent_ask.as_ref() {
+            if ask.multi_select {
+                vec![("↑↓", "move"), ("space", "toggle"), ("↵", "confirm")]
+            } else {
+                vec![("↑↓", "move"), ("↵", "select"), ("esc", "dismiss")]
+            }
+        } else if self.agent_review.is_some() {
+            vec![("y", "approve"), ("n", "reject"), ("↑↓", "scroll")]
         } else if self.sending {
             vec![("esc", "interrupt"), ("type", "queue next")]
         } else {
@@ -2421,8 +2515,9 @@ fn permission_keys_line(tool: &str, composing: bool) -> Line<'static> {
     ])
 }
 
-/// The `ask_user` card's key-hint row (with a "type your own" note when allowed).
-fn ask_user_keys_line(allow_free_text: bool) -> Line<'static> {
+/// The `ask_user` card's key-hint row: "space toggle · ↵ confirm" in multi-select,
+/// otherwise "↵ select" (with a "type your own" note when free text is allowed).
+fn ask_user_keys_line(allow_free_text: bool, multi_select: bool) -> Line<'static> {
     let keycap = |key: &str| {
         Span::styled(
             key.to_string(),
@@ -2431,21 +2526,52 @@ fn ask_user_keys_line(allow_free_text: bool) -> Line<'static> {
     };
     let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
     let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
-    let mut spans = vec![
-        keycap("↑↓"),
-        label(" move"),
-        gap(),
-        keycap("↵"),
-        label(" select"),
-    ];
-    if allow_free_text {
+    let mut spans = vec![keycap("↑↓"), label(" move")];
+    if multi_select {
         spans.push(gap());
-        spans.push(label("type your own"));
+        spans.push(keycap("space"));
+        spans.push(label(" toggle"));
+        spans.push(gap());
+        spans.push(keycap("↵"));
+        spans.push(label(" confirm"));
+    } else {
+        spans.push(gap());
+        spans.push(keycap("↵"));
+        spans.push(label(" select"));
+        if allow_free_text {
+            spans.push(gap());
+            spans.push(label("type your own"));
+        }
     }
     spans.push(gap());
     spans.push(keycap("esc"));
     spans.push(label(" dismiss"));
     Line::from(spans)
+}
+
+/// The edit-review card's key-hint row.
+fn review_keys_line() -> Line<'static> {
+    let keycap = |key: &str| {
+        Span::styled(
+            key.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )
+    };
+    let label = |text: &str| Span::styled(text.to_string(), Style::default().fg(MUTED));
+    let gap = || Span::styled("    ".to_string(), Style::default().fg(FAINT));
+    Line::from(vec![
+        keycap("y"),
+        label(" approve"),
+        gap(),
+        keycap("n"),
+        label(" reject"),
+        gap(),
+        keycap("↑↓"),
+        label(" scroll"),
+        gap(),
+        keycap("esc"),
+        label(" reject"),
+    ])
 }
 
 #[cfg(test)]

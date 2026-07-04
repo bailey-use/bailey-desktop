@@ -739,6 +739,9 @@ pub struct MessageAttachment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatToggles {
     pub auto_approve: bool,
+    /// Whether an edit-bearing batch pauses for a diff-review card before writing
+    /// (`/config`). Defaults off (opt-in).
+    pub review_edits: bool,
     /// Whether the model is asked to think (and its reasoning shown, folded) — the
     /// single thinking on/off concept. Defaults on.
     pub thinking_enabled: bool,
@@ -1826,6 +1829,18 @@ impl SessionStore {
         self.write_code_prefs(&prefs).await
     }
 
+    /// The persisted edit-review toggle (code-prefs.json). Missing → off (opt-in).
+    pub async fn get_chat_review_edits(&self) -> bool {
+        self.get_chat_pref_bool("reviewEdits", false).await
+    }
+
+    /// Persist the global edit-review toggle, preserving sibling prefs. Best-effort.
+    pub async fn set_chat_review_edits(&self, on: bool) -> Result<()> {
+        let mut prefs = self.read_code_prefs().await;
+        prefs.insert("reviewEdits".into(), serde_json::Value::Bool(on));
+        self.write_code_prefs(&prefs).await
+    }
+
     /// The persisted thinking on/off toggle (remembered across `aivo code`
     /// sessions, set in the `/config` overlay). Shares code-prefs.json with the
     /// auto-approve flag. Defaults to ON — reasoning is high-signal feedback
@@ -1917,6 +1932,7 @@ impl SessionStore {
             .unwrap_or(true);
         ChatToggles {
             auto_approve: bool_or("autoApprove", false),
+            review_edits: bool_or("reviewEdits", false),
             thinking_enabled,
             web_search_enabled: bool_or("useWebSearch", false),
             agent_tools_enabled: bool_or("agentTools", true),
@@ -2503,6 +2519,35 @@ mod tests {
         let resolved = store.resolve_key_by_id_or_name(&id).await.unwrap();
         assert_eq!(resolved.id, id);
         assert_eq!(resolved.name, "my-key");
+    }
+
+    /// The edit-review toggle defaults off, round-trips, and coexists with the
+    /// auto-approve pref (each read-merge-writes without clobbering the other).
+    #[tokio::test]
+    async fn test_review_edits_pref_persists_beside_auto_approve() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        // Default off, and absent from the toggles snapshot's default.
+        assert!(!store.get_chat_review_edits().await);
+        assert!(!store.get_chat_toggles().await.review_edits);
+
+        // Set a sibling pref first, then flip review-edits; neither clobbers the other.
+        store.set_chat_auto_approve(true).await.unwrap();
+        store.set_chat_review_edits(true).await.unwrap();
+
+        assert!(store.get_chat_review_edits().await);
+        let toggles = store.get_chat_toggles().await;
+        assert!(toggles.review_edits);
+        assert!(
+            toggles.auto_approve,
+            "sibling autoApprove survived the write"
+        );
+
+        // And it can be turned back off.
+        store.set_chat_review_edits(false).await.unwrap();
+        assert!(!store.get_chat_review_edits().await);
+        assert!(store.get_chat_auto_approve().await);
     }
 
     #[tokio::test]

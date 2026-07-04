@@ -67,6 +67,14 @@ impl CodeTuiApp {
             return self.handle_editor_key(key).await;
         }
 
+        // Same draft-guard as the permission card so a queued message isn't corrupted.
+        if self.agent_review.is_some() {
+            if self.handle_review_key(key) {
+                return Ok(false);
+            }
+            return self.handle_editor_key(key).await;
+        }
+
         if let Some(should_exit) = self.handle_overlay_key(key).await? {
             return Ok(should_exit);
         }
@@ -158,6 +166,7 @@ impl CodeTuiApp {
         };
         let len = ask.options.len();
         let allow_free_text = ask.allow_free_text;
+        let multi = ask.multi_select;
 
         // Esc dismisses regardless of composer state — Esc is never message text.
         if matches!(key.code, KeyCode::Esc) {
@@ -207,16 +216,30 @@ impl CodeTuiApp {
                 self.move_ask_selection(1);
                 true
             }
-            KeyCode::Enter if !ctrl => {
+            // Multi-select: space toggles the highlighted box.
+            KeyCode::Char(' ') if multi => {
                 let idx = self.agent_ask.as_ref().map(|a| a.selected).unwrap_or(0);
-                self.select_ask_option(idx);
+                self.toggle_ask_check(idx);
                 true
             }
-            // A 1–9 digit picks that option (numbered-menu style).
+            KeyCode::Enter if !ctrl => {
+                if multi {
+                    self.confirm_ask_multi();
+                } else {
+                    let idx = self.agent_ask.as_ref().map(|a| a.selected).unwrap_or(0);
+                    self.select_ask_option(idx);
+                }
+                true
+            }
+            // A 1–9 digit picks that option (single-select) or toggles its box (multi).
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let idx = (c as usize) - ('1' as usize);
                 if idx < len {
-                    self.select_ask_option(idx);
+                    if multi {
+                        self.toggle_ask_check(idx);
+                    } else {
+                        self.select_ask_option(idx);
+                    }
                     true
                 } else {
                     !allow_free_text
@@ -249,6 +272,36 @@ impl CodeTuiApp {
         let _ = ask.reply.send(Ok(answer));
     }
 
+    /// Toggle the checkbox for option `idx` in a multi-select card.
+    fn toggle_ask_check(&mut self, idx: usize) {
+        if let Some(ask) = self.agent_ask.as_mut()
+            && let Some(c) = ask.checked.get_mut(idx)
+        {
+            *c = !*c;
+        }
+    }
+
+    /// Confirm a multi-select card: send the checked labels joined by ", " (an empty
+    /// selection sends "none" so the model still gets an explicit answer, not a hang).
+    fn confirm_ask_multi(&mut self) {
+        let Some(ask) = self.agent_ask.take() else {
+            return;
+        };
+        let picked: Vec<String> = ask
+            .options
+            .iter()
+            .zip(ask.checked.iter())
+            .filter(|(_, checked)| **checked)
+            .map(|(o, _)| o.label.clone())
+            .collect();
+        let answer = if picked.is_empty() {
+            "none".to_string()
+        } else {
+            picked.join(", ")
+        };
+        let _ = ask.reply.send(Ok(answer));
+    }
+
     /// Send a free-text answer back to the waiting engine task.
     fn answer_ask_user(&mut self, answer: String) {
         if let Some(ask) = self.agent_ask.take() {
@@ -266,6 +319,67 @@ impl CodeTuiApp {
         }
     }
 
+    /// Resolve a key against the edit-review card: on an empty composer `y`/Enter
+    /// approve, `n` rejects, arrows scroll. Esc always rejects; decision/scroll keys
+    /// fall through while a queued message is being typed. `true` when consumed.
+    fn handle_review_key(&mut self, key: KeyEvent) -> bool {
+        if self.agent_review.is_none() {
+            return false;
+        }
+        // Esc rejects regardless of composer state — Esc is never message text.
+        if matches!(key.code, KeyCode::Esc) {
+            self.resolve_review(crate::agent::review::ReviewDecision::Reject);
+            return true;
+        }
+        if !self.draft.is_empty() {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up | KeyCode::PageUp => {
+                self.scroll_review(-1);
+                true
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.scroll_review(-1);
+                true
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                self.scroll_review(1);
+                true
+            }
+            KeyCode::Char('n') if ctrl => {
+                self.scroll_review(1);
+                true
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.resolve_review(crate::agent::review::ReviewDecision::ApproveAll);
+                true
+            }
+            KeyCode::Char('n') => {
+                self.resolve_review(crate::agent::review::ReviewDecision::Reject);
+                true
+            }
+            // The card owns every other key while the composer is empty.
+            _ => true,
+        }
+    }
+
+    /// Scroll the review body by `delta` rows, clamped to its length.
+    fn scroll_review(&mut self, delta: isize) {
+        if let Some(review) = self.agent_review.as_mut() {
+            let max = (review.body.len().saturating_sub(1)) as isize;
+            review.scroll = (review.scroll as isize + delta).clamp(0, max.max(0)) as u16;
+        }
+    }
+
+    /// Send the review verdict back to the waiting engine task and close the card.
+    fn resolve_review(&mut self, decision: crate::agent::review::ReviewDecision) {
+        if let Some(review) = self.agent_review.take() {
+            let _ = review.reply.send(decision);
+        }
+    }
+
     /// Set session auto-approve and mirror it to the shared live flag the running
     /// agent turn reads (native engine + cursor ACP), with a fading toast. A
     /// toast — not a persistent notice — so the confirmation flashes and vanishes
@@ -278,6 +392,18 @@ impl CodeTuiApp {
             "Auto-approve ON — the agent runs tools without asking"
         } else {
             "Auto-approve off — the agent will ask before write/edit/bash"
+        });
+    }
+
+    /// Set edit-review and mirror it to the live flag, with a toast (cf. `set_auto_approve`).
+    pub(super) fn set_review_edits(&mut self, on: bool) {
+        self.agent_review_edits = on;
+        self.review_edits_flag
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        self.show_toast(if on {
+            "Review edits ON — the agent shows edits for approval before writing"
+        } else {
+            "Review edits off — in-cwd edits apply without a review card"
         });
     }
 

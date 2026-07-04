@@ -627,10 +627,7 @@ is preserved."
                 // disabled flag left by a same-name skill removed earlier.
                 self.session_store.set_skill_enabled(&name, true).await.ok();
                 self.agent_engine = None;
-                self.notice = Some((
-                    MUTED,
-                    format!("Created skill `{name}` — edit {}", path.display()),
-                ));
+                self.notice = Some((MUTED, skill_add_success_notice(&name, &description, &path)));
             }
             Err(e) => {
                 self.notice = Some((ERROR, format!("Failed to add skill: {e}")));
@@ -1896,6 +1893,31 @@ pub(super) fn parse_skill_add_input(input: &str) -> std::result::Result<(String,
         );
     }
     Ok((name.to_string(), description.to_string()))
+}
+
+pub(super) fn skill_add_success_notice(
+    name: &str,
+    description: &str,
+    path: &std::path::Path,
+) -> String {
+    let used_placeholder = description.trim().is_empty();
+    let description = if used_placeholder {
+        crate::agent::skills::PLACEHOLDER_DESCRIPTION
+    } else {
+        description.trim()
+    };
+    let advert = crate::agent::skills::advert_description(description);
+    let warnings = crate::agent::skills::description_advert_warnings(description, used_placeholder);
+
+    let mut notice = format!(
+        "Created skill `{name}` — edit {}\nAdvert: {advert}",
+        path.display()
+    );
+    for warning in warnings {
+        notice.push_str("\nWarning: ");
+        notice.push_str(&warning);
+    }
+    notice
 }
 
 /// Map a connect-time per-server outcome to the overlay's `(status, health)`

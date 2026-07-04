@@ -6961,6 +6961,32 @@ fn test_parse_skill_add_input() {
     assert!(parse_skill_add_input("").is_err(), "empty");
 }
 
+#[test]
+fn test_skill_add_success_notice_includes_advert_and_warnings() {
+    use super::session_impl::skill_add_success_notice;
+    let path = std::path::Path::new("/tmp/aivo-test/skills/deploy/SKILL.md");
+
+    let notice = skill_add_success_notice("deploy", "Deploy safely", path);
+    assert!(notice.contains("Created skill `deploy`"), "{notice}");
+    assert!(notice.contains("Advert: Deploy safely"), "{notice}");
+    assert!(!notice.contains("Warning:"), "{notice}");
+
+    let multi = skill_add_success_notice(
+        "deploy",
+        "Deploy safely. Use when release or rollback cues appear.",
+        path,
+    );
+    assert!(multi.contains("Advert: Deploy safely."), "{multi}");
+    assert!(
+        multi.contains("only first sentence is advertised"),
+        "{multi}"
+    );
+
+    let blank = skill_add_success_notice("deploy", "", path);
+    assert!(blank.contains("Advert: One-line summary"), "{blank}");
+    assert!(blank.contains("replace placeholder description"), "{blank}");
+}
+
 #[tokio::test]
 async fn test_skills_command_dispatch() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

@@ -96,6 +96,9 @@ pub fn user_skills_dir() -> Option<PathBuf> {
     crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/skills"))
 }
 
+pub(crate) const PLACEHOLDER_DESCRIPTION: &str =
+    "One-line summary of what this skill does and when to use it.";
+
 /// Classify a discovered skill's dir: `User` (deletable from chat) only when it
 /// lives under a root aivo manages itself; everything else is `Project`
 /// (discovered + usable, but protected from deletion). A repo's `.agents/.aivo/
@@ -169,7 +172,7 @@ fn scaffold_skill_at(root: &Path, name: &str, description: &str) -> Result<PathB
     let desc = {
         let trimmed = description.trim();
         if trimmed.is_empty() {
-            "One-line summary of what this skill does and when to use it."
+            PLACEHOLDER_DESCRIPTION
         } else {
             trimmed
         }
@@ -801,6 +804,31 @@ pub(crate) fn advert_description(description: &str) -> String {
     format!("{cut}…")
 }
 
+pub(crate) fn description_advert_warnings(
+    description: &str,
+    used_placeholder: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if used_placeholder
+        || description.trim().is_empty()
+        || description.trim() == PLACEHOLDER_DESCRIPTION
+    {
+        warnings.push("replace placeholder description".to_string());
+        return warnings;
+    }
+
+    let one_line = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let advert = advert_description(description);
+    if advert.ends_with('…') {
+        warnings.push("advert is capped at 160 chars; shorten description".to_string());
+    } else if one_line.len() > advert.len() {
+        warnings.push(
+            "only first sentence is advertised; move trigger cues before first period".to_string(),
+        );
+    }
+    warnings
+}
+
 /// One advert line (`- name: desc`). An untrusted skill's name/desc are stripped of
 /// `<`/`>` so a crafted value can't forge the `<untrusted>` frame boundary.
 fn advert_line(skill: &Skill, untrusted: bool) -> String {
@@ -1017,6 +1045,23 @@ mod tests {
         assert!(out.ends_with('…'));
         // Short, no period → whitespace-collapsed but otherwise unchanged.
         assert_eq!(advert_description("just  a   skill"), "just a skill");
+    }
+
+    #[test]
+    fn description_advert_warnings_are_mechanical() {
+        let multi = description_advert_warnings(
+            "Do the setup. Trigger when the user asks for deployment help.",
+            false,
+        );
+        assert!(multi.iter().any(|w| w.contains("only first sentence")));
+
+        let capped = description_advert_warnings(&"word ".repeat(80), false);
+        assert!(capped.iter().any(|w| w.contains("capped at 160")));
+
+        let placeholder = description_advert_warnings(PLACEHOLDER_DESCRIPTION, true);
+        assert!(placeholder.iter().any(|w| w.contains("placeholder")));
+
+        assert!(description_advert_warnings("Short direct trigger cue", false).is_empty());
     }
 
     #[test]

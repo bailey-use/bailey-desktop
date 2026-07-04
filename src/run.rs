@@ -76,12 +76,14 @@ fn is_hf_takeover(model: Option<&str>) -> bool {
 /// `aivo code -p "..."`. Without this, `aivo code "hello world"` would dead-end
 /// on a "ref only" error. Lift such a positional into `prompt` (an explicit
 /// `-p` still wins) and clear the ref slot so it never reaches the
-/// model-ref/HF path.
+/// model-ref/HF path. A bare `-` maps to the empty-string prompt so `execute`
+/// reads it from stdin, matching bare `aivo code -p`.
 fn lift_code_positional_to_prompt(args: &mut CodeArgs) {
     if let Some(raw) = args.reference.clone()
         && !is_hf_takeover(Some(raw.as_str()))
     {
-        args.prompt.get_or_insert(raw);
+        let lifted = if raw == "-" { String::new() } else { raw };
+        args.prompt.get_or_insert(lifted);
         args.reference = None;
     }
 }
@@ -1196,6 +1198,22 @@ mod tests {
     #[test]
     fn explicit_prompt_wins_over_positional() {
         let mut a = code_args(&["aivo", "chat", "POS", "-p", "PFLAG"]);
+        lift_code_positional_to_prompt(&mut a);
+        assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
+        assert_eq!(a.reference, None);
+    }
+
+    #[test]
+    fn bare_dash_positional_reads_from_stdin() {
+        let mut a = code_args(&["aivo", "chat", "-"]);
+        lift_code_positional_to_prompt(&mut a);
+        assert_eq!(a.prompt.as_deref(), Some(""));
+        assert_eq!(a.reference, None);
+    }
+
+    #[test]
+    fn explicit_prompt_wins_over_bare_dash() {
+        let mut a = code_args(&["aivo", "chat", "-", "-p", "PFLAG"]);
         lift_code_positional_to_prompt(&mut a);
         assert_eq!(a.prompt.as_deref(), Some("PFLAG"));
         assert_eq!(a.reference, None);

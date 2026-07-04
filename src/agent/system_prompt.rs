@@ -115,9 +115,11 @@ the `curl` alias) and chain with `;` (not `&&`). Paths use `\\`.",
     }
     if !guides.is_empty() {
         p.push_str(&format!(
-            "\n\nThis project has convention file(s): {}. Before you create or edit ANY file here, \
-read the relevant one(s) first — they may dictate file headers, style, or workflow, and you must \
-follow them. (Skip them for questions, chat, or read-only exploration.)",
+            "\n\nThis project has convention file(s): {}. Read the relevant one(s) BEFORE you act \
+on this project — before creating or editing ANY file, and before running a project workflow (a \
+build, release, commit/tag, or a skill/slash-command that operates on this repo). They may \
+dictate file headers, style, git and release process, or workflow, and you must follow them — a \
+workflow's own steps do not override them. (Skip them for questions, chat, or read-only exploration.)",
             guides.join(", ")
         ));
     }
@@ -162,6 +164,7 @@ mod tests {
         assert!(p.contains("AGENTS.md"));
         assert!(p.contains("Skip them for questions"));
         assert!(p.contains("just to say hello"));
+        assert!(p.contains("before running a project workflow"));
         // No guides → no convention-file section. Match the section opener, not "convention file" (the base prompt mentions those too).
         let none = system_prompt("/tmp/proj", "", &[], &[]);
         assert!(!none.contains("This project has convention file"));

@@ -1711,7 +1711,7 @@ impl CodeTuiApp {
         self.discard_resume_state();
         // The share is pinned to the current session; a new chat swaps it out.
         self.stop_live_share();
-        self.cancel_inflight_request(false);
+        self.cancel_inflight_request(CancelKind::Discard);
         self.overlay = Overlay::None;
         self.history.clear();
         self.expanded_thinking.clear();
@@ -1757,7 +1757,7 @@ impl CodeTuiApp {
     /// `restore_draft` puts a cancelled non-agent submission back in the composer
     /// (model-picker, to resend after switching); `false` (ESC / resume / `/new`)
     /// un-sends it instead, leaving the composer empty — recallable via ↑.
-    pub(super) fn cancel_inflight_request(&mut self, restore_draft: bool) {
+    pub(super) fn cancel_inflight_request(&mut self, kind: CancelKind) {
         let was_sending = self.sending;
         // Cancelling (interrupt path 1, /new, resume, key switch) also exits any
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
@@ -1792,11 +1792,20 @@ impl CodeTuiApp {
                     .await;
             });
         }
-        if was_agent_turn {
+        if matches!(kind, CancelKind::Unsend) {
+            // Nothing committed, so un-send is safe even for an agent turn: the engine
+            // keeps its bare user message and merges the resent text (see `begin_user_turn`).
+            restore_cancelled_submission(
+                &mut self.history,
+                &mut self.draft,
+                &mut self.draft_attachments,
+                &mut self.pending_submit,
+            );
+        } else if was_agent_turn {
             // Keep the user turn in the transcript; just drop the restore buffer so
             // it can't be resurrected by a later non-agent cancel.
             self.pending_submit = None;
-        } else if restore_draft {
+        } else if matches!(kind, CancelKind::RestoreDraft) {
             restore_cancelled_submission(
                 &mut self.history,
                 &mut self.draft,
@@ -1835,7 +1844,19 @@ impl CodeTuiApp {
         self.drain_incoming_buffer();
         self.pending_finish = None;
         if self.pending_response.is_empty() {
-            self.cancel_inflight_request(false);
+            // Still "just pending" (nothing streamed, no tool/reasoning row after the
+            // user turn) → return the message to the composer. Goal-mode
+            // continuations are synthetic, so leave those on the discard path.
+            let nothing_produced = !goal_was_active
+                && self
+                    .history
+                    .last()
+                    .is_some_and(|message| message.role == "user");
+            self.cancel_inflight_request(if nothing_produced {
+                CancelKind::Unsend
+            } else {
+                CancelKind::Discard
+            });
             if goal_was_active {
                 self.notice = Some((MUTED, "Goal mode stopped".to_string()));
             }

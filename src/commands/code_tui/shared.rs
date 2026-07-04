@@ -1127,6 +1127,17 @@ pub(super) enum SubmitAction {
     Shell(String),
 }
 
+/// How `cancel_inflight_request` disposes of the pending user turn. Agent turns
+/// keep their (engine-consumed) message except under `Unsend`.
+pub(super) enum CancelKind {
+    Discard,
+    /// Restore the draft to the composer on the plain-chat path (model picker).
+    RestoreDraft,
+    /// Nothing produced yet — drop the message from the transcript and back into
+    /// the composer, even for an agent turn.
+    Unsend,
+}
+
 /// An in-flight `!cmd` local shell run. Independent of model turns (`sending`):
 /// the background reader task streams output here line by line, rendered live in
 /// the transcript's volatile tail and committed to a `local_command` history

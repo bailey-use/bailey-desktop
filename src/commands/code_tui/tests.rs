@@ -9075,7 +9075,7 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     app.agent_serve = Some((handle, shutdown));
 
-    app.cancel_inflight_request(false);
+    app.cancel_inflight_request(CancelKind::Discard);
 
     // The engine already consumed this turn (and may have edited files), so the
     // request stays in the transcript instead of being silently un-sent — unlike
@@ -9162,10 +9162,9 @@ async fn test_discard_segment_drops_leaked_markup_from_scrollback() {
     );
 }
 
-/// Interrupting an output-less request must not prepend the cancelled text onto
-/// a freshly typed message.
+/// Esc on a still-pending request returns the message to the composer, un-sent.
 #[tokio::test]
-async fn test_interrupt_empty_does_not_restore_draft() {
+async fn test_interrupt_empty_restores_draft() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
@@ -9184,19 +9183,121 @@ async fn test_interrupt_empty_does_not_restore_draft() {
     app.interrupt_inflight_request().await.unwrap();
 
     assert!(!app.sending);
-    assert!(
-        app.draft.is_empty(),
-        "the cancelled message must not be restored to the composer"
+    assert_eq!(
+        app.draft, "first message",
+        "the pending message returns to the composer"
     );
+    assert_eq!(app.cursor, "first message".len());
     assert!(app.pending_submit.is_none());
     assert!(
         app.history.is_empty(),
         "the unanswered user turn is un-sent so resent history stays alternating"
     );
 
-    app.insert_char_at_cursor('h');
-    app.insert_char_at_cursor('i');
-    assert_eq!(app.draft, "hi");
+    app.insert_char_at_cursor('!');
+    assert_eq!(app.draft, "first message!");
+}
+
+/// A draft typed while pending is not clobbered by the un-sent message.
+#[tokio::test]
+async fn test_interrupt_empty_keeps_typed_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "first message".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "first message".to_string(),
+        attachments: Vec::new(),
+    });
+    app.draft = "typed while waiting".to_string();
+    app.cursor = app.draft.len();
+    app.sending = true;
+    app.request_started_at = Some(Instant::now());
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert_eq!(
+        app.draft, "typed while waiting",
+        "a freshly typed draft is not overwritten by the cancelled message"
+    );
+    assert!(
+        app.history.is_empty(),
+        "the unanswered user turn is un-sent"
+    );
+}
+
+/// An agent turn that produced nothing is un-sent too (engine merges on resend).
+#[tokio::test]
+async fn test_interrupt_empty_agent_turn_restores_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "edit the config".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "edit the config".to_string(),
+        attachments: Vec::new(),
+    });
+    app.sending = true;
+    app.request_started_at = Some(Instant::now());
+    let handle = tokio::spawn(async { anyhow::Ok(()) });
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    app.agent_serve = Some((handle, shutdown));
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert!(!app.sending);
+    assert_eq!(app.draft, "edit the config");
+    assert!(app.pending_submit.is_none());
+    assert!(
+        app.history.is_empty(),
+        "the untouched agent turn is un-sent"
+    );
+}
+
+/// An agent turn that already ran a tool is kept, not un-sent.
+#[tokio::test]
+async fn test_interrupt_empty_agent_turn_with_tool_keeps_turn() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        role: "user".to_string(),
+        content: "edit the config".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.history.push(ChatMessage {
+        role: "tool_call".to_string(),
+        content: "{\"name\":\"edit_file\"}".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_submit = Some(PendingSubmission {
+        content: "edit the config".to_string(),
+        attachments: Vec::new(),
+    });
+    app.sending = true;
+    app.request_started_at = Some(Instant::now());
+    let handle = tokio::spawn(async { anyhow::Ok(()) });
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    app.agent_serve = Some((handle, shutdown));
+
+    app.interrupt_inflight_request().await.unwrap();
+
+    assert!(!app.sending);
+    assert!(
+        app.draft.is_empty(),
+        "a turn that ran a tool is not restored"
+    );
+    assert_eq!(app.history.len(), 2, "the user + tool rows are kept");
+    assert!(app.pending_submit.is_none());
 }
 
 /// Watchdog: a task that finished WITHOUT a terminal event (a `run_turn` panic
@@ -9277,7 +9378,7 @@ async fn test_stopping_a_turn_clears_goal_mode() {
     };
 
     let mut app = armed();
-    app.cancel_inflight_request(false);
+    app.cancel_inflight_request(CancelKind::Discard);
     assert!(app.goal_mode.is_none(), "cancel must clear goal mode");
 
     // Interrupt with NO partial response routes through cancel.

@@ -41,7 +41,7 @@ impl CodeTuiApp {
 
     pub(super) fn prepare_for_model_picker(&mut self) {
         if self.sending {
-            self.cancel_inflight_request(true);
+            self.cancel_inflight_request(CancelKind::RestoreDraft);
         }
     }
 
@@ -1609,7 +1609,7 @@ is preserved."
         self.stop_live_share();
         self.overlay = Overlay::None;
         if self.sending {
-            self.cancel_inflight_request(false);
+            self.cancel_inflight_request(CancelKind::Discard);
         }
 
         self.resume_restore_state = Some(ResumeRestoreState::capture(self));

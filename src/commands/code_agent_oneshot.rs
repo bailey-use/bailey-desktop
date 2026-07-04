@@ -37,6 +37,17 @@ fn env_or<T: std::str::FromStr>(var: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+fn cli_env_or<T: Copy + std::str::FromStr>(cli: Option<T>, var: &str, default: T) -> T {
+    cli.unwrap_or_else(|| env_or(var, default))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OneShotAgentLimits {
+    pub(crate) max_steps: Option<u32>,
+    pub(crate) max_output_tokens: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_one_shot_agent(
     session_store: &SessionStore,
     cache: &ModelsCache,
@@ -45,6 +56,7 @@ pub(crate) async fn run_one_shot_agent(
     prompt: String,
     context_window_override: Option<u64>,
     format: OutputFormat,
+    limits: OneShotAgentLimits,
 ) -> anyhow::Result<ExitCode> {
     // Real launch dir (like the TUI's real_cwd), not chat's sandbox.
     let cwd = std::env::current_dir()
@@ -63,7 +75,7 @@ pub(crate) async fn run_one_shot_agent(
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let guides = discover_project_guides(Path::new(&cwd));
     let skills = crate::agent::skills::discover_skills(Path::new(&cwd));
-    let max_steps = env_or("AIVO_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS);
+    let max_steps = cli_env_or(limits.max_steps, "AIVO_AGENT_MAX_STEPS", DEFAULT_MAX_STEPS);
     let mut engine = AgentEngine::new(
         &cwd,
         model,
@@ -73,7 +85,8 @@ pub(crate) async fn run_one_shot_agent(
         context_window,
         max_steps,
     );
-    engine.set_output_budget(env_or(
+    engine.set_output_budget(cli_env_or(
+        limits.max_output_tokens,
         "AIVO_AGENT_MAX_OUTPUT_TOKENS",
         DEFAULT_MAX_OUTPUT_TOKENS,
     ));
@@ -558,5 +571,47 @@ mod tests {
         let red = redact_args(&secret);
         assert!(red.is_object() || red.is_string());
         assert!(!red.to_string().contains("sk-ant-api03-AAAA"));
+    }
+
+    #[test]
+    fn cli_limit_overrides_env_and_default() {
+        let var = "AIVO_TEST_AGENT_LIMIT_CLI_WINS";
+        // SAFETY: this test uses a unique env var name, so it does not race with
+        // production env reads or other tests.
+        unsafe { std::env::set_var(var, "7") };
+        assert_eq!(cli_env_or(Some(42_u32), var, 1000_u32), 42);
+        // SAFETY: see set_var note above.
+        unsafe { std::env::remove_var(var) };
+    }
+
+    #[test]
+    fn env_limit_overrides_default() {
+        let var = "AIVO_TEST_AGENT_LIMIT_ENV_WINS";
+        // SAFETY: this test uses a unique env var name, so it does not race with
+        // production env reads or other tests.
+        unsafe { std::env::set_var(var, "7") };
+        assert_eq!(cli_env_or(None::<u32>, var, 1000_u32), 7);
+        // SAFETY: see set_var note above.
+        unsafe { std::env::remove_var(var) };
+    }
+
+    #[test]
+    fn default_limit_used_when_no_cli_or_env() {
+        let var = "AIVO_TEST_AGENT_LIMIT_DEFAULT";
+        // SAFETY: this test uses a unique env var name, so it does not race with
+        // production env reads or other tests.
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(cli_env_or(None::<u64>, var, 300_000_u64), 300_000);
+    }
+
+    #[test]
+    fn cli_limit_preserves_zero() {
+        let var = "AIVO_TEST_AGENT_LIMIT_ZERO";
+        // SAFETY: this test uses a unique env var name, so it does not race with
+        // production env reads or other tests.
+        unsafe { std::env::set_var(var, "7") };
+        assert_eq!(cli_env_or(Some(0_u64), var, 300_000_u64), 0);
+        // SAFETY: see set_var note above.
+        unsafe { std::env::remove_var(var) };
     }
 }

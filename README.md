@@ -147,6 +147,14 @@ git diff | aivo -p "Write a commit message"  # piped stdin appended as context
 cat error.log | aivo -p                      # stdin alone becomes the prompt
 ```
 
+Headless agent mode with `-e/--exec` runs tools and exits. Limit long unattended
+runs with `--max-steps <N>` or `--max-output-tokens <N>` (0 disables each limit).
+
+```bash
+aivo code -e "make the failing test pass"
+aivo code -e "fix lint" --max-steps 50 --max-output-tokens 20000
+```
+
 
 ## hf
 

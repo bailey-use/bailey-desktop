@@ -410,6 +410,8 @@ impl CodeCommand {
         share: bool,
         agent_mode: bool,
         output_format: Option<String>,
+        max_steps: Option<u32>,
+        max_output_tokens: Option<u64>,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -425,6 +427,8 @@ impl CodeCommand {
                 share,
                 agent_mode,
                 output_format,
+                max_steps,
+                max_output_tokens,
             )
             .await
         {
@@ -451,7 +455,13 @@ impl CodeCommand {
         share: bool,
         agent_mode: bool,
         output_format: Option<String>,
+        max_steps: Option<u32>,
+        max_output_tokens: Option<u64>,
     ) -> Result<ExitCode> {
+        if (max_steps.is_some() || max_output_tokens.is_some()) && !agent_mode {
+            anyhow::bail!("--max-steps and --max-output-tokens may only be used with -e/--exec");
+        }
+
         // Validate `--max-context` up front so a malformed value fails fast.
         let max_context: Option<u64> = match max_context.as_deref() {
             Some(s) => Some(
@@ -656,6 +666,10 @@ impl CodeCommand {
                     one_shot_input,
                     max_context,
                     code_agent_oneshot::OutputFormat::parse(output_format.as_deref()),
+                    code_agent_oneshot::OneShotAgentLimits {
+                        max_steps,
+                        max_output_tokens,
+                    },
                 )
                 .await;
             }
@@ -914,6 +928,11 @@ impl CodeCommand {
         print_opt(
             "-e, --exec [prompt]",
             "One prompt, run the agent, exit (tools)",
+        );
+        print_opt("--max-steps <N>", "Max -e agent steps (0 disables)");
+        print_opt(
+            "--max-output-tokens <N>",
+            "Max -e output tokens (0 disables)",
         );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
@@ -2754,6 +2773,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn headless_limits_require_exec_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_path(dir.path().join("config.json"));
+        let cache = ModelsCache::with_path(dir.path().join("models-cache.json"));
+        let command = CodeCommand::new(store, cache);
+
+        let code = command
+            .execute(
+                None,
+                Some("hi".to_string()),
+                Vec::new(),
+                false,
+                None,
+                false,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                Some(1),
+                None,
+            )
+            .await;
+
+        assert_eq!(code, ExitCode::UserError);
+    }
 
     #[test]
     fn build_one_shot_persist_inputs_includes_assistant_turn() {

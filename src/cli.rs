@@ -847,6 +847,14 @@ pub struct CodeArgs {
     )]
     pub exec: Option<String>,
 
+    /// Maximum agent steps for -e/--exec (0 disables; overrides AIVO_AGENT_MAX_STEPS)
+    #[arg(long = "max-steps", value_name = "N")]
+    pub max_steps: Option<u32>,
+
+    /// Maximum output tokens for -e/--exec (0 disables; overrides AIVO_AGENT_MAX_OUTPUT_TOKENS)
+    #[arg(long = "max-output-tokens", value_name = "N")]
+    pub max_output_tokens: Option<u64>,
+
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]
     pub json: bool,
@@ -1283,6 +1291,49 @@ mod tests {
         let cli = Cli::try_parse_from(["aivo", "chat"]).unwrap();
         if let Some(Commands::Code(chat_args)) = cli.command {
             assert_eq!(chat_args.model, None);
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_exec_limits() {
+        let cli = Cli::try_parse_from([
+            "aivo",
+            "chat",
+            "-e",
+            "fix it",
+            "--max-steps",
+            "42",
+            "--max-output-tokens",
+            "12345",
+        ])
+        .unwrap();
+        if let Some(Commands::Code(chat_args)) = cli.command {
+            assert_eq!(chat_args.exec, Some("fix it".to_string()));
+            assert_eq!(chat_args.max_steps, Some(42));
+            assert_eq!(chat_args.max_output_tokens, Some(12345));
+        } else {
+            panic!("Expected Chat command");
+        }
+    }
+
+    #[test]
+    fn test_chat_args_exec_limits_preserve_zero() {
+        let cli = Cli::try_parse_from([
+            "aivo",
+            "chat",
+            "-e",
+            "--max-steps",
+            "0",
+            "--max-output-tokens",
+            "0",
+        ])
+        .unwrap();
+        if let Some(Commands::Code(chat_args)) = cli.command {
+            assert_eq!(chat_args.exec, Some(String::new()));
+            assert_eq!(chat_args.max_steps, Some(0));
+            assert_eq!(chat_args.max_output_tokens, Some(0));
         } else {
             panic!("Expected Chat command");
         }

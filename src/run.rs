@@ -324,6 +324,8 @@ pub async fn run() -> ! {
                     code_args.share,
                     agent_mode,
                     code_args.output_format,
+                    code_args.max_steps,
+                    code_args.max_output_tokens,
                 )
                 .await
         }

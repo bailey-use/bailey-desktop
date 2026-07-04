@@ -139,6 +139,8 @@ aivo code                     # interactive agent TUI
 -k, --key <id|name>           API key by id/name (bare = picker)
 -p, --prompt [prompt]         one prompt, plain reply, exit (no tools)
 -e, --exec   [prompt]         one prompt, run the full agent (tools), exit
+--max-steps <N>               max -e agent steps (0 disables)
+--max-output-tokens <N>       max -e output tokens (0 disables)
 -r, --refresh                 refresh the model list (skip cache)
 --resume [last|id]            resume a saved session
 --share                       share this session live (needs `aivo login`)
@@ -152,6 +154,7 @@ aivo code                     # interactive agent TUI
 aivo -p "Summarize this repo"                # bare string → one-shot plain reply
 git diff | aivo -p "Write a commit message"  # piped stdin appended as context
 aivo code -e "make the failing test pass"    # one-shot agent run
+aivo code -e "fix lint" --max-steps 50       # override headless agent limits
 ```
 
 ### Inside the code TUI

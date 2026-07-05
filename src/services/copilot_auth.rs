@@ -81,6 +81,14 @@ impl CopilotTokenManager {
         }
     }
 
+    /// Drops the cached token so the next `get_token` re-exchanges. Called
+    /// when Copilot rejects a token mid-validity-window (sign-out elsewhere,
+    /// server-side rotation) — expiry-based refresh alone can't recover.
+    pub async fn invalidate(&self) {
+        let mut cached = self.cached.write().await;
+        *cached = None;
+    }
+
     /// Returns a valid (token, api_endpoint) pair, refreshing if expired.
     pub async fn get_token(&self) -> Result<(String, String)> {
         // Check cache first

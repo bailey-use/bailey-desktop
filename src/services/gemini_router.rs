@@ -23,7 +23,7 @@ use crate::services::openai_gemini_bridge::{
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
-    commit_protocol_switch, mismatch_directive, protocol_candidates,
+    commit_protocol_switch, mismatch_directive, protocol_candidates, record_slot_outcome,
 };
 use crate::services::provider_protocol::{PathVariant, ProviderProtocol, classify_failed_attempt};
 use crate::services::route_cache::{PersistedRoute, RouteCache, RouteSlot};
@@ -450,6 +450,7 @@ async fn forward_to_provider(
             AttemptOutcome::Success(result) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
                 slot.confirm();
+                record_slot_outcome(slot, true);
                 return Ok(ForwardResult::Success(result));
             }
             AttemptOutcome::Mismatch { status, body } => {
@@ -476,6 +477,9 @@ async fn forward_to_provider(
         idx += 1;
     }
 
+    // Failure-streak valve: resets a stale learned pin after repeated
+    // exhausted requests so long-lived sessions recover without restart.
+    record_slot_outcome(slot, false);
     let (status, body) = first_error.take().unwrap_or_default();
     Ok(ForwardResult::Exhausted { status, body })
 }
@@ -523,17 +527,22 @@ pub fn convert_gemini_to_openai(
     let mut pending_tool_calls: HashMap<String, VecDeque<String>> = HashMap::new();
     let mut tool_call_id_counts: HashMap<String, usize> = HashMap::new();
 
-    // System instruction → system message
-    if let Some(system_text) = body
+    // System instruction → system message; join ALL parts — clients may
+    // split the system prompt across several.
+    if let Some(parts) = body
         .get("systemInstruction")
         .and_then(|si| si.get("parts"))
         .and_then(|p| p.as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        && !system_text.is_empty()
     {
-        messages.push(serde_json::json!({"role": "system", "content": system_text}));
+        let system_text = parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !system_text.is_empty() {
+            messages.push(serde_json::json!({"role": "system", "content": system_text}));
+        }
     }
 
     // Convert contents → messages
@@ -576,7 +585,9 @@ pub fn convert_gemini_to_openai(
                         "type": "function",
                         "function": {
                             "name": func_decl.get("name").cloned().unwrap_or_default(),
-                            "description": func_decl.get("description").cloned().unwrap_or_default(),
+                            // Empty string, not null — strict providers
+                            // reject a null description.
+                            "description": func_decl.get("description").cloned().unwrap_or_else(|| serde_json::json!("")),
                             "parameters": normalize_parameters(func_decl.get("parameters").unwrap_or(&serde_json::json!({}))),
                         }
                     })
@@ -827,6 +838,9 @@ fn convert_parts_to_messages(
     let mut thought_parts: Vec<&str> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut tool_results: Vec<Value> = Vec::new();
+    // inlineData/fileData parts → OpenAI image_url parts; without this an
+    // attached image (or an image-only turn) silently vanishes.
+    let mut image_parts: Vec<Value> = Vec::new();
 
     for part in parts {
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
@@ -878,6 +892,28 @@ fn convert_parts_to_messages(
                 "tool_call_id": call_id,
                 "content": response
             }));
+        } else if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+            let mime = inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("image/png");
+            if let Some(data) = inline.get("data").and_then(|d| d.as_str()) {
+                image_parts.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": format!("data:{mime};base64,{data}")}
+                }));
+            }
+        } else if let Some(file) = part.get("fileData").or_else(|| part.get("file_data"))
+            && let Some(uri) = file
+                .get("fileUri")
+                .or_else(|| file.get("file_uri"))
+                .and_then(|u| u.as_str())
+        {
+            image_parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": uri}
+            }));
         }
     }
 
@@ -885,6 +921,17 @@ fn convert_parts_to_messages(
         // Function responses → individual tool messages
         for tr in tool_results {
             messages.push(tr);
+        }
+        // A tool can return an image as a sibling inlineData part; carry it
+        // (plus any sibling text) as a follow-up user message — OpenAI tool
+        // messages can't hold image parts.
+        if !image_parts.is_empty() {
+            let mut parts: Vec<Value> = text_parts
+                .iter()
+                .map(|t| serde_json::json!({"type": "text", "text": t}))
+                .collect();
+            parts.append(&mut image_parts);
+            messages.push(serde_json::json!({"role": "user", "content": parts}));
         }
     } else if !tool_calls.is_empty() {
         // Function calls → assistant message with tool_calls
@@ -903,10 +950,19 @@ fn convert_parts_to_messages(
             );
         }
         messages.push(msg);
-    } else if !text_parts.is_empty() {
+    } else if !text_parts.is_empty() || !image_parts.is_empty() {
         // Plain text message (skip turns with only empty text to avoid sending
         // empty content strings that strict providers / Responses API gateways reject)
-        let content = text_parts.join("\n");
+        let content = if image_parts.is_empty() {
+            Value::String(text_parts.join("\n"))
+        } else {
+            let mut parts: Vec<Value> = text_parts
+                .iter()
+                .map(|t| serde_json::json!({"type": "text", "text": t}))
+                .collect();
+            parts.extend(image_parts);
+            Value::Array(parts)
+        };
         let mut msg = serde_json::json!({"role": openai_role, "content": content});
         if openai_role == "assistant" {
             attach_reasoning_content(
@@ -1264,6 +1320,92 @@ mod tests {
         assert_eq!(messages[1]["content"], "Hi!");
         assert_eq!(messages[2]["role"], "user");
         assert_eq!(messages[2]["content"], "How are you?");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_multipart_system_instruction() {
+        let body = serde_json::json!({
+            "contents": [{"role": "user", "parts": [{"text": "Hi"}]}],
+            "systemInstruction": {"parts": [
+                {"text": "You are helpful."},
+                {"text": "Answer in French."}
+            ]}
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[0]["content"],
+            "You are helpful.\nAnswer in French."
+        );
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_inline_data_image() {
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "What is this?"},
+                    {"inlineData": {"mimeType": "image/png", "data": "aGk="}}
+                ]
+            }]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let content = result["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aGk=");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_image_only_turn_survives() {
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": "aGk="}}]
+            }]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_tool_result_with_sibling_image() {
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"functionResponse": {"name": "screenshot", "response": {"ok": true}}},
+                    {"inlineData": {"mimeType": "image/png", "data": "aGk="}}
+                ]
+            }]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let messages = result["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "image_url");
+    }
+
+    #[test]
+    fn test_convert_gemini_to_openai_file_data_uri() {
+        let body = serde_json::json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"fileData": {"mimeType": "image/png", "fileUri": "https://example.com/i.png"}}]
+            }]
+        });
+        let result = convert_gemini_to_openai(&body, "gemini-2.0-flash", false, None);
+        let content = result["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "https://example.com/i.png");
     }
 
     #[test]

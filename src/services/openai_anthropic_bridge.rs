@@ -106,7 +106,10 @@ pub fn convert_openai_chat_to_anthropic_request(
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             match role {
-                "system" => {
+                // `developer` is OpenAI's successor to `system`; Anthropic
+                // only accepts user/assistant roles in messages, so both
+                // hoist into the top-level system field.
+                "system" | "developer" => {
                     system_blocks.extend(extract_openai_anthropic_text_blocks(msg.get("content")));
                 }
                 "assistant" => messages.push(openai_assistant_to_anthropic(msg)),
@@ -165,7 +168,7 @@ pub fn convert_openai_chat_to_anthropic_request(
         }
     }
     if let Some(v) = body.get("stop") {
-        req["stop_sequences"] = v.clone();
+        req["stop_sequences"] = crate::services::bridge_defaults::stop_sequences_array(v);
     }
     // Note: `seed`, `frequency_penalty`, `presence_penalty`, `logit_bias`,
     // `response_format`, `user` are not part of the Anthropic Messages
@@ -188,6 +191,9 @@ pub fn convert_openai_chat_to_anthropic_request(
                     obj.remove("tools");
                 }
             }
+            // tool_choice without surviving tools 400s on Anthropic (e.g.
+            // every tool was an unknown hosted type and got dropped above).
+            _ if req.get("tools").is_none() => {}
             _ => {
                 req["tool_choice"] = match tc {
                     Value::String(s) if s == "auto" => json!({"type": "auto"}),
@@ -365,6 +371,11 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
         // conversation as terminated. With no tool_calls present (e.g.,
         // server-side tool execution we currently drop), fall back to "stop".
         "pause_turn" if !tool_calls.is_empty() => "tool_calls",
+        // Lenient Anthropic-compat upstreams (MiniMax, qwen, DeepSeek) emit
+        // tool_use blocks with stop_reason "end_turn" (or none at all);
+        // trusting that leaves finish_reason "stop" and OpenAI agent loops
+        // never execute the tools.
+        "end_turn" | "" if !tool_calls.is_empty() => "tool_calls",
         "stop_sequence" | "end_turn" | "pause_turn" => "stop",
         _ => "stop",
     };
@@ -425,6 +436,11 @@ pub fn convert_anthropic_to_openai_chat_response(resp: &Value, fallback_model: &
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            // Deliberately NOT mirrored into prompt_tokens_details: here
+            // prompt_tokens is Anthropic-fresh (excludes cache reads), so an
+            // OpenAI-convention cached_tokens would exceed prompt_tokens and
+            // break clients computing `prompt - cached`. The Anthropic
+            // extension fields above carry the cache info.
             prompt_tokens_details: None,
         },
     };
@@ -676,7 +692,7 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
         blocks.push(json!({"type": "text", "text": text}));
     }
     if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-        for tc in tool_calls {
+        for (i, tc) in tool_calls.iter().enumerate() {
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
@@ -685,7 +701,9 @@ fn openai_assistant_to_anthropic(msg: &Value) -> Value {
                 .unwrap_or_else(|| json!({}));
             blocks.push(json!({
                 "type": "tool_use",
-                "id": tc.get("id").cloned().unwrap_or(json!("call_0")),
+                // Index fallback: a shared "call_0" would duplicate tool_use
+                // ids in one turn, which Anthropic rejects.
+                "id": tc.get("id").cloned().unwrap_or_else(|| json!(format!("call_{i}"))),
                 "name": tc.get("function").and_then(|f| f.get("name")).cloned().unwrap_or(json!("")),
                 "input": args
             }));
@@ -990,6 +1008,48 @@ mod tests {
             converted["choices"][0]["message"]["tool_calls"][0]["id"],
             "call_1"
         );
+    }
+
+    fn tool_use_resp_with_stop_reason(stop_reason: Option<&str>) -> Value {
+        let mut body = json!({
+            "id": "msg_1",
+            "model": "MiniMax-M1",
+            "content": [
+                {"type": "tool_use", "id": "call_1", "name": "ls", "input": {"path":"."}}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        });
+        if let Some(sr) = stop_reason {
+            body["stop_reason"] = json!(sr);
+        }
+        body
+    }
+
+    #[test]
+    fn end_turn_with_tool_use_promotes_to_tool_calls() {
+        let converted = convert_anthropic_to_openai_chat_response(
+            &tool_use_resp_with_stop_reason(Some("end_turn")),
+            "fallback",
+        );
+        assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn missing_stop_reason_with_tool_use_promotes_to_tool_calls() {
+        let converted = convert_anthropic_to_openai_chat_response(
+            &tool_use_resp_with_stop_reason(None),
+            "fallback",
+        );
+        assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn max_tokens_with_tool_use_keeps_length() {
+        let converted = convert_anthropic_to_openai_chat_response(
+            &tool_use_resp_with_stop_reason(Some("max_tokens")),
+            "fallback",
+        );
+        assert_eq!(converted["choices"][0]["finish_reason"], "length");
     }
 
     #[test]
@@ -2101,12 +2161,87 @@ mod tests {
                 default_model: "gpt-4o",
             },
         );
-        // "developer" falls through to the _ match arm which calls openai_user_to_anthropic
-        // preserving the role as-is ("developer")
+        // "developer" hoists into the top-level system field — Anthropic only
+        // accepts user/assistant roles inside messages.
         let messages = converted["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "developer");
-        // Content should be converted properly
-        assert!(messages[0]["content"].is_string() || messages[0]["content"].is_array());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let system = converted["system"].to_string();
+        assert!(system.contains("You are a helpful assistant."), "{system}");
+    }
+
+    #[test]
+    fn request_side_missing_tool_call_ids_get_index_fallback() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [
+                    {"type": "function", "function": {"name": "a", "arguments": "{}"}},
+                    {"type": "function", "function": {"name": "b", "arguments": "{}"}}
+                ]}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4",
+            },
+        );
+        let blocks = converted["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["id"], "call_0");
+        assert_eq!(blocks[1]["id"], "call_1");
+    }
+
+    #[test]
+    fn cache_read_tokens_not_mirrored_into_prompt_tokens_details() {
+        // prompt_tokens here is Anthropic-fresh (excludes cache reads);
+        // mirroring cache_read into OpenAI's cached_tokens would violate
+        // cached <= prompt and send `prompt - cached` negative downstream.
+        let body = json!({
+            "id": "msg_1", "model": "m",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 90}
+        });
+        let converted = convert_anthropic_to_openai_chat_response(&body, "m");
+        assert!(converted["usage"].get("prompt_tokens_details").is_none());
+        assert_eq!(converted["usage"]["cache_read_input_tokens"], 90);
+    }
+
+    #[test]
+    fn scalar_stop_becomes_stop_sequences_array() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "END"
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4",
+            },
+        );
+        assert_eq!(converted["stop_sequences"], json!(["END"]));
+    }
+
+    #[test]
+    fn tool_choice_dropped_when_no_tools_survive() {
+        // A hosted-tool-only request: the unknown tool is dropped in
+        // translation, so tool_choice must not reach Anthropic alone.
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "hosted_web_browser_v9"}],
+            "tool_choice": "required"
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4",
+            },
+        );
+        assert!(converted.get("tools").is_none());
+        assert!(converted.get("tool_choice").is_none());
     }
 }

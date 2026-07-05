@@ -21,7 +21,10 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Returns true if the body uses OpenAI Responses API format
 /// (has "input" array, no "messages" array)
 pub fn is_responses_api_format(body: &Value) -> bool {
-    body.get("input").and_then(|v| v.as_array()).is_some() && body.get("messages").is_none()
+    // `input` may be an item array or (rarely) a bare prompt string.
+    body.get("input")
+        .is_some_and(|v| v.is_array() || v.is_string())
+        && body.get("messages").is_none()
 }
 
 pub(crate) fn cap_token_value(v: &Value, cap: Option<u64>) -> Value {
@@ -202,7 +205,25 @@ pub fn convert_responses_to_chat_request(
                 Some("function_call_output") => {
                     current_assistant = None;
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                    // `output` may be a plain string or an array of content
+                    // parts; collapsing non-strings to "" loses tool results.
+                    let output = match item.get("output") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Array(parts)) => {
+                            let text = parts
+                                .iter()
+                                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if text.is_empty() {
+                                serde_json::to_string(parts).unwrap_or_default()
+                            } else {
+                                text
+                            }
+                        }
+                        Some(other) if !other.is_null() => other.to_string(),
+                        _ => String::new(),
+                    };
                     messages
                         .push(json!({"role": "tool", "tool_call_id": call_id, "content": output}));
                 }
@@ -215,6 +236,11 @@ pub fn convert_responses_to_chat_request(
                 }
                 _ => {}
             }
+        }
+    } else if let Some(s) = body.get("input").and_then(|v| v.as_str()) {
+        // String-form `input` — the whole prompt as one user message.
+        if !s.is_empty() {
+            messages.push(json!({"role": "user", "content": s}));
         }
     }
 
@@ -293,6 +319,46 @@ pub fn convert_responses_to_chat_request(
         chat["reasoning_effort"] = json!(effort);
     }
     cap_reasoning_effort(&mut chat);
+
+    // tool_choice: the forced-function shape differs ({type:"function",name}
+    // vs {type:"function",function:{name}}); hosted-tool choices drop with
+    // their tools. Both fields gated on surviving tools — upstreams 400 on
+    // tool_choice / parallel_tool_calls without tools.
+    if chat.get("tools").is_some() {
+        match body.get("tool_choice") {
+            Some(Value::String(s)) if matches!(s.as_str(), "auto" | "none" | "required") => {
+                chat["tool_choice"] = json!(s);
+            }
+            Some(tc) if tc.get("type").and_then(|t| t.as_str()) == Some("function") => {
+                if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
+                    chat["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+                }
+            }
+            _ => {}
+        }
+        if let Some(ptc) = body.get("parallel_tool_calls") {
+            chat["parallel_tool_calls"] = ptc.clone();
+        }
+    }
+    // Responses structured output lives in `text.format`; Chat providers
+    // expect `response_format`.
+    if let Some(format) = body.get("text").and_then(|t| t.get("format")) {
+        match format.get("type").and_then(|t| t.as_str()) {
+            Some("json_schema") => {
+                let mut js = json!({});
+                for field in ["name", "schema", "strict"] {
+                    if let Some(v) = format.get(field) {
+                        js[field] = v.clone();
+                    }
+                }
+                chat["response_format"] = json!({"type": "json_schema", "json_schema": js});
+            }
+            Some("json_object") => {
+                chat["response_format"] = json!({"type": "json_object"});
+            }
+            _ => {}
+        }
+    }
 
     chat
 }
@@ -559,7 +625,7 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
     let mut finish_reason = String::from("stop");
 
     for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = http_utils::sse_data_payload(line) {
             if data.trim() == "[DONE]" {
                 break;
             }
@@ -618,11 +684,25 @@ pub fn accumulate_chat_sse(text: &str) -> Value {
                 })
             })
             .collect();
-        let mut msg = json!({"role": "assistant", "content": null, "tool_calls": tcs});
+        // Keep accumulated assistant text alongside the tool calls — dropping
+        // it loses the model's preamble ("Let me check that file.").
+        let content_value = if content.is_empty() {
+            Value::Null
+        } else {
+            json!(content)
+        };
+        let mut msg = json!({"role": "assistant", "content": content_value, "tool_calls": tcs});
         if !reasoning_content.is_empty() {
             msg["reasoning_content"] = json!(reasoning_content);
         }
-        json!({"choices": [{"message": msg, "finish_reason": "tool_calls"}]})
+        // Preserve "length": masking a truncation as tool_calls would hide
+        // the incomplete status (and let a half-emitted tool call execute).
+        let fr = if finish_reason == "length" {
+            "length"
+        } else {
+            "tool_calls"
+        };
+        json!({"choices": [{"message": msg, "finish_reason": fr}]})
     } else {
         let mut msg = json!({"role": "assistant", "content": content});
         if !reasoning_content.is_empty() {
@@ -758,74 +838,10 @@ pub fn convert_chat_response_to_responses_sse(
         next_output_index += 1;
     }
 
-    if !tool_calls.is_empty() {
-        // Tool call response — each tool call becomes a function_call output item
-        for (offset, tc) in tool_calls.iter().enumerate() {
-            let i = next_output_index + offset;
-            // call_id = the Chat Completions tool call ID (referenced in tool results)
-            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
-            // item_id = a fresh item identifier within this response
-            let item_id = gen_id("fc");
-            let tc_name = tc["function"]["name"].as_str().unwrap_or("");
-            let tc_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
-
-            sse.push_str(&sse_event(
-                "response.output_item.added",
-                &json!({
-                    "type": "response.output_item.added",
-                    "response_id": resp_id, "output_index": i,
-                    "item": {
-                        "id": item_id, "call_id": call_id,
-                        "type": "function_call", "status": "in_progress",
-                        "name": tc_name, "arguments": ""
-                    }
-                }),
-            ));
-            sse.push_str(&sse_event(
-                "response.function_call_arguments.delta",
-                &json!({
-                    "type": "response.function_call_arguments.delta",
-                    "response_id": resp_id, "output_index": i,
-                    "item_id": item_id, "delta": tc_args
-                }),
-            ));
-            sse.push_str(&sse_event(
-                "response.function_call_arguments.done",
-                &json!({
-                    "type": "response.function_call_arguments.done",
-                    "response_id": resp_id, "output_index": i,
-                    "item_id": item_id, "arguments": tc_args
-                }),
-            ));
-
-            // Build done_item with reasoning_content if the provider returned any
-            let mut done_item = json!({
-                "id": item_id, "call_id": call_id,
-                "type": "function_call", "status": "completed",
-                "name": tc_name, "arguments": tc_args
-            });
-            if !reasoning_for_tool.is_empty() {
-                done_item["reasoning_content"] = json!(reasoning_for_tool.clone());
-            }
-            sse.push_str(&sse_event(
-                "response.output_item.done",
-                &json!({
-                    "type": "response.output_item.done",
-                    "response_id": resp_id, "output_index": i,
-                    "item": done_item
-                }),
-            ));
-            let mut output_item = json!({
-                "id": item_id, "call_id": call_id,
-                "type": "function_call", "status": "completed",
-                "name": tc_name, "arguments": tc_args
-            });
-            if !reasoning_for_tool.is_empty() {
-                output_item["reasoning_content"] = json!(reasoning_for_tool.clone());
-            }
-            output_items.push(output_item);
-        }
-    } else {
+    // A turn can carry both assistant text and tool calls; emit the message
+    // item before the function_call items (same order as streaming). A fully
+    // empty turn still emits the empty message item so Codex sees a turn.
+    if !content.is_empty() || tool_calls.is_empty() {
         // Text message response
         let msg_id = gen_id("msg");
         let i = next_output_index;
@@ -899,17 +915,92 @@ pub fn convert_chat_response_to_responses_sse(
         output_items.push(json!({
             "id": msg_id, "type": "message", "status": "completed",
             "role": "assistant",
-            "content": content_parts
+            "content": done_item["content"].clone()
         }));
+        next_output_index += 1;
     }
 
-    // response.completed — required closing event with full output array
+    if !tool_calls.is_empty() {
+        for (offset, tc) in tool_calls.iter().enumerate() {
+            let i = next_output_index + offset;
+            // call_id is the Chat tool-call id (referenced by tool results);
+            // item_id is a fresh per-response identifier.
+            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
+            let item_id = gen_id("fc");
+            let tc_name = tc["function"]["name"].as_str().unwrap_or("");
+            let tc_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+
+            sse.push_str(&sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "response_id": resp_id, "output_index": i,
+                    "item": {
+                        "id": item_id, "call_id": call_id,
+                        "type": "function_call", "status": "in_progress",
+                        "name": tc_name, "arguments": ""
+                    }
+                }),
+            ));
+            sse.push_str(&sse_event(
+                "response.function_call_arguments.delta",
+                &json!({
+                    "type": "response.function_call_arguments.delta",
+                    "response_id": resp_id, "output_index": i,
+                    "item_id": item_id, "delta": tc_args
+                }),
+            ));
+            sse.push_str(&sse_event(
+                "response.function_call_arguments.done",
+                &json!({
+                    "type": "response.function_call_arguments.done",
+                    "response_id": resp_id, "output_index": i,
+                    "item_id": item_id, "arguments": tc_args
+                }),
+            ));
+
+            let mut done_item = json!({
+                "id": item_id, "call_id": call_id,
+                "type": "function_call", "status": "completed",
+                "name": tc_name, "arguments": tc_args
+            });
+            if !reasoning_for_tool.is_empty() {
+                done_item["reasoning_content"] = json!(reasoning_for_tool.clone());
+            }
+            sse.push_str(&sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "response_id": resp_id, "output_index": i,
+                    "item": done_item
+                }),
+            ));
+            let mut output_item = json!({
+                "id": item_id, "call_id": call_id,
+                "type": "function_call", "status": "completed",
+                "name": tc_name, "arguments": tc_args
+            });
+            if !reasoning_for_tool.is_empty() {
+                output_item["reasoning_content"] = json!(reasoning_for_tool.clone());
+            }
+            output_items.push(output_item);
+        }
+    }
+
+    // response.completed — required closing event with full output array.
+    // A length-truncated turn must surface as `incomplete`, or the client
+    // can't tell the cutoff from a normal completion.
+    let truncated = chat["choices"][0]["finish_reason"].as_str() == Some("length");
     let mut response = json!({
         "id": resp_id, "object": "response",
         "model": codex_model,
-        "created_at": created_at, "status": "completed",
+        "created_at": created_at,
+        "status": if truncated { "incomplete" } else { "completed" },
         "output": output_items
     });
+    if truncated {
+        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
     if let Some(usage) = chat_usage_to_responses_usage(chat) {
         response["usage"] = usage;
     }
@@ -945,6 +1036,8 @@ pub struct ResponsesStreamConverter {
     message: Option<StreamItem>,
     tools: Vec<StreamToolCall>,
     usage: Option<Value>,
+    /// Upstream sent finish_reason "length" — surface status "incomplete".
+    truncated: bool,
 }
 
 struct StreamItem {
@@ -977,6 +1070,7 @@ impl ResponsesStreamConverter {
             message: None,
             tools: Vec::new(),
             usage: None,
+            truncated: false,
         }
     }
 
@@ -1142,9 +1236,13 @@ impl ResponsesStreamConverter {
         let mut response = json!({
             "id": self.resp_id, "object": "response",
             "model": self.codex_model,
-            "created_at": self.created_at, "status": "completed",
+            "created_at": self.created_at,
+            "status": if self.truncated { "incomplete" } else { "completed" },
             "output": output
         });
+        if self.truncated {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
         if let Some(usage) = &self.usage {
             response["usage"] = usage.clone();
         }
@@ -1174,7 +1272,7 @@ impl ResponsesStreamConverter {
     }
 
     fn process_line(&mut self, line: &str, out: &mut String) {
-        let Some(data) = line.strip_prefix("data: ") else {
+        let Some(data) = http_utils::sse_data_payload(line) else {
             return;
         };
         if data == "[DONE]" {
@@ -1192,6 +1290,9 @@ impl ResponsesStreamConverter {
             return;
         };
         for choice in choices {
+            if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("length") {
+                self.truncated = true;
+            }
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
@@ -1665,7 +1766,7 @@ impl ResponsesToChatStreamConverter {
     }
 
     fn process_line(&mut self, line: &str, out: &mut String) {
-        let Some(data) = line.strip_prefix("data: ") else {
+        let Some(data) = http_utils::sse_data_payload(line) else {
             return;
         };
         if data == "[DONE]" {
@@ -1894,6 +1995,98 @@ mod tests {
     }
 
     // ── convert_responses_to_chat_request ─────────────────────────────────────
+
+    fn openai_router_config() -> ResponsesToChatRouterConfig {
+        ResponsesToChatRouterConfig {
+            target_base_url: "https://api.example.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            target_protocol: ProviderProtocol::Openai,
+            target_path_variant: None,
+            copilot_token_manager: None,
+            model_prefix: None,
+            requires_reasoning_content: false,
+            actual_model: None,
+            max_tokens_cap: None,
+            responses_api_supported: None,
+            is_starter: false,
+            aivo_prefix_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_convert_request_forwards_tool_choice_and_parallel() {
+        let body = json!({
+            "model": "gpt-4",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        assert_eq!(chat["tool_choice"], "required");
+        assert_eq!(chat["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn test_convert_request_translates_forced_function_tool_choice() {
+        let body = json!({
+            "model": "gpt-4",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "shell"}
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        assert_eq!(
+            chat["tool_choice"],
+            json!({"type": "function", "function": {"name": "shell"}})
+        );
+    }
+
+    #[test]
+    fn test_convert_request_drops_tool_choice_when_no_tools_survive() {
+        // Hosted-only tool list: every tool is filtered out, so forwarding
+        // tool_choice / parallel_tool_calls would 400 on OpenAI upstreams.
+        let body = json!({
+            "model": "gpt-4",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search_preview"}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        assert!(chat.get("tools").is_none());
+        assert!(chat.get("tool_choice").is_none());
+        assert!(chat.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_accumulate_chat_sse_preserves_length_over_tool_calls() {
+        // A truncated tool call must keep finish_reason "length" so the
+        // Responses conversion reports status "incomplete".
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cm\"}}]},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\
+                   data: [DONE]\n";
+        let result = accumulate_chat_sse(sse);
+        assert_eq!(result["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn test_convert_request_text_format_becomes_response_format() {
+        let body = json!({
+            "model": "gpt-4",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "text": {"format": {"type": "json_schema", "name": "out", "strict": true,
+                                "schema": {"type": "object", "properties": {}}}}
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        assert_eq!(chat["response_format"]["type"], "json_schema");
+        assert_eq!(chat["response_format"]["json_schema"]["name"], "out");
+        assert_eq!(chat["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            chat["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+    }
 
     #[test]
     fn test_convert_request_simple_message() {
@@ -2657,6 +2850,130 @@ mod tests {
         assert!(sse.contains("\"call_id\":\"call_abc123\""));
     }
 
+    #[test]
+    fn test_convert_response_length_reports_incomplete_status() {
+        let chat = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "truncat"},
+                "finish_reason": "length"
+            }]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        assert!(sse.contains("\"status\":\"incomplete\""), "{sse}");
+        assert!(sse.contains("\"reason\":\"max_output_tokens\""), "{sse}");
+    }
+
+    #[test]
+    fn stream_converter_length_reports_incomplete_status() {
+        let mut c = ResponsesStreamConverter::new("gpt-4o", false);
+        let mut sse = String::new();
+        sse.push_str(&c.push_bytes(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"length\"}]}\n",
+        ));
+        sse.push_str(&c.finish());
+        assert!(sse.contains("\"status\":\"incomplete\""), "{sse}");
+    }
+
+    #[test]
+    fn test_convert_request_function_call_output_array_form() {
+        let body = json!({
+            "model": "gpt-4",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": [{"type": "output_text", "text": "line one"},
+                            {"type": "output_text", "text": "line two"}]}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["content"], "line one\nline two");
+    }
+
+    #[test]
+    fn test_convert_request_string_input() {
+        let body = json!({"model": "gpt-4", "input": "hello there"});
+        assert!(is_responses_api_format(&body));
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        let msgs = chat["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], "hello there");
+    }
+
+    #[test]
+    fn test_convert_response_text_only_emits_single_message_item() {
+        let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let completed = sse
+            .lines()
+            .find(|l| l.contains("\"type\":\"response.completed\""))
+            .and_then(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).unwrap())
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
+    }
+
+    #[test]
+    fn test_convert_response_keeps_text_alongside_tool_calls() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Let me check that file.",
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        // Preamble text must survive as a message item, before the call.
+        assert!(
+            sse.contains("\"text\":\"Let me check that file.\""),
+            "{sse}"
+        );
+        assert!(sse.contains("\"call_id\":\"call_1\""));
+        let completed = sse
+            .lines()
+            .find(|l| l.contains("\"type\":\"response.completed\""))
+            .and_then(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).unwrap())
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Let me check that file.");
+        assert_eq!(output[1]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_convert_response_tool_calls_without_text_skip_message_item() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let completed = sse
+            .lines()
+            .find(|l| l.contains("\"type\":\"response.completed\""))
+            .and_then(|l| l.strip_prefix("data: "))
+            .map(|d| serde_json::from_str::<Value>(d).unwrap())
+            .unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
+    }
+
     // ── SSE accumulator ────────────────────────────────────────────────────────
 
     #[test]
@@ -2682,12 +2999,26 @@ mod tests {
             .unwrap();
         assert_eq!(tcs[0]["id"], "call_x");
         assert_eq!(tcs[0]["function"]["name"], "shell");
+        // No content deltas arrived → content stays null.
+        assert!(result["choices"][0]["message"]["content"].is_null());
         assert!(
             tcs[0]["function"]["arguments"]
                 .as_str()
                 .unwrap()
                 .contains("ls")
         );
+    }
+
+    #[test]
+    fn test_accumulate_chat_sse_keeps_content_with_tool_calls() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Let me check.\"},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\
+                   data: [DONE]\n";
+        let result = accumulate_chat_sse(sse);
+        let msg = &result["choices"][0]["message"];
+        assert_eq!(msg["content"], "Let me check.");
+        assert_eq!(msg["tool_calls"][0]["id"], "call_x");
     }
 
     #[test]
@@ -3242,6 +3573,18 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "Hello");
         assert!(!content.iter().any(|p| p["type"] == "reasoning"));
+    }
+
+    #[test]
+    fn stream_converter_accepts_spaceless_data_prefix() {
+        let mut c = ResponsesStreamConverter::new("deepseek-chat", false);
+        let mut sse = String::new();
+        sse.push_str(&c.push_bytes(
+            b"data:{\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n",
+        ));
+        sse.push_str(&c.push_bytes(b"data:[DONE]\n"));
+        sse.push_str(&c.finish());
+        assert!(sse.contains("\"delta\":\"hi\""), "{sse}");
     }
 
     #[test]

@@ -281,6 +281,10 @@ impl ServeRouter {
             ))
         });
 
+        // Failover handlers re-parse the RAW request, so each failover config
+        // needs the alias map too — an aliased model name would otherwise
+        // reach the failover upstream unresolved and 400.
+        let failover_aliases = self.config.aliases.clone();
         let failover_entries: Vec<FailoverEntry> = self
             .failover_keys
             .into_iter()
@@ -309,8 +313,7 @@ impl ServeRouter {
                         cors: false,
                         timeout,
                         auth_token: None,
-                        // aliases resolved on primary before failover runs
-                        aliases: HashMap::new(),
+                        aliases: failover_aliases.clone(),
                     }),
                     key: fk,
                     copilot_tokens: ct,
@@ -380,7 +383,19 @@ async fn run_accept_loop(listener: tokio::net::TcpListener, state: Arc<ServeStat
                 return Ok(());
             }
         };
-        let (mut socket, peer_addr) = accept?;
+        // Transient accept errors (ECONNABORTED on client reset, EMFILE under
+        // fd pressure) must not kill the server; back off briefly and keep
+        // accepting.
+        let (mut socket, peer_addr) = match accept {
+            Ok(pair) => pair,
+            Err(e) => {
+                if !state.quiet {
+                    eprintln!("  \u{26a0} accept error (continuing): {e}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let peer_ip = peer_addr.ip().to_string();
         let state = state.clone();
         let permit = match semaphore.clone().acquire_owned().await {
@@ -743,8 +758,16 @@ pub(crate) fn extract_usage_from_value(v: &Value) -> Option<TokenUsage> {
 
 /// Extract token usage from a buffered JSON response body.
 pub(crate) fn parse_token_usage(body: &[u8]) -> Option<TokenUsage> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    extract_usage_from_value(&v)
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        return extract_usage_from_value(&v);
+    }
+    // Buffered SSE body — the Responses-via-chat path returns
+    // text/event-stream even when buffered, so usage rides on `data:` lines
+    // instead of a JSON envelope. Without this, those turns account zero.
+    let mut sniffer = StreamUsageSniffer::new(true);
+    sniffer.observe(body);
+    sniffer.observe(b"\n");
+    sniffer.finish()
 }
 
 /// Accumulates token usage from a forwarded SSE stream by scanning `data:` lines
@@ -1177,6 +1200,7 @@ fn upstream_context(state: &ServeState) -> UpstreamRequestContext {
         is_openrouter: state.config.is_openrouter,
         is_starter: state.config.is_starter,
         copilot_tokens: state.copilot_tokens.clone(),
+        accounting: state.usage_sink.is_some(),
     }
 }
 
@@ -2023,6 +2047,17 @@ mod tests {
         .to_string();
         let u = parse_token_usage(body.as_bytes()).unwrap();
         assert_eq!((u.prompt, u.completion, u.cache_read), (30, 12, 8));
+    }
+
+    #[test]
+    fn parse_token_usage_buffered_sse_body() {
+        // Responses-via-chat returns text/event-stream even on the buffered
+        // path; usage rides on a data: line, not a JSON envelope.
+        let body = "event: response.completed\n\
+                    data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":21,\"output_tokens\":7}}}\n\n\
+                    data: [DONE]\n";
+        let u = parse_token_usage(body.as_bytes()).unwrap();
+        assert_eq!((u.prompt, u.completion), (21, 7));
     }
 
     #[test]

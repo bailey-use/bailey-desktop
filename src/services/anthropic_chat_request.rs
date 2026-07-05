@@ -335,6 +335,11 @@ pub fn convert_anthropic_to_openai_request(
                     req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
                 }
             }
+            // Anthropic "none" forbids tool calls; dropping it would let the
+            // OpenAI default (auto) call a tool the caller explicitly banned.
+            Some("none") => {
+                req["tool_choice"] = json!("none");
+            }
             _ => {}
         }
     }
@@ -412,6 +417,9 @@ fn convert_content_blocks(
     // string form for legacy callers.
     let mut text_parts_with_cache: Vec<Value> = Vec::new();
     let mut any_text_has_cache_control = false;
+    // Image blocks in regular (non-tool_result) messages → OpenAI image_url
+    // parts; without this a pasted image silently vanishes on the bridge.
+    let mut image_parts: Vec<Value> = Vec::new();
 
     for block in blocks {
         let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -440,6 +448,12 @@ fn convert_content_blocks(
                         any_text_has_cache_control = true;
                     }
                     text_parts_with_cache.push(part);
+                }
+            }
+            "image" => {
+                // Same translation as tool_result images (base64 → data URL).
+                if let Some(part) = convert_tool_result_part(block) {
+                    image_parts.push(part);
                 }
             }
             "thinking" => {
@@ -519,8 +533,12 @@ fn convert_content_blocks(
         // follow the tool messages — a user message between an assistant
         // tool_calls turn and its results breaks pairing on strict upstreams
         // (DeepSeek).
-        if !text_parts.is_empty() {
-            let content = if any_text_has_cache_control {
+        if !text_parts.is_empty() || !image_parts.is_empty() {
+            let content = if !image_parts.is_empty() {
+                let mut parts = text_parts_with_cache;
+                parts.extend(image_parts);
+                Value::Array(parts)
+            } else if any_text_has_cache_control {
                 Value::Array(text_parts_with_cache)
             } else {
                 Value::String(text_parts.join("\n"))
@@ -559,7 +577,11 @@ fn convert_content_blocks(
         }
         messages.push(msg);
     } else {
-        let content = if any_text_has_cache_control {
+        let content = if !image_parts.is_empty() {
+            let mut parts = text_parts_with_cache;
+            parts.extend(image_parts);
+            Value::Array(parts)
+        } else if any_text_has_cache_control {
             Value::Array(text_parts_with_cache)
         } else {
             Value::String(text_parts.join("\n"))
@@ -712,6 +734,69 @@ mod tests {
             preserve_stream: true,
             ..test_config()
         }
+    }
+
+    #[test]
+    fn tool_choice_none_maps_to_openai_none() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "none"}
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["tool_choice"], "none");
+    }
+
+    #[test]
+    fn user_message_image_block_becomes_image_url_part() {
+        let body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aGk="
+                    }}
+                ]
+            }],
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is this?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,aGk=");
+    }
+
+    #[test]
+    fn image_only_user_message_survives() {
+        let body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "aGk="
+                }}]
+            }],
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        let content = req["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn text_only_message_keeps_string_content() {
+        let body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            }],
+        });
+        let req = convert_anthropic_to_openai_request(&body, &test_config());
+        assert_eq!(req["messages"][0]["content"], "hi");
     }
 
     #[test]

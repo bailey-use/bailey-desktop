@@ -94,6 +94,19 @@ pub fn record_request_outcome(
     }
 }
 
+/// [`record_request_outcome`] for callers holding a [`RouteSlot`]: seeds the
+/// reset target from the slot's own default route.
+pub fn record_slot_outcome(slot: &RouteSlot, succeeded: bool) -> bool {
+    let (seed_protocol, seed_variant) = slot.seed_route();
+    record_request_outcome(
+        slot.route_atom(),
+        slot.failures_atom(),
+        seed_protocol,
+        seed_variant,
+        succeeded,
+    )
+}
+
 /// Decide whether a fallback cascade should stop after a single mismatch
 /// instead of continuing to the next `(protocol, path_variant)` candidate.
 ///
@@ -580,6 +593,28 @@ mod tests {
             std::collections::BTreeMap::new(),
         )
         .resolve("test-model")
+    }
+
+    #[test]
+    fn record_slot_outcome_resets_pin_to_seed_at_threshold() {
+        let slot = test_slot(ProviderProtocol::Anthropic);
+        // Simulate a learned (drifted) route away from the seed.
+        slot.route_atom().store(
+            encode_route(ProviderProtocol::Openai, PathVariant::Default),
+            Ordering::Relaxed,
+        );
+        for _ in 0..(CONSECUTIVE_FAILURES_BEFORE_RESET - 1) {
+            assert!(!record_slot_outcome(&slot, false));
+        }
+        assert!(record_slot_outcome(&slot, false));
+        assert_eq!(
+            decode_route(slot.route_atom().load(Ordering::Relaxed)).0,
+            ProviderProtocol::Anthropic,
+            "threshold failure must reset the pin back to the seed route"
+        );
+        // Success resets the counter without touching the route.
+        assert!(!record_slot_outcome(&slot, true));
+        assert_eq!(slot.failures_atom().load(Ordering::Relaxed), 0);
     }
 
     #[test]

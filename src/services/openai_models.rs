@@ -189,8 +189,15 @@ pub(crate) struct ResponsesRequest {
     pub top_p: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ResponsesTool>>,
+    /// Responses wire shape: mode string or `{type:"function", name}` —
+    /// NOT Chat's `{type:"function", function:{name}}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<OpenAIChatToolChoice>,
+    pub tool_choice: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<Value>,
+    /// Structured output: `{format: {type: "json_schema"|"json_object", ...}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ResponsesReasoning>,
     #[serde(default)]
@@ -716,11 +723,46 @@ pub(crate) fn convert_chat_to_responses_request(
         }
     }
 
+    // Reasoning-model Chat clients send max_completion_tokens (those models
+    // 400 on max_tokens), and migrate_max_tokens_for_reasoning_models may
+    // have already renamed the field — accept either as the output cap.
+    let max_output_tokens = openai_req
+        .max_tokens
+        .clone()
+        .or_else(|| openai_req.extra.get("max_completion_tokens").cloned());
+
+    // Chat response_format → Responses `text.format` (flattened json_schema).
+    let text = match openai_req.extra.get("response_format") {
+        Some(rf) if rf.get("type").and_then(|t| t.as_str()) == Some("json_schema") => {
+            let mut format = serde_json::json!({"type": "json_schema"});
+            if let Some(js) = rf.get("json_schema") {
+                for field in ["name", "schema", "strict"] {
+                    if let Some(v) = js.get(field) {
+                        format[field] = v.clone();
+                    }
+                }
+            }
+            Some(serde_json::json!({ "format": format }))
+        }
+        Some(rf) if rf.get("type").and_then(|t| t.as_str()) == Some("json_object") => {
+            Some(serde_json::json!({"format": {"type": "json_object"}}))
+        }
+        _ => None,
+    };
+
+    // Chat's forced-function shape nests the name; Responses flattens it.
+    let tool_choice = openai_req.tool_choice.as_ref().map(|tc| match tc {
+        OpenAIChatToolChoice::Mode(mode) => Value::String(mode.clone()),
+        OpenAIChatToolChoice::Named(named) => {
+            serde_json::json!({"type": "function", "name": named.function.name})
+        }
+    });
+
     ResponsesRequest {
         model: openai_req.model.clone(),
         input,
         instructions,
-        max_output_tokens: openai_req.max_tokens.clone(),
+        max_output_tokens,
         temperature: openai_req.temperature.clone(),
         top_p: openai_req.top_p.clone(),
         tools: openai_req.tools.as_ref().map(|tools| {
@@ -734,7 +776,9 @@ pub(crate) fn convert_chat_to_responses_request(
                 })
                 .collect()
         }),
-        tool_choice: openai_req.tool_choice.clone(),
+        tool_choice,
+        parallel_tool_calls: openai_req.extra.get("parallel_tool_calls").cloned(),
+        text,
         reasoning: openai_req
             .reasoning_effort
             .as_ref()
@@ -1093,6 +1137,61 @@ mod tests {
             req.messages[0].content,
             Some(OpenAIMessageContent::Text("hello".to_string()))
         );
+    }
+
+    fn chat_req_from_json(v: Value) -> OpenAIChatRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn chat_to_responses_forwards_response_format_as_text_format() {
+        let req = chat_req_from_json(serde_json::json!({
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "out", "strict": true,
+                "schema": {"type": "object", "properties": {}}
+            }}
+        }));
+        let responses = convert_chat_to_responses_request(&req);
+        let v = serde_json::to_value(&responses).unwrap();
+        assert_eq!(v["text"]["format"]["type"], "json_schema");
+        assert_eq!(v["text"]["format"]["name"], "out");
+        assert_eq!(v["text"]["format"]["strict"], true);
+        assert_eq!(v["text"]["format"]["schema"]["type"], "object");
+    }
+
+    #[test]
+    fn chat_to_responses_accepts_max_completion_tokens() {
+        let req = chat_req_from_json(serde_json::json!({
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 4096
+        }));
+        let responses = convert_chat_to_responses_request(&req);
+        let v = serde_json::to_value(&responses).unwrap();
+        assert_eq!(v["max_output_tokens"], 4096);
+    }
+
+    #[test]
+    fn chat_to_responses_flattens_named_tool_choice() {
+        let req = chat_req_from_json(serde_json::json!({
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "shell", "description": "", "parameters": {"type": "object"}
+            }}],
+            "tool_choice": {"type": "function", "function": {"name": "shell"}},
+            "parallel_tool_calls": false
+        }));
+        let responses = convert_chat_to_responses_request(&req);
+        let v = serde_json::to_value(&responses).unwrap();
+        // Responses wire shape is flat — no nested `function` object.
+        assert_eq!(
+            v["tool_choice"],
+            serde_json::json!({"type": "function", "name": "shell"})
+        );
+        assert_eq!(v["parallel_tool_calls"], false);
     }
 
     #[test]

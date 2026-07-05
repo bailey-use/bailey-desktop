@@ -46,7 +46,7 @@ use crate::services::openai_models::{
 };
 use crate::services::protocol_fallback::{
     AttemptOutcome, FirstError, MismatchDirective, QuirkRetryState, classify_attempt,
-    commit_protocol_switch, mismatch_directive, protocol_candidates,
+    commit_protocol_switch, mismatch_directive, protocol_candidates, record_slot_outcome,
 };
 use crate::services::provider_profile::is_direct_openai_base;
 use crate::services::provider_protocol::{
@@ -206,9 +206,13 @@ enum RouterResponse {
 enum SendNativeOutcome {
     Success(RouterResponse),
     EndpointMissing,
-    /// Path answered with an authoritative error (5xx/auth/rate-limit) that
-    /// chat/completions fallback can't fix; surface the response as-is.
+    /// Path answered with an authoritative auth error (401/403). Ambiguous:
+    /// could be a real auth failure or a host that doesn't serve the
+    /// Anthropic shape — the caller flips the pin and lets chat decide.
     Terminal(RouterResponse),
+    /// Path answered with a transient error (429/5xx): the endpoint exists
+    /// and works, so the protocol pin must NOT flip.
+    Transient(RouterResponse),
     UpstreamError,
 }
 
@@ -220,6 +224,7 @@ enum NativeAnthropicResult {
     Success(RouterResponse),
     EndpointMissing,
     Terminal(RouterResponse),
+    Transient(RouterResponse),
     UpstreamError,
 }
 
@@ -501,13 +506,27 @@ async fn classify_native_failure(
     if is_terminal_upstream_error(status) {
         let content_type = http_utils::response_content_type(&response);
         let body = response.bytes().await?;
-        return Ok(SendNativeOutcome::Terminal(RouterResponse::Buffered {
+        let buffered = RouterResponse::Buffered {
             status,
             content_type,
             body: body.to_vec(),
-        }));
+        };
+        return Ok(if native_terminal_flips_pin(status) {
+            SendNativeOutcome::Terminal(buffered)
+        } else {
+            SendNativeOutcome::Transient(buffered)
+        });
     }
     Ok(SendNativeOutcome::UpstreamError)
+}
+
+/// Only 401/403 from `/v1/messages` may flip the protocol pin: a host that
+/// doesn't serve the Anthropic shape can answer auth-like errors (Cloudflare
+/// AI Gateway), so chat fallback must arbitrate. 429/5xx mean the endpoint
+/// exists and hit transient trouble — flipping on those would permanently
+/// abandon the native path (and prompt caching) after a single blip.
+fn native_terminal_flips_pin(status: u16) -> bool {
+    matches!(status, 401 | 403)
 }
 
 /// Try sending the request in native Anthropic format to the upstream's `/v1/messages`.
@@ -562,6 +581,10 @@ async fn try_native_anthropic(
                 // Path is real — keep probing on retries (don't bump the streak).
                 probe.reset_upstream_error_streak();
                 return Ok(NativeAnthropicResult::Terminal(response));
+            }
+            SendNativeOutcome::Transient(response) => {
+                probe.reset_upstream_error_streak();
+                return Ok(NativeAnthropicResult::Transient(response));
             }
             SendNativeOutcome::EndpointMissing => continue,
             SendNativeOutcome::UpstreamError => {
@@ -658,6 +681,7 @@ async fn handle_anthropic_to_upstream(
         match try_native_anthropic(&body, config, client, &passthrough_headers, probe).await? {
             NativeAnthropicResult::Success(response) => {
                 slot.confirm();
+                record_slot_outcome(&slot, true);
                 return Ok(response);
             }
             NativeAnthropicResult::Terminal(response) => {
@@ -683,6 +707,11 @@ async fn handle_anthropic_to_upstream(
                 {
                     active_protocol.store(ProviderProtocol::Openai.to_u8(), Ordering::Relaxed);
                 }
+            }
+            NativeAnthropicResult::Transient(response) => {
+                // Endpoint exists (429/5xx); surface the error via the chat
+                // cascade's first_error seed but leave the pin alone.
+                native_anthropic_terminal = Some(response);
             }
             NativeAnthropicResult::UpstreamError => {
                 // Endpoint may exist; don't flip the pin on transient errors.
@@ -878,6 +907,7 @@ async fn handle_anthropic_to_upstream(
                         socket.write_all(b"0\r\n\r\n").await?;
                         commit_protocol_switch(active_protocol, protocol, variant, attempt);
                         slot.confirm();
+                        record_slot_outcome(&slot, true);
                         return Ok(RouterResponse::AlreadyStreamed);
                     }
 
@@ -914,6 +944,7 @@ async fn handle_anthropic_to_upstream(
             AttemptOutcome::Success(r) => {
                 commit_protocol_switch(active_protocol, protocol, variant, attempt);
                 slot.confirm();
+                record_slot_outcome(&slot, true);
                 return Ok(r);
             }
             AttemptOutcome::Mismatch {
@@ -966,6 +997,10 @@ async fn handle_anthropic_to_upstream(
         idx += 1;
     }
 
+    // Failure-streak valve: after CONSECUTIVE_FAILURES_BEFORE_RESET exhausted
+    // requests the learned pin resets, so a long-lived session can recover
+    // from a stale route without a process restart.
+    record_slot_outcome(&slot, false);
     Ok(first_error.take().unwrap_or(RouterResponse::Buffered {
         status: 503,
         content_type: CONTENT_TYPE_JSON.to_string(),
@@ -1446,6 +1481,8 @@ struct OpenAIStreamConverter {
     cache_read_input_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     pending_stop_reason: Option<&'static str>,
+    /// Raw finish_reason was "content_filter" — blocks tool_use promotion.
+    finish_was_content_filter: bool,
     saw_tool_use: bool,
 }
 
@@ -1468,7 +1505,27 @@ impl OpenAIStreamConverter {
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
             pending_stop_reason: None,
+            finish_was_content_filter: false,
             saw_tool_use: false,
+        }
+    }
+
+    /// Final Anthropic stop_reason for this stream. Lenient upstreams emit
+    /// tool_calls yet finish with "stop"; trusting that strands the tool loop
+    /// (Claude Code renders the call, never runs it), so an end_turn with
+    /// tool_use blocks promotes to tool_use. length/content_filter never do —
+    /// a truncated or filtered tool call must not execute.
+    fn resolve_stop_reason(&self) -> &'static str {
+        let fallback = if self.saw_tool_use {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        let resolved = self.pending_stop_reason.unwrap_or(fallback);
+        if resolved == "end_turn" && self.saw_tool_use && !self.finish_was_content_filter {
+            "tool_use"
+        } else {
+            resolved
         }
     }
 
@@ -1518,11 +1575,7 @@ impl OpenAIStreamConverter {
         }
 
         if !self.finished && self.message_started {
-            let fallback_stop = if self.saw_tool_use {
-                "tool_use"
-            } else {
-                "end_turn"
-            };
+            let stop_reason = self.resolve_stop_reason();
             finalize_stream_message(
                 &mut output,
                 &mut self.message_started,
@@ -1535,7 +1588,7 @@ impl OpenAIStreamConverter {
                 &mut self.thinking_block_idx,
                 &mut self.text_block_idx,
                 &mut self.tool_blocks,
-                self.pending_stop_reason.unwrap_or(fallback_stop),
+                stop_reason,
             );
             self.finished = true;
         }
@@ -1550,11 +1603,7 @@ impl OpenAIStreamConverter {
 
         if data == "[DONE]" {
             if !self.finished {
-                let fallback_stop = if self.saw_tool_use {
-                    "tool_use"
-                } else {
-                    "end_turn"
-                };
+                let stop_reason = self.resolve_stop_reason();
                 finalize_stream_message(
                     output,
                     &mut self.message_started,
@@ -1567,7 +1616,7 @@ impl OpenAIStreamConverter {
                     &mut self.thinking_block_idx,
                     &mut self.text_block_idx,
                     &mut self.tool_blocks,
-                    self.pending_stop_reason.unwrap_or(fallback_stop),
+                    stop_reason,
                 );
                 self.finished = true;
             }
@@ -1764,6 +1813,7 @@ impl OpenAIStreamConverter {
                 // Defer Anthropic message_delta until [DONE]/EOF so Claude Code
                 // logs the real token totals instead of zeros.
                 self.pending_stop_reason = Some(map_openai_finish_reason(finish_reason));
+                self.finish_was_content_filter = finish_reason == "content_filter";
             }
         }
 
@@ -2459,6 +2509,54 @@ data: [DONE]\n";
         assert!(output.contains("\"text\":\" world\""));
         assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert_eq!(output.matches("event: message_stop").count(), 1);
+    }
+
+    fn stream_tool_call_turn(finish_reason: &str) -> String {
+        let mut converter = OpenAIStreamConverter::new();
+        let mut output = String::new();
+        output.push_str(
+            &converter
+                .push_bytes(b"data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n")
+                .unwrap(),
+        );
+        let finish = format!(
+            "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish_reason}\"}}]}}\n"
+        );
+        output.push_str(&converter.push_bytes(finish.as_bytes()).unwrap());
+        output.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
+        output.push_str(&converter.finish().unwrap());
+        output
+    }
+
+    #[test]
+    fn stream_stop_with_tool_calls_promotes_to_tool_use() {
+        let output = stream_tool_call_turn("stop");
+        assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
+    }
+
+    #[test]
+    fn stream_length_with_tool_calls_keeps_max_tokens() {
+        let output = stream_tool_call_turn("length");
+        assert!(
+            output.contains("\"stop_reason\":\"max_tokens\""),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn stream_content_filter_with_tool_calls_keeps_end_turn() {
+        let output = stream_tool_call_turn("content_filter");
+        assert!(output.contains("\"stop_reason\":\"end_turn\""), "{output}");
+    }
+
+    #[test]
+    fn native_pin_flip_only_on_auth_statuses() {
+        assert!(native_terminal_flips_pin(401));
+        assert!(native_terminal_flips_pin(403));
+        // Transient statuses must never flip a working native-Anthropic pin.
+        for status in [429, 500, 502, 503, 504] {
+            assert!(!native_terminal_flips_pin(status), "status {status}");
+        }
     }
 
     #[test]

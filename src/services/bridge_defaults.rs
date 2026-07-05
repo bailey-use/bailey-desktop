@@ -18,3 +18,13 @@ pub(crate) const BRIDGE_FALLBACK_OPENAI_RESPONSE_ID: &str = "chatcmpl-aivo";
 /// Raised from 4096 → 16384 because Claude 4 supports up to 64k output and
 /// the older 4096 silently truncated long responses through the bridge.
 pub(crate) const BRIDGE_DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 16_384;
+
+/// OpenAI `stop` accepts a bare string or an array; Anthropic
+/// `stop_sequences` and Gemini `stopSequences` are arrays only — forwarding
+/// the scalar form verbatim turns into an upstream 400.
+pub(crate) fn stop_sequences_array(stop: &serde_json::Value) -> serde_json::Value {
+    match stop {
+        serde_json::Value::String(_) => serde_json::Value::Array(vec![stop.clone()]),
+        other => other.clone(),
+    }
+}

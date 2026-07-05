@@ -510,7 +510,10 @@ pub fn convert_openai_chat_to_gemini_request(body: &Value, config: &OpenAIToGemi
         );
     }
     if let Some(v) = body.get("stop") {
-        generation.insert("stopSequences".to_string(), v.clone());
+        generation.insert(
+            "stopSequences".to_string(),
+            crate::services::bridge_defaults::stop_sequences_array(v),
+        );
     }
     // OpenAI `reasoning_effort` → Gemini `thinkingConfig`; the surface differs
     // by version (see `gemini_uses_thinking_level`).
@@ -551,6 +554,7 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         .unwrap_or_default();
 
     let mut text_parts: Vec<String> = Vec::new();
+    let mut thought_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
     // The first part-position-based signature stands in for any non-functionCall
     // part (text, inlineData) that needs to be replayed in image-edit / thinking
@@ -562,7 +566,17 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         if let Some(text) = part.get("text").and_then(|v| v.as_str())
             && !text.is_empty()
         {
-            text_parts.push(text.to_string());
+            // `thought: true` marks the thinking trace — surface it as
+            // reasoning_content, never as user-visible text.
+            if part
+                .get("thought")
+                .and_then(|t| t.as_bool())
+                .unwrap_or(false)
+            {
+                thought_parts.push(text.to_string());
+            } else {
+                text_parts.push(text.to_string());
+            }
         }
         if leading_part_signature.is_none()
             && let Some(sig) = part.get("thoughtSignature").and_then(|v| v.as_str())
@@ -622,6 +636,9 @@ pub fn convert_gemini_to_openai_chat_response(resp: &Value, fallback_model: &str
         && let Some(obj) = message.as_object_mut()
     {
         obj.remove("content");
+    }
+    if !thought_parts.is_empty() {
+        message["reasoning_content"] = Value::String(thought_parts.join("\n"));
     }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
@@ -1599,6 +1616,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_response_routes_thought_parts_to_reasoning_content() {
+        let resp = json!({
+            "candidates": [{
+                "content": {"parts": [
+                    {"text": "pondering...", "thought": true},
+                    {"text": "The answer is 4."}
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        let converted = convert_gemini_to_openai_chat_response(&resp, "gemini-2.5-pro");
+        let msg = &converted["choices"][0]["message"];
+        assert_eq!(msg["content"], "The answer is 4.");
+        assert_eq!(msg["reasoning_content"], "pondering...");
+    }
+
+    #[test]
     fn gemini_signature_round_trips_through_call_id_cache() {
         // Gemini-3 returns `thoughtSignature` on functionCall response parts
         // and *requires* the same signature echoed back on subsequent turns.
@@ -1878,6 +1912,25 @@ mod tests {
         assert_eq!(g["seed"], 7);
         assert_eq!(g["responseMimeType"], "application/json");
         assert_eq!(g["stopSequences"][0], "END");
+    }
+
+    #[test]
+    fn convert_openai_to_gemini_wraps_scalar_stop_into_array() {
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop": "END"
+        });
+        let converted = convert_openai_chat_to_gemini_request(
+            &body,
+            &OpenAIToGeminiConfig {
+                default_model: "gemini-2.5-pro",
+            },
+        );
+        assert_eq!(
+            converted["generationConfig"]["stopSequences"],
+            json!(["END"])
+        );
     }
 
     #[test]

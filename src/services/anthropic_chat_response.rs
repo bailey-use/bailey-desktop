@@ -64,13 +64,21 @@ pub fn convert_openai_to_anthropic_message(
         }
 
         if let Some(tool_calls) = &choice.message.tool_calls {
-            for tc in tool_calls {
+            for (tool_index, tc) in tool_calls.iter().enumerate() {
                 let input: Value =
                     serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
 
+                // An empty id would make the follow-up tool_result's
+                // tool_use_id empty too, which strict upstreams reject on the
+                // next turn (streaming synthesizes ids for the same reason).
+                let id = if tc.id.is_empty() {
+                    format!("toolu_{choice_index}_{tool_index}")
+                } else {
+                    tc.id.clone()
+                };
                 content.push(json!({
                     "type": "tool_use",
-                    "id": tc.id,
+                    "id": id,
                     "name": tc.function.name,
                     "input": input,
                 }));
@@ -97,13 +105,29 @@ pub fn convert_openai_to_anthropic_message(
         content.push(json!({"type": "text", "text": ""}));
     }
 
+    // Lenient upstreams emit tool_calls with finish_reason "stop"; trusting it
+    // makes Claude Code render the call but never run it, stalling the turn.
+    // Truncated/filtered turns (length, content_filter) must not execute tools.
+    let has_tool_use = content
+        .iter()
+        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+    let mapped_stop_reason = map_finish_reason(final_finish_reason);
+    let stop_reason = if has_tool_use
+        && mapped_stop_reason == "end_turn"
+        && final_finish_reason != "content_filter"
+    {
+        "tool_use"
+    } else {
+        mapped_stop_reason
+    };
+
     let mut anthropic_resp = json!({
         "id": response.id.as_deref().unwrap_or(config.fallback_id),
         "type": "message",
         "role": "assistant",
         "content": content,
         "model": config.model,
-        "stop_reason": map_finish_reason(final_finish_reason),
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": build_anthropic_usage(resp, &config.usage_value_mode),
     });
@@ -249,6 +273,88 @@ mod tests {
         assert_eq!(content[1]["type"], "tool_use");
         assert_eq!(content[1]["name"], "get_weather");
         assert_eq!(content[1]["input"]["city"], "Paris");
+    }
+
+    fn tool_call_resp(finish_reason: &str) -> Value {
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Checking.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "ls", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": finish_reason
+            }]
+        })
+    }
+
+    fn convert_tool_call_resp(finish_reason: &str) -> Value {
+        convert_openai_to_anthropic_message(
+            &tool_call_resp(finish_reason),
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg_default",
+                model: "gpt-4o",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn empty_tool_call_id_gets_synthesized() {
+        let resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                        {"id": "", "type": "function", "function": {"name": "b", "arguments": "{}"}}
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let result = convert_openai_to_anthropic_message(
+            &resp,
+            &OpenAIToAnthropicConfig {
+                fallback_id: "msg_default",
+                model: "gpt-4o",
+                include_created: false,
+                usage_value_mode: UsageValueMode::CoerceU64,
+            },
+        )
+        .unwrap();
+        let content = result["content"].as_array().unwrap();
+        let id0 = content[0]["id"].as_str().unwrap();
+        let id1 = content[1]["id"].as_str().unwrap();
+        assert!(!id0.is_empty() && !id1.is_empty());
+        assert_ne!(id0, id1, "synthesized ids must be unique");
+    }
+
+    #[test]
+    fn stop_with_tool_calls_promotes_to_tool_use() {
+        assert_eq!(convert_tool_call_resp("stop")["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn length_with_tool_calls_keeps_max_tokens() {
+        assert_eq!(
+            convert_tool_call_resp("length")["stop_reason"],
+            "max_tokens"
+        );
+    }
+
+    #[test]
+    fn content_filter_with_tool_calls_keeps_end_turn() {
+        assert_eq!(
+            convert_tool_call_resp("content_filter")["stop_reason"],
+            "end_turn"
+        );
     }
 
     #[test]

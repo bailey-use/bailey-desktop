@@ -7,7 +7,9 @@ use crate::services::http_utils::{current_unix_ts, sse_data_payload};
 use crate::services::responses_to_chat_router::convert_chat_response_to_responses_sse;
 
 pub(crate) struct OpenAIToResponsesStreamConverter {
-    pending: String,
+    // Raw bytes, decoded per complete line: decoding each network chunk
+    // individually corrupts multi-byte UTF-8 split across chunk boundaries.
+    pending: Vec<u8>,
     response_id: String,
     created_at: u64,
     model: String,
@@ -58,7 +60,7 @@ static RESPONSES_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 impl OpenAIToResponsesStreamConverter {
     pub(crate) fn new(original_model: &str) -> Self {
         Self {
-            pending: String::new(),
+            pending: Vec::new(),
             response_id: next_responses_id("resp"),
             created_at: current_unix_ts(),
             model: original_model.to_string(),
@@ -76,13 +78,13 @@ impl OpenAIToResponsesStreamConverter {
     }
 
     pub(crate) fn push_bytes(&mut self, chunk: &[u8]) -> Result<String> {
-        self.pending.push_str(&String::from_utf8_lossy(chunk));
+        self.pending.extend_from_slice(chunk);
         let mut output = String::new();
 
-        while let Some(pos) = self.pending.find('\n') {
-            let line = self.pending[..pos].trim_end_matches('\r').to_string();
-            self.pending = self.pending[pos + 1..].to_string();
-            self.process_line(&line, &mut output)?;
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.pending[..pos]).into_owned();
+            self.pending.drain(..=pos);
+            self.process_line(line.trim_end_matches('\r'), &mut output)?;
         }
         anyhow::ensure!(
             self.pending.len() <= crate::services::http_utils::MAX_SSE_PENDING_BYTES,
@@ -96,10 +98,11 @@ impl OpenAIToResponsesStreamConverter {
     pub(crate) fn finish(&mut self) -> Result<String> {
         let mut output = String::new();
 
-        let tail = self.pending.trim_end_matches('\r').trim().to_string();
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
+        let tail = tail.trim_end_matches('\r').trim();
         if !tail.is_empty() {
-            self.process_line(&tail, &mut output)?;
+            self.process_line(tail, &mut output)?;
         }
 
         if !self.completed {
@@ -596,8 +599,8 @@ fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        convert_chat_response_to_responses_json, convert_chat_sse_to_responses_sse,
-        extract_completed_response_from_sse,
+        OpenAIToResponsesStreamConverter, convert_chat_response_to_responses_json,
+        convert_chat_sse_to_responses_sse, extract_completed_response_from_sse,
     };
     use serde_json::json;
 
@@ -652,6 +655,25 @@ mod tests {
         assert_eq!(response["output"][0]["type"], "function_call");
         assert_eq!(response["output"][0]["call_id"], "call_123");
         assert_eq!(response["output"][0]["name"], "shell");
+    }
+
+    #[test]
+    fn test_push_bytes_survives_utf8_split_across_chunks() {
+        // "你好" split mid-character: each chunk alone is invalid UTF-8, so a
+        // per-chunk lossy decode would emit U+FFFD instead of the character.
+        let line =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n";
+        let bytes = line.as_bytes();
+        let split = line.find("你好").unwrap() + 2; // mid-way through 你 (3 bytes)
+
+        let mut converter = OpenAIToResponsesStreamConverter::new("gpt-4o");
+        let mut out = converter.push_bytes(&bytes[..split]).unwrap();
+        out.push_str(&converter.push_bytes(&bytes[split..]).unwrap());
+        out.push_str(&converter.push_bytes(b"data: [DONE]\n").unwrap());
+        out.push_str(&converter.finish().unwrap());
+
+        assert!(out.contains("你好"), "{out}");
+        assert!(!out.contains('\u{FFFD}'), "{out}");
     }
 
     #[test]

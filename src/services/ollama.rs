@@ -251,7 +251,15 @@ pub async fn list_models() -> Result<Vec<String>> {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        return s;
+    }
+    // Back off to a char boundary — slicing mid-UTF-8-sequence panics.
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Returns `true` if the given model name is already pulled locally.
@@ -283,47 +291,23 @@ pub async fn pull_model(name: &str) -> Result<()> {
 
     let mut last_status = String::new();
     let mut saw_success = false;
+    // Network chunks split at arbitrary byte offsets, not line boundaries —
+    // buffer and consume complete lines, or a JSON line straddling two
+    // chunks (including the final success/error line) is silently dropped.
+    let mut pending: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
         .context("Stream error during model pull")?
     {
-        // Each line is a JSON object with status and optional progress fields
-        for line in chunk.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
-                // Check for error responses in the stream
-                if let Some(error) = v["error"].as_str() {
-                    eprintln!("\r\x1b[2K");
-                    anyhow::bail!("Ollama pull failed: {}", error);
-                }
-                let status = v["status"].as_str().unwrap_or("");
-                if status == "success" {
-                    saw_success = true;
-                }
-                if !status.is_empty() && status != last_status {
-                    eprint!("\r\x1b[2K  {} {}", crate::style::dim("⟳"), status);
-                    let _ = std::io::stderr().flush();
-                    last_status = status.to_string();
-                }
-                // Show download progress percentage
-                if let (Some(completed), Some(total)) =
-                    (v["completed"].as_u64(), v["total"].as_u64())
-                    && total > 0
-                {
-                    let pct = (completed as f64 / total as f64 * 100.0) as u64;
-                    eprint!(
-                        "\r\x1b[2K  {} {} ({}%)",
-                        crate::style::dim("⟳"),
-                        status,
-                        pct
-                    );
-                    let _ = std::io::stderr().flush();
-                }
-            }
+        pending.extend_from_slice(&chunk);
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            apply_pull_line(&line[..line.len() - 1], &mut last_status, &mut saw_success)?;
         }
+    }
+    if !pending.is_empty() {
+        apply_pull_line(&pending, &mut last_status, &mut saw_success)?;
     }
 
     if !saw_success {
@@ -339,6 +323,43 @@ pub async fn pull_model(name: &str) -> Result<()> {
         crate::style::success_symbol(),
         name
     );
+    Ok(())
+}
+
+/// Applies one complete /api/pull progress line (a JSON object with status
+/// and optional progress fields). Bails on an in-stream error object.
+fn apply_pull_line(line: &[u8], last_status: &mut String, saw_success: &mut bool) -> Result<()> {
+    if line.is_empty() {
+        return Ok(());
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return Ok(());
+    };
+    if let Some(error) = v["error"].as_str() {
+        eprintln!("\r\x1b[2K");
+        anyhow::bail!("Ollama pull failed: {}", error);
+    }
+    let status = v["status"].as_str().unwrap_or("");
+    if status == "success" {
+        *saw_success = true;
+    }
+    if !status.is_empty() && status != last_status {
+        eprint!("\r\x1b[2K  {} {}", crate::style::dim("⟳"), status);
+        let _ = std::io::stderr().flush();
+        *last_status = status.to_string();
+    }
+    if let (Some(completed), Some(total)) = (v["completed"].as_u64(), v["total"].as_u64())
+        && total > 0
+    {
+        let pct = (completed as f64 / total as f64 * 100.0) as u64;
+        eprint!(
+            "\r\x1b[2K  {} {} ({}%)",
+            crate::style::dim("⟳"),
+            status,
+            pct
+        );
+        let _ = std::io::stderr().flush();
+    }
     Ok(())
 }
 
@@ -380,6 +401,48 @@ pub async fn ensure_model(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_backs_off_to_char_boundary() {
+        // 200-byte cut lands mid-character for CJK text; must not panic.
+        let s = "错".repeat(100); // 300 bytes
+        let t = truncate(&s, 200);
+        assert!(t.len() <= 200);
+        assert!(s.starts_with(t));
+        assert_eq!(truncate("short", 200), "short");
+    }
+
+    #[test]
+    fn pull_line_split_across_chunks_still_seen() {
+        // Simulate the reassembly loop from pull_model: the success line
+        // arrives split across two network chunks.
+        let chunks: [&[u8]; 2] = [b"{\"status\":\"succ", b"ess\"}\n"];
+        let mut pending: Vec<u8> = Vec::new();
+        let mut last_status = String::new();
+        let mut saw_success = false;
+        for chunk in chunks {
+            pending.extend_from_slice(chunk);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                apply_pull_line(&line[..line.len() - 1], &mut last_status, &mut saw_success)
+                    .unwrap();
+            }
+        }
+        assert!(saw_success);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pull_line_error_bails() {
+        let mut last_status = String::new();
+        let mut saw_success = false;
+        let err = apply_pull_line(
+            b"{\"error\":\"manifest unknown\"}",
+            &mut last_status,
+            &mut saw_success,
+        );
+        assert!(err.is_err());
+    }
 
     #[test]
     fn test_ollama_host_default() {

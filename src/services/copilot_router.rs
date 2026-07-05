@@ -106,7 +106,7 @@ async fn handle_messages(request: &str, state: &CopilotRouterState) -> Result<St
         .unwrap_or("claude-sonnet-4-20250514")
         .to_string();
 
-    let (copilot_token, api_endpoint) = state.token_manager.get_token().await?;
+    let (mut copilot_token, api_endpoint) = state.token_manager.get_token().await?;
     let initiator = http_utils::copilot_initiator_from_anthropic(&body);
     let base = api_endpoint.trim_end_matches('/');
 
@@ -114,7 +114,7 @@ async fn handle_messages(request: &str, state: &CopilotRouterState) -> Result<St
     // No cross-request caching — API support is model-specific and models
     // can change mid-session (e.g. Claude Code fast mode).
     let responses_req = anthropic_to_responses(&body);
-    let (s, b) = copilot_post(
+    let (mut s, mut b) = copilot_post(
         &state.client,
         &format!("{base}/v1/responses"),
         &copilot_token,
@@ -122,6 +122,22 @@ async fn handle_messages(request: &str, state: &CopilotRouterState) -> Result<St
         &responses_req,
     )
     .await?;
+
+    // A 401 inside the token's validity window means it was revoked server-
+    // side; expiry-based refresh never recovers, so re-exchange once.
+    if s == 401 {
+        state.token_manager.invalidate().await;
+        let (fresh, _) = state.token_manager.get_token().await?;
+        copilot_token = fresh;
+        (s, b) = copilot_post(
+            &state.client,
+            &format!("{base}/v1/responses"),
+            &copilot_token,
+            initiator,
+            &responses_req,
+        )
+        .await?;
+    }
 
     if s == 200 {
         let resp_value: Value = serde_json::from_str(&b)?;
@@ -163,17 +179,18 @@ async fn copilot_post(
     initiator: &str,
     body: &Value,
 ) -> Result<(u16, String)> {
-    let resp = client
+    let mut req = client
         .post(url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", CONTENT_TYPE_JSON)
         .header("Editor-Version", COPILOT_EDITOR_VERSION)
         .header("Copilot-Integration-Id", COPILOT_INTEGRATION_ID)
         .header("Openai-Intent", COPILOT_OPENAI_INTENT)
-        .header(COPILOT_INITIATOR_HEADER, initiator)
-        .json(body)
-        .send_logged()
-        .await?;
+        .header(COPILOT_INITIATOR_HEADER, initiator);
+    if http_utils::body_requests_vision(body) {
+        req = req.header("Copilot-Vision-Request", "true");
+    }
+    let resp = req.json(body).send_logged().await?;
     let status = resp.status().as_u16();
     let body = resp.text().await?;
     Ok((status, body))
@@ -330,6 +347,7 @@ fn anthropic_to_responses(body: &Value) -> Value {
             };
 
             let mut user_text = String::new();
+            let mut user_images: Vec<Value> = Vec::new();
             let mut asst_parts: Vec<Value> = Vec::new();
             for block in blocks {
                 match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
@@ -369,10 +387,23 @@ fn anthropic_to_responses(body: &Value) -> Value {
                             "output": extract_tool_result_text(block)
                         }));
                     }
+                    "image" => {
+                        if let Some(part) = anthropic_image_to_responses_part(block) {
+                            user_images.push(part);
+                        }
+                    }
                     _ => {}
                 }
             }
-            if !user_text.is_empty() {
+            if !user_images.is_empty() {
+                // Images require the parts form; plain text rides alongside.
+                let mut parts: Vec<Value> = Vec::new();
+                if !user_text.is_empty() {
+                    parts.push(json!({"type": "input_text", "text": user_text}));
+                }
+                parts.append(&mut user_images);
+                input.push(json!({"type": "message", "role": role, "content": parts}));
+            } else if !user_text.is_empty() {
                 input.push(json!({"type": "message", "role": role, "content": user_text}));
             }
             if !asst_parts.is_empty() {
@@ -432,14 +463,19 @@ fn anthropic_to_responses(body: &Value) -> Value {
         }
     }
 
-    // tool_choice: auto→auto, any→required, tool→{type:"function",function:{name}}
-    if let Some(tc) = body.get("tool_choice") {
+    // Forced tool uses the flat Responses shape {type:"function",name}, NOT
+    // Chat's nested function:{name}. Skipped when no tools survived —
+    // tool_choice without tools is rejected upstream.
+    if req.get("tools").is_some()
+        && let Some(tc) = body.get("tool_choice")
+    {
         match tc.get("type").and_then(|t| t.as_str()) {
             Some("auto") => req["tool_choice"] = json!("auto"),
             Some("any") => req["tool_choice"] = json!("required"),
+            Some("none") => req["tool_choice"] = json!("none"),
             Some("tool") => {
                 if let Some(name) = tc.get("name") {
-                    req["tool_choice"] = json!({"type": "function", "function": {"name": name}});
+                    req["tool_choice"] = json!({"type": "function", "name": name});
                 }
             }
             _ => {}
@@ -447,6 +483,24 @@ fn anthropic_to_responses(body: &Value) -> Value {
     }
 
     req
+}
+
+/// Anthropic image block → Responses `input_image` part (data URL or URL).
+fn anthropic_image_to_responses_part(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(|t| t.as_str())? {
+        "base64" => {
+            let media = source
+                .get("media_type")
+                .and_then(|m| m.as_str())
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(|d| d.as_str())?;
+            format!("data:{media};base64,{data}")
+        }
+        "url" => source.get("url").and_then(|u| u.as_str())?.to_string(),
+        _ => return None,
+    };
+    Some(json!({"type": "input_image", "image_url": url}))
 }
 
 fn extract_tool_result_text(block: &Value) -> String {
@@ -739,6 +793,77 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_responses_image_block_becomes_input_image() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "aGk="
+                    }}
+                ]
+            }]
+        });
+        let result = anthropic_to_responses(&body);
+        let msg = result["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "message")
+            .unwrap();
+        let parts = msg["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "What is this?");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGk=");
+        assert!(crate::services::http_utils::body_requests_vision(&result));
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_tool_choice_none_and_forced_shape() {
+        let tools = json!([{
+            "name": "get_weather",
+            "description": "",
+            "input_schema": {"type": "object"}
+        }]);
+        let none_body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": tools,
+            "tool_choice": {"type": "none"}
+        });
+        assert_eq!(anthropic_to_responses(&none_body)["tool_choice"], "none");
+
+        let forced_body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": tools,
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        });
+        // Flat Responses shape, not Chat's nested function:{name}.
+        assert_eq!(
+            anthropic_to_responses(&forced_body)["tool_choice"],
+            json!({"type": "function", "name": "get_weather"})
+        );
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_skips_tool_choice_without_tools() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "tool_choice": {"type": "any"}
+        });
+        let result = anthropic_to_responses(&body);
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+    }
+
+    #[test]
     fn test_anthropic_to_responses_drops_server_tools() {
         let body = json!({
             "model": "claude-sonnet-4",
@@ -850,9 +975,10 @@ mod tests {
             "tool_choice": {"type": "tool", "name": "read_file"}
         });
         let req = anthropic_to_responses(&body);
+        // Responses wire shape is flat {type,name}, not Chat's nested function:{name}.
         assert_eq!(
             req["tool_choice"],
-            json!({"type": "function", "function": {"name": "read_file"}})
+            json!({"type": "function", "name": "read_file"})
         );
     }
 

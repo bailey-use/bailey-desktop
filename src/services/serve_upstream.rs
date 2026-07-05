@@ -38,6 +38,9 @@ pub(crate) struct UpstreamRequestContext {
     pub(crate) is_openrouter: bool,
     pub(crate) is_starter: bool,
     pub(crate) copilot_tokens: Option<Arc<CopilotTokenManager>>,
+    /// Usage accounting is on — streamed OpenAI requests must ask for the
+    /// trailing usage chunk or the sniffer records zero for the turn.
+    pub(crate) accounting: bool,
 }
 
 impl UpstreamRequestContext {
@@ -159,6 +162,7 @@ pub(crate) async fn send_openai_chat(
     normalize_openai_request_model(body, context.is_openrouter, context.is_copilot);
     migrate_max_tokens_for_reasoning_models(body);
     strip_non_function_tools(body);
+    inject_include_usage_for_accounting(body, context.accounting);
     // Surface OpenAI's GPT-5.4 Chat Completions restriction (no tools when
     // reasoning_effort is "none") with a clear local 400 instead of letting
     // the upstream reject and producing a generic error the user has to
@@ -187,7 +191,7 @@ pub(crate) async fn send_openai_chat(
     } else {
         None
     };
-    let req = http_utils::authorized_openai_post(
+    let mut req = http_utils::authorized_openai_post(
         &context.client,
         &url,
         context.upstream_api_key.as_str(),
@@ -195,6 +199,9 @@ pub(crate) async fn send_openai_chat(
         initiator,
     )
     .await?;
+    if context.is_copilot && http_utils::body_requests_vision(body) {
+        req = req.header("Copilot-Vision-Request", "true");
+    }
 
     let response = context
         .with_device_headers(req)
@@ -202,6 +209,21 @@ pub(crate) async fn send_openai_chat(
         .send_logged()
         .await?;
     finalize_openai_response(response, client_wants_stream).await
+}
+
+/// When usage accounting is on, streamed OpenAI upstreams only emit the
+/// trailing usage chunk if asked; without this the sniffer records zero
+/// tokens for the turn. Client-provided stream_options win.
+fn inject_include_usage_for_accounting(body: &mut Value, accounting: bool) {
+    if accounting
+        && body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        && body.get("stream_options").is_none()
+    {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
 }
 
 /// True when a Copilot `/chat/completions` error demands the Responses API.
@@ -226,7 +248,7 @@ pub(crate) async fn send_copilot_responses(
     // Bare path, not a URL: Copilot's endpoint comes from the token exchange, and
     // a URL built from the "copilot" sentinel base wouldn't parse to `/responses`.
     let initiator = http_utils::copilot_initiator_from_openai(&chat_body);
-    let req = http_utils::authorized_openai_post(
+    let mut req = http_utils::authorized_openai_post(
         &context.client,
         "/v1/responses",
         context.upstream_api_key.as_str(),
@@ -234,6 +256,10 @@ pub(crate) async fn send_copilot_responses(
         Some(initiator),
     )
     .await?;
+    let responses_value = serde_json::to_value(&responses_body)?;
+    if http_utils::body_requests_vision(&responses_value) {
+        req = req.header("Copilot-Vision-Request", "true");
+    }
 
     let response = context
         .with_device_headers(req)
@@ -560,6 +586,27 @@ mod tests {
             .body(body.into())
             .unwrap()
             .into()
+    }
+
+    #[test]
+    fn include_usage_injected_only_for_accounted_streaming() {
+        let mut body = json!({"model": "m", "stream": true});
+        inject_include_usage_for_accounting(&mut body, true);
+        assert_eq!(body["stream_options"], json!({"include_usage": true}));
+
+        // Client-provided stream_options win.
+        let mut body =
+            json!({"model": "m", "stream": true, "stream_options": {"include_usage": false}});
+        inject_include_usage_for_accounting(&mut body, true);
+        assert_eq!(body["stream_options"], json!({"include_usage": false}));
+
+        // No accounting or no stream → untouched.
+        let mut body = json!({"model": "m", "stream": true});
+        inject_include_usage_for_accounting(&mut body, false);
+        assert!(body.get("stream_options").is_none());
+        let mut body = json!({"model": "m", "stream": false});
+        inject_include_usage_for_accounting(&mut body, true);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]

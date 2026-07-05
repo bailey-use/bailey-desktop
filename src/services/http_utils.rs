@@ -885,6 +885,30 @@ pub fn copilot_initiator_from_anthropic(body: &Value) -> &'static str {
     "user"
 }
 
+/// True when an outbound body carries image parts — Copilot ignores (or
+/// rejects) them unless the request also sends `Copilot-Vision-Request: true`.
+/// Handles both wire shapes: Responses `input[].content[]` with
+/// `type:"input_image"`, and Chat `messages[].content[]` with `image_url`.
+pub fn body_requests_vision(body: &Value) -> bool {
+    let items = body
+        .get("input")
+        .or_else(|| body.get("messages"))
+        .and_then(|v| v.as_array());
+    let Some(items) = items else {
+        return false;
+    };
+    items.iter().any(|item| {
+        item.get("content")
+            .and_then(|c| c.as_array())
+            .is_some_and(|parts| {
+                parts.iter().any(|p| {
+                    p.get("image_url").is_some()
+                        || p.get("type").and_then(|t| t.as_str()) == Some("input_image")
+                })
+            })
+    })
+}
+
 /// Detects `X-Initiator` value from an OpenAI Chat Completions body.
 /// Returns `"user"` for genuine user messages, `"agent"` for tool/assistant follow-ups.
 pub fn copilot_initiator_from_openai(body: &Value) -> &'static str {

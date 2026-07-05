@@ -773,11 +773,13 @@ impl CodeTuiApp {
                 self.scroll_to_bottom();
                 true
             }
-            KeyCode::Up if self.sending => {
+            // While a turn streams, bare ↑/↓ scroll the transcript (swipe-scroll
+            // on mobile terminals) — unless the `/` menu is open, which owns them.
+            KeyCode::Up if self.sending && self.visible_command_menu().is_none() => {
                 self.scroll_up_lines(3);
                 true
             }
-            KeyCode::Down if self.sending => {
+            KeyCode::Down if self.sending && self.visible_command_menu().is_none() => {
                 self.scroll_down_lines(3);
                 true
             }

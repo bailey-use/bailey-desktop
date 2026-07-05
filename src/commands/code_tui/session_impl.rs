@@ -8,7 +8,6 @@ impl CodeTuiApp {
         target: ModelSelectionTarget,
         auto_accept_exact: bool,
     ) {
-        self.prepare_for_model_picker();
         let query = query.unwrap_or_default();
         self.overlay = Overlay::Picker(Box::new(PickerState::loading(
             "Select model",
@@ -37,12 +36,6 @@ impl CodeTuiApp {
                 tx.send(RuntimeEvent::ModelsLoaded(Ok(choices))).ok();
             }
         });
-    }
-
-    pub(super) fn prepare_for_model_picker(&mut self) {
-        if self.sending {
-            self.cancel_inflight_request(CancelKind::RestoreDraft);
-        }
     }
 
     /// Resolve and cache the active model's context window for the footer
@@ -1442,8 +1435,15 @@ is preserved."
         match (kind, value) {
             (PickerKind::Model { target, .. }, PickerValue::Model(model)) => match target {
                 ModelSelectionTarget::CurrentChat => {
+                    // Mid-turn is fine: the running turn keeps its model (same as
+                    // the agent's `switch_model` tool); the new one applies next turn.
                     self.apply_model(model.clone()).await?;
-                    self.notice = Some((MUTED, format!("Now using {model}")));
+                    let msg = if self.sending {
+                        format!("Now using {model} — applies from the next turn")
+                    } else {
+                        format!("Now using {model}")
+                    };
+                    self.notice = Some((MUTED, msg));
                 }
                 ModelSelectionTarget::KeySwitch(key) => {
                     self.complete_key_switch(key, model).await?

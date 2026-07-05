@@ -246,6 +246,7 @@ impl CodeTuiApp {
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
+            queued_commands: Vec::new(),
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
             local_command: None,

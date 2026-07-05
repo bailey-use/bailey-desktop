@@ -2289,7 +2289,7 @@ impl CodeTuiApp {
                 Style::default().fg(TOOL),
             ));
         }
-        let queued = self.queued_messages.len();
+        let queued = self.queued_messages.len() + self.queued_commands.len();
         if queued > 0 {
             if !spans.is_empty() {
                 spans.push(Span::styled("   ".to_string(), Style::default().fg(FAINT)));

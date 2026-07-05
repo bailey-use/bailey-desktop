@@ -685,6 +685,9 @@ impl CodeTuiApp {
         self.refresh_skill_commands().await;
         // Before a queued message can flip `sending` and skip the capture.
         self.maybe_capture_plan();
+        // Commands queued mid-turn run first (a queued `/plan go` needs the plan
+        // captured above; a queued `/compact` should fold before the next message).
+        self.drain_queued_commands().await;
         self.drain_queued_message().await?;
         // Autonomous `/goal` loop: if active (and a queued message didn't already
         // start the next turn), continue toward the goal or stop on completion/cap.
@@ -865,6 +868,7 @@ impl CodeTuiApp {
         self.agent_ask = None;
         self.agent_review = None;
         self.queued_messages.clear();
+        self.queued_commands.clear();
         self.stop_agent_serve();
         self.follow_output = true;
         // A crash mid-loop must NOT auto-continue the goal into a likely repeat.
@@ -898,6 +902,7 @@ impl CodeTuiApp {
         // Keep the `/` menu in sync with any skills added/edited during the turn
         // (parity with the agent path's `finish_agent_turn`).
         self.refresh_skill_commands().await;
+        self.drain_queued_commands().await;
         self.drain_queued_message().await?;
         Ok(())
     }

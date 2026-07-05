@@ -1197,6 +1197,7 @@ fn make_test_app(
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
+        queued_commands: Vec::new(),
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
         local_command: None,
@@ -7222,12 +7223,17 @@ async fn test_goal_command_status_stop_and_guards() {
     app.run_goal_command(Some("stop".to_string())).await;
     assert!(app.goal_mode.is_none());
 
-    // Starting mid-turn is refused (no send).
+    // Starting mid-turn queues the command for turn end (no send yet).
     app.sending = true;
     app.run_goal_command(Some("do it".to_string())).await;
     assert!(app.goal_mode.is_none());
-    assert!(app.notice.as_ref().unwrap().1.contains("Wait"));
+    assert_eq!(
+        app.queued_commands,
+        vec![SlashCommand::Goal(Some("do it".to_string()))]
+    );
+    assert!(app.notice.as_ref().unwrap().1.contains("queued"));
     app.sending = false;
+    app.queued_commands.clear();
 
     // A non-agent key (OAuth) is refused (no send).
     app.key.base_url = "claude-oauth".to_string();
@@ -9051,8 +9057,11 @@ fn test_composer_attachment_lines_show_indices() {
     assert_eq!(plain, "· 1. [file] hi.css");
 }
 
-#[test]
-fn test_prepare_for_model_picker_cancels_inflight_request() {
+/// Opening the model picker mid-turn must NOT cancel the in-flight turn (it
+/// used to): the running turn keeps its model and the pick applies next turn,
+/// same as the agent's `switch_model` tool.
+#[tokio::test]
+async fn test_open_model_picker_keeps_inflight_turn() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.history.push(ChatMessage {
@@ -9061,25 +9070,20 @@ fn test_prepare_for_model_picker_cancels_inflight_request() {
         reasoning_content: None,
         attachments: vec![],
     });
-    app.pending_submit = Some(PendingSubmission {
-        content: "draft".to_string(),
-        attachments: Vec::new(),
-    });
     app.pending_response = "partial".to_string();
     app.sending = true;
     app.request_started_at = Some(Instant::now());
 
-    app.prepare_for_model_picker();
+    app.open_model_picker(None, ModelSelectionTarget::CurrentChat, false);
 
-    assert!(!app.sending);
-    assert!(app.pending_response.is_empty());
-    assert_eq!(app.draft, "draft");
-    assert!(app.history.is_empty());
-    assert!(app.request_started_at.is_none());
+    assert!(app.sending, "the in-flight turn must keep running");
+    assert_eq!(app.pending_response, "partial");
     assert_eq!(
-        app.notice.as_ref().map(|(_, text)| text.as_str()),
-        Some("Request cancelled")
+        app.history.len(),
+        1,
+        "the user turn stays in the transcript"
     );
+    assert!(matches!(app.overlay, Overlay::Picker(_)));
 }
 
 #[tokio::test]
@@ -9107,7 +9111,7 @@ async fn test_cancel_keeps_user_turn_for_in_process_agent_turn() {
 
     // The engine already consumed this turn (and may have edited files), so the
     // request stays in the transcript instead of being silently un-sent — unlike
-    // the plain-chat path (see test_prepare_for_model_picker_cancels_inflight_request).
+    // the plain-chat Discard path, which drops the dangling user message.
     assert_eq!(app.history.len(), 1, "agent user turn must be kept");
     assert_eq!(app.history[0].content, "edit the config");
     assert!(
@@ -11105,6 +11109,84 @@ fn test_queued_indicator_shows_count() {
         screen.contains("3 queued"),
         "the indicator must show the queue length:\n{screen}"
     );
+}
+
+/// The `/` menu (dropdown + inline hint) stays available while a turn is in
+/// flight — it used to be blanket-hidden by `is_busy()`, which made slash
+/// commands look dead mid-turn.
+#[test]
+fn test_command_menu_visible_while_sending() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.draft = "/mo".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+
+    let menu = app.visible_command_menu().expect("menu shows mid-turn");
+    assert!(!menu.entries.is_empty(), "matching commands are listed");
+}
+
+/// While the `/` menu is open mid-turn, ↑/↓ navigate the menu instead of
+/// scrolling the transcript (which owns bare arrows during a turn otherwise).
+#[tokio::test]
+async fn test_arrows_navigate_menu_while_sending() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.draft = "/".to_string();
+    app.cursor = app.draft.len();
+    app.sync_command_menu_state();
+    assert!(app.visible_command_menu().is_some());
+    assert_eq!(app.command_menu.selected, 0);
+
+    app.handle_key(KeyEvent::from(KeyCode::Down)).await.unwrap();
+    assert_eq!(
+        app.command_menu.selected, 1,
+        "Down moves the menu selection, not the transcript"
+    );
+    app.handle_key(KeyEvent::from(KeyCode::Up)).await.unwrap();
+    assert_eq!(app.command_menu.selected, 0);
+}
+
+/// Commands that need the engine idle queue mid-turn (instead of refusing) and
+/// run when the turn finishes.
+#[tokio::test]
+async fn test_engine_idle_commands_queue_and_drain() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+
+    app.open_rewind_picker().await.unwrap();
+    assert_eq!(app.queued_commands, vec![SlashCommand::Rewind]);
+    let (_lvl, notice) = app.notice.clone().expect("a queued notice");
+    assert!(
+        notice.contains("/rewind queued"),
+        "the notice names the queued command: {notice}"
+    );
+
+    app.sending = false;
+    app.drain_queued_commands().await;
+    assert!(app.queued_commands.is_empty(), "the queue drained");
+    // With no history there is nothing to rewind to — the command still ran.
+    let (_lvl, notice) = app.notice.clone().expect("the drained command's notice");
+    assert!(notice.contains("Nothing to rewind"), "{notice}");
+}
+
+/// A queued command is dropped by an interrupt/cancel, like queued messages.
+#[tokio::test]
+async fn test_queued_commands_cleared_on_cancel() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.run_compact_command(true).await;
+    assert_eq!(
+        app.queued_commands,
+        vec![SlashCommand::Compact { fast: true }]
+    );
+
+    app.cancel_inflight_request(CancelKind::Discard);
+    assert!(app.queued_commands.is_empty());
 }
 
 /// `/mcp` Ctrl+D arms a two-press delete (removal edits the user mcp.json), the

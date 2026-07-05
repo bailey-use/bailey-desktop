@@ -409,6 +409,28 @@ impl CodeTuiApp {
         Ok(())
     }
 
+    /// Stash a slash command typed mid-turn that needs the engine idle; it runs
+    /// when the turn finishes (see `drain_queued_commands`).
+    fn queue_command(&mut self, command: SlashCommand, label: &str) {
+        self.queued_commands.push(command);
+        self.notice = Some((
+            MUTED,
+            format!("{label} queued — runs when the current turn finishes"),
+        ));
+    }
+
+    /// After a turn ends, run the commands queued mid-turn, in order. One that
+    /// starts a new turn (`/goal`, `/plan`, `/compact`) flips `sending`, ending
+    /// the loop; the rest re-queue themselves behind it via their mid-turn gates.
+    pub(super) async fn drain_queued_commands(&mut self) {
+        while !self.sending && !self.queued_commands.is_empty() {
+            let command = self.queued_commands.remove(0);
+            if let Err(err) = self.execute_slash_command(command).await {
+                self.notice = Some((ERROR, err.to_string()));
+            }
+        }
+    }
+
     /// True when any history message carries an image attachment.
     pub(super) fn history_has_image(&self) -> bool {
         self.history.iter().any(|m| {
@@ -792,11 +814,14 @@ impl CodeTuiApp {
     }
 
     /// `/compact` folds older turns via the LLM; `/compact fast` clears stale output.
-    /// Both refuse mid-turn (the running turn holds the engine lock) and no-op with
+    /// Both queue mid-turn (the running turn holds the engine lock) and no-op with
     /// no agent conversation.
     pub(super) async fn run_compact_command(&mut self, fast: bool) {
         if self.sending {
-            self.notice = Some((MUTED, "can't compact while a turn is running".to_string()));
+            self.queue_command(
+                SlashCommand::Compact { fast },
+                if fast { "/compact fast" } else { "/compact" },
+            );
             return;
         }
         let Some(session) = self.agent_engine.as_ref() else {
@@ -1233,10 +1258,7 @@ impl CodeTuiApp {
     /// predate the live engine (restored on resume — no file snapshots).
     pub(super) async fn open_rewind_picker(&mut self) -> Result<()> {
         if self.sending {
-            self.notice = Some((
-                MUTED,
-                "Can't rewind while a turn is in progress".to_string(),
-            ));
+            self.queue_command(SlashCommand::Rewind, "/rewind");
             return Ok(());
         }
         let user_indices: Vec<usize> = self
@@ -1507,10 +1529,7 @@ impl CodeTuiApp {
             }
             Some(objective) => {
                 if self.sending {
-                    self.notice = Some((
-                        ERROR,
-                        "Wait for the current turn to finish before starting a goal".to_string(),
-                    ));
+                    self.queue_command(SlashCommand::Goal(Some(objective.to_string())), "/goal");
                     return;
                 }
                 if !self.agent_capable() {
@@ -1606,10 +1625,7 @@ impl CodeTuiApp {
         match head {
             "go" | "run" | "execute" => {
                 if self.sending {
-                    self.notice = Some((
-                        ERROR,
-                        "Wait for the current turn to finish before executing the plan".to_string(),
-                    ));
+                    self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan go");
                     return;
                 }
                 let Some(plan) = self.pending_plan.take() else {
@@ -1648,10 +1664,7 @@ impl CodeTuiApp {
             }
             _ => {
                 if self.sending {
-                    self.notice = Some((
-                        ERROR,
-                        "Wait for the current turn to finish before planning".to_string(),
-                    ));
+                    self.queue_command(SlashCommand::Plan(Some(arg.to_string())), "/plan");
                     return;
                 }
                 if !self.agent_capable() {
@@ -1754,9 +1767,9 @@ impl CodeTuiApp {
         self.stop_agent_serve();
     }
 
-    /// `restore_draft` puts a cancelled non-agent submission back in the composer
-    /// (model-picker, to resend after switching); `false` (ESC / resume / `/new`)
-    /// un-sends it instead, leaving the composer empty — recallable via ↑.
+    /// `Unsend` (ESC before anything streamed) puts the cancelled submission back
+    /// in the composer; `Discard` (ESC / resume / `/new`) un-sends it instead,
+    /// leaving the composer empty — recallable via ↑.
     pub(super) fn cancel_inflight_request(&mut self, kind: CancelKind) {
         let was_sending = self.sending;
         // Cancelling (interrupt path 1, /new, resume, key switch) also exits any
@@ -1781,6 +1794,7 @@ impl CodeTuiApp {
         self.agent_ask = None;
         self.agent_review = None;
         self.queued_messages.clear();
+        self.queued_commands.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
             // even though our task already dropped the prompt stream.
@@ -1805,13 +1819,6 @@ impl CodeTuiApp {
             // Keep the user turn in the transcript; just drop the restore buffer so
             // it can't be resurrected by a later non-agent cancel.
             self.pending_submit = None;
-        } else if matches!(kind, CancelKind::RestoreDraft) {
-            restore_cancelled_submission(
-                &mut self.history,
-                &mut self.draft,
-                &mut self.draft_attachments,
-                &mut self.pending_submit,
-            );
         } else {
             self.pending_submit = None;
             if self
@@ -1872,6 +1879,7 @@ impl CodeTuiApp {
         self.agent_ask = None;
         self.agent_review = None;
         self.queued_messages.clear();
+        self.queued_commands.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
         // Keep the reasoning shown for this partial reply (the user saw it); the

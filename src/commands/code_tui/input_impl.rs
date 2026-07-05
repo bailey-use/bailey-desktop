@@ -184,7 +184,6 @@ impl CodeTuiApp {
 
     pub(super) fn active_command_query(&self) -> Option<&str> {
         if self.overlay.blocks_input()
-            || self.is_busy()
             || !self.draft.starts_with('/')
             || self.draft.starts_with("//")
             || self.draft.contains('\n')
@@ -202,7 +201,6 @@ impl CodeTuiApp {
     /// single-token name matches and the hint clears.
     pub(super) fn composer_command_hint(&self) -> Option<&'static str> {
         if self.overlay.blocks_input()
-            || self.is_busy()
             || self.cursor != self.draft.len()
             || !self.draft.starts_with('/')
             || self.draft.starts_with("//")
@@ -215,7 +213,6 @@ impl CodeTuiApp {
 
     pub(super) fn active_attach_query(&self) -> Option<&str> {
         if self.overlay.blocks_input()
-            || self.is_busy()
             || !self.draft.starts_with("/attach ")
             || self.draft.starts_with("//")
             || self.draft.contains('\n')

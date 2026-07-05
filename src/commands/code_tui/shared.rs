@@ -1131,8 +1131,6 @@ pub(super) enum SubmitAction {
 /// keep their (engine-consumed) message except under `Unsend`.
 pub(super) enum CancelKind {
     Discard,
-    /// Restore the draft to the composer on the plain-chat path (model picker).
-    RestoreDraft,
     /// Nothing produced yet — drop the message from the transcript and back into
     /// the composer, even for an agent turn.
     Unsend,
@@ -1863,6 +1861,11 @@ pub(super) struct CodeTuiApp {
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.
     pub(super) queued_messages: Vec<String>,
+    /// Slash commands typed while a turn was in flight that need the engine idle
+    /// (`/compact`, `/rewind`, `/goal`, `/plan`), in submit order; executed as the
+    /// turn finishes, before any queued message. Cleared with `queued_messages` on
+    /// interrupt/cancel.
+    pub(super) queued_commands: Vec<SlashCommand>,
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.
     pub(super) local_command: Option<LocalCommandRun>,

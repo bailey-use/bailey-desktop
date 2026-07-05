@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.36.2
+
+- feat(bridge): translate OpenAI structured outputs to Anthropic (5a87e8e)
+- feat(code): broaden convention-file trigger to workflows/skills (e8cca8d)
+- feat(code): expose headless agent limits via --max-steps / --max-output-tokens (36d03a2)
+- feat(skills): preview scaffold advert with mechanical warnings (f1f93cb)
+- fix: protocol conversion correctness sweep across bridges, routers, and serve (9491cc8)
+- fix(code): treat `aivo code -` as read prompt from stdin (b54cf61)
+- refactor: unify the three chat→Responses emitters into ResponsesStreamConverter (68d2d11)
+- ci: shrink linux-x64 via build-std (b54cf61)
+
 ## v0.36.1
 
 - feat(code): widen thinking window to 4 lines and use ✓ for multi-select (dc05f87)

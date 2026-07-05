@@ -57,11 +57,23 @@ fn is_anthropic_server_block_type(t: &str) -> bool {
 fn translate_openai_tool_to_anthropic(tool: &Value) -> Option<Value> {
     let kind = tool.get("type").and_then(|v| v.as_str())?;
     match kind {
-        "function" => Some(json!({
-            "name": tool.get("function").and_then(|f| f.get("name")).cloned().unwrap_or_default(),
-            "description": tool.get("function").and_then(|f| f.get("description")).cloned().unwrap_or(json!("")),
-            "input_schema": tool.get("function").and_then(|f| f.get("parameters")).cloned().unwrap_or(json!({}))
-        })),
+        "function" => {
+            let function = tool.get("function");
+            let mut anthropic = json!({
+                "name": function.and_then(|f| f.get("name")).cloned().unwrap_or_default(),
+                "description": function.and_then(|f| f.get("description")).cloned().unwrap_or(json!("")),
+                "input_schema": function.and_then(|f| f.get("parameters")).cloned().unwrap_or(json!({}))
+            });
+            // OpenAI strict schemas already satisfy Anthropic's strict-mode rules.
+            if function
+                .and_then(|f| f.get("strict"))
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                anthropic["strict"] = json!(true);
+            }
+            Some(anthropic)
+        }
         "web_search" | "web_search_preview" => {
             let mut anthropic = json!({
                 "type": "web_search_20260209",
@@ -171,9 +183,9 @@ pub fn convert_openai_chat_to_anthropic_request(
         req["stop_sequences"] = crate::services::bridge_defaults::stop_sequences_array(v);
     }
     // Note: `seed`, `frequency_penalty`, `presence_penalty`, `logit_bias`,
-    // `response_format`, `user` are not part of the Anthropic Messages
-    // API surface and are intentionally dropped here. Document drops near
-    // the call site so future readers don't think they were forgotten.
+    // `user` are not part of the Anthropic Messages API surface and are
+    // intentionally dropped here. Document drops near the call site so
+    // future readers don't think they were forgotten.
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let anthropic_tools: Vec<Value> = tools
             .iter()
@@ -254,6 +266,24 @@ pub fn convert_openai_chat_to_anthropic_request(
             {
                 req["output_config"] = json!({ "effort": effort.to_anthropic_effort() });
             }
+        }
+    }
+
+    // response_format.json_schema → output_config.format; json_object stays
+    // dropped (Anthropic requires a schema). Placed after the effort block so
+    // `format` merges with an `output_config` that already carries `effort`.
+    if let Some(schema) = body
+        .get("response_format")
+        .filter(|rf| rf.get("type").and_then(|t| t.as_str()) == Some("json_schema"))
+        .and_then(|rf| rf.get("json_schema"))
+        .and_then(|js| js.get("schema"))
+    {
+        let format = json!({"type": "json_schema", "schema": schema.clone()});
+        match req.get_mut("output_config").and_then(|v| v.as_object_mut()) {
+            Some(oc) => {
+                oc.insert("format".to_string(), format);
+            }
+            None => req["output_config"] = json!({ "format": format }),
         }
     }
 
@@ -1444,6 +1474,84 @@ mod tests {
                 "OpenAI-only param {k} should not be forwarded to Anthropic"
             );
         }
+        // json_object has no Anthropic equivalent (format requires a schema).
+        assert!(converted.get("output_config").is_none());
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_response_format_json_schema_maps_to_output_config() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+            "additionalProperties": false
+        });
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "person", "schema": schema, "strict": true}
+            }
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4",
+            },
+        );
+        assert!(converted.get("response_format").is_none());
+        assert_eq!(converted["output_config"]["format"]["type"], "json_schema");
+        assert_eq!(converted["output_config"]["format"]["schema"], schema);
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_response_format_merges_with_effort_output_config() {
+        let body = json!({
+            "model": "claude-opus-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object", "additionalProperties": false}}
+            }
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-opus-4-5",
+            },
+        );
+        assert_eq!(converted["output_config"]["effort"], "high");
+        assert_eq!(converted["output_config"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn convert_openai_to_anthropic_tool_strict_passes_through() {
+        let body = json!({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {
+                    "name": "strict_tool",
+                    "parameters": {"type": "object", "additionalProperties": false},
+                    "strict": true
+                }},
+                {"type": "function", "function": {
+                    "name": "loose_tool",
+                    "parameters": {"type": "object"}
+                }}
+            ]
+        });
+        let converted = convert_openai_chat_to_anthropic_request(
+            &body,
+            &OpenAIToAnthropicChatConfig {
+                default_model: "claude-sonnet-4",
+            },
+        );
+        let tools = converted["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["strict"], true);
+        assert!(tools[1].get("strict").is_none());
     }
 
     #[test]

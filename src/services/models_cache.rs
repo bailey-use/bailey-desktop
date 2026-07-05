@@ -231,6 +231,14 @@ impl ModelsCache {
         }
     }
 
+    /// Drops both starter spellings (sentinel + real gateway URL) and their
+    /// `#all` twins. The starter catalog is per-account and its metadata is
+    /// looked up ignoring the TTL, so a profile change must clear it explicitly.
+    pub async fn clear_starter(&self) {
+        self.remove(crate::constants::AIVO_STARTER_SENTINEL).await;
+        self.remove(crate::constants::AIVO_STARTER_REAL_URL).await;
+    }
+
     /// Lower-level: returns metadata stored under `cache_key`, ignoring TTL.
     pub async fn get_metadata(&self, cache_key: &str, model_id: &str) -> Option<ModelMetadata> {
         let entries = self.entries().await;
@@ -463,6 +471,31 @@ mod tests {
             .await;
         cache.remove("https://api.example.com").await;
         assert!(cache.get("https://api.kept.com").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn clear_starter_drops_all_four_starter_keys_only() {
+        let dir = TempDir::new().unwrap();
+        let cache = make_cache(&dir);
+        let sentinel = crate::constants::AIVO_STARTER_SENTINEL;
+        let real = crate::constants::AIVO_STARTER_REAL_URL;
+        for key in [
+            sentinel.to_string(),
+            full_catalog_key(sentinel),
+            real.to_string(),
+            full_catalog_key(real),
+        ] {
+            cache.set(&key, vec!["aivo/starter".to_string()]).await;
+        }
+        cache
+            .set("https://api.other.com", vec!["gpt-4o".to_string()])
+            .await;
+
+        cache.clear_starter().await;
+
+        assert!(cache.model_ids(sentinel).await.is_none());
+        assert!(cache.model_ids(real).await.is_none());
+        assert!(cache.get("https://api.other.com").await.is_some());
     }
 
     #[tokio::test]

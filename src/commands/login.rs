@@ -174,7 +174,14 @@ impl LoginCommand {
             plan,
             plan_label,
         };
+        // Different account/plan → the cached starter catalog is the old profile's.
+        let profile_changed = account_store::load()
+            .map(|prev| prev.user_id != account.user_id || prev.plan != account.plan)
+            .unwrap_or(true);
         account_store::save(&account).await?;
+        if profile_changed {
+            clear_starter_model_cache().await;
+        }
 
         // Ensure a device-signed key exists so the binding is usable now.
         if let Some((starter, is_new_user)) = self.session_store.ensure_starter_key().await
@@ -261,7 +268,15 @@ pub(crate) async fn sync_account_status() -> AccountSync {
                 plan_label: local.as_ref().and_then(|a| a.plan_label.clone()),
             };
             if local.as_ref() != Some(&account) {
+                // Plan is preserved from `local` here, so only identity can differ.
+                let identity_changed = local
+                    .as_ref()
+                    .map(|a| a.user_id != account.user_id)
+                    .unwrap_or(true);
                 let _ = account_store::save(&account).await;
+                if identity_changed {
+                    clear_starter_model_cache().await;
+                }
             }
             AccountSync::Linked(account)
         }
@@ -269,11 +284,20 @@ pub(crate) async fn sync_account_status() -> AccountSync {
             let had_local = local.is_some();
             if had_local {
                 account_store::clear();
+                // Entitlements revert to the anonymous starter tier.
+                clear_starter_model_cache().await;
             }
             AccountSync::Unlinked { had_local }
         }
         device_auth::DeviceStatus::Unknown => AccountSync::Unverified(local),
     }
+}
+
+/// Drops the cached `aivo/starter` catalog after a login-profile change.
+async fn clear_starter_model_cache() {
+    crate::services::models_cache::ModelsCache::shared()
+        .clear_starter()
+        .await;
 }
 
 /// Prints `prompt`, then on an interactive terminal reads one line and returns
@@ -410,6 +434,7 @@ impl LogoutCommand {
         // record so local and server stay consistent.
         device_auth::unlink_device().await?;
         account_store::clear();
+        clear_starter_model_cache().await;
 
         println!(
             "  {} Logged out — this device is no longer linked.",

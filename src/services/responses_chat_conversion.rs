@@ -728,290 +728,51 @@ pub fn convert_chat_response_to_responses_sse(
     requires_reasoning_content: bool,
     original_model: &str,
 ) -> String {
-    let resp_id = gen_id("resp");
-    let created_at = current_unix_ts();
-    // Map model name for Codex CLI compatibility
-    let codex_model = map_model_for_codex_cli(original_model);
-    let mut sse = String::new();
-    let mut output_items: Vec<Value> = Vec::new();
-
-    // response.created — required opening event
-    sse.push_str(&sse_event(
-        "response.created",
-        &json!({
-            "type": "response.created",
-            "response": {
-                "id": resp_id, "object": "response",
-                "model": codex_model,
-                "created_at": created_at, "status": "in_progress", "output": []
-            }
-        }),
-    ));
-
     let (content, tool_calls, reasoning_content) = extract_chat_response_payload(chat);
 
-    // Pass reasoning_content through to function_call output items so subsequent requests
-    // can round-trip it back. Auto-detected from provider response; no config flag needed.
-    // For providers that require a non-empty value even when none was returned (requires_reasoning_content),
-    // fall back to content or a single-space sentinel.
-    let reasoning_for_tool = if !reasoning_content.is_empty() {
-        reasoning_content.clone()
-    } else if requires_reasoning_content {
-        if !content.is_empty() {
-            content.clone()
-        } else {
-            " ".to_string() // single-space sentinel satisfies non-empty requirement
-        }
-    } else {
-        String::new()
-    };
-
-    // Emit a standard `type:"reasoning"` output item before any message or
-    // function_call items. Codex CLI parses output items with typed structs,
-    // so a stray `reasoning_content` field tucked onto a function_call would
-    // be stripped on the round-trip; only a real reasoning item survives.
-    // Provider quirk fixes still rely on the non-standard field below — emit
-    // both so legacy paths and Codex both work.
-    let mut next_output_index: usize = 0;
+    // Replay the buffered payload as a single synthetic delta chunk through
+    // the streaming converter, so buffered and streamed responses come from
+    // one emitter and can't drift apart again.
+    let mut delta = json!({});
     if !reasoning_content.is_empty() {
-        let rs_id = gen_id("rs");
-        sse.push_str(&sse_event(
-            "response.output_item.added",
-            &json!({
-                "type": "response.output_item.added",
-                "response_id": resp_id, "output_index": next_output_index,
-                "item": {
-                    "id": rs_id, "type": "reasoning",
-                    "summary": []
-                }
-            }),
-        ));
-        sse.push_str(&sse_event(
-            "response.reasoning_summary_part.added",
-            &json!({
-                "type": "response.reasoning_summary_part.added",
-                "response_id": resp_id, "item_id": rs_id,
-                "output_index": next_output_index, "summary_index": 0,
-                "part": {"type": "summary_text", "text": ""}
-            }),
-        ));
-        sse.push_str(&sse_event(
-            "response.reasoning_summary_text.delta",
-            &json!({
-                "type": "response.reasoning_summary_text.delta",
-                "response_id": resp_id, "item_id": rs_id,
-                "output_index": next_output_index, "summary_index": 0,
-                "delta": reasoning_content
-            }),
-        ));
-        sse.push_str(&sse_event(
-            "response.reasoning_summary_text.done",
-            &json!({
-                "type": "response.reasoning_summary_text.done",
-                "response_id": resp_id, "item_id": rs_id,
-                "output_index": next_output_index, "summary_index": 0,
-                "text": reasoning_content
-            }),
-        ));
-        sse.push_str(&sse_event(
-            "response.reasoning_summary_part.done",
-            &json!({
-                "type": "response.reasoning_summary_part.done",
-                "response_id": resp_id, "item_id": rs_id,
-                "output_index": next_output_index, "summary_index": 0,
-                "part": {"type": "summary_text", "text": reasoning_content}
-            }),
-        ));
-        let reasoning_done_item = json!({
-            "id": rs_id, "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": reasoning_content}]
-        });
-        sse.push_str(&sse_event(
-            "response.output_item.done",
-            &json!({
-                "type": "response.output_item.done",
-                "response_id": resp_id, "output_index": next_output_index,
-                "item": reasoning_done_item.clone()
-            }),
-        ));
-        output_items.push(reasoning_done_item);
-        next_output_index += 1;
+        delta["reasoning_content"] = json!(reasoning_content);
     }
-
-    // A turn can carry both assistant text and tool calls; emit the message
-    // item before the function_call items (same order as streaming). A fully
-    // empty turn still emits the empty message item so Codex sees a turn.
-    if !content.is_empty() || tool_calls.is_empty() {
-        // Text message response
-        let msg_id = gen_id("msg");
-        let i = next_output_index;
-
-        sse.push_str(&sse_event(
-            "response.output_item.added",
-            &json!({
-                "type": "response.output_item.added",
-                "response_id": resp_id, "output_index": i,
-                "item": {
-                    "id": msg_id, "type": "message",
-                    "status": "in_progress", "role": "assistant", "content": []
-                }
-            }),
-        ));
-        // Output text part (always present, even if empty)
-        sse.push_str(&sse_event(
-            "response.content_part.added",
-            &json!({
-                "type": "response.content_part.added",
-                "response_id": resp_id, "item_id": msg_id,
-                "output_index": i, "content_index": 0,
-                "part": {"type": "output_text", "text": ""}
-            }),
-        ));
-        if !content.is_empty() {
-            sse.push_str(&sse_event(
-                "response.output_text.delta",
-                &json!({
-                    "type": "response.output_text.delta",
-                    "response_id": resp_id, "item_id": msg_id,
-                    "output_index": i, "content_index": 0, "delta": content
-                }),
-            ));
-        }
-        sse.push_str(&sse_event(
-            "response.output_text.done",
-            &json!({
-                "type": "response.output_text.done",
-                "response_id": resp_id, "item_id": msg_id,
-                "output_index": i, "content_index": 0, "text": content
-            }),
-        ));
-        sse.push_str(&sse_event(
-            "response.content_part.done",
-            &json!({
-                "type": "response.content_part.done",
-                "response_id": resp_id, "item_id": msg_id,
-                "output_index": i, "content_index": 0,
-                "part": {"type": "output_text", "text": content}
-            }),
-        ));
-
-        // Reasoning lives in the standalone reasoning item, not here: a
-        // `reasoning` part inside `message.content` makes Codex.app reject the
-        // whole message ("Unexpected content item in agent message").
-        let content_parts =
-            vec![json!({"type": "output_text", "text": content, "annotations": []})];
-        let done_item = json!({
-            "id": msg_id, "type": "message", "status": "completed",
-            "role": "assistant",
-            "content": content_parts
-        });
-        sse.push_str(&sse_event(
-            "response.output_item.done",
-            &json!({
-                "type": "response.output_item.done",
-                "response_id": resp_id, "output_index": i, "item": done_item
-            }),
-        ));
-        output_items.push(json!({
-            "id": msg_id, "type": "message", "status": "completed",
-            "role": "assistant",
-            "content": done_item["content"].clone()
-        }));
-        next_output_index += 1;
+    if !content.is_empty() {
+        delta["content"] = json!(content);
     }
-
     if !tool_calls.is_empty() {
-        for (offset, tc) in tool_calls.iter().enumerate() {
-            let i = next_output_index + offset;
-            // call_id is the Chat tool-call id (referenced by tool results);
-            // item_id is a fresh per-response identifier.
-            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
-            let item_id = gen_id("fc");
-            let tc_name = tc["function"]["name"].as_str().unwrap_or("");
-            let tc_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
-
-            sse.push_str(&sse_event(
-                "response.output_item.added",
-                &json!({
-                    "type": "response.output_item.added",
-                    "response_id": resp_id, "output_index": i,
-                    "item": {
-                        "id": item_id, "call_id": call_id,
-                        "type": "function_call", "status": "in_progress",
-                        "name": tc_name, "arguments": ""
+        // Re-index and default-fill: without a distinct `index` per call the
+        // streaming ingester would collapse them all into slot 0.
+        let tcs: Vec<Value> = tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| {
+                json!({
+                    "index": i,
+                    "id": tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0"),
+                    "function": {
+                        "name": tc["function"]["name"].as_str().unwrap_or(""),
+                        "arguments": tc["function"]["arguments"].as_str().unwrap_or("{}")
                     }
-                }),
-            ));
-            sse.push_str(&sse_event(
-                "response.function_call_arguments.delta",
-                &json!({
-                    "type": "response.function_call_arguments.delta",
-                    "response_id": resp_id, "output_index": i,
-                    "item_id": item_id, "delta": tc_args
-                }),
-            ));
-            sse.push_str(&sse_event(
-                "response.function_call_arguments.done",
-                &json!({
-                    "type": "response.function_call_arguments.done",
-                    "response_id": resp_id, "output_index": i,
-                    "item_id": item_id, "arguments": tc_args
-                }),
-            ));
-
-            let mut done_item = json!({
-                "id": item_id, "call_id": call_id,
-                "type": "function_call", "status": "completed",
-                "name": tc_name, "arguments": tc_args
-            });
-            if !reasoning_for_tool.is_empty() {
-                done_item["reasoning_content"] = json!(reasoning_for_tool.clone());
-            }
-            sse.push_str(&sse_event(
-                "response.output_item.done",
-                &json!({
-                    "type": "response.output_item.done",
-                    "response_id": resp_id, "output_index": i,
-                    "item": done_item
-                }),
-            ));
-            let mut output_item = json!({
-                "id": item_id, "call_id": call_id,
-                "type": "function_call", "status": "completed",
-                "name": tc_name, "arguments": tc_args
-            });
-            if !reasoning_for_tool.is_empty() {
-                output_item["reasoning_content"] = json!(reasoning_for_tool.clone());
-            }
-            output_items.push(output_item);
-        }
+                })
+            })
+            .collect();
+        delta["tool_calls"] = json!(tcs);
     }
 
-    // response.completed — required closing event with full output array.
-    // A length-truncated turn must surface as `incomplete`, or the client
-    // can't tell the cutoff from a normal completion.
-    let truncated = chat["choices"][0]["finish_reason"].as_str() == Some("length");
-    let mut response = json!({
-        "id": resp_id, "object": "response",
-        "model": codex_model,
-        "created_at": created_at,
-        "status": if truncated { "incomplete" } else { "completed" },
-        "output": output_items
-    });
-    if truncated {
-        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    let mut chunk = json!({"choices": [{"delta": delta}]});
+    if let Some(fr) = chat["choices"][0]["finish_reason"].as_str() {
+        chunk["choices"][0]["finish_reason"] = json!(fr);
     }
-    if let Some(usage) = chat_usage_to_responses_usage(chat) {
-        response["usage"] = usage;
+    if let Some(usage) = chat.get("usage") {
+        chunk["usage"] = usage.clone();
     }
-    sse.push_str(&sse_event(
-        "response.completed",
-        &json!({
-            "type": "response.completed",
-            "response": response
-        }),
-    ));
 
+    let mut converter = ResponsesStreamConverter::new(original_model, requires_reasoning_content);
+    let mut sse = String::new();
+    converter.ensure_created(&mut sse);
+    converter.process_chunk(&chunk, &mut sse);
+    sse.push_str(&converter.finish());
     sse
 }
 
@@ -1020,9 +781,9 @@ pub fn convert_chat_response_to_responses_sse(
 /// Responses API SSE events, so output reaches Codex as it's produced instead of
 /// arriving in one blob after the turn finishes.
 ///
-/// Emits the same event sequence and `response.completed` output shape as the
-/// buffered `convert_chat_response_to_responses_sse`, so a round-trip through the
-/// streaming path is indistinguishable from the buffered one to Codex.
+/// This is the single chat→Responses emitter: the buffered
+/// `convert_chat_response_to_responses_sse` replays its payload through this
+/// converter, and serve's /v1/responses streaming path drives it directly.
 pub struct ResponsesStreamConverter {
     pending: Vec<u8>,
     resp_id: String,
@@ -1281,8 +1042,12 @@ impl ResponsesStreamConverter {
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return;
         };
+        self.process_chunk(&chunk, out);
+    }
+
+    fn process_chunk(&mut self, chunk: &Value, out: &mut String) {
         if chunk.get("usage").is_some_and(|u| !u.is_null())
-            && let Some(usage) = chat_usage_to_responses_usage(&chunk)
+            && let Some(usage) = chat_usage_to_responses_usage(chunk)
         {
             self.usage = Some(usage);
         }

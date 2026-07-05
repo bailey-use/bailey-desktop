@@ -23,14 +23,14 @@ use crate::services::provider_protocol::{
     PathVariant, ProviderProtocol, classify_failed_attempt, is_protocol_mismatch,
 };
 use crate::services::request_log::RequestLogger;
+use crate::services::responses_chat_conversion::ResponsesStreamConverter;
 use crate::services::responses_to_chat_router::{
     ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
     convert_responses_to_chat_request,
 };
 use crate::services::route_cache::{RouteCache, RouteSlot};
 use crate::services::serve_responses::{
-    OpenAIToResponsesStreamConverter, convert_chat_response_to_responses_json,
-    convert_chat_sse_to_responses_sse,
+    convert_chat_response_to_responses_json, convert_chat_sse_to_responses_sse,
 };
 use crate::services::serve_upstream::{
     RouterResponse, StreamingBody, UpstreamRequestContext, copilot_requires_responses_api,
@@ -1311,7 +1311,7 @@ async fn write_router_response(
                         StreamingBody::Upstream(mut upstream) => {
                             while let Some(chunk) = upstream.chunk().await? {
                                 sniffer.observe(&chunk);
-                                let mapped = converter.push_bytes(&chunk)?;
+                                let mapped = converter.push_bytes(&chunk);
                                 if !mapped.is_empty() {
                                     write_chunk(socket, mapped.as_bytes()).await?;
                                 }
@@ -1325,7 +1325,7 @@ async fn write_router_response(
                                 sniffer.observe(&chunk);
                                 let openai = openai_converter.push_bytes(&chunk)?;
                                 if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes())?;
+                                    let mapped = converter.push_bytes(openai.as_bytes());
                                     if !mapped.is_empty() {
                                         write_chunk(socket, mapped.as_bytes()).await?;
                                     }
@@ -1333,7 +1333,7 @@ async fn write_router_response(
                             }
                             let openai_tail = openai_converter.finish()?;
                             if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
+                                let mapped = converter.push_bytes(openai_tail.as_bytes());
                                 if !mapped.is_empty() {
                                     write_chunk(socket, mapped.as_bytes()).await?;
                                 }
@@ -1347,7 +1347,7 @@ async fn write_router_response(
                                 sniffer.observe(&chunk);
                                 let openai = openai_converter.push_bytes(&chunk)?;
                                 if !openai.is_empty() {
-                                    let mapped = converter.push_bytes(openai.as_bytes())?;
+                                    let mapped = converter.push_bytes(openai.as_bytes());
                                     if !mapped.is_empty() {
                                         write_chunk(socket, mapped.as_bytes()).await?;
                                     }
@@ -1355,7 +1355,7 @@ async fn write_router_response(
                             }
                             let openai_tail = openai_converter.finish()?;
                             if !openai_tail.is_empty() {
-                                let mapped = converter.push_bytes(openai_tail.as_bytes())?;
+                                let mapped = converter.push_bytes(openai_tail.as_bytes());
                                 if !mapped.is_empty() {
                                     write_chunk(socket, mapped.as_bytes()).await?;
                                 }
@@ -1366,7 +1366,7 @@ async fn write_router_response(
                         }
                     }
 
-                    let tail = converter.finish()?;
+                    let tail = converter.finish();
                     if !tail.is_empty() {
                         write_chunk(socket, tail.as_bytes()).await?;
                     }
@@ -1408,7 +1408,7 @@ fn convert_chat_response_for_responses_route(
 
             if client_wants_stream {
                 let sse = if content_type.contains("text/event-stream") {
-                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, original_model)?
+                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, original_model)
                 } else {
                     let chat_json: Value = serde_json::from_slice(&body)?;
                     convert_chat_response_to_responses_sse(&chat_json, false, original_model)
@@ -1445,7 +1445,7 @@ fn convert_chat_response_for_responses_route(
                 content_type: "text/event-stream".to_string(),
                 body: Box::new(StreamingBody::Responses {
                     source: body,
-                    converter: OpenAIToResponsesStreamConverter::new(original_model),
+                    converter: ResponsesStreamConverter::new(original_model, false),
                 }),
             })
         }

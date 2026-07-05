@@ -22,9 +22,8 @@ use crate::services::openai_gemini_bridge::{
     convert_openai_chat_to_gemini_request,
 };
 use crate::services::responses_chat_conversion::{
-    convert_chat_to_responses_request, convert_responses_json_to_chat,
+    ResponsesStreamConverter, convert_chat_to_responses_request, convert_responses_json_to_chat,
 };
-use crate::services::serve_responses::OpenAIToResponsesStreamConverter;
 use crate::services::serve_stream_converters::{
     AnthropicToOpenAIStreamConverter, GeminiToOpenAIStreamConverter,
 };
@@ -78,7 +77,7 @@ pub(crate) enum StreamingBody {
     },
     Responses {
         source: Box<StreamingBody>,
-        converter: OpenAIToResponsesStreamConverter,
+        converter: ResponsesStreamConverter,
     },
 }
 

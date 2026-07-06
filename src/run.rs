@@ -205,6 +205,7 @@ pub async fn run() -> ! {
             Commands::Update(_) => UpdateCommand::print_help(),
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Plugins(_) => PluginsCommand::print_help(),
+            Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -807,6 +808,11 @@ pub async fn run() -> ! {
             command.execute(plugin_args).await
         }
 
+        Commands::Mcp(mcp_args) => {
+            let command = crate::commands::mcp::McpCommand::new();
+            command.execute(mcp_args).await
+        }
+
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
@@ -896,6 +902,7 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
+    print_cmd("mcp", "Manage the coding agent's MCP servers");
     print_cmd("hf", "Manage cached HuggingFace GGUF files");
     print_cmd("logs", "Show recent local logs from code, run, and serve");
     print_cmd("stats", "Show usage statistics");

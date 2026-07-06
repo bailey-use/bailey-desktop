@@ -2216,6 +2216,18 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Mcp(_), _) => Ok(Some(false)),
+            (Overlay::McpTools(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                if let Overlay::McpTools(state) = &mut self.overlay {
+                    if up {
+                        state.select_prev();
+                    } else {
+                        state.select_next();
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::McpTools(_), _) => Ok(Some(false)),
             (Overlay::Config(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 if let Overlay::Config(state) = &mut self.overlay {

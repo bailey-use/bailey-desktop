@@ -91,6 +91,9 @@ pub enum Commands {
     #[command(alias = "plugin")]
     Plugins(PluginsArgs),
 
+    /// Manage the coding agent's MCP servers (list, add, rm)
+    Mcp(McpArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
@@ -298,6 +301,44 @@ pub enum PluginsSubcommand {
     /// Remove an installed plugin by name
     #[command(name = "rm", alias = "remove")]
     Remove(PluginRemoveArgs),
+}
+
+/// Arguments for `aivo mcp`. No subcommand → defaults to `list`. The
+/// interactive twin is `/mcp` inside `aivo code`; both manage the user
+/// `~/.config/aivo/mcp.json` (project `.mcp.json` is read-only here).
+#[derive(Args, Debug, Clone)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum McpSubcommand {
+    /// List configured servers (user + project scope) with their state
+    #[command(alias = "ls")]
+    List,
+
+    /// Add a server: `command [args…]`, an http(s):// URL, or a JSON block
+    Add(McpAddArgs),
+
+    /// Remove a user-scope server by name
+    #[command(name = "rm", alias = "remove")]
+    Remove(McpRemoveArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpAddArgs {
+    /// `command [args…]` (stdio), an `http(s)://` URL, or a pasted
+    /// `{"mcpServers":…}` JSON block as one argument
+    #[arg(value_name = "SPEC", num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]
+    pub spec: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpRemoveArgs {
+    /// Server name as shown by `aivo mcp list`
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
 }
 
 #[derive(Args, Debug, Clone)]

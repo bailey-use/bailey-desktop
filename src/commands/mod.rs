@@ -94,6 +94,7 @@ pub mod keys;
 pub(crate) mod keys_ui;
 pub mod login;
 pub mod logs;
+pub mod mcp;
 pub mod models;
 pub mod plugins;
 pub mod run;

@@ -1692,6 +1692,19 @@ impl SessionStore {
             .await
     }
 
+    /// Individual MCP tools turned off in `/mcp` (Ctrl+T), as qualified
+    /// `mcp__server__tool` names — the same form the engine advertises, so the
+    /// filter needs no reverse parsing.
+    pub async fn get_disabled_mcp_tools(&self) -> Result<Vec<String>> {
+        Ok(self.get_disabled_list("disabledMcpTools").await)
+    }
+
+    /// Enable or disable one MCP tool by its qualified name (idempotent).
+    pub async fn set_mcp_tool_enabled(&self, qualified: &str, enabled: bool) -> Result<()> {
+        self.set_disabled_list("disabledMcpTools", qualified, enabled)
+            .await
+    }
+
     /// A "disabled names" list (skills or MCP servers) read from code-prefs.json by
     /// `key`. chat-prefs is an opaque JSON map that round-trips verbatim through any
     /// build (even an older chat that doesn't know the key), so — unlike the typed
@@ -2864,6 +2877,35 @@ mod tests {
         // Re-enabling removes the entry.
         store.set_skill_enabled("repo-study", true).await.unwrap();
         assert!(store.get_disabled_skills().await.unwrap().is_empty());
+    }
+
+    /// The Ctrl+T per-tool opt-outs share the disabled-list machinery, keyed by
+    /// qualified `mcp__server__tool` names.
+    #[tokio::test]
+    async fn disabled_mcp_tools_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+
+        store
+            .set_mcp_tool_enabled("mcp__github__create_issue", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_disabled_mcp_tools().await.unwrap(),
+            vec!["mcp__github__create_issue"]
+        );
+        // Idempotent re-disable doesn't duplicate.
+        store
+            .set_mcp_tool_enabled("mcp__github__create_issue", false)
+            .await
+            .unwrap();
+        assert_eq!(store.get_disabled_mcp_tools().await.unwrap().len(), 1);
+        // Re-enabling removes the entry.
+        store
+            .set_mcp_tool_enabled("mcp__github__create_issue", true)
+            .await
+            .unwrap();
+        assert!(store.get_disabled_mcp_tools().await.unwrap().is_empty());
     }
 
     /// The original bug: toggles lived in config.json, so any other config writer

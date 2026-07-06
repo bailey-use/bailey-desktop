@@ -15,6 +15,9 @@ enum OverlayKeyAction {
     RemoveMcpServer(usize),
     AuthorizeMcpServer(usize),
     SignOutMcpServer(usize),
+    RetryMcpServers,
+    OpenMcpTools(usize),
+    ToggleMcpTool(usize),
     ToggleConfigSetting(usize),
 }
 
@@ -459,6 +462,18 @@ impl CodeTuiApp {
                 self.sign_out_mcp_server(index).await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::RetryMcpServers => {
+                self.retry_mcp_failed();
+                Ok(Some(false))
+            }
+            OverlayKeyAction::OpenMcpTools(index) => {
+                self.open_mcp_tools(index);
+                Ok(Some(false))
+            }
+            OverlayKeyAction::ToggleMcpTool(index) => {
+                self.toggle_mcp_tool(index).await?;
+                Ok(Some(false))
+            }
             OverlayKeyAction::ToggleConfigSetting(index) => {
                 self.toggle_config_setting(index).await;
                 Ok(Some(false))
@@ -495,6 +510,11 @@ impl CodeTuiApp {
                 true
             }
             Overlay::SkillInstall(state) => {
+                state.query.push_str(clean);
+                state.refilter();
+                true
+            }
+            Overlay::McpTools(state) => {
                 state.query.push_str(clean);
                 state.refilter();
                 true
@@ -742,6 +762,16 @@ impl CodeTuiApp {
                         state.pending_delete = None;
                         return OverlayKeyAction::SignOutMcpServer(state.selected);
                     }
+                    // Retry failed servers without the toggle-off/on dance; live
+                    // ones are preserved, so this only reconnects the broken set.
+                    KeyCode::Char('r') if ctrl => {
+                        state.pending_delete = None;
+                        return OverlayKeyAction::RetryMcpServers;
+                    }
+                    KeyCode::Char('t') if ctrl && state.has_selection() => {
+                        state.pending_delete = None;
+                        return OverlayKeyAction::OpenMcpTools(state.selected);
+                    }
                     // First Ctrl+D arms the delete (removal edits the user
                     // mcp.json), a second on the same row carries it out — same
                     // two-press confirm as /skills and the resume picker.
@@ -754,6 +784,39 @@ impl CodeTuiApp {
                     // Page keys scroll the split's right detail pane.
                     KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
                         apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
+                    KeyCode::Backspace => {
+                        state.query.pop();
+                        state.refilter();
+                    }
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
+                        state.query.push(c);
+                        state.refilter();
+                    }
+                    _ => {}
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::McpTools(state) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc if !state.query.is_empty() => {
+                        state.query.clear();
+                        state.refilter();
+                    }
+                    // Esc returns to `/mcp`, statuses refreshed so the server
+                    // row's `· N off` count reflects the toggles just made.
+                    KeyCode::Esc => {
+                        let parent = std::mem::take(&mut state.parent);
+                        self.overlay = Overlay::Mcp(*parent);
+                        self.refresh_mcp_overlay_status();
+                    }
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    KeyCode::Enter | KeyCode::Char(' ') if state.has_selection() => {
+                        return OverlayKeyAction::ToggleMcpTool(state.selected);
                     }
                     KeyCode::Backspace => {
                         state.query.pop();

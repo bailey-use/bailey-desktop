@@ -980,6 +980,69 @@ impl CodeTuiApp {
         );
     }
 
+    /// The Ctrl+T drill-in: one MCP server's tools as a toggle list. Toggling
+    /// only changes what's advertised to the agent; the connection is untouched.
+    pub(super) fn render_mcp_tools_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &McpToolsOverlay,
+    ) {
+        let on = state.items.iter().filter(|i| i.enabled).count();
+        let input_line = search_input_line(&state.query, "type to filter tools…");
+        let inner_width = usize::from(area.width).saturating_sub(6).max(1);
+        let mut rows: Vec<Line> = Vec::new();
+        let mut selected_pos = 0usize;
+        let filtered = state.filtered_indices();
+        if filtered.is_empty() {
+            rows.push(Line::from(Span::styled(
+                if state.items.is_empty() {
+                    "This server exposes no tools.".to_string()
+                } else {
+                    format!("No tools match \"{}\".", state.query)
+                },
+                Style::default().fg(MUTED),
+            )));
+        }
+        for (pos, &i) in filtered.iter().enumerate() {
+            let item = &state.items[i];
+            let desc = item
+                .description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let desc = truncate_for_display_width(&desc, toggle_detail_room(inner_width));
+            if i == state.selected {
+                selected_pos = rows.len() + 1;
+            }
+            rows.extend(toggle_list_rows(
+                item.enabled,
+                &item.name,
+                &desc,
+                MUTED,
+                i == state.selected,
+                inner_width,
+            ));
+            if pos + 1 < filtered.len() {
+                rows.push(Line::from(""));
+            }
+        }
+        let title = format!("{} tools", state.server);
+        render_toggle_list(
+            frame,
+            area,
+            ToggleListView {
+                title: &title,
+                badge: count_badge(true, on, state.items.len()),
+                input_line,
+                rows,
+                selected_pos,
+                detail: None,
+                footer: vec![("↑↓", "move"), ("Space", "toggle"), ("Esc", "back")],
+            },
+        );
+    }
+
     /// One-line detail for the selected `/skills` row: where the skill lives (home
     /// dir abbreviated to `~`) and, for a repo skill, a `project` tag — so the user
     /// knows where to edit it and that `d` won't delete it.
@@ -1131,6 +1194,8 @@ impl CodeTuiApp {
                 ("^A", "add"),
                 ("^D", "rm"),
                 ("^O", "auth"),
+                ("^R", "retry"),
+                ("^T", "tools"),
             ];
         }
 
@@ -1271,13 +1336,9 @@ impl CodeTuiApp {
             ),
             Span::styled(format!("  [{scope}]"), Style::default().fg(MUTED)),
         ])];
-        // `row.command` holds the launch command for stdio servers and the
-        // endpoint URL for HTTP ones; label it accordingly, wrapping if long.
-        let label = if row.command.contains("://") {
-            "url"
-        } else {
-            "command"
-        };
+        // `row.command` holds the launch command line for stdio servers and the
+        // endpoint URL for HTTP ones; the transport kind rides on the row.
+        let label = if row.remote { "url" } else { "command" };
         for chunk in wrap_chars(&format!("{label}: {}", row.command), width) {
             lines.push(Line::from(Span::styled(chunk, Style::default().fg(MUTED))));
         }
@@ -1297,14 +1358,30 @@ impl CodeTuiApp {
                     Style::default().fg(MUTED),
                 )));
             } else {
+                let tools: Vec<(&str, &str, bool)> = tools
+                    .into_iter()
+                    .map(|(t, d)| {
+                        let on = !self
+                            .disabled_mcp_tools
+                            .contains(&crate::agent::mcp::qualified_name(&row.name, t));
+                        (t, d, on)
+                    })
+                    .collect();
+                let off = tools.iter().filter(|(_, _, on)| !on).count();
+                // Estimate excludes toggled-off tools — they aren't advertised.
                 let cost = self
                     .mcp_client
                     .as_ref()
-                    .and_then(|c| c.estimated_tokens(&row.name))
+                    .and_then(|c| c.estimated_tokens(&row.name, &self.disabled_mcp_tools))
                     .map(|t| format!(" · ~{} tokens/turn", humanize_count(t)))
                     .unwrap_or_default();
+                let counts = if off > 0 {
+                    format!("{} on · {off} off", tools.len() - off)
+                } else {
+                    tools.len().to_string()
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("Tools ({}){cost}:", tools.len()),
+                    format!("Tools ({counts}){cost}:"),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(""));
@@ -2034,24 +2111,32 @@ pub(super) fn wrap_chars(text: &str, width: usize) -> Vec<String> {
 /// and indented beneath, a blank line between tools. Stacking name-over-desc
 /// (rather than a name column) keeps short names from stranding their text in a
 /// far-right gutter and gives long descriptions the whole panel width.
-pub(super) fn mcp_tool_lines(tools: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+pub(super) fn mcp_tool_lines(tools: &[(&str, &str, bool)], width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (i, (tname, tdesc)) in tools.iter().enumerate() {
+    for (i, (tname, tdesc, on)) in tools.iter().enumerate() {
         if i > 0 {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(vec![
-            Span::styled("  • ", Style::default().fg(TOOL)),
-            Span::styled(
-                (*tname).to_string(),
-                Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        if *on {
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(TOOL)),
+                Span::styled(
+                    (*tname).to_string(),
+                    Style::default().fg(TOOL).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(FAINT)),
+                Span::styled((*tname).to_string(), Style::default().fg(FAINT)),
+                Span::styled(" · off", Style::default().fg(FAINT)),
+            ]));
+        }
         let desc = tdesc.split_whitespace().collect::<Vec<_>>().join(" ");
         for chunk in wrap_chars(&desc, width.saturating_sub(4)) {
             lines.push(Line::from(Span::styled(
                 format!("    {chunk}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(if *on { MUTED } else { FAINT }),
             )));
         }
     }

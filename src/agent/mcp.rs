@@ -86,7 +86,13 @@ impl Transport {
     /// endpoint URL (http).
     fn display_target(&self) -> String {
         match self {
-            Transport::Stdio { command, .. } => command.clone(),
+            Transport::Stdio { command, args, .. } => {
+                if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{command} {}", args.join(" "))
+                }
+            }
             Transport::Http { url, .. } => url.clone(),
         }
     }
@@ -169,6 +175,9 @@ pub struct ConfiguredServer {
     pub command: String,
     pub trust: bool,
     pub scope: ServerScope,
+    /// `true` for a remote (`url`) server — carried structurally so consumers
+    /// never re-derive the transport kind from the display string.
+    pub remote: bool,
 }
 
 /// A set of connected MCP servers, offered to the engine as external tools.
@@ -231,6 +240,7 @@ fn configured_servers_from(user_path: Option<&Path>, cwd: &Path) -> Vec<Configur
                     command: cfg.transport.display_target(),
                     trust: cfg.trust,
                     scope,
+                    remote: matches!(cfg.transport, Transport::Http { .. }),
                 },
             );
         }
@@ -561,6 +571,45 @@ pub async fn remove_user_server(name: &str) -> Result<bool, String> {
     remove_server_at(&path, name).await
 }
 
+/// If `input` is a bare http(s) URL (a remote Streamable HTTP server), the
+/// `{url}` JSON config to add for it; `None` for anything else (a `{…}` block
+/// or a command line, handled on their own paths). Shared by the `/mcp` add
+/// field and `aivo mcp add`.
+pub fn bare_url_to_config(input: &str) -> Option<String> {
+    let t = input.trim();
+    if t.starts_with("http://") || t.starts_with("https://") {
+        let url = t.split_whitespace().next().unwrap_or(t);
+        Some(json!({ "url": url }).to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse an MCP add line into `(command, args)`, shell-splitting so quoted
+/// args/paths survive. The server name is derived from the command (see
+/// [`derive_server_name`]), not typed. `Err` is a user-facing message.
+pub fn parse_mcp_add_input(input: &str) -> Result<(String, Vec<String>), String> {
+    let tokens = shlex::split(input.trim()).unwrap_or_default();
+    let Some((command, args)) = tokens.split_first() else {
+        return Err(
+            "Usage: <command> [args…]  (e.g. npx -y @modelcontextprotocol/server-filesystem ~)"
+                .to_string(),
+        );
+    };
+    Ok((command.clone(), args.to_vec()))
+}
+
+/// Append `-2`, `-3`, … to `base` until it doesn't collide with an existing name.
+pub fn dedupe_name(base: String, existing: &HashSet<String>) -> String {
+    if !existing.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !existing.contains(candidate))
+        .unwrap_or(base)
+}
+
 async fn remove_server_at(path: &Path, name: &str) -> Result<bool, String> {
     let mut root = read_user_root_for_write(path)?;
     let removed = root
@@ -740,6 +789,15 @@ impl McpClient {
         self.needs_auth.contains(name)
     }
 
+    /// Whether `name` connected but its transport has since been poisoned (a
+    /// crash or stream desync mid-session). Such a server still has tools in the
+    /// snapshot, so check this before `tool_count` when deriving health.
+    pub fn is_dead(&self, name: &str) -> bool {
+        self.servers
+            .get(name)
+            .is_some_and(|s| s.dead.load(Ordering::Relaxed))
+    }
+
     /// Tools discovered for `name`, or `None` if that server isn't connected
     /// (disabled, failed, or not yet attempted). Drives the `/mcp` status column.
     pub fn tool_count(&self, name: &str) -> Option<usize> {
@@ -770,11 +828,16 @@ impl McpClient {
     /// request, so a chatty server quietly eats the context window. ~chars/4 of
     /// the advertised tool JSON (name + description + schema, plus per-tool
     /// scaffolding). `None` if the server isn't connected.
-    pub fn estimated_tokens(&self, name: &str) -> Option<usize> {
+    pub fn estimated_tokens(
+        &self,
+        name: &str,
+        disabled: &std::collections::HashSet<String>,
+    ) -> Option<usize> {
         self.servers.get(name).map(|s| {
             let chars: usize = s
                 .tools
                 .iter()
+                .filter(|t| !disabled.contains(&qualified_name(name, &t.name)))
                 .map(|t| t.name.len() + t.description.len() + t.input_schema.to_string().len() + 24)
                 .sum();
             chars / 4
@@ -897,6 +960,53 @@ impl ExternalTools for McpClient {
     }
 }
 
+/// An `ExternalTools` view of a client minus the tools the user turned off in
+/// `/mcp` (Ctrl+T). A filtered tool isn't advertised; a stray call to one (e.g.
+/// replayed from stale history) is refused rather than routed.
+pub struct FilteredTools {
+    inner: Arc<dyn ExternalTools>,
+    /// Qualified `mcp__server__tool` names — the advertised form, so no parsing.
+    disabled: std::collections::HashSet<String>,
+}
+
+impl FilteredTools {
+    pub fn new(inner: Arc<dyn ExternalTools>, disabled: std::collections::HashSet<String>) -> Self {
+        Self { inner, disabled }
+    }
+}
+
+impl ExternalTools for FilteredTools {
+    fn specs(&self) -> Vec<Value> {
+        self.inner
+            .specs()
+            .into_iter()
+            .filter(|s| {
+                s["function"]["name"]
+                    .as_str()
+                    .is_none_or(|n| !self.disabled.contains(n))
+            })
+            .collect()
+    }
+
+    fn handles(&self, name: &str) -> bool {
+        self.inner.handles(name)
+    }
+
+    fn requires_approval(&self, name: &str) -> bool {
+        // A disabled tool is refused in `call` without user involvement — a
+        // permission card here could even persist an AlwaysAllow grant for it.
+        !self.disabled.contains(name) && self.inner.requires_approval(name)
+    }
+
+    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
+        if self.disabled.contains(name) {
+            let msg = format!("MCP tool `{name}` is disabled — re-enable it in /mcp (Ctrl+T)");
+            return Box::pin(async move { Err(msg) });
+        }
+        self.inner.call(name, args)
+    }
+}
+
 /// Read the `mcpServers` config from the user file then the project dir (the
 /// latter overrides on name collision). Returns the configs plus per-file parse
 /// errors — a present-but-malformed mcp.json (a JSON typo) is reported, not
@@ -986,6 +1096,76 @@ fn parse_headers(value: Option<&Value>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Expand `${VAR}` / `${VAR:-default}` references in a config string from the
+/// process environment. Applied at connect time, not parse time: the raw text
+/// stays in the file and the UI, so secrets never render anywhere. An unset
+/// variable without a default is an error naming the variable; `:-` also
+/// substitutes when the variable is set but empty. `$VAR` without braces and an
+/// unterminated `${` pass through literally.
+pub fn expand_env_refs(s: &str) -> Result<String, String> {
+    expand_env_refs_with(s, |name| std::env::var(name).ok())
+}
+
+fn expand_env_refs_with(
+    s: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[i..]);
+            return Ok(out);
+        };
+        let (name, default) = match after[..end].split_once(":-") {
+            Some((n, d)) => (n, Some(d)),
+            None => (&after[..end], None),
+        };
+        let value = lookup(name).filter(|v| !(v.is_empty() && default.is_some()));
+        match (value, default) {
+            (Some(v), _) => out.push_str(&v),
+            (None, Some(d)) => out.push_str(d),
+            (None, None) => {
+                return Err(format!("environment variable ${{{name}}} is not set"));
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// A copy of `cfg` with `${VAR}` references resolved in every value a server
+/// actually receives: command, args, env values, url, header values.
+fn expand_config(cfg: &ServerConfig) -> Result<ServerConfig, String> {
+    let transport = match &cfg.transport {
+        Transport::Stdio { command, args, env } => Transport::Stdio {
+            command: expand_env_refs(command)?,
+            args: args
+                .iter()
+                .map(|a| expand_env_refs(a))
+                .collect::<Result<Vec<_>, _>>()?,
+            env: env
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), expand_env_refs(v)?)))
+                .collect::<Result<HashMap<_, _>, String>>()?,
+        },
+        Transport::Http { url, headers } => Transport::Http {
+            url: expand_env_refs(url)?,
+            headers: headers
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), expand_env_refs(v)?)))
+                .collect::<Result<Vec<_>, String>>()?,
+        },
+    };
+    Ok(ServerConfig {
+        transport,
+        trust: cfg.trust,
+    })
+}
+
 /// A failed connect, carrying the human message plus whether the failure was a
 /// `401` (so the caller records it as needs-auth, not a generic failure).
 struct ConnectFailure {
@@ -1017,6 +1197,7 @@ async fn connect_server(
     cfg: &ServerConfig,
     handshake_timeout: Duration,
 ) -> Result<McpServer, ConnectFailure> {
+    let cfg = expand_config(cfg)?;
     let (mut io, protocol_version) = match &cfg.transport {
         Transport::Stdio { command, args, env } => (
             ServerIo::Stdio(spawn_stdio(command, args, env)?),
@@ -1096,15 +1277,28 @@ fn spawn_stdio(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<StdioIo, String> {
-    let mut child = Command::new(command)
-        .args(args)
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("spawn {command}: {e}"))?;
+    let try_spawn = |program: &str| {
+        Command::new(program)
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+    };
+    let spawned = try_spawn(command);
+    // Windows: bare `npx`/`uvx` etc. are `.cmd`/`.bat` shims, and CreateProcess
+    // only auto-appends `.exe` — retry with the batch extension (std then routes
+    // through cmd.exe with safe quoting). Keep the original error if both fail.
+    #[cfg(windows)]
+    let spawned = match spawned {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => try_spawn(&format!("{command}.cmd"))
+            .or_else(|_| try_spawn(&format!("{command}.bat")))
+            .map_err(|_| e),
+        other => other,
+    };
+    let mut child = spawned.map_err(|e| format!("spawn {command}: {e}"))?;
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
     Ok(StdioIo {
@@ -1661,7 +1855,7 @@ fn cap_chars(s: &str, max: usize) -> String {
 /// or unicode would otherwise be an invalid function name and make the provider
 /// reject the whole request. `lookup` reverses this by matching the same
 /// computed name, so routing back to the real tool still works.
-fn qualified_name(server: &str, tool: &str) -> String {
+pub fn qualified_name(server: &str, tool: &str) -> String {
     sanitize_fn_name(&format!("mcp__{server}__{tool}"))
 }
 
@@ -1723,6 +1917,108 @@ mod tests {
         assert!(parse_config(r#"{"other":1}"#).unwrap().is_empty());
         // A JSON syntax error IS reported (so a typo'd mcp.json isn't silent).
         assert!(parse_config("{ not json").is_err());
+    }
+
+    #[test]
+    fn env_ref_expansion() {
+        let lk = |name: &str| match name {
+            "TOK" => Some("secret".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(
+            expand_env_refs_with("Bearer ${TOK}", lk).unwrap(),
+            "Bearer secret"
+        );
+        assert_eq!(
+            expand_env_refs_with("${TOK}/${TOK}", lk).unwrap(),
+            "secret/secret"
+        );
+        assert_eq!(
+            expand_env_refs_with("${MISSING:-dflt}", lk).unwrap(),
+            "dflt"
+        );
+        // `:-` substitutes on set-but-empty; a plain ref keeps the empty value.
+        assert_eq!(expand_env_refs_with("${EMPTY:-dflt}", lk).unwrap(), "dflt");
+        assert_eq!(expand_env_refs_with("${EMPTY}", lk).unwrap(), "");
+        // Bare `$VAR` and an unterminated `${` pass through literally.
+        assert_eq!(expand_env_refs_with("$HOME/x", lk).unwrap(), "$HOME/x");
+        assert_eq!(expand_env_refs_with("a ${TOK", lk).unwrap(), "a ${TOK");
+        let err = expand_env_refs_with("${MISSING}", lk).unwrap_err();
+        assert!(err.contains("MISSING"), "error names the variable: {err}");
+    }
+
+    struct StubTools;
+    impl ExternalTools for StubTools {
+        fn specs(&self) -> Vec<Value> {
+            vec![
+                json!({"type":"function","function":{"name":"mcp__s__a","description":"","parameters":{}}}),
+                json!({"type":"function","function":{"name":"mcp__s__b","description":"","parameters":{}}}),
+            ]
+        }
+        fn handles(&self, name: &str) -> bool {
+            name.starts_with("mcp__s__")
+        }
+        fn call<'a>(
+            &'a self,
+            name: &'a str,
+            _args: &'a Value,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move { Ok(format!("ran {name}")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn filtered_tools_hides_and_refuses_disabled() {
+        let disabled = HashSet::from(["mcp__s__b".to_string()]);
+        let f = FilteredTools::new(Arc::new(StubTools), disabled);
+        let specs = f.specs();
+        let names: Vec<&str> = specs
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["mcp__s__a"], "disabled tool is not advertised");
+        assert!(
+            f.handles("mcp__s__b"),
+            "still owns the name, so a stray call routes here (and is refused)"
+        );
+        let err = f.call("mcp__s__b", &json!({})).await.unwrap_err();
+        assert!(err.contains("disabled"), "stray call refused: {err}");
+        assert_eq!(
+            f.call("mcp__s__a", &json!({})).await.unwrap(),
+            "ran mcp__s__a"
+        );
+    }
+
+    #[test]
+    fn expand_config_reports_unset_var() {
+        let cfg = ServerConfig {
+            transport: Transport::Http {
+                url: "https://h/mcp".to_string(),
+                headers: vec![(
+                    "Authorization".to_string(),
+                    "Bearer ${AIVO_TEST_SURELY_UNSET_VAR}".to_string(),
+                )],
+            },
+            trust: true,
+        };
+        let err = expand_config(&cfg).unwrap_err();
+        assert!(err.contains("AIVO_TEST_SURELY_UNSET_VAR"));
+        // A config without refs round-trips unchanged.
+        let plain = ServerConfig {
+            transport: Transport::Stdio {
+                command: "npx".to_string(),
+                args: vec!["-y".to_string(), "srv".to_string()],
+                env: HashMap::from([("K".to_string(), "V".to_string())]),
+            },
+            trust: false,
+        };
+        let expanded = expand_config(&plain).unwrap();
+        let (command, args, env) = stdio(&expanded);
+        assert_eq!(command, "npx");
+        assert_eq!(args, ["-y", "srv"]);
+        assert_eq!(env.get("K").map(String::as_str), Some("V"));
+        assert!(!expanded.trust);
     }
 
     #[test]
@@ -2389,9 +2685,18 @@ for line in sys.stdin:
             "an unknown server has no tool names"
         );
         // A connected server reports a non-zero per-turn token estimate; an
-        // unknown one reports none.
-        assert!(client.estimated_tokens("fake").is_some_and(|t| t > 0));
-        assert!(client.estimated_tokens("nope").is_none());
+        // unknown one reports none. Disabling a tool shrinks the estimate.
+        let no_disabled = HashSet::new();
+        let full = client.estimated_tokens("fake", &no_disabled);
+        assert!(full.is_some_and(|t| t > 0));
+        assert!(client.estimated_tokens("nope", &no_disabled).is_none());
+        let all_off: HashSet<String> = client
+            .tool_names("fake")
+            .unwrap()
+            .iter()
+            .map(|t| qualified_name("fake", t))
+            .collect();
+        assert_eq!(client.estimated_tokens("fake", &all_off), Some(0));
         assert!(
             client.error_for("fake").is_none(),
             "healthy server has no error"

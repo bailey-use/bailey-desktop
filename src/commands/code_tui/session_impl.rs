@@ -1118,6 +1118,14 @@ is preserved."
             self.real_cwd.clone()
         };
         let disabled = self.effective_disabled_mcp_servers().await;
+        // Refresh the Ctrl+T tool opt-outs so row statuses count `· N off` right.
+        self.disabled_mcp_tools = self
+            .session_store
+            .get_disabled_mcp_tools()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         // Kick the connect off first so the snapshot below reads "connecting…".
         // Project stdio servers are gated (consent card) the same as on a turn.
         self.connect_mcp_with_consent(cwd.clone(), disabled.clone())
@@ -1135,6 +1143,7 @@ is preserved."
                         enabled,
                         scope: srv.scope,
                         command: srv.command,
+                        remote: srv.remote,
                     }
                 })
                 .collect();
@@ -1369,9 +1378,32 @@ is preserved."
             return ("off".to_string(), McpHealth::Disabled);
         }
         if let Some(client) = &self.mcp_client {
+            // A poisoned transport still carries its tool snapshot — surface the
+            // crash instead of a healthy-looking tool count.
+            if client.is_dead(name) {
+                return ("failed: connection lost".to_string(), McpHealth::Failed);
+            }
             if let Some(n) = client.tool_count(name) {
-                let plural = if n == 1 { "" } else { "s" };
-                return (format!("{n} tool{plural}"), McpHealth::Connected);
+                let off = client
+                    .tool_names(name)
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter(|t| {
+                                self.disabled_mcp_tools
+                                    .contains(&crate::agent::mcp::qualified_name(name, t))
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let on = n.saturating_sub(off);
+                let plural = if on == 1 { "" } else { "s" };
+                let status = if off > 0 {
+                    format!("{on} tool{plural} · {off} off")
+                } else {
+                    format!("{on} tool{plural}")
+                };
+                return (status, McpHealth::Connected);
             }
             // A 401 isn't a hard failure — the server just needs OAuth.
             if client.needs_auth(name) {
@@ -1423,6 +1455,115 @@ is preserved."
             self.mcp_configured_count = state.items.iter().filter(|i| i.enabled).count();
         }
         Ok(())
+    }
+
+    /// Open the Ctrl+T tool-toggle drill-in for the server at `index` in the
+    /// open `/mcp` overlay. Needs the server connected (tools are unknown
+    /// otherwise); keeps the `/mcp` state to restore on Esc.
+    pub(super) fn open_mcp_tools(&mut self, index: usize) {
+        let name = match &self.overlay {
+            Overlay::Mcp(state) => match state.items.get(index) {
+                Some(row) => row.name.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+        let details: Option<Vec<(String, String)>> = self
+            .mcp_client
+            .as_ref()
+            .and_then(|c| c.tool_details(&name))
+            .map(|v| {
+                v.into_iter()
+                    .map(|(t, d)| (t.to_string(), d.to_string()))
+                    .collect()
+            });
+        let Some(details) = details else {
+            self.notice = Some((
+                WARNING,
+                format!("`{name}` isn't connected — its tools are unknown"),
+            ));
+            return;
+        };
+        if details.is_empty() {
+            self.notice = Some((MUTED, format!("`{name}` exposes no tools")));
+            return;
+        }
+        let items: Vec<McpToolRow> = details
+            .into_iter()
+            .map(|(tool, desc)| McpToolRow {
+                enabled: !self
+                    .disabled_mcp_tools
+                    .contains(&crate::agent::mcp::qualified_name(&name, &tool)),
+                name: tool,
+                description: desc,
+            })
+            .collect();
+        let parent = match std::mem::replace(&mut self.overlay, Overlay::None) {
+            Overlay::Mcp(state) => Box::new(state),
+            other => {
+                self.overlay = other;
+                return;
+            }
+        };
+        self.overlay = Overlay::McpTools(McpToolsOverlay {
+            server: name,
+            parent,
+            items,
+            selected: 0,
+            query: String::new(),
+        });
+    }
+
+    /// Flip one tool in the Ctrl+T drill-in, persist it, and drop the engine so
+    /// the next turn advertises the filtered set. No reconnect — the server
+    /// connection is untouched; only what's advertised changes.
+    pub(super) async fn toggle_mcp_tool(&mut self, index: usize) -> Result<()> {
+        let Some((server, tool, enabled)) = (match &self.overlay {
+            Overlay::McpTools(state) => state
+                .items
+                .get(index)
+                .map(|item| (state.server.clone(), item.name.clone(), !item.enabled)),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let qualified = crate::agent::mcp::qualified_name(&server, &tool);
+        // Persist FIRST — a store failure must not leave the row, the cache,
+        // and the engine disagreeing about the tool's state.
+        self.session_store
+            .set_mcp_tool_enabled(&qualified, enabled)
+            .await?;
+        if let Overlay::McpTools(state) = &mut self.overlay
+            && let Some(item) = state.items.get_mut(index)
+        {
+            item.enabled = enabled;
+        }
+        if enabled {
+            self.disabled_mcp_tools.remove(&qualified);
+        } else {
+            self.disabled_mcp_tools.insert(qualified);
+        }
+        // Specs are baked in at set_external_tools — rebuild on the next turn.
+        self.agent_engine = None;
+        Ok(())
+    }
+
+    /// Retry the failed servers in the open `/mcp` overlay (Ctrl+R). Reuses the
+    /// preserve-live reconnect: connected servers are carried over verbatim, so
+    /// only failed / crashed / needs-auth ones actually reconnect.
+    pub(super) fn retry_mcp_failed(&mut self) {
+        let any_failed = match &self.overlay {
+            Overlay::Mcp(state) => state
+                .items
+                .iter()
+                .any(|i| matches!(i.health, McpHealth::Failed)),
+            _ => return,
+        };
+        if !any_failed {
+            self.notice = Some((MUTED, "No failed MCP servers to retry".to_string()));
+            return;
+        }
+        self.reconnect_mcp_preserving_for_overlay();
     }
 
     /// Kick a fresh background connect for the server set shown in the open `/mcp`
@@ -1573,16 +1714,16 @@ is preserved."
     /// the outcome via `RuntimeEvent::McpAuthorized`. A stdio server is rejected —
     /// OAuth only applies to `url` servers.
     pub(super) async fn authorize_mcp_server(&mut self, index: usize) -> Result<()> {
-        let Some((name, target)) = (match &self.overlay {
+        let Some((name, target, remote)) = (match &self.overlay {
             Overlay::Mcp(state) => state
                 .items
                 .get(index)
-                .map(|i| (i.name.clone(), i.command.clone())),
+                .map(|i| (i.name.clone(), i.command.clone(), i.remote)),
             _ => None,
         }) else {
             return Ok(());
         };
-        if !target.contains("://") {
+        if !remote {
             self.notice = Some((
                 WARNING,
                 format!("`{name}` is a stdio server — OAuth applies only to HTTP (url) servers"),
@@ -1599,6 +1740,14 @@ is preserved."
     /// `RuntimeEvent::McpAuthorized`. Shared by the explicit Ctrl+O action and the
     /// auto-authorize that follows adding a server that turns out to need OAuth.
     pub(super) fn start_mcp_authorize(&mut self, name: String, url: String) {
+        // A config url may carry `${VAR}` refs — resolve them like connect does.
+        let url = match crate::agent::mcp::expand_env_refs(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                self.notice = Some((WARNING, format!("`{name}`: {e}")));
+                return;
+            }
+        };
         self.notice = Some((
             MUTED,
             format!("Authorizing `{name}` — a browser window should open…"),
@@ -2063,36 +2212,10 @@ is preserved."
     }
 }
 
-/// Parse a `/mcp` add line into `(command, args)`, shell-splitting so quoted
-/// args/paths survive. The server name is derived from the command (see
-/// `mcp::derive_server_name`), not typed. `Err` is a user-facing message.
-/// If `input` is a bare http(s) URL (a remote Streamable HTTP server), the `{url}`
-/// JSON config to add for it; `None` for anything else (a `{…}` block or a
-/// command line, handled on their own paths).
-pub(super) fn bare_url_to_config(input: &str) -> Option<String> {
-    let t = input.trim();
-    if t.starts_with("http://") || t.starts_with("https://") {
-        let url = t.split_whitespace().next().unwrap_or(t);
-        Some(serde_json::json!({ "url": url }).to_string())
-    } else {
-        None
-    }
-}
+// The add-line parsing and name dedup moved to `crate::agent::mcp` so
+// `aivo mcp add` shares them; re-exported for the call sites and tests here.
+pub(super) use crate::agent::mcp::{bare_url_to_config, dedupe_name, parse_mcp_add_input};
 
-pub(super) fn parse_mcp_add_input(
-    input: &str,
-) -> std::result::Result<(String, Vec<String>), String> {
-    let tokens = shlex::split(input.trim()).unwrap_or_default();
-    let Some((command, args)) = tokens.split_first() else {
-        return Err(
-            "Usage: <command> [args…]  (e.g. npx -y @modelcontextprotocol/server-filesystem ~)"
-                .to_string(),
-        );
-    };
-    Ok((command.clone(), args.to_vec()))
-}
-
-/// Append `-2`, `-3`, … to `base` until it doesn't collide with an existing name.
 /// Stable key for the per-repo project-MCP allow-list: the canonicalized cwd
 /// (symlinks resolved, so the same repo reached two ways shares one decision),
 /// falling back to the raw path when it can't be canonicalized.
@@ -2100,16 +2223,6 @@ pub(super) fn canonical_dir_key(cwd: &str) -> String {
     std::fs::canonicalize(cwd)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| cwd.to_string())
-}
-
-fn dedupe_name(base: String, existing: &std::collections::HashSet<String>) -> String {
-    if !existing.contains(&base) {
-        return base;
-    }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !existing.contains(candidate))
-        .unwrap_or(base)
 }
 
 /// Appended to a `-p/--project` add/install notice: repo-local skills are

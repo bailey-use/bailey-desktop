@@ -57,6 +57,7 @@ pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     "stats",
     "update",
     "context",
+    "mcp",
     "mcp-serve",
     "share",
     "hf",

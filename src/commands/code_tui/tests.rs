@@ -1181,6 +1181,7 @@ fn make_test_app(
         mcp_client: None,
         mcp_connecting: false,
         mcp_connect_progress: std::collections::HashMap::new(),
+        disabled_mcp_tools: std::collections::HashSet::new(),
         mcp_connect_gen: 0,
         mcp_rebuild_pending: false,
         pending_mcp_auth: std::collections::HashMap::new(),
@@ -5093,6 +5094,7 @@ async fn test_apply_mcp_connected_refreshes_open_overlay() {
             enabled: true,
             scope: ServerScope::Project,
             command: "aivo_no_such_binary_zzz".to_string(),
+            remote: false,
         }],
         selected: 0,
         query: String::new(),
@@ -8356,6 +8358,7 @@ async fn project_mcp_server_connects_by_default_and_toggles_like_user() {
             enabled: true,
             scope: ServerScope::Project,
             command: "echo".to_string(),
+            remote: false,
         }],
         selected: 0,
         query: String::new(),
@@ -8395,6 +8398,7 @@ fn test_sort_mcp_rows_problems_first() {
         enabled: !matches!(health, McpHealth::Disabled),
         scope: ServerScope::User,
         command: "x".to_string(),
+        remote: false,
     };
     let mut rows = vec![
         row("zeta", McpHealth::Connected),
@@ -8555,6 +8559,7 @@ fn mcp_overlay_fixture() -> McpOverlay {
                 enabled: true,
                 scope: ServerScope::User,
                 command: "npx".to_string(),
+                remote: false,
             },
             McpServerRow {
                 name: "github".to_string(),
@@ -8563,6 +8568,7 @@ fn mcp_overlay_fixture() -> McpOverlay {
                 enabled: false,
                 scope: ServerScope::User,
                 command: "docker".to_string(),
+                remote: false,
             },
         ],
         selected: 0,
@@ -9491,10 +9497,11 @@ fn test_mcp_tool_lines_stacks_name_over_wrapped_desc() {
     let line_text =
         |line: &Line| -> String { line.spans.iter().map(|s| s.content.as_ref()).collect() };
     let tools = [
-        ("short_tool", "A brief description."),
+        ("short_tool", "A brief description.", true),
         (
             "browserslist_compatibility_check",
             "Check web feature compatibility against your browserslist configuration across many supported browsers.",
+            true,
         ),
     ];
     let lines: Vec<String> = mcp_tool_lines(&tools, 40).iter().map(line_text).collect();

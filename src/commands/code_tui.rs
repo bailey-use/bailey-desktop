@@ -223,6 +223,7 @@ impl CodeTuiApp {
             mcp_client: None,
             mcp_connecting: false,
             mcp_connect_progress: std::collections::HashMap::new(),
+            disabled_mcp_tools: std::collections::HashSet::new(),
             mcp_connect_gen: 0,
             mcp_rebuild_pending: false,
             pending_mcp_auth: std::collections::HashMap::new(),

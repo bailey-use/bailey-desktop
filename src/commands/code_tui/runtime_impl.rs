@@ -671,7 +671,23 @@ impl CodeTuiApp {
                 _ => None,
             };
             if let Some(client) = connected {
-                engine.set_external_tools(client);
+                // Advertise minus the Ctrl+T-disabled tools. Prefs are the source
+                // of truth (not the UI cache), so a toggle always lands on the
+                // next engine build even if `/mcp` was never opened this session.
+                let disabled: std::collections::HashSet<String> = self
+                    .session_store
+                    .get_disabled_mcp_tools()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                if disabled.is_empty() {
+                    engine.set_external_tools(client);
+                } else {
+                    engine.set_external_tools(std::sync::Arc::new(
+                        crate::agent::mcp::FilteredTools::new(client, disabled),
+                    ));
+                }
             } else if self.mcp_client.is_none() {
                 // Connect the configured servers the user hasn't disabled. A repo's
                 // project `.mcp.json` STDIO servers run local code, so they're held

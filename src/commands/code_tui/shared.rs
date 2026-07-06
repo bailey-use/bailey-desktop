@@ -658,6 +658,9 @@ pub(super) struct McpServerRow {
     pub(super) scope: crate::agent::mcp::ServerScope,
     /// The configured launch command, for the Enter drill-in detail view.
     pub(super) command: String,
+    /// `true` for a remote (`url`) server — drives the Ctrl+O gate and the
+    /// detail label without re-sniffing the display string.
+    pub(super) remote: bool,
 }
 
 /// The interactive `/mcp` overlay: a filterable toggle list of configured MCP
@@ -725,6 +728,54 @@ impl McpOverlay {
             self.pending_delete = Some(self.selected);
             false
         }
+    }
+}
+
+/// One row in the Ctrl+T per-server tool drill-in: an MCP tool and whether it's
+/// offered to the agent.
+#[derive(Clone, Debug)]
+pub(super) struct McpToolRow {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) enabled: bool,
+}
+
+/// The Ctrl+T tool-toggle sub-overlay for one MCP server. `parent` is the
+/// `/mcp` overlay state to restore on Esc (its statuses are refreshed then, so
+/// the server row's `· N off` count stays current).
+#[derive(Clone, Debug)]
+pub(super) struct McpToolsOverlay {
+    pub(super) server: String,
+    pub(super) parent: Box<McpOverlay>,
+    pub(super) items: Vec<McpToolRow>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+}
+
+impl McpToolsOverlay {
+    pub(super) fn filtered_indices(&self) -> Vec<usize> {
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.description.as_str())),
+        )
+    }
+
+    pub(super) fn select_prev(&mut self) {
+        move_within(&self.filtered_indices(), &mut self.selected, -1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        move_within(&self.filtered_indices(), &mut self.selected, 1);
+    }
+
+    pub(super) fn refilter(&mut self) {
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.filtered_indices().contains(&self.selected)
     }
 }
 
@@ -875,6 +926,8 @@ pub(super) enum Overlay {
     SkillInstall(SkillInstallOverlay),
     /// `/mcp` — the configured MCP servers with status, toggleable.
     Mcp(McpOverlay),
+    /// Ctrl+T from `/mcp` — one server's tools, individually toggleable.
+    McpTools(McpToolsOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
     Config(ConfigOverlay),
     Picker(Box<PickerState>),
@@ -1998,6 +2051,10 @@ pub(super) struct CodeTuiApp {
     /// while slower ones still read "connecting…". Cleared when a new connect
     /// starts; superseded by `mcp_client` once the whole connect lands.
     pub(super) mcp_connect_progress: std::collections::HashMap<String, (String, McpHealth)>,
+    /// Qualified `mcp__server__tool` names turned off with Ctrl+T — a UI-side
+    /// cache of code-prefs' `disabledMcpTools`, loaded when `/mcp` opens; the
+    /// engine re-reads the store on each rebuild, so this is display-only.
+    pub(super) disabled_mcp_tools: std::collections::HashSet<String>,
     /// Bumped whenever the configured server set changes (a `/mcp` toggle). A
     /// background connect carries the generation it started under; a result from
     /// an older generation is dropped, so a connect launched before a toggle can't

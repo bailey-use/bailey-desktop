@@ -197,29 +197,232 @@ pub fn remove_skill_dir(dir: &Path) -> Result<(), String> {
 
 // ── install from an online / local source ───────────────────────────────────
 //
-// Follows the Agent Skills `skills/*/SKILL.md` convention shared by `npx skills`
-// and `gh skill install`: scan a fetched source tree for skill folders (root
-// SKILL.md + `skills/<name>` flat + `skills/<cat>/<name>` catalog under the
-// standard containers), then COPY the chosen folder(s) into the user skills dir.
+// Follows the Agent Skills `skills/*/SKILL.md` convention (`npx skills`,
+// `gh skill install`). Fetch and copy are separate steps so a UI can pick from
+// a multi-skill source without re-downloading.
 
-/// What `install_from_source` resolved to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstallOutcome {
-    /// Skills copied in, by display name.
-    Installed(Vec<String>),
-    /// The source held several skills and none was picked — names to choose from
-    /// (re-run with `<source> <name>` or `<source> *`).
-    Ambiguous(Vec<String>),
+/// What a completed copy did: fresh installs, in-place updates, and names
+/// skipped because a same-named skill already exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallReport {
+    pub installed: Vec<String>,
+    pub updated: Vec<String>,
+    pub skipped_existing: Vec<String>,
 }
 
-/// Scan a source tree for installable skills, following the `skills/*/SKILL.md`
-/// convention: a root `SKILL.md`, plus skill folders one level deep
-/// (`skills/<name>/SKILL.md`) and one catalog level (`skills/<cat>/<name>/`)
-/// under `skills/`, `.agents/skills/`, `.claude/skills/`, `.github/skills/`.
-/// Deduped by skill name (first wins), sorted for determinism.
+impl InstallReport {
+    fn merge(&mut self, other: InstallReport) {
+        self.installed.extend(other.installed);
+        self.updated.extend(other.updated);
+        self.skipped_existing.extend(other.skipped_existing);
+    }
+}
+
+/// Provenance file inside each installed skill; `/skills update` re-fetches from it.
+const SOURCE_FILE: &str = ".aivo-source.json";
+
+/// The source recorded at install time, if any.
+pub fn skill_source(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(SOURCE_FILE)).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("source")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// What `install_or_stage` resolved to.
+#[derive(Debug)]
+pub enum InstallOrStage {
+    Installed(InstallReport),
+    /// Several skills, no filter — kept staged so a picker installs without re-fetching.
+    Pick(StagedInstall),
+}
+
+/// A fetched-and-scanned source held on disk until the pick resolves. Drop
+/// removes the downloaded temp tree (a staged local path has nothing to clean).
+#[derive(Debug)]
+pub struct StagedInstall {
+    /// Recorded as provenance in every skill this stage installs.
+    source: String,
+    /// Scan root: the extracted tree, or its `/tree/<ref>/<path>` subfolder.
+    root: PathBuf,
+    cleanup: Option<PathBuf>,
+    /// Discovered candidates, sorted by name.
+    pub skills: Vec<Skill>,
+}
+
+impl Drop for StagedInstall {
+    fn drop(&mut self) {
+        if let Some(tmp) = self.cleanup.take() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+}
+
+impl StagedInstall {
+    /// Which staged skills already exist in the user skills dir, index-aligned
+    /// with `skills`.
+    pub fn already_installed(&self) -> Vec<bool> {
+        let dest = user_skills_dir();
+        self.skills
+            .iter()
+            .map(|s| {
+                dest.as_ref().is_some_and(|root| {
+                    let folder = skill_folder_name(&s.name);
+                    !folder.is_empty() && root.join(folder).exists()
+                })
+            })
+            .collect()
+    }
+
+    /// Copy the named staged skills into `~/.config/aivo/skills`. An existing
+    /// name is skipped, or replaced in place when `update_existing`.
+    pub fn install(
+        &self,
+        names: &[String],
+        update_existing: bool,
+    ) -> Result<InstallReport, String> {
+        let dest_root = user_skills_dir().ok_or("no home directory")?;
+        self.install_into(&dest_root, names, update_existing)
+    }
+
+    /// Inner with the destination root injected (tests install into a tempdir).
+    fn install_into(
+        &self,
+        dest_root: &Path,
+        names: &[String],
+        update_existing: bool,
+    ) -> Result<InstallReport, String> {
+        // Symlink-escape guard: a candidate skill dir must canonicalize (through
+        // every symlink in its chain) to a path inside the fetched tree, else an
+        // untrusted repo's `skills/x -> /etc` would copy the link target's real
+        // files into the user's skills dir. Like `archive::find_executable`.
+        let root_canon = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let mut report = InstallReport::default();
+        for name in names {
+            let skill = self
+                .skills
+                .iter()
+                .find(|s| &s.name == name)
+                .ok_or_else(|| format!("no staged skill named `{name}`"))?;
+            let folder = skill_folder_name(&skill.name);
+            if folder.is_empty() {
+                return Err(format!("skill `{}` has no usable folder name", skill.name));
+            }
+            let escapes = std::fs::canonicalize(&skill.dir)
+                .map(|c| !c.starts_with(&root_canon))
+                .unwrap_or(true);
+            if escapes {
+                return Err(format!(
+                    "skill `{}` resolves outside the source tree (symlink escape) — refusing to install",
+                    skill.name
+                ));
+            }
+            let dest = dest_root.join(&folder);
+            let existed = dest.exists();
+            if existed {
+                if !update_existing {
+                    report.skipped_existing.push(skill.name.clone());
+                    continue;
+                }
+                // Same can't-nuke-a-random-folder guard as `/skills rm`.
+                remove_skill_dir(&dest)?;
+            }
+            copy_dir_all(&skill.dir, &dest)
+                .map_err(|e| format!("copying `{}`: {e}", skill.name))?;
+            let _ = std::fs::write(
+                dest.join(SOURCE_FILE),
+                format!("{{\"source\": {}}}\n", serde_json::json!(&self.source)),
+            );
+            if existed {
+                report.updated.push(skill.name.clone());
+            } else {
+                report.installed.push(skill.name.clone());
+            }
+        }
+        Ok(report)
+    }
+}
+
+/// Re-fetch installed skills from their recorded sources and replace them:
+/// `Some(name)` for one, `None` for every skill carrying provenance.
+pub async fn update_installed_skills(
+    only: Option<&str>,
+    progress: Option<DownloadProgress>,
+) -> Result<InstallReport, String> {
+    let dest_root = user_skills_dir().ok_or("no home directory")?;
+    update_installed_skills_in(&dest_root, only, progress).await
+}
+
+/// Inner with the skills root injected (tests update inside a tempdir).
+async fn update_installed_skills_in(
+    dest_root: &Path,
+    only: Option<&str>,
+    progress: Option<DownloadProgress>,
+) -> Result<InstallReport, String> {
+    // One fetch per distinct recorded source.
+    let mut by_source: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let installed = read_root(dest_root);
+    match only {
+        Some(name) => {
+            let skill = installed
+                .iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| format!("no skill named `{name}` in {}", dest_root.display()))?;
+            let source = skill_source(&skill.dir).ok_or_else(|| {
+                format!(
+                    "`{name}` has no recorded source (installed before sources were tracked, \
+scaffolded, or hand-copied) — reinstall it with /skills add <source>"
+                )
+            })?;
+            by_source.entry(source).or_default().push(name.to_string());
+        }
+        None => {
+            for skill in &installed {
+                if let Some(source) = skill_source(&skill.dir) {
+                    by_source
+                        .entry(source)
+                        .or_default()
+                        .push(skill.name.clone());
+                }
+            }
+            if by_source.is_empty() {
+                return Err("no installed skills have a recorded source to update from".to_string());
+            }
+        }
+    }
+    let mut report = InstallReport::default();
+    for (source, names) in by_source {
+        let staged = stage_install(&source, progress.clone()).await?;
+        for name in &names {
+            if !staged.skills.iter().any(|s| &s.name == name) {
+                return Err(format!("skill `{name}` no longer exists in `{source}`"));
+            }
+        }
+        report.merge(staged.install_into(dest_root, &names, true)?);
+    }
+    Ok(report)
+}
+
+/// Scan a source tree for installable skills: a root `SKILL.md`, folders
+/// directly under the root (what a `/tree/…/skills` container URL resolves to),
+/// and flat + one catalog level under the standard containers. Deduped by name
+/// (first wins), sorted for determinism.
 pub fn discover_installable(root: &Path) -> Vec<Skill> {
     let mut found: Vec<Skill> = Vec::new();
     try_push_skill(root, &mut found); // the source root itself may be a skill
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut subdirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        subdirs.sort();
+        for sub in subdirs {
+            try_push_skill(&sub, &mut found); // flat at the root: <name>/SKILL.md
+        }
+    }
     for container in [
         "skills",
         ".agents/skills",
@@ -263,83 +466,77 @@ fn try_push_skill(dir: &Path, found: &mut Vec<Skill>) {
     }
 }
 
-/// Fetch + discover + copy skills from `source` (a `github:owner/repo[@ref]`,
-/// `gh:`, bare `github.com/owner/repo`, or local path) into `~/.config/aivo/skills`.
-/// `only` filters: `Some("*")` = all, `Some(name)` = just that one, `None` =
-/// install the sole skill or report `Ambiguous` when there are several.
-pub async fn install_from_source(
+/// Live byte counter written by the tarball download, polled for the UI readout.
+pub type DownloadProgress = std::sync::Arc<std::sync::atomic::AtomicU64>;
+
+/// Fetch `source` (github:owner/repo[@ref], a github.com repo or /tree/… URL,
+/// or a local path) and scan it; the tree stays on disk inside the stage.
+pub async fn stage_install(
+    source: &str,
+    progress: Option<DownloadProgress>,
+) -> Result<StagedInstall, String> {
+    let tree = fetch_source_tree(source, progress.as_deref()).await?;
+    let mut skills = discover_installable(&tree.root);
+    if skills.is_empty() {
+        if let Some(tmp) = &tree.cleanup {
+            let _ = std::fs::remove_dir_all(tmp);
+        }
+        return Err(format!(
+            "no SKILL.md found in `{source}` (looked at the root and skills/ folders)"
+        ));
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(StagedInstall {
+        source: source.to_string(),
+        root: tree.root,
+        cleanup: tree.cleanup,
+        skills,
+    })
+}
+
+/// Fetch + discover, then install when unambiguous (`only`: name / `"*"` /
+/// sole skill); a multi-skill source with no filter comes back as `Pick`.
+pub async fn install_or_stage(
     source: &str,
     only: Option<&str>,
-) -> Result<InstallOutcome, String> {
+    progress: Option<DownloadProgress>,
+) -> Result<InstallOrStage, String> {
     let dest_root = user_skills_dir().ok_or("no home directory")?;
-    install_from_source_into(&dest_root, source, only).await
+    install_or_stage_into(&dest_root, source, only, progress).await
 }
 
 /// Inner with the destination root injected, so a test installs into a tempdir
 /// instead of the real `~/.config/aivo/skills`.
-async fn install_from_source_into(
+async fn install_or_stage_into(
     dest_root: &Path,
     source: &str,
     only: Option<&str>,
-) -> Result<InstallOutcome, String> {
-    let tree = fetch_source_tree(source).await?;
-    let result = (|| {
-        let mut skills = discover_installable(&tree.root);
-        if skills.is_empty() {
-            return Err(format!(
-                "no SKILL.md found in `{source}` (looked at the root and skills/ folders)"
-            ));
-        }
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        match only {
-            Some("*") => {}
-            Some(name) => {
-                skills.retain(|s| s.name == name);
-                if skills.is_empty() {
-                    return Err(format!("no skill named `{name}` in `{source}`"));
-                }
+    progress: Option<DownloadProgress>,
+) -> Result<InstallOrStage, String> {
+    let staged = stage_install(source, progress).await?;
+    let all: Vec<String> = staged.skills.iter().map(|s| s.name.clone()).collect();
+    match only {
+        Some("*") => staged
+            .install_into(dest_root, &all, false)
+            .map(InstallOrStage::Installed),
+        Some(name) => {
+            if !all.iter().any(|n| n == name) {
+                return Err(format!("no skill named `{name}` in `{source}`"));
             }
-            None if skills.len() > 1 => {
-                return Ok(InstallOutcome::Ambiguous(
-                    skills.into_iter().map(|s| s.name).collect(),
-                ));
-            }
-            None => {}
-        }
-        // Symlink-escape guard: a candidate skill dir must canonicalize (through
-        // every symlink in its chain) to a path inside the fetched tree, else an
-        // untrusted repo's `skills/x -> /etc` would copy the link target's real
-        // files into the user's skills dir. Like `archive::find_executable`.
-        let root_canon = std::fs::canonicalize(&tree.root).unwrap_or_else(|_| tree.root.clone());
-        let mut installed = Vec::new();
-        for skill in &skills {
-            let folder = skill_folder_name(&skill.name);
-            if folder.is_empty() {
-                return Err(format!("skill `{}` has no usable folder name", skill.name));
-            }
-            let escapes = std::fs::canonicalize(&skill.dir)
-                .map(|c| !c.starts_with(&root_canon))
-                .unwrap_or(true);
-            if escapes {
+            let report =
+                staged.install_into(dest_root, std::slice::from_ref(&name.to_string()), false)?;
+            if report.installed.is_empty() {
                 return Err(format!(
-                    "skill `{}` resolves outside the source tree (symlink escape) — refusing to install",
-                    skill.name
+                    "a skill named `{name}` already exists (try `/skills update {name}`)"
                 ));
             }
-            let dest = dest_root.join(&folder);
-            if dest.exists() {
-                return Err(format!("a skill named `{folder}` already exists"));
-            }
-            copy_dir_all(&skill.dir, &dest)
-                .map_err(|e| format!("copying `{}`: {e}", skill.name))?;
-            installed.push(skill.name.clone());
+            Ok(InstallOrStage::Installed(report))
         }
-        Ok(InstallOutcome::Installed(installed))
-    })();
-    if let Some(tmp) = &tree.cleanup {
-        let _ = std::fs::remove_dir_all(tmp);
+        None if all.len() > 1 => Ok(InstallOrStage::Pick(staged)),
+        None => staged
+            .install_into(dest_root, &all, false)
+            .map(InstallOrStage::Installed),
     }
-    result
 }
 
 /// A resolved source tree on disk: `root` is where to scan; `cleanup` is a temp
@@ -349,8 +546,17 @@ struct SourceTree {
     cleanup: Option<PathBuf>,
 }
 
-async fn fetch_source_tree(source: &str) -> Result<SourceTree, String> {
+async fn fetch_source_tree(
+    source: &str,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<SourceTree, String> {
     use crate::plugin::source::{SourceKind, classify};
+    // A deep `/tree/<ref>/<path>` (or `/blob/…/SKILL.md`) folder link — the URL a
+    // browser hands you on a skill's page — before `classify`, which would call
+    // any deep github.com URL a direct asset.
+    if let Some((owner, repo, gref, subpath)) = parse_github_tree_url(source) {
+        return fetch_github_tree(&owner, &repo, Some(&gref), subpath.as_deref(), progress).await;
+    }
     match classify(source).map_err(|e| e.to_string())? {
         SourceKind::LocalPath => {
             let path = PathBuf::from(shellexpand_tilde(source));
@@ -363,47 +569,103 @@ async fn fetch_source_tree(source: &str) -> Result<SourceTree, String> {
             })
         }
         SourceKind::GitHub { owner, repo, tag } => {
-            let tmp = std::env::temp_dir().join(format!(
-                "aivo-skill-install-{}-{}",
-                std::process::id(),
-                next_install_seq()
-            ));
-            let _ = std::fs::remove_dir_all(&tmp);
-            std::fs::create_dir_all(&tmp).map_err(|e| format!("create temp dir: {e}"))?;
-            let tgz = tmp.join("source.tar.gz");
-            // Stream the tarball straight to disk with a hard byte cap so a giant
-            // (or malicious) repo can't spike memory by being read whole into RAM.
-            download_github_tarball(&owner, &repo, tag.as_deref(), &tgz)
-                .await
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                })?;
-            crate::services::archive::extract_archive(
-                &tgz,
-                &tmp,
-                crate::services::archive::ArchiveKind::TarGz,
-            )
-            .map_err(|e| {
-                let _ = std::fs::remove_dir_all(&tmp);
-                format!("extract tarball: {e}")
-            })?;
-            let _ = std::fs::remove_file(&tgz);
-            // Guard against a compression bomb: tiny on the wire, huge on disk.
-            if let Err(e) = enforce_extracted_caps(&tmp) {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(e);
-            }
-            // GitHub wraps everything in one `owner-repo-<sha>/` folder.
-            let _ = crate::services::archive::flatten_single_subdir(&tmp);
-            Ok(SourceTree {
-                root: tmp.clone(),
-                cleanup: Some(tmp),
-            })
+            fetch_github_tree(&owner, &repo, tag.as_deref(), None, progress).await
         }
         SourceKind::DirectUrl | SourceKind::Npm { .. } | SourceKind::Cargo { .. } => Err(format!(
-            "`{source}`: skills install from a github:owner/repo, a github.com URL, or a local path"
+            "`{source}`: skills install from a github:owner/repo, a github.com repo or /tree/… folder URL, or a local path"
         )),
     }
+}
+
+/// Download + extract a GitHub repo at `gref` (default branch when `None`),
+/// scoping the scan root to `subpath` when given.
+async fn fetch_github_tree(
+    owner: &str,
+    repo: &str,
+    gref: Option<&str>,
+    subpath: Option<&str>,
+    progress: Option<&std::sync::atomic::AtomicU64>,
+) -> Result<SourceTree, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "aivo-skill-install-{}-{}",
+        std::process::id(),
+        next_install_seq()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("create temp dir: {e}"))?;
+    let tgz = tmp.join("source.tar.gz");
+    // Stream the tarball straight to disk with a hard byte cap so a giant
+    // (or malicious) repo can't spike memory by being read whole into RAM.
+    download_github_tarball(owner, repo, gref, &tgz, progress)
+        .await
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&tmp);
+        })?;
+    crate::services::archive::extract_archive(
+        &tgz,
+        &tmp,
+        crate::services::archive::ArchiveKind::TarGz,
+    )
+    .map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        format!("extract tarball: {e}")
+    })?;
+    let _ = std::fs::remove_file(&tgz);
+    // Guard against a compression bomb: tiny on the wire, huge on disk.
+    if let Err(e) = enforce_extracted_caps(&tmp) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    // GitHub wraps everything in one `owner-repo-<sha>/` folder.
+    let _ = crate::services::archive::flatten_single_subdir(&tmp);
+    let root = match subpath {
+        Some(sub) => {
+            let scoped = tmp.join(sub);
+            if !scoped.is_dir() {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(format!("`{sub}` not found in {owner}/{repo}"));
+            }
+            scoped
+        }
+        None => tmp.clone(),
+    };
+    Ok(SourceTree {
+        root,
+        cleanup: Some(tmp),
+    })
+}
+
+/// Parse `github.com/<owner>/<repo>/tree|blob/<ref>[/<path…>]` into
+/// `(owner, repo, ref, subpath)`. A blob URL's trailing `SKILL.md` is dropped;
+/// the first segment after tree/blob is the ref (a `/`-branch is
+/// indistinguishable from the path in a URL alone); dot-segments are rejected.
+fn parse_github_tree_url(source: &str) -> Option<(String, String, String, Option<String>)> {
+    let rest = source
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.strip_prefix("github.com/")?;
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.len() < 4 || !matches!(segs[2], "tree" | "blob") {
+        return None;
+    }
+    let mut tail = &segs[4..];
+    if segs[2] == "blob" {
+        // A file link: only SKILL.md makes sense, and its skill is the folder.
+        tail = tail.strip_suffix(&["SKILL.md"]).unwrap_or(tail);
+    }
+    if tail.iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    let subpath = (!tail.is_empty()).then(|| tail.join("/"));
+    Some((
+        segs[0].to_string(),
+        segs[1].trim_end_matches(".git").to_string(),
+        segs[3].to_string(),
+        subpath,
+    ))
 }
 
 /// Hard cap on a downloaded skill tarball (compressed). Skills are a few KB of
@@ -424,6 +686,7 @@ async fn download_github_tarball(
     repo: &str,
     gref: Option<&str>,
     dest: &Path,
+    progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     use std::io::Write;
     let base =
@@ -456,6 +719,9 @@ async fn download_github_tarball(
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 total += chunk.len() as u64;
+                if let Some(p) = progress {
+                    p.store(total, std::sync::atomic::Ordering::Relaxed);
+                }
                 if total > MAX_SKILL_TARBALL_BYTES {
                     drop(file);
                     let _ = std::fs::remove_file(dest);
@@ -1274,8 +1540,9 @@ mod tests {
         assert_eq!(skill_folder_name("--edge--"), "edge");
     }
 
-    /// `discover_installable` finds a root SKILL.md, a flat `skills/<name>`, and a
-    /// catalog `skills/<cat>/<name>` — the `skills/*/SKILL.md` convention.
+    /// `discover_installable` finds a root SKILL.md, a folder directly under the
+    /// root (`<name>/SKILL.md` — what a pasted container URL resolves to), a flat
+    /// `skills/<name>`, and a catalog `skills/<cat>/<name>`.
     #[test]
     fn discover_installable_covers_root_flat_and_catalog() {
         let root = tmp();
@@ -1284,6 +1551,11 @@ mod tests {
             "---\nname: root-skill\ndescription: d\n---\nBody.\n",
         )
         .unwrap();
+        write_skill(
+            &root,
+            "toplevel",
+            "---\nname: toplevel-skill\ndescription: d\n---\nBody.\n",
+        );
         write_skill(
             &root.join("skills"),
             "flat",
@@ -1299,12 +1571,74 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert!(names.contains(&"root-skill".to_string()), "{names:?}");
+        assert!(names.contains(&"toplevel-skill".to_string()), "{names:?}");
         assert!(names.contains(&"flat-skill".to_string()), "{names:?}");
         assert!(names.contains(&"deep-skill".to_string()), "{names:?}");
     }
 
-    /// End-to-end install from a LOCAL source into a tempdir (no network): the
-    /// sole-skill, ambiguous-many, pick-one, install-all, and collision cases.
+    #[test]
+    fn parse_github_tree_url_shapes() {
+        assert_eq!(
+            parse_github_tree_url("https://github.com/anthropics/skills/tree/main/skills/pdf"),
+            Some((
+                "anthropics".into(),
+                "skills".into(),
+                "main".into(),
+                Some("skills/pdf".into())
+            ))
+        );
+        assert_eq!(
+            parse_github_tree_url("github.com/o/r/blob/main/skills/pdf/SKILL.md"),
+            Some((
+                "o".into(),
+                "r".into(),
+                "main".into(),
+                Some("skills/pdf".into())
+            ))
+        );
+        assert_eq!(
+            parse_github_tree_url("https://www.github.com/o/r/tree/v1.2?tab=readme#x"),
+            Some(("o".into(), "r".into(), "v1.2".into(), None))
+        );
+        assert_eq!(
+            parse_github_tree_url("https://github.com/o/r/tree/main/../../etc"),
+            None
+        );
+        assert_eq!(parse_github_tree_url("https://github.com/o/r"), None);
+        assert_eq!(
+            parse_github_tree_url("https://example.com/o/r/tree/main"),
+            None
+        );
+        assert_eq!(parse_github_tree_url("github:o/r"), None);
+    }
+
+    /// Drop removes a downloaded tree but never a staged local path.
+    #[tokio::test]
+    async fn staged_install_drop_cleans_only_downloads() {
+        let src = tmp();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: solo\ndescription: d\n---\nBody.\n",
+        )
+        .unwrap();
+        let staged = stage_install(src.to_str().unwrap(), None).await.unwrap();
+        assert_eq!(staged.skills.len(), 1);
+        drop(staged);
+        assert!(src.join("SKILL.md").is_file(), "local source must survive");
+
+        let fake_tmp = tmp();
+        let staged = StagedInstall {
+            source: "test".to_string(),
+            root: fake_tmp.clone(),
+            cleanup: Some(fake_tmp.clone()),
+            skills: Vec::new(),
+        };
+        drop(staged);
+        assert!(!fake_tmp.exists(), "downloaded tree cleaned on drop");
+    }
+
+    /// Install from a LOCAL source (no network): sole-skill, stage-for-pick,
+    /// pick-one, install-all, and collision cases.
     #[tokio::test]
     async fn install_from_local_source_paths() {
         // A single-skill source (root SKILL.md) installs straight away.
@@ -1315,13 +1649,15 @@ mod tests {
         )
         .unwrap();
         let dest = tmp();
-        let out = install_from_source_into(&dest, solo_src.to_str().unwrap(), None)
+        let out = install_or_stage_into(&dest, solo_src.to_str().unwrap(), None, None)
             .await
             .unwrap();
-        assert_eq!(out, InstallOutcome::Installed(vec!["solo".to_string()]));
+        assert!(
+            matches!(&out, InstallOrStage::Installed(r) if r.installed == ["solo"]),
+            "sole skill installs directly"
+        );
         assert!(dest.join("solo").join("SKILL.md").is_file());
 
-        // A multi-skill source with no filter is Ambiguous (installs nothing).
         let pack = tmp();
         write_skill(
             &pack.join("skills"),
@@ -1334,38 +1670,46 @@ mod tests {
             "---\nname: beta\ndescription: d\n---\nB\n",
         );
         let dest2 = tmp();
-        let out = install_from_source_into(&dest2, pack.to_str().unwrap(), None)
+        let out = install_or_stage_into(&dest2, pack.to_str().unwrap(), None, None)
             .await
             .unwrap();
-        assert!(
-            matches!(&out, InstallOutcome::Ambiguous(n) if n.len() == 2),
-            "{out:?}"
-        );
-        assert!(
-            !dest2.join("alpha").exists(),
-            "ambiguous must install nothing"
-        );
+        let InstallOrStage::Pick(staged) = out else {
+            panic!("multi-skill source must stage for a pick");
+        };
+        let staged_names: Vec<&str> = staged.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(staged_names, ["alpha", "beta"]);
+        assert!(!dest2.join("alpha").exists(), "staging installs nothing");
 
-        // Picking one installs just it; a second pick collides.
-        let out = install_from_source_into(&dest2, pack.to_str().unwrap(), Some("alpha"))
-            .await
+        let report = staged
+            .install_into(&dest2, &["alpha".to_string()], false)
             .unwrap();
-        assert_eq!(out, InstallOutcome::Installed(vec!["alpha".to_string()]));
+        assert_eq!(report.installed, ["alpha"]);
         assert!(dest2.join("alpha").join("SKILL.md").is_file());
         assert!(!dest2.join("beta").exists());
-        let err = install_from_source_into(&dest2, pack.to_str().unwrap(), Some("alpha"))
+        let report = staged
+            .install_into(&dest2, &["alpha".to_string(), "beta".to_string()], false)
+            .unwrap();
+        assert_eq!(report.installed, ["beta"]);
+        assert_eq!(report.skipped_existing, ["alpha"]);
+        assert!(
+            staged
+                .install_into(&dest2, &["nope".to_string()], false)
+                .is_err()
+        );
+
+        let err = install_or_stage_into(&dest2, pack.to_str().unwrap(), Some("alpha"), None)
             .await
             .unwrap_err();
         assert!(err.contains("already exists"), "{err}");
 
         // `*` installs all.
         let dest3 = tmp();
-        let out = install_from_source_into(&dest3, pack.to_str().unwrap(), Some("*"))
+        let out = install_or_stage_into(&dest3, pack.to_str().unwrap(), Some("*"), None)
             .await
             .unwrap();
         assert!(
-            matches!(&out, InstallOutcome::Installed(n) if n.len() == 2),
-            "{out:?}"
+            matches!(&out, InstallOrStage::Installed(r) if r.installed.len() == 2),
+            "`*` installs all"
         );
     }
 
@@ -1373,15 +1717,132 @@ mod tests {
     async fn install_from_local_source_errors() {
         // A directory with no SKILL.md anywhere.
         let empty = tmp();
-        let err = install_from_source_into(&tmp(), empty.to_str().unwrap(), None)
+        let err = install_or_stage_into(&tmp(), empty.to_str().unwrap(), None, None)
             .await
             .unwrap_err();
         assert!(err.contains("no SKILL.md"), "{err}");
         // A path that isn't a directory.
-        let err = install_from_source_into(&tmp(), "/no/such/aivo/skill/dir", None)
+        let err = install_or_stage_into(&tmp(), "/no/such/aivo/skill/dir", None, None)
             .await
             .unwrap_err();
         assert!(err.contains("not a directory"), "{err}");
+        // A filter naming a skill the source doesn't have.
+        let src = tmp();
+        std::fs::write(
+            src.join("SKILL.md"),
+            "---\nname: solo\ndescription: d\n---\nB\n",
+        )
+        .unwrap();
+        let err = install_or_stage_into(&tmp(), src.to_str().unwrap(), Some("ghost"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no skill named `ghost`"), "{err}");
+    }
+
+    /// Install records provenance; `update_existing` replaces in place and
+    /// reports `updated`.
+    #[tokio::test]
+    async fn install_records_provenance_and_update_replaces() {
+        let src = tmp();
+        write_skill(
+            &src,
+            "solo",
+            "---\nname: solo\ndescription: d\n---\nold body\n",
+        );
+        let dest = tmp();
+        let source_str = src.to_str().unwrap().to_string();
+
+        let staged = stage_install(&source_str, None).await.unwrap();
+        let report = staged
+            .install_into(&dest, &["solo".to_string()], false)
+            .unwrap();
+        assert_eq!(report.installed, ["solo"]);
+        assert_eq!(
+            skill_source(&dest.join("solo")).as_deref(),
+            Some(source_str.as_str())
+        );
+
+        // Upstream changes; a plain re-install skips, an update replaces.
+        std::fs::write(
+            src.join("solo").join("SKILL.md"),
+            "---\nname: solo\ndescription: d2\n---\nnew body\n",
+        )
+        .unwrap();
+        let staged = stage_install(&source_str, None).await.unwrap();
+        let report = staged
+            .install_into(&dest, &["solo".to_string()], false)
+            .unwrap();
+        assert_eq!(report.skipped_existing, ["solo"]);
+        let report = staged
+            .install_into(&dest, &["solo".to_string()], true)
+            .unwrap();
+        assert_eq!(report.updated, ["solo"]);
+        assert!(report.installed.is_empty());
+        let body = std::fs::read_to_string(dest.join("solo").join("SKILL.md")).unwrap();
+        assert!(body.contains("new body"), "update must replace the folder");
+        assert!(skill_source(&dest.join("solo")).is_some());
+    }
+
+    /// Update by name, update-all with provenance, and the error paths.
+    #[tokio::test]
+    async fn update_installed_skills_paths() {
+        let src = tmp();
+        write_skill(&src, "aaa", "---\nname: aaa\ndescription: d\n---\nv1\n");
+        write_skill(&src, "bbb", "---\nname: bbb\ndescription: d\n---\nv1\n");
+        let dest = tmp();
+        let staged = stage_install(src.to_str().unwrap(), None).await.unwrap();
+        staged
+            .install_into(&dest, &["aaa".to_string(), "bbb".to_string()], false)
+            .unwrap();
+        write_skill(&dest, "loner", "---\nname: loner\ndescription: d\n---\nx\n");
+
+        // Upstream moves to v2; a named update pulls just that one.
+        for name in ["aaa", "bbb"] {
+            std::fs::write(
+                src.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\n---\nv2\n"),
+            )
+            .unwrap();
+        }
+        let report = update_installed_skills_in(&dest, Some("aaa"), None)
+            .await
+            .unwrap();
+        assert_eq!(report.updated, ["aaa"]);
+        assert!(
+            std::fs::read_to_string(dest.join("aaa").join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+        assert!(
+            std::fs::read_to_string(dest.join("bbb").join("SKILL.md"))
+                .unwrap()
+                .contains("v1"),
+            "named update must not touch siblings"
+        );
+
+        // Unnamed updates everything with provenance; the loner is left alone.
+        let report = update_installed_skills_in(&dest, None, None).await.unwrap();
+        assert_eq!(report.updated, ["aaa", "bbb"]);
+        assert!(
+            std::fs::read_to_string(dest.join("bbb").join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+
+        let err = update_installed_skills_in(&dest, Some("ghost"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no skill named `ghost`"), "{err}");
+        let err = update_installed_skills_in(&dest, Some("loner"), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no recorded source"), "{err}");
+        let bare = tmp();
+        write_skill(&bare, "solo", "---\nname: solo\ndescription: d\n---\nx\n");
+        let err = update_installed_skills_in(&bare, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("recorded source"), "{err}");
     }
 
     /// The extracted-tree guard rejects an archive that busts the entry cap or
@@ -1464,7 +1925,7 @@ mod tests {
         );
 
         let dest = tmp();
-        let err = install_from_source_into(&dest, src.to_str().unwrap(), Some("evil"))
+        let err = install_or_stage_into(&dest, src.to_str().unwrap(), Some("evil"), None)
             .await
             .unwrap_err();
         assert!(

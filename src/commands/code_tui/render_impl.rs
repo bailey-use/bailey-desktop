@@ -435,19 +435,21 @@ impl CodeTuiApp {
     /// or `None` when idle. Rebuilt per frame and appended after the cached body
     /// so animation never invalidates the cache.
     pub(super) fn spinner_status_line(&self) -> Option<StyledLine> {
-        // A background skill install drives the status spinner when no turn or
-        // `!cmd` run owns it.
+        // A background skill install drives the spinner when no turn or `!cmd`
+        // owns it. Suppressed while a skills modal is open — its row narrates,
+        // and the status must show in exactly one place.
         if !self.sending
             && self.local_command.is_none()
-            && let Some((source, started)) = &self.installing_skill
+            && !matches!(self.overlay, Overlay::Skills(_) | Overlay::SkillInstall(_))
+            && let Some(progress) = &self.installing_skill
         {
             let mut block = Vec::new();
             render_pending_status(
                 &mut block,
                 self.frame_tick,
                 self.reduce_motion,
-                started.elapsed(),
-                &format!("Installing skill from {source}"),
+                progress.started.elapsed(),
+                &progress.status_text(),
                 "",
             );
             return block.into_iter().next();
@@ -851,6 +853,20 @@ impl CodeTuiApp {
                         s.detail_scroll = c;
                     }
                     // Canonicalize a drill-in that a resize carried into split mode.
+                    if split {
+                        s.viewing = None;
+                    }
+                }
+            }
+            Overlay::SkillInstall(pick) => {
+                let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
+                self.screen_region = Some(overlay_content_rect(area));
+                let out = self.render_skill_install_overlay(frame, area, &pick, split);
+                self.overlay_detail_area = out.detail_area;
+                if let Overlay::SkillInstall(s) = &mut self.overlay {
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
                     if split {
                         s.viewing = None;
                     }
@@ -1807,6 +1823,7 @@ impl CodeTuiApp {
                 self.display_cwd().to_string(),
             ];
             rows.extend(self.notice_plain_lines(content_width));
+            rows.extend(self.spinner_status_plain_lines(content_width));
             wrap_plain_lines(&rows, content_width).len() as u16
         } else {
             let mut rows = self.transcript_intro_lines();
@@ -1817,6 +1834,7 @@ impl CodeTuiApp {
                     .map(|line| plain_text_from_spans(&line.spans)),
             );
             rows.extend(self.notice_plain_lines(content_width));
+            rows.extend(self.spinner_status_plain_lines(content_width));
             wrap_plain_lines(&rows, content_width).len() as u16
         };
         height = height
@@ -1830,6 +1848,17 @@ impl CodeTuiApp {
             .map(|(_, text)| {
                 let mut lines = vec![String::new()];
                 lines.extend(wrap_plain_lines(&[text.into_owned()], width));
+                lines
+            })
+            .unwrap_or_default()
+    }
+
+    /// Height-side twin of the spinner line `render_empty_state` appends.
+    fn spinner_status_plain_lines(&self, width: u16) -> Vec<String> {
+        self.spinner_status_line()
+            .map(|line| {
+                let mut lines = vec![String::new()];
+                lines.extend(wrap_plain_lines(&[line.plain], width));
                 lines
             })
             .unwrap_or_default()
@@ -2026,6 +2055,12 @@ impl CodeTuiApp {
         if let Some(spans) = notice_spans(self.notice.as_ref()) {
             lines.push(Line::from(""));
             lines.push(Line::from(spans));
+        }
+        // The empty state replaces the transcript's spinner tail, so a fetch on
+        // a fresh chat with no overlay open must narrate here.
+        if let Some(spinner) = self.spinner_status_line() {
+            lines.push(Line::from(""));
+            lines.push(spinner.line);
         }
 
         frame.render_widget(

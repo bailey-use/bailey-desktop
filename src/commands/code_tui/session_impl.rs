@@ -556,10 +556,15 @@ is preserved."
                 Ok(())
             }
             "remove" | "rm" => self.remove_skill_named(rest).await,
+            "update" => {
+                let name = (!rest.is_empty()).then(|| rest.to_string());
+                self.update_skills_command(name).await
+            }
             _ => {
                 self.notice = Some((
                     ERROR,
-                    "Usage: /skills [add <name>|<github:owner/repo> …] [rm <name>]".to_string(),
+                    "Usage: /skills [add <name>|<github:owner/repo> …] [rm <name>] [update [name]]"
+                        .to_string(),
                 ));
                 Ok(())
             }
@@ -644,19 +649,44 @@ is preserved."
             self.notice = Some((WARNING, "A skill install is already running".to_string()));
             return Ok(());
         }
-        // Download + extract on a background task so the TUI doesn't freeze; the
-        // outcome arrives as `RuntimeEvent::SkillInstalled`.
-        self.installing_skill = Some((source.clone(), Instant::now()));
+        // Fetch on a background task; an unambiguous choice installs there and
+        // arrives as `SkillInstalled`, a multi-skill source as `SkillInstallPick`.
+        let progress = SkillInstallProgress::new(source.clone(), "Fetching");
+        let bytes = progress.bytes.clone();
+        let overlay_source = source.clone();
+        self.installing_skill = Some(progress);
         self.notice = None;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = crate::agent::skills::install_from_source(&source, only.as_deref()).await;
-            tx.send(RuntimeEvent::SkillInstalled { source, result })
-                .ok();
+            use crate::agent::skills::InstallOrStage;
+            let event =
+                match crate::agent::skills::install_or_stage(&source, only.as_deref(), Some(bytes))
+                    .await
+                {
+                    Ok(InstallOrStage::Installed(report)) => RuntimeEvent::SkillInstalled {
+                        source,
+                        result: Ok(report),
+                    },
+                    Ok(InstallOrStage::Pick(staged)) => {
+                        RuntimeEvent::SkillInstallPick { source, staged }
+                    }
+                    Err(e) => RuntimeEvent::SkillInstalled {
+                        source,
+                        result: Err(e),
+                    },
+                };
+            tx.send(event).ok();
         });
-        // Close the add field so the in-overlay spinner row shows.
-        if matches!(self.overlay, Overlay::Skills(_)) {
-            self.open_skills_overlay().await?;
+        // Open the install modal in its loading state right away; the pick/
+        // installed events replace it in place.
+        if matches!(
+            self.overlay,
+            Overlay::None | Overlay::Skills(_) | Overlay::SkillInstall(_)
+        ) {
+            self.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+                source: overlay_source,
+                ..Default::default()
+            });
         }
         Ok(())
     }
@@ -666,34 +696,137 @@ is preserved."
     pub(super) async fn apply_skill_installed(
         &mut self,
         source: String,
-        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
+        result: std::result::Result<crate::agent::skills::InstallReport, String>,
     ) -> Result<()> {
-        use crate::agent::skills::InstallOutcome;
         self.installing_skill = None;
         match result {
-            Ok(InstallOutcome::Installed(names)) if names.is_empty() => {
-                self.notice = Some((WARNING, format!("No skills found in `{source}`")));
-            }
-            Ok(InstallOutcome::Installed(names)) => {
-                for name in &names {
+            Ok(report) => {
+                for name in &report.installed {
                     self.session_store.set_skill_enabled(name, true).await.ok();
                 }
-                self.agent_engine = None;
-                let label = if names.len() == 1 { "skill" } else { "skills" };
-                self.notice = Some((MUTED, format!("Installed {label}: {}", names.join(", "))));
-            }
-            Ok(InstallOutcome::Ambiguous(names)) => {
-                self.notice = Some((
-                    WARNING,
-                    format!(
-                        "`{source}` has {} skills: {}. Re-run `/skills add {source} <name>` (or `*` for all)",
-                        names.len(),
-                        names.join(", ")
-                    ),
-                ));
+                if !report.installed.is_empty() || !report.updated.is_empty() {
+                    self.agent_engine = None;
+                }
+                self.notice = Some(install_report_notice(&source, &report));
             }
             Err(e) => self.notice = Some((ERROR, format!("Failed to install skill: {e}"))),
         }
+        if matches!(
+            self.overlay,
+            Overlay::None | Overlay::Skills(_) | Overlay::SkillInstall(_)
+        ) {
+            self.open_skills_overlay().await?;
+        }
+        Ok(())
+    }
+
+    /// A fetched source held several skills: open the install picker over its
+    /// staged tree. If an unrelated overlay took over meanwhile, don't barge in.
+    pub(super) async fn apply_skill_install_pick(
+        &mut self,
+        source: String,
+        staged: crate::agent::skills::StagedInstall,
+    ) -> Result<()> {
+        self.installing_skill = None;
+        if !matches!(
+            self.overlay,
+            Overlay::None | Overlay::Skills(_) | Overlay::SkillInstall(_)
+        ) {
+            self.notice = Some((
+                WARNING,
+                format!(
+                    "`{source}` has {} skills — run `/skills add {source}` again to pick",
+                    staged.skills.len()
+                ),
+            ));
+            return Ok(());
+        }
+        let installed = staged.already_installed();
+        let items: Vec<InstallPickItem> = staged
+            .skills
+            .iter()
+            .zip(&installed)
+            .map(|(skill, &installed)| InstallPickItem {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                // Read now — the staged tree is gone once the pick resolves.
+                body: skill.instructions().into_owned(),
+                checked: false,
+                installed,
+            })
+            .collect();
+        self.staged_skill_install = Some(staged);
+        self.notice = None;
+        self.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+            source,
+            items,
+            selected: 0,
+            query: String::new(),
+            viewing: None,
+            detail_scroll: 0,
+        });
+        Ok(())
+    }
+
+    /// The picker's Enter: copy the chosen skills out of the staged tree on a
+    /// blocking task (it can be large) and report via `SkillInstalled`.
+    pub(super) async fn install_staged_skills(&mut self, names: Vec<String>) -> Result<()> {
+        let source = match &self.overlay {
+            Overlay::SkillInstall(state) => state.source.clone(),
+            _ => String::new(),
+        };
+        self.overlay = Overlay::None;
+        let Some(staged) = self.staged_skill_install.take() else {
+            return self.open_skills_overlay().await;
+        };
+        self.installing_skill = Some(SkillInstallProgress::new(source.clone(), "Installing"));
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            // update_existing: a marked installed row is an explicit replace ask.
+            let result = staged.install(&names, true);
+            tx.send(RuntimeEvent::SkillInstalled { source, result })
+                .ok();
+        });
+        // Land back on /skills, where the spinner row shows until the copy ends.
+        self.open_skills_overlay().await
+    }
+
+    /// Esc: discard the stage and fall back to `/skills` — except from the
+    /// loading state, which closes to the composer the user came from.
+    pub(super) async fn cancel_skill_install(&mut self) -> Result<()> {
+        let loading = matches!(&self.overlay, Overlay::SkillInstall(s) if s.items.is_empty());
+        self.staged_skill_install = None;
+        self.overlay = Overlay::None;
+        if loading {
+            return Ok(());
+        }
+        self.open_skills_overlay().await
+    }
+
+    /// `/skills update [name]`: re-fetch from the recorded source and replace
+    /// in place; bare form updates everything with provenance.
+    pub(super) async fn update_skills_command(&mut self, name: Option<String>) -> Result<()> {
+        if self.installing_skill.is_some() {
+            self.notice = Some((WARNING, "A skill install is already running".to_string()));
+            return Ok(());
+        }
+        let label = name
+            .clone()
+            .unwrap_or_else(|| "installed skills".to_string());
+        let progress = SkillInstallProgress::new(label.clone(), "Updating");
+        let bytes = progress.bytes.clone();
+        self.installing_skill = Some(progress);
+        self.notice = None;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result =
+                crate::agent::skills::update_installed_skills(name.as_deref(), Some(bytes)).await;
+            tx.send(RuntimeEvent::SkillInstalled {
+                source: label,
+                result,
+            })
+            .ok();
+        });
         if matches!(self.overlay, Overlay::None | Overlay::Skills(_)) {
             self.open_skills_overlay().await?;
         }
@@ -1919,6 +2052,46 @@ pub(super) fn skill_add_success_notice(
         notice.push_str(&warning);
     }
     notice
+}
+
+/// One-line notice for a finished install; warning-hued when nothing changed.
+pub(super) fn install_report_notice(
+    source: &str,
+    report: &crate::agent::skills::InstallReport,
+) -> (ratatui::style::Color, String) {
+    let installed = &report.installed;
+    let updated = &report.updated;
+    let skipped = &report.skipped_existing;
+    if installed.is_empty() && updated.is_empty() && skipped.is_empty() {
+        return (WARNING, format!("No skills found in `{source}`"));
+    }
+    if installed.is_empty() && updated.is_empty() {
+        return (
+            WARNING,
+            format!("Already installed: {}", skipped.join(", ")),
+        );
+    }
+    let label = |names: &[String]| if names.len() == 1 { "skill" } else { "skills" };
+    let mut parts: Vec<String> = Vec::new();
+    if !installed.is_empty() {
+        parts.push(format!(
+            "Installed {}: {}",
+            label(installed),
+            installed.join(", ")
+        ));
+    }
+    if !updated.is_empty() {
+        parts.push(format!(
+            "Updated {}: {}",
+            label(updated),
+            updated.join(", ")
+        ));
+    }
+    let mut msg = parts.join(" · ");
+    if !skipped.is_empty() {
+        msg.push_str(&format!(" (already installed: {})", skipped.join(", ")));
+    }
+    (MUTED, msg)
 }
 
 /// Map a connect-time per-server outcome to the overlay's `(status, health)`

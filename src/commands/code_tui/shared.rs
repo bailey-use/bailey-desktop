@@ -204,7 +204,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "skills",
-        help_label: "/skills [add|rm …]",
+        help_label: "/skills [add|rm|update …]",
         description: "list, add, or remove agent skills",
         takes_argument: true,
     },
@@ -511,6 +511,128 @@ impl SkillsOverlay {
     }
 }
 
+/// A background skill install in flight; `bytes` is written live by the
+/// download stream for the size readout.
+pub(super) struct SkillInstallProgress {
+    pub(super) source: String,
+    pub(super) started: Instant,
+    /// "Fetching" while the source downloads/stages; "Installing" during a copy.
+    pub(super) verb: &'static str,
+    pub(super) bytes: crate::agent::skills::DownloadProgress,
+}
+
+impl SkillInstallProgress {
+    pub(super) fn new(source: String, verb: &'static str) -> Self {
+        Self {
+            source,
+            started: Instant::now(),
+            verb,
+            bytes: Default::default(),
+        }
+    }
+
+    /// `Fetching (2.4MB) <source>…` — the size sits BEFORE the source because a
+    /// long URL clips at the pane edge; omitted until the first chunk lands.
+    pub(super) fn status_text(&self) -> String {
+        let bytes = self.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if bytes == 0 {
+            format!("{} {}…", self.verb, self.source)
+        } else {
+            format!(
+                "{} ({}) {}…",
+                self.verb,
+                crate::services::huggingface::human_size(bytes),
+                self.source
+            )
+        }
+    }
+}
+
+/// One candidate row in the skill-install picker.
+#[derive(Clone, Debug)]
+pub(super) struct InstallPickItem {
+    pub(super) name: String,
+    pub(super) description: String,
+    /// Read at open time — the staged tree is gone once the pick resolves.
+    pub(super) body: String,
+    pub(super) checked: bool,
+    /// Already installed; a mark on it means update-in-place.
+    pub(super) installed: bool,
+}
+
+/// The install picker; empty `items` = the fetch is still running. The staged
+/// tree lives on the app — the overlay is cloned every render.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SkillInstallOverlay {
+    pub(super) source: String,
+    pub(super) items: Vec<InstallPickItem>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+    pub(super) viewing: Option<usize>,
+    pub(super) detail_scroll: u16,
+}
+
+impl SkillInstallOverlay {
+    pub(super) fn filtered_indices(&self) -> Vec<usize> {
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.description.as_str())),
+        )
+    }
+
+    pub(super) fn select_prev(&mut self) {
+        self.detail_scroll = 0;
+        move_within(&self.filtered_indices(), &mut self.selected, -1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        self.detail_scroll = 0;
+        move_within(&self.filtered_indices(), &mut self.selected, 1);
+    }
+
+    pub(super) fn refilter(&mut self) {
+        self.detail_scroll = 0;
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.filtered_indices().contains(&self.selected)
+    }
+
+    /// The checked set (a checked installed row = update mark), else the
+    /// highlighted row — which never implicitly updates an installed one.
+    pub(super) fn pick_names(&self) -> Vec<String> {
+        let checked: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| i.checked)
+            .map(|i| i.name.clone())
+            .collect();
+        if !checked.is_empty() {
+            return checked;
+        }
+        self.items
+            .get(self.selected)
+            .filter(|i| !i.installed && self.has_selection())
+            .map(|i| vec![i.name.clone()])
+            .unwrap_or_default()
+    }
+
+    /// Ctrl+A: check every not-yet-installed skill, or clear all.
+    pub(super) fn toggle_all(&mut self) {
+        let all_checked = self
+            .items
+            .iter()
+            .filter(|i| !i.installed)
+            .all(|i| i.checked);
+        for item in self.items.iter_mut().filter(|i| !i.installed) {
+            item.checked = !all_checked;
+        }
+    }
+}
+
 /// Coarse health of one MCP server, for coloring its `/mcp` status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum McpHealth {
@@ -747,6 +869,8 @@ pub(super) enum Overlay {
     },
     /// `/skills` — the agent skills discovered for the working dir, toggleable.
     Skills(SkillsOverlay),
+    /// A multi-skill install source was staged — pick which skills to copy in.
+    SkillInstall(SkillInstallOverlay),
     /// `/mcp` — the configured MCP servers with status, toggleable.
     Mcp(McpOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
@@ -1577,7 +1701,12 @@ pub(super) enum RuntimeEvent {
     /// A background `/skills add <source>` install finished, off the event loop.
     SkillInstalled {
         source: String,
-        result: std::result::Result<crate::agent::skills::InstallOutcome, String>,
+        result: std::result::Result<crate::agent::skills::InstallReport, String>,
+    },
+    /// A fetch found several skills — the staged tree is handed to the picker.
+    SkillInstallPick {
+        source: String,
+        staged: crate::agent::skills::StagedInstall,
     },
     /// A `/share` (or `--share`) start finished: `Ok` the handle, `Err` the reason.
     LiveShareReady(std::result::Result<crate::services::share_live::LiveShareHandle, String>),
@@ -1973,8 +2102,11 @@ pub(super) struct CodeTuiApp {
     /// streaming so the displayed time excludes answer-streaming. `None` until the
     /// answer starts (the live timer runs from `reasoning_started_at` until then).
     pub(super) reasoning_elapsed_ms: Option<u64>,
-    /// In-flight `/skills add` install `(source, started)`; drives the spinner.
-    pub(super) installing_skill: Option<(String, Instant)>,
+    /// In-flight skill install; drives the progress row and idle status line.
+    pub(super) installing_skill: Option<SkillInstallProgress>,
+    /// Held here, not in the (cloned-every-render) overlay, so the temp tree is
+    /// deleted exactly once.
+    pub(super) staged_skill_install: Option<crate::agent::skills::StagedInstall>,
     /// Active share, `None` when not sharing; its presence drives the footer
     /// `● sharing` badge. Stopped on `/share stop`, `/new`, resume, and exit.
     pub(super) live_share: Option<crate::services::share_live::LiveShareHandle>,

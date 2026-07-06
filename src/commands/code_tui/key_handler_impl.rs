@@ -8,6 +8,8 @@ enum OverlayKeyAction {
     ToggleSkill(usize),
     AddSkill(String),
     RemoveSkill(usize),
+    InstallStagedSkills(Vec<String>),
+    CancelSkillInstall,
     ToggleMcpServer(usize),
     AddMcpServer(String),
     RemoveMcpServer(usize),
@@ -429,6 +431,14 @@ impl CodeTuiApp {
                 self.remove_skill(index).await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::InstallStagedSkills(names) => {
+                self.install_staged_skills(names).await?;
+                Ok(Some(false))
+            }
+            OverlayKeyAction::CancelSkillInstall => {
+                self.cancel_skill_install().await?;
+                Ok(Some(false))
+            }
             OverlayKeyAction::ToggleMcpServer(index) => {
                 self.toggle_mcp_server(index).await?;
                 Ok(Some(false))
@@ -453,6 +463,49 @@ impl CodeTuiApp {
                 self.toggle_config_setting(index).await;
                 Ok(Some(false))
             }
+        }
+    }
+
+    /// Route a bracketed paste into the focused overlay text input (add field,
+    /// else filter). Control chars collapse to spaces — the inputs are one line,
+    /// and JSON pasted into `/mcp` stays valid. `false` = not consumed.
+    pub(super) fn overlay_paste(&mut self, text: &str) -> bool {
+        let clean: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let clean = clean.trim();
+        match &mut self.overlay {
+            Overlay::Skills(state) => {
+                if let Some(buffer) = state.adding.as_mut() {
+                    buffer.push_str(clean);
+                } else {
+                    state.query.push_str(clean);
+                    state.refilter();
+                }
+                true
+            }
+            Overlay::Mcp(state) => {
+                if let Some(buffer) = state.adding.as_mut() {
+                    buffer.push_str(clean);
+                } else {
+                    state.query.push_str(clean);
+                    state.refilter();
+                }
+                true
+            }
+            Overlay::SkillInstall(state) => {
+                state.query.push_str(clean);
+                state.refilter();
+                true
+            }
+            Overlay::Picker(picker) => {
+                picker.clear_pending_delete();
+                picker.query.push_str(clean);
+                picker.selected = 0;
+                true
+            }
+            Overlay::Help { .. } | Overlay::Config(_) | Overlay::None => false,
         }
     }
 
@@ -549,6 +602,60 @@ impl CodeTuiApp {
                         if confirmed {
                             return OverlayKeyAction::RemoveSkill(state.selected);
                         }
+                    }
+                    // Page keys scroll the split's right detail pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
+                    KeyCode::Backspace => {
+                        state.query.pop();
+                        state.refilter();
+                    }
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
+                        state.query.push(c);
+                        state.refilter();
+                    }
+                    _ => {}
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::SkillInstall(state) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Narrow-only drill-in: scroll the body; Esc/Enter/Tab back out.
+                if state.viewing.is_some() && !split {
+                    apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab) {
+                        state.viewing = None;
+                        state.detail_scroll = 0;
+                    }
+                    return OverlayKeyAction::Handled;
+                }
+                match key.code {
+                    KeyCode::Esc if !state.query.is_empty() => {
+                        state.query.clear();
+                        state.refilter();
+                    }
+                    KeyCode::Esc => return OverlayKeyAction::CancelSkillInstall,
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    // Space never types (dead in the fuzzy filter); on an
+                    // installed row the mark means update-in-place.
+                    KeyCode::Char(' ') if state.has_selection() => {
+                        if let Some(item) = state.items.get_mut(state.selected) {
+                            item.checked = !item.checked;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let names = state.pick_names();
+                        if !names.is_empty() {
+                            return OverlayKeyAction::InstallStagedSkills(names);
+                        }
+                    }
+                    KeyCode::Char('a') if ctrl => state.toggle_all(),
+                    KeyCode::Tab if state.has_selection() && !split => {
+                        state.viewing = Some(state.selected);
                     }
                     // Page keys scroll the split's right detail pane.
                     KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {

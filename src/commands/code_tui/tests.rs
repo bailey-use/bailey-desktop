@@ -1213,6 +1213,7 @@ fn make_test_app(
         reasoning_started_at: None,
         reasoning_elapsed_ms: None,
         installing_skill: None,
+        staged_skill_install: None,
         live_share: None,
         live_share_starting: false,
         live_requested: false,
@@ -7550,6 +7551,454 @@ async fn test_skills_add_routes_source_not_scaffold() {
         notice.contains("Failed to install") || notice.contains("not a directory"),
         "expected an install error, got: {notice}"
     );
+}
+
+/// A local two-skill install source (`skills/alpha`, `skills/beta`) in a tempdir.
+fn write_skill_pack() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let pack = std::env::temp_dir().join(format!(
+        "aivo-tui-skill-pack-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    for (name, desc) in [("alpha", "First skill."), ("beta", "Second skill.")] {
+        let dir = pack.join("skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {desc}\n---\nBody of {name}.\n"),
+        )
+        .unwrap();
+    }
+    pack
+}
+
+/// Phase verb + live size readout; the size precedes the source so a clipped
+/// URL never hides it.
+#[test]
+fn test_skill_install_progress_status_text() {
+    let progress = SkillInstallProgress::new("github:o/r".to_string(), "Fetching");
+    assert_eq!(progress.status_text(), "Fetching github:o/r…");
+    progress
+        .bytes
+        .store(2_621_440, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(progress.status_text(), "Fetching (2.5MB) github:o/r…");
+    let copy = SkillInstallProgress::new("github:o/r".to_string(), "Installing");
+    assert_eq!(copy.status_text(), "Installing github:o/r…");
+}
+
+/// The `/skills` overlay carries the progress row; the transcript line is
+/// suppressed while it does.
+#[test]
+fn test_skills_overlay_shows_fetch_progress_row() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let progress = SkillInstallProgress::new("github:anthropics/skills".to_string(), "Fetching");
+    progress
+        .bytes
+        .store(1_048_576, std::sync::atomic::Ordering::Relaxed);
+    app.installing_skill = Some(progress);
+    app.overlay = Overlay::Skills(skills_overlay_fixture());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(
+        screen.contains("Fetching (1.0MB)"),
+        "missing progress row with size:\n{screen}"
+    );
+    assert!(
+        app.spinner_status_line().is_none(),
+        "status line must be suppressed while /skills shows the progress row"
+    );
+
+    app.overlay = Overlay::None;
+    let line = app
+        .spinner_status_line()
+        .expect("status line while fetching");
+    let text = plain_text_from_spans(&line.line.spans);
+    assert!(
+        text.contains("Fetching (1.0MB) github:anthropics/skills"),
+        "status line: {text:?}"
+    );
+}
+
+/// Picker chrome: title, marked badge, source line, checkbox rows, footer.
+#[test]
+fn test_skill_install_overlay_renders_picker() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+        source: "github:anthropics/skills".to_string(),
+        items: vec![
+            InstallPickItem {
+                name: "alpha".to_string(),
+                description: "First skill.".to_string(),
+                body: "Body.".to_string(),
+                checked: true,
+                installed: false,
+            },
+            InstallPickItem {
+                name: "beta".to_string(),
+                description: "Second skill.".to_string(),
+                body: "Body.".to_string(),
+                checked: false,
+                installed: true,
+            },
+        ],
+        selected: 0,
+        query: String::new(),
+        viewing: None,
+        detail_scroll: 0,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(
+        screen.contains("Install skills"),
+        "missing title:\n{screen}"
+    );
+    assert!(
+        screen.contains("from github:anthropics/skills"),
+        "missing source line:\n{screen}"
+    );
+    assert!(screen.contains("alpha"), "missing skill row:\n{screen}");
+    assert!(
+        screen.contains("First skill."),
+        "missing description:\n{screen}"
+    );
+    assert!(screen.contains("1/2 marked"), "missing badge:\n{screen}");
+    assert!(
+        screen.contains("installed — Space to update"),
+        "missing installed/update note:\n{screen}"
+    );
+    // Footer clips in narrow terminals; the mark/install/Esc trio comes first.
+    assert!(
+        screen.contains("mark") && screen.contains("install") && screen.contains("Esc"),
+        "missing footer controls:\n{screen}"
+    );
+    assert!(
+        screen.contains("Enter applies the 1 marked"),
+        "missing marked-count detail:\n{screen}"
+    );
+}
+
+/// A bracketed paste lands in the open overlay's text input (add field first,
+/// else filter) instead of being dropped.
+#[tokio::test]
+async fn test_paste_routes_into_overlay_inputs() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let mut overlay = skills_overlay_fixture();
+    overlay.adding = Some("".to_string());
+    app.overlay = Overlay::Skills(overlay);
+    assert!(app.overlay_paste("github:anthropics/skills\n"));
+    if let Overlay::Skills(state) = &app.overlay {
+        assert_eq!(state.adding.as_deref(), Some("github:anthropics/skills"));
+    } else {
+        panic!("skills overlay vanished");
+    }
+
+    let mut overlay = skills_overlay_fixture();
+    overlay.adding = None;
+    app.overlay = Overlay::Skills(overlay);
+    assert!(app.overlay_paste("brand"));
+    if let Overlay::Skills(state) = &app.overlay {
+        assert_eq!(state.query, "brand");
+    } else {
+        panic!("skills overlay vanished");
+    }
+
+    app.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+        source: "github:o/r".to_string(),
+        ..Default::default()
+    });
+    assert!(app.overlay_paste("pdf"));
+    if let Overlay::SkillInstall(state) = &app.overlay {
+        assert_eq!(state.query, "pdf");
+    } else {
+        panic!("install picker vanished");
+    }
+
+    app.overlay = Overlay::None;
+    assert!(!app.overlay_paste("plain text"));
+}
+
+/// The loading state narrates the fetch; Esc from it returns to the composer.
+#[tokio::test]
+async fn test_skill_install_loading_state_renders_and_esc_closes() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.installing_skill = Some(SkillInstallProgress::new(
+        "github:anthropics/skills".to_string(),
+        "Fetching",
+    ));
+    app.overlay = Overlay::SkillInstall(SkillInstallOverlay {
+        source: "github:anthropics/skills".to_string(),
+        ..Default::default()
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut screen = String::new();
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    assert!(
+        screen.contains("Install skills"),
+        "missing modal title:\n{screen}"
+    );
+    assert!(
+        screen.contains("Fetching github:anthropics/skills"),
+        "missing loading row:\n{screen}"
+    );
+    assert!(
+        screen.contains("will appear here"),
+        "missing loading hint:\n{screen}"
+    );
+    assert!(
+        app.spinner_status_line().is_none(),
+        "transcript line must stay quiet while the modal narrates"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        matches!(app.overlay, Overlay::None),
+        "Esc on loading must close the modal, not open /skills"
+    );
+}
+
+/// A mark on an installed row is an update ask.
+#[test]
+fn test_skill_install_picker_marks_installed_for_update() {
+    let mut state = SkillInstallOverlay {
+        source: "github:o/r".to_string(),
+        items: vec![
+            InstallPickItem {
+                name: "fresh".to_string(),
+                description: String::new(),
+                body: String::new(),
+                checked: false,
+                installed: false,
+            },
+            InstallPickItem {
+                name: "have".to_string(),
+                description: String::new(),
+                body: String::new(),
+                checked: false,
+                installed: true,
+            },
+        ],
+        selected: 1,
+        query: String::new(),
+        viewing: None,
+        detail_scroll: 0,
+    };
+    // Enter's fallback never implicitly updates an installed row.
+    assert!(state.pick_names().is_empty());
+    state.items[1].checked = true;
+    assert_eq!(state.pick_names(), ["have"]);
+    // Mark-all targets only the not-yet-installed rows.
+    state.items[1].checked = false;
+    state.toggle_all();
+    assert!(state.items[0].checked && !state.items[1].checked);
+}
+
+/// Multi-skill source: loading modal at once, picker when staged, marking keys,
+/// Esc discards the stage.
+#[tokio::test]
+async fn test_skills_install_multi_source_opens_picker() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let pack = write_skill_pack();
+
+    app.submit_skill_add(pack.display().to_string())
+        .await
+        .unwrap();
+    // Loading modal opens at once — never the installed-skills list.
+    assert!(
+        matches!(&app.overlay, Overlay::SkillInstall(s) if s.items.is_empty()),
+        "submit must open the install modal right away, before the fetch completes"
+    );
+    assert!(
+        app.installing_skill.is_some(),
+        "progress state set from the first frame"
+    );
+    // The loading modal is already SkillInstall — wait for the staged items.
+    for _ in 0..1000 {
+        app.handle_runtime_events().await.unwrap();
+        if matches!(&app.overlay, Overlay::SkillInstall(s) if !s.items.is_empty()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Overlay::SkillInstall(state) = &app.overlay else {
+        panic!(
+            "multi-skill source must open the install picker: {:?}",
+            app.notice
+        );
+    };
+    assert!(
+        !state.items.is_empty(),
+        "picker never populated: {:?}",
+        app.notice
+    );
+    let names: Vec<&str> = state.items.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, ["alpha", "beta"]);
+    assert!(state.items.iter().all(|i| !i.checked), "nothing pre-marked");
+    assert_eq!(state.source, pack.display().to_string());
+    assert!(
+        app.staged_skill_install.is_some(),
+        "the fetched tree stays staged for the pick"
+    );
+    assert!(app.installing_skill.is_none(), "spinner cleared");
+    assert_eq!(state.items[0].description, "First skill.");
+    assert_eq!(state.items[0].body, "Body of alpha.");
+    // Nothing marked: Enter targets the highlighted row.
+    assert_eq!(state.pick_names(), ["alpha"]);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    if let Overlay::SkillInstall(state) = &app.overlay {
+        assert!(state.items[0].checked, "Space marks");
+        assert_eq!(state.pick_names(), ["alpha"]);
+    } else {
+        panic!("picker vanished on Space");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        .await
+        .unwrap();
+    if let Overlay::SkillInstall(state) = &app.overlay {
+        assert!(
+            state.items.iter().all(|i| i.checked),
+            "Ctrl+A marks all when any is unmarked"
+        );
+        assert_eq!(state.pick_names(), ["alpha", "beta"]);
+    } else {
+        panic!("picker vanished on Ctrl+A");
+    }
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        app.staged_skill_install.is_none(),
+        "Esc must discard the staged tree"
+    );
+    assert!(
+        matches!(app.overlay, Overlay::Skills(_)),
+        "Esc falls back to the /skills overlay"
+    );
+    // A local source is never deleted by the discard.
+    assert!(pack.join("skills/alpha/SKILL.md").is_file());
+    let _ = std::fs::remove_dir_all(&pack);
+}
+
+/// Notice wording per report shape.
+#[test]
+fn test_install_report_notice_wording() {
+    use super::session_impl::install_report_notice;
+    use crate::agent::skills::InstallReport;
+    let (_, msg) = install_report_notice(
+        "src",
+        &InstallReport {
+            installed: vec!["a".into()],
+            updated: vec![],
+            skipped_existing: vec![],
+        },
+    );
+    assert_eq!(msg, "Installed skill: a");
+    let (_, msg) = install_report_notice(
+        "src",
+        &InstallReport {
+            installed: vec!["a".into(), "b".into()],
+            updated: vec![],
+            skipped_existing: vec!["c".into()],
+        },
+    );
+    assert_eq!(msg, "Installed skills: a, b (already installed: c)");
+    let (color, msg) = install_report_notice(
+        "src",
+        &InstallReport {
+            installed: vec![],
+            updated: vec![],
+            skipped_existing: vec!["c".into()],
+        },
+    );
+    assert_eq!(msg, "Already installed: c");
+    assert_eq!(color, WARNING);
+    let (_, msg) = install_report_notice(
+        "src",
+        &InstallReport {
+            installed: vec!["a".into()],
+            updated: vec!["u".into(), "v".into()],
+            skipped_existing: vec![],
+        },
+    );
+    assert_eq!(msg, "Installed skill: a · Updated skills: u, v");
+    let (color, _) = install_report_notice("src", &InstallReport::default());
+    assert_eq!(color, WARNING);
+}
+
+/// An unrelated open overlay is not replaced; the stage drops with a hint.
+#[tokio::test]
+async fn test_skills_install_pick_defers_to_open_overlay() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let pack = write_skill_pack();
+
+    app.submit_skill_add(pack.display().to_string())
+        .await
+        .unwrap();
+    app.overlay = Overlay::Help { scroll: 0 };
+    for _ in 0..1000 {
+        app.handle_runtime_events().await.unwrap();
+        if app.installing_skill.is_none() && app.notice.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        matches!(app.overlay, Overlay::Help { .. }),
+        "an unrelated overlay is not replaced"
+    );
+    assert!(app.staged_skill_install.is_none(), "stage is discarded");
+    let notice = &app.notice.as_ref().unwrap().1;
+    assert!(notice.contains("has 2 skills"), "{notice}");
+    let _ = std::fs::remove_dir_all(&pack);
 }
 
 #[tokio::test]

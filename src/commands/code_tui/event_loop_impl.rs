@@ -215,6 +215,9 @@ impl CodeTuiApp {
             RuntimeEvent::SkillInstalled { source, result } => {
                 self.apply_skill_installed(source, result).await?
             }
+            RuntimeEvent::SkillInstallPick { source, staged } => {
+                self.apply_skill_install_pick(source, staged).await?
+            }
             RuntimeEvent::LiveShareReady(result) => self.apply_live_share_ready(result),
         }
         Ok(())
@@ -1570,7 +1573,7 @@ impl CodeTuiApp {
             Event::Mouse(mouse) => Ok(Some(self.handle_mouse(mouse).await?)),
             Event::Resize(_, _) => Ok(None),
             Event::Paste(text) => {
-                if !self.overlay.blocks_input() && !self.is_busy() {
+                if !self.overlay_paste(&text) && !self.overlay.blocks_input() && !self.is_busy() {
                     self.insert_pasted_text(&text);
                 }
                 Ok(None)
@@ -2170,6 +2173,23 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Skills(_), _) => Ok(Some(false)),
+            (Overlay::SkillInstall(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
+                if let Overlay::SkillInstall(state) = &mut self.overlay {
+                    if state.viewing.is_some() || over_detail {
+                        state.detail_scroll = wheel_scroll(state.detail_scroll, up);
+                    } else if up {
+                        state.select_prev();
+                    } else {
+                        state.select_next();
+                    }
+                }
+                Ok(Some(false))
+            }
+            (Overlay::SkillInstall(_), _) => Ok(Some(false)),
             (Overlay::Mcp(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
                 let over_detail = self

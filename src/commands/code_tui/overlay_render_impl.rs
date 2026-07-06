@@ -530,7 +530,7 @@ impl CodeTuiApp {
         if state.adding.is_some() {
             rows.extend([
                 Line::from(Span::styled(
-                    "name [description], or a github:owner/repo to install",
+                    "name [description], or github:owner/repo · GitHub URL · path to install",
                     Style::default().fg(MUTED),
                 )),
                 Line::from(Span::styled(
@@ -605,13 +605,13 @@ impl CodeTuiApp {
             )));
         }
 
-        // Animated install row at the top while a background install runs.
-        if let Some((source, _)) = &self.installing_skill {
+        // Animated install-progress row while a background install runs.
+        if let Some(progress) = &self.installing_skill {
             let spinner = spinner_frame_indexed(self.frame_tick, self.reduce_motion);
             rows.insert(
                 0,
                 Line::from(Span::styled(
-                    format!("{spinner} Installing from {source}…"),
+                    format!("{spinner} {}", progress.status_text()),
                     Style::default().fg(ACCENT),
                 )),
             );
@@ -668,6 +668,226 @@ impl CodeTuiApp {
             Some(item) => Some(self.render_skill_detail(
                 frame,
                 right,
+                item,
+                usize::from(right.width).max(1),
+                state.detail_scroll,
+                "",
+            )),
+            None => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "no skill selected",
+                        Style::default().fg(MUTED),
+                    )),
+                    right,
+                );
+                None
+            }
+        };
+        OverlayRenderOut {
+            detail_scroll,
+            detail_area: Some(right),
+            scroll_for: None,
+        }
+    }
+
+    /// The skill-install picker (empty items = loading). Space marks, Enter
+    /// applies, Esc cancels; chrome shared with `/skills`.
+    pub(super) fn render_skill_install_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &SkillInstallOverlay,
+        split: bool,
+    ) -> OverlayRenderOut {
+        // Narrow-only Tab drill-in; the split's right pane replaces it.
+        if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
+            let inner = overlay_shell(frame, area, "Install skills", None);
+            if inner.height == 0 {
+                return OverlayRenderOut {
+                    detail_scroll: Some(state.detail_scroll),
+                    ..Default::default()
+                };
+            }
+            return OverlayRenderOut {
+                detail_scroll: Some(self.render_install_pick_detail(
+                    frame,
+                    inner,
+                    &state.source,
+                    item,
+                    usize::from(inner.width).max(1),
+                    state.detail_scroll,
+                    "Esc back",
+                )),
+                ..Default::default()
+            };
+        }
+
+        let filtered = state.filtered_indices();
+        let marked = state.items.iter().filter(|i| i.checked).count();
+        let badge = (!state.items.is_empty()).then(|| {
+            let color = if marked > 0 { ASSISTANT } else { MUTED };
+            (format!("{marked}/{} marked", state.items.len()), color)
+        });
+        let inner = overlay_shell(frame, area, "Install skills", badge);
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        // Split: two panes over a full-width footer strip, same as `/skills`.
+        // Loading stays single-pane — nothing to preview.
+        let (list_pane, split_panes) = if split && inner.height > 1 && !state.items.is_empty() {
+            let footer_rect = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            let body = Rect {
+                height: inner.height - 1,
+                ..inner
+            };
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some((right, footer_rect)))
+        } else {
+            (inner, None)
+        };
+
+        let inner_width = usize::from(list_pane.width).saturating_sub(2).max(1);
+        let mut rows: Vec<Line> = Vec::new();
+        if !state.items.is_empty() {
+            rows.push(Line::from(Span::styled(
+                truncate_for_display_width(&format!("from {}", state.source), inner_width),
+                Style::default().fg(FAINT),
+            )));
+            rows.push(Line::from(""));
+        }
+        let mut selected_pos = 0usize;
+        let footer: Vec<(&str, &str)>;
+        if state.items.is_empty() {
+            if let Some(progress) = &self.installing_skill {
+                let spinner = spinner_frame_indexed(self.frame_tick, self.reduce_motion);
+                rows.push(Line::from(Span::styled(
+                    format!("{spinner} {}", progress.status_text()),
+                    Style::default().fg(ACCENT),
+                )));
+                rows.push(Line::from(""));
+                rows.push(Line::from(Span::styled(
+                    "Skills found in the source will appear here to pick from.",
+                    Style::default().fg(MUTED),
+                )));
+            } else {
+                rows.push(Line::from(Span::styled(
+                    "Nothing to install.",
+                    Style::default().fg(MUTED),
+                )));
+            }
+            footer = vec![("Esc", "cancel")];
+        } else if filtered.is_empty() {
+            rows.push(Line::from(Span::styled(
+                format!("No skills match “{}”", state.query),
+                Style::default().fg(MUTED),
+            )));
+            footer = vec![("Esc", "cancel")];
+        } else {
+            for (pos, &i) in filtered.iter().enumerate() {
+                let item = &state.items[i];
+                let advert = crate::agent::skills::advert_description(&item.description);
+                let (desc, desc_color) = if item.installed && item.checked {
+                    (format!("will update · {advert}"), ACCENT)
+                } else if item.installed {
+                    (format!("installed — Space to update · {advert}"), FAINT)
+                } else {
+                    (advert, MUTED)
+                };
+                let desc = truncate_for_display_width(&desc, toggle_detail_room(inner_width));
+                if i == state.selected {
+                    // Anchor scrolling to the item's second (description) line so
+                    // both of its lines stay visible.
+                    selected_pos = rows.len() + 1;
+                }
+                rows.extend(toggle_list_rows(
+                    item.checked,
+                    &item.name,
+                    &desc,
+                    desc_color,
+                    i == state.selected,
+                    inner_width,
+                ));
+                if pos + 1 < filtered.len() {
+                    rows.push(Line::from(""));
+                }
+            }
+            footer = vec![
+                ("↑↓", "move"),
+                ("Space", "mark"),
+                ("Enter", "install"),
+                ("Esc", "cancel"),
+                ("^A", "all"),
+                ("Tab", "view"),
+            ];
+        }
+
+        let selected_item = state
+            .items
+            .get(state.selected)
+            .filter(|_| filtered.contains(&state.selected));
+        // One-line detail only in narrow — the split's right pane carries the full version.
+        let detail = if split_panes.is_none() {
+            selected_item.map(|item| {
+                if item.installed && !item.checked {
+                    (
+                        "already installed — Space marks it for update".to_string(),
+                        FAINT,
+                    )
+                } else if marked > 0 {
+                    (format!("Enter applies the {marked} marked"), MUTED)
+                } else {
+                    ("Enter installs the highlighted skill".to_string(), MUTED)
+                }
+            })
+        } else {
+            None
+        };
+        let (body_footer, strip_footer): (Vec<_>, Vec<_>) = match split_panes {
+            Some(_) => (
+                Vec::new(),
+                footer
+                    .into_iter()
+                    .map(|hint| {
+                        if hint == ("Tab", "view") {
+                            ("PgDn", "scroll")
+                        } else {
+                            hint
+                        }
+                    })
+                    .collect(),
+            ),
+            None => (footer, Vec::new()),
+        };
+
+        render_toggle_list_body(
+            frame,
+            list_pane,
+            ToggleListView {
+                title: "Install skills",
+                badge: None,
+                input_line: search_input_line(&state.query, "filter skills"),
+                rows,
+                selected_pos,
+                detail,
+                footer: body_footer,
+            },
+        );
+
+        let Some((right, footer_rect)) = split_panes else {
+            return OverlayRenderOut::default();
+        };
+        render_footer_hints(frame, footer_rect, &strip_footer);
+        let detail_scroll = match selected_item {
+            Some(item) => Some(self.render_install_pick_detail(
+                frame,
+                right,
+                &state.source,
                 item,
                 usize::from(right.width).max(1),
                 state.detail_scroll,
@@ -1120,25 +1340,87 @@ impl CodeTuiApp {
             SkillScope::User => "user",
             SkillScope::Project => "project",
         };
+        self.render_skill_doc_detail(
+            frame,
+            area,
+            &item.name,
+            &format!("[{scope}{}]", if item.enabled { "" } else { " · off" }),
+            &abbreviate_home_path(&item.dir),
+            &item.description,
+            &item.body,
+            width,
+            scroll,
+            esc_label,
+        )
+    }
+
+    /// Picker detail — located by source; the staged dir is a meaningless temp path.
+    #[allow(clippy::too_many_arguments)]
+    fn render_install_pick_detail(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        source: &str,
+        item: &InstallPickItem,
+        width: usize,
+        scroll: u16,
+        esc_label: &str,
+    ) -> u16 {
+        let tag = if item.installed && item.checked {
+            "[marked for update]"
+        } else if item.installed {
+            "[already installed]"
+        } else if item.checked {
+            "[marked]"
+        } else {
+            ""
+        };
+        self.render_skill_doc_detail(
+            frame,
+            area,
+            &item.name,
+            tag,
+            &format!("from {source}"),
+            &item.description,
+            &item.body,
+            width,
+            scroll,
+            esc_label,
+        )
+    }
+
+    /// Shared layout behind the `/skills` and install-picker detail panes.
+    #[allow(clippy::too_many_arguments)]
+    fn render_skill_doc_detail(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        name: &str,
+        tag: &str,
+        location: &str,
+        description: &str,
+        body: &str,
+        width: usize,
+        scroll: u16,
+        esc_label: &str,
+    ) -> u16 {
+        let mut title = vec![Span::styled(
+            name.to_string(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )];
+        if !tag.is_empty() {
+            title.push(Span::styled(format!("  {tag}"), Style::default().fg(MUTED)));
+        }
         let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    item.name.clone(),
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{scope}{}]", if item.enabled { "" } else { " · off" }),
-                    Style::default().fg(MUTED),
-                ),
-            ]),
+            Line::from(title),
             Line::from(Span::styled(
-                truncate_for_display_width(&abbreviate_home_path(&item.dir), width),
+                truncate_for_display_width(location, width),
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
         ];
-        if !item.description.is_empty() {
-            for chunk in wrap_chars(&item.description, width) {
+        if !description.is_empty() {
+            for chunk in wrap_chars(description, width) {
                 lines.push(Line::from(Span::styled(chunk, Style::default().fg(TEXT))));
             }
             lines.push(Line::from(""));
@@ -1147,7 +1429,7 @@ impl CodeTuiApp {
             "Instructions:",
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )));
-        if item.body.trim().is_empty() {
+        if body.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 "  (empty — edit SKILL.md to add instructions)",
                 Style::default().fg(FAINT),
@@ -1155,11 +1437,14 @@ impl CodeTuiApp {
         } else {
             // The body IS markdown — render it like the transcript, not dim raw lines.
             lines.push(Line::from(""));
-            let mut body = render_markdown_lines(&item.body, width as u16);
-            while body.first().is_some_and(|l| l.plain.trim().is_empty()) {
-                body.remove(0);
+            let mut body_lines = render_markdown_lines(body, width as u16);
+            while body_lines
+                .first()
+                .is_some_and(|l| l.plain.trim().is_empty())
+            {
+                body_lines.remove(0);
             }
-            for styled in body {
+            for styled in body_lines {
                 for row in wrap_styled_line(&styled.line.spans, width) {
                     lines.push(row.line);
                 }

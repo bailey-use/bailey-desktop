@@ -262,6 +262,7 @@ impl CodeTuiApp {
             reasoning_started_at: None,
             reasoning_elapsed_ms: None,
             installing_skill: None,
+            staged_skill_install: None,
             live_share: None,
             live_share_starting: false,
             live_requested: false,

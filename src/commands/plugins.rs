@@ -116,6 +116,13 @@ fn list_action() -> Result<ExitCode> {
     // Continuation lines align under the name: "  ● " (4) + name + "  " (2).
     let indent = " ".repeat(width + 6);
     let sep = style::dim("  ·  ");
+    // Piped output keeps single lines for greppability.
+    let cols = if std::io::stdout().is_terminal() {
+        (console::Term::stdout().size().1 as usize).max(40)
+    } else {
+        usize::MAX
+    };
+    let body_width = cols.saturating_sub(indent.len());
 
     println!(
         "{} {}",
@@ -178,12 +185,13 @@ fn list_action() -> Result<ExitCode> {
         if let Some(desc) = manifest.and_then(|m| m.description.as_deref())
             && !desc.is_empty()
         {
-            println!("{indent}{}", style::dim(desc));
+            for line in wrap_plain(desc, body_width) {
+                println!("{indent}{}", style::dim(line));
+            }
         }
 
-        // Detail line: granted/declared caps, requirement status, and — for
-        // external plugins only — where the binary resolves (managed ones all
-        // live in the footer dir, so the path would be noise).
+        // Detail line: caps, requirement status, provenance (what `update`
+        // re-fetches); external plugins show their resolved path instead.
         let mut details: Vec<String> = Vec::new();
         if let Some(m) = manifest {
             let grantable = grantable_capabilities(&m.capabilities);
@@ -220,19 +228,100 @@ fn list_action() -> Result<ExitCode> {
                 details.push(format!("{} {marked}", style::dim("requires")));
             }
         }
+        if let Some(rec) = records.get(name).filter(|_| is_managed) {
+            details.push(style::dim(format!("from {}", collapse_tilde(&rec.source))));
+        }
         if !is_managed {
             details.push(style::dim(collapse_tilde(&path.display().to_string())));
         }
-        if !details.is_empty() {
-            println!("{indent}{}", details.join(&sep));
+        for line in wrap_segments(&details, &sep, body_width) {
+            println!("{indent}{line}");
         }
         println!();
     }
 
     if let Some(dir) = &managed_dir_display {
-        println!("  {}", style::dim(format!("Plugins live in {dir}")));
+        println!(
+            "  {}",
+            style::dim(format!(
+                "Run one with `aivo <name>` · plugins live in {dir}"
+            ))
+        );
     }
     Ok(ExitCode::Success)
+}
+
+/// Greedy word-wrap by display width; wide (CJK) chars break anywhere.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let mut units: Vec<(bool, String)> = Vec::new();
+    let mut word = String::new();
+    let mut spaced = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !word.is_empty() {
+                units.push((spaced, std::mem::take(&mut word)));
+            }
+            spaced = true;
+        } else if UnicodeWidthChar::width(ch).unwrap_or(1) >= 2 {
+            if !word.is_empty() {
+                units.push((spaced, std::mem::take(&mut word)));
+                spaced = false;
+            }
+            units.push((spaced, ch.to_string()));
+            spaced = false;
+        } else {
+            word.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        units.push((spaced, word));
+    }
+
+    let mut lines = Vec::new();
+    let (mut line, mut used) = (String::new(), 0usize);
+    for (spaced, unit) in units {
+        let w = UnicodeWidthStr::width(unit.as_str());
+        let glue = usize::from(spaced && !line.is_empty());
+        if !line.is_empty() && used + glue + w > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if !line.is_empty() && glue == 1 {
+            line.push(' ');
+            used += 1;
+        }
+        line.push_str(&unit);
+        used += w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Pack pre-styled segments onto lines, breaking only between them (ANSI-aware widths).
+fn wrap_segments(segments: &[String], sep: &str, width: usize) -> Vec<String> {
+    let sep_w = console::measure_text_width(sep);
+    let mut lines = Vec::new();
+    let (mut line, mut used) = (String::new(), 0usize);
+    for seg in segments {
+        let w = console::measure_text_width(seg);
+        if !line.is_empty() && used + sep_w + w > width {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if !line.is_empty() {
+            line.push_str(sep);
+            used += sep_w;
+        }
+        line.push_str(seg);
+        used += w;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Install-on-demand entry used by plugin dispatch when a known plugin is
@@ -925,6 +1014,29 @@ mod tests {
             transcripts: None,
             requires: Vec::new(),
         }
+    }
+
+    #[test]
+    fn wrap_plain_breaks_at_word_boundaries() {
+        assert_eq!(wrap_plain("alpha beta gamma", 11), ["alpha beta", "gamma"]);
+        assert_eq!(wrap_plain("unbreakable", 5), ["unbreakable"]);
+    }
+
+    #[test]
+    fn wrap_plain_breaks_cjk_by_display_width() {
+        assert_eq!(wrap_plain("点单点", 4), ["点单", "点"]);
+        assert_eq!(wrap_plain("aivo 提供模型", 9), ["aivo 提供", "模型"]);
+    }
+
+    #[test]
+    fn wrap_segments_breaks_between_segments_only() {
+        let segs = vec![
+            crate::style::dim("caps: endpoint"),
+            crate::style::dim("requires git ✓"),
+        ];
+        let lines = wrap_segments(&segs, "  ·  ", 20);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(wrap_segments(&segs, "  ·  ", 40).len(), 1);
     }
 
     #[test]

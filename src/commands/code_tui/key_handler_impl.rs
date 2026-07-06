@@ -18,6 +18,7 @@ enum OverlayKeyAction {
     RetryMcpServers,
     OpenMcpTools(usize),
     ToggleMcpTool(usize),
+    ApplyMcpPaste,
     ToggleConfigSetting(usize),
 }
 
@@ -474,6 +475,10 @@ impl CodeTuiApp {
                 self.toggle_mcp_tool(index).await?;
                 Ok(Some(false))
             }
+            OverlayKeyAction::ApplyMcpPaste => {
+                self.apply_mcp_paste().await?;
+                Ok(Some(false))
+            }
             OverlayKeyAction::ToggleConfigSetting(index) => {
                 self.toggle_config_setting(index).await;
                 Ok(Some(false))
@@ -515,6 +520,11 @@ impl CodeTuiApp {
                 true
             }
             Overlay::McpTools(state) => {
+                state.query.push_str(clean);
+                state.refilter();
+                true
+            }
+            Overlay::McpPaste(state) => {
                 state.query.push_str(clean);
                 state.refilter();
                 true
@@ -817,6 +827,46 @@ impl CodeTuiApp {
                     KeyCode::Char('n') if ctrl => state.select_next(),
                     KeyCode::Enter | KeyCode::Char(' ') if state.has_selection() => {
                         return OverlayKeyAction::ToggleMcpTool(state.selected);
+                    }
+                    KeyCode::Backspace => {
+                        state.query.pop();
+                        state.refilter();
+                    }
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
+                        state.query.push(c);
+                        state.refilter();
+                    }
+                    _ => {}
+                }
+                OverlayKeyAction::Handled
+            }
+            Overlay::McpPaste(state) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc if !state.query.is_empty() => {
+                        state.query.clear();
+                        state.refilter();
+                    }
+                    // Esc abandons the paste; back to `/mcp` when it was open.
+                    KeyCode::Esc => {
+                        self.overlay = match state.parent.take() {
+                            Some(parent) => Overlay::Mcp(*parent),
+                            None => Overlay::None,
+                        };
+                    }
+                    KeyCode::Up => state.select_prev(),
+                    KeyCode::Char('p') if ctrl => state.select_prev(),
+                    KeyCode::Down => state.select_next(),
+                    KeyCode::Char('n') if ctrl => state.select_next(),
+                    // Space marks; on an existing name the mark means replace.
+                    KeyCode::Char(' ') if state.has_selection() => {
+                        if let Some(item) = state.items.get_mut(state.selected) {
+                            item.checked = !item.checked;
+                        }
+                    }
+                    KeyCode::Char('a') if ctrl => state.toggle_all(),
+                    KeyCode::Enter => {
+                        return OverlayKeyAction::ApplyMcpPaste;
                     }
                     KeyCode::Backspace => {
                         state.query.pop();

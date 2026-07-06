@@ -6507,6 +6507,67 @@ async fn test_mcp_add_project_flag_writes_repo_config_and_grants_consent() {
 }
 
 #[tokio::test]
+async fn test_mcp_multi_paste_opens_picker_and_replaces_on_apply() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let dir = std::env::temp_dir().join(format!("aivo-mcp-paste-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.real_cwd = dir.to_string_lossy().into_owned();
+    // A same-named server is already configured (project scope).
+    std::fs::write(
+        dir.join(".mcp.json"),
+        r#"{"mcpServers":{"github":{"command":"old-cmd"}}}"#,
+    )
+    .unwrap();
+
+    app.submit_mcp_add(
+        r#"-p {"mcpServers":{
+            "github":{"command":"echo","args":["new"]},
+            "linear":{"url":"http://127.0.0.1:1/mcp"}
+        }}"#
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    // ≥2 servers → picker, not a blind add: the new name is prechecked, the
+    // existing one needs an explicit replace mark.
+    let github = {
+        let Overlay::McpPaste(state) = &app.overlay else {
+            panic!("expected the paste picker to open");
+        };
+        assert!(state.project);
+        assert!(
+            state.parent.is_none(),
+            "composer paste has no /mcp to restore"
+        );
+        let github = state.items.iter().position(|i| i.name == "github").unwrap();
+        let linear = state.items.iter().position(|i| i.name == "linear").unwrap();
+        assert!(state.items[github].exists && !state.items[github].checked);
+        assert!(!state.items[linear].exists && state.items[linear].checked);
+        github
+    };
+    // Mark the existing row too — that means replace-in-place.
+    if let Overlay::McpPaste(state) = &mut app.overlay {
+        state.items[github].checked = true;
+    }
+    app.apply_mcp_paste().await.unwrap();
+
+    let root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+    let servers = root["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 2, "no `github-2` duplicate: {root}");
+    assert_eq!(servers["github"]["command"], "echo", "replaced in place");
+    assert_eq!(servers["linear"]["url"], "http://127.0.0.1:1/mcp");
+    let notice = app.notice.as_ref().unwrap().1.clone();
+    assert!(
+        notice.contains("Added linear") && notice.contains("replaced github"),
+        "notice: {notice}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn test_mcp_add_json_routes_and_reports_parse_error() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);

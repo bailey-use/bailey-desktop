@@ -891,6 +891,11 @@ impl CodeTuiApp {
                 self.screen_region = Some(overlay_content_rect(area));
                 self.render_mcp_tools_overlay(frame, area, &tools);
             }
+            Overlay::McpPaste(paste) => {
+                let area = centered_rect(64, 80, body);
+                self.screen_region = Some(overlay_content_rect(area));
+                self.render_mcp_paste_overlay(frame, area, &paste);
+            }
             Overlay::Config(config) => {
                 let area = centered_rect(64, 80, body);
                 self.screen_region = Some(overlay_content_rect(area));

@@ -779,6 +779,69 @@ impl McpToolsOverlay {
     }
 }
 
+/// One server from a multi-server JSON paste, awaiting the pick.
+#[derive(Clone, Debug)]
+pub(super) struct McpPasteRow {
+    pub(super) name: String,
+    /// Listing target: the command line or the URL.
+    pub(super) display: String,
+    pub(super) config: serde_json::Value,
+    pub(super) checked: bool,
+    /// A same-named server is already configured; a mark on it replaces that
+    /// entry in place (never a `-2` duplicate).
+    pub(super) exists: bool,
+}
+
+/// The paste picker for a `mcpServers` block defining ≥2 servers: new names
+/// arrive prechecked, existing ones need an explicit mark to replace. `parent`
+/// is the `/mcp` overlay to restore on Esc (`None` when the paste came from
+/// the composer, where no overlay was open).
+#[derive(Clone, Debug, Default)]
+pub(super) struct McpPasteOverlay {
+    pub(super) parent: Option<Box<McpOverlay>>,
+    /// `-p/--project`: writing into the repo `.mcp.json`.
+    pub(super) project: bool,
+    pub(super) items: Vec<McpPasteRow>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+}
+
+impl McpPasteOverlay {
+    pub(super) fn filtered_indices(&self) -> Vec<usize> {
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.display.as_str())),
+        )
+    }
+
+    pub(super) fn select_prev(&mut self) {
+        move_within(&self.filtered_indices(), &mut self.selected, -1);
+    }
+
+    pub(super) fn select_next(&mut self) {
+        move_within(&self.filtered_indices(), &mut self.selected, 1);
+    }
+
+    pub(super) fn refilter(&mut self) {
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
+    }
+
+    pub(super) fn has_selection(&self) -> bool {
+        self.filtered_indices().contains(&self.selected)
+    }
+
+    /// Ctrl+A: check every new (non-existing) server, or clear them all.
+    /// Existing servers only replace via an explicit Space.
+    pub(super) fn toggle_all(&mut self) {
+        let all_checked = self.items.iter().filter(|i| !i.exists).all(|i| i.checked);
+        for item in self.items.iter_mut().filter(|i| !i.exists) {
+            item.checked = !all_checked;
+        }
+    }
+}
+
 /// One toggleable chat preference, identified so the handler knows which flag to
 /// flip (and where to persist it) without matching on the row's label text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -928,6 +991,8 @@ pub(super) enum Overlay {
     Mcp(McpOverlay),
     /// Ctrl+T from `/mcp` — one server's tools, individually toggleable.
     McpTools(McpToolsOverlay),
+    /// A multi-server `mcpServers` JSON paste — pick which to add/replace.
+    McpPaste(McpPasteOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
     Config(ConfigOverlay),
     Picker(Box<PickerState>),

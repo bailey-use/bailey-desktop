@@ -118,8 +118,9 @@ fn normalize(cfg: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-/// Listing target for a normalized config: the URL or the command line.
-fn display_of(config: &Value) -> String {
+/// Listing target for a server config `Value`: the URL or the command line.
+/// Also used by the TUI's paste picker rows.
+pub fn display_of(config: &Value) -> String {
     if let Some(url) = config.get("url").and_then(|u| u.as_str()) {
         return url.to_string();
     }

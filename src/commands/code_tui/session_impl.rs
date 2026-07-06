@@ -1265,6 +1265,14 @@ is preserved."
         } else {
             self.real_cwd.clone()
         };
+        // Two or more servers in one paste → a pick overlay instead of adding
+        // everything: new names arrive prechecked, an already-configured name
+        // needs an explicit mark and then REPLACES that entry (re-pasting a
+        // README block no longer mints `github-2` duplicates).
+        if parsed.len() >= 2 {
+            self.open_mcp_paste_picker(parsed, project, &cwd);
+            return Ok(());
+        }
         let mut existing: std::collections::HashSet<String> =
             crate::agent::mcp::configured_servers(std::path::Path::new(&cwd))
                 .into_iter()
@@ -1322,6 +1330,130 @@ is preserved."
             MUTED,
             format!("Added {label}: {}{suffix}", added.join(", ")),
         ));
+        self.reset_mcp_after_config_change();
+        self.open_mcp_overlay().await
+    }
+
+    /// Stage a ≥2-server JSON paste as a pick overlay. Names come from the
+    /// JSON keys (unique by construction — multi-entry pastes are maps), so
+    /// there's nothing to dedupe: an existing name is a *replace* candidate.
+    fn open_mcp_paste_picker(
+        &mut self,
+        parsed: Vec<(Option<String>, serde_json::Value)>,
+        project: bool,
+        cwd: &str,
+    ) {
+        let existing: std::collections::HashSet<String> =
+            crate::agent::mcp::configured_servers(std::path::Path::new(cwd))
+                .into_iter()
+                .map(|s| s.name)
+                .collect();
+        let items: Vec<McpPasteRow> = parsed
+            .into_iter()
+            .map(|(name_opt, config)| {
+                let name =
+                    name_opt.unwrap_or_else(|| crate::agent::mcp::derive_name_from_value(&config));
+                let exists = existing.contains(&name);
+                McpPasteRow {
+                    display: crate::agent::mcp_import::display_of(&config),
+                    checked: !exists,
+                    exists,
+                    name,
+                    config,
+                }
+            })
+            .collect();
+        let parent = match std::mem::replace(&mut self.overlay, Overlay::None) {
+            Overlay::Mcp(state) => Some(Box::new(state)),
+            other => {
+                // Composer-initiated paste: nothing to restore on Esc.
+                drop(other);
+                None
+            }
+        };
+        self.overlay = Overlay::McpPaste(McpPasteOverlay {
+            parent,
+            project,
+            items,
+            selected: 0,
+            query: String::new(),
+        });
+    }
+
+    /// Enter in the paste picker: write every checked row (an existing name is
+    /// overwritten in place), then land back on `/mcp` with a summary notice.
+    pub(super) async fn apply_mcp_paste(&mut self) -> Result<()> {
+        let (rows, project) = match &self.overlay {
+            Overlay::McpPaste(state) => {
+                let rows: Vec<McpPasteRow> =
+                    state.items.iter().filter(|i| i.checked).cloned().collect();
+                (rows, state.project)
+            }
+            _ => return Ok(()),
+        };
+        if rows.is_empty() {
+            self.notice = Some((
+                WARNING,
+                "Nothing marked — Space marks a server to add".to_string(),
+            ));
+            return Ok(());
+        }
+        let cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        let mut added = Vec::new();
+        let mut replaced = Vec::new();
+        let mut added_stdio = false;
+        for row in rows {
+            let write = if project {
+                crate::agent::mcp::add_project_server_value(
+                    std::path::Path::new(&cwd),
+                    &row.name,
+                    &row.config,
+                )
+                .await
+            } else {
+                crate::agent::mcp::add_user_server_value(&row.name, &row.config).await
+            };
+            if let Err(e) = write {
+                self.notice = Some((ERROR, format!("Failed to add `{}`: {e}", row.name)));
+                self.reset_mcp_after_config_change();
+                return self.open_mcp_overlay().await;
+            }
+            self.session_store
+                .set_mcp_server_enabled(&row.name, true)
+                .await
+                .ok();
+            // A url server may need OAuth — queue the auto-authorize.
+            if let Some(url) = row.config.get("url").and_then(|u| u.as_str()) {
+                self.pending_mcp_auth
+                    .insert(row.name.clone(), url.to_string());
+            }
+            added_stdio |= row.config.get("command").is_some();
+            if row.exists {
+                replaced.push(row.name);
+            } else {
+                added.push(row.name);
+            }
+        }
+        if project && added_stdio {
+            self.allow_self_added_project_stdio();
+        }
+        let mut parts = Vec::new();
+        if !added.is_empty() {
+            parts.push(format!("Added {}", added.join(", ")));
+        }
+        if !replaced.is_empty() {
+            parts.push(format!("replaced {}", replaced.join(", ")));
+        }
+        let suffix = if project {
+            " → ./.mcp.json (project)"
+        } else {
+            ""
+        };
+        self.notice = Some((MUTED, format!("{}{suffix}", parts.join(" · "))));
         self.reset_mcp_after_config_change();
         self.open_mcp_overlay().await
     }

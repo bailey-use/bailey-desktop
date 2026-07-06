@@ -1043,6 +1043,78 @@ impl CodeTuiApp {
         );
     }
 
+    /// The multi-server paste picker: choose which pasted servers to add. An
+    /// existing name needs an explicit mark and replaces that entry in place.
+    pub(super) fn render_mcp_paste_overlay(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        state: &McpPasteOverlay,
+    ) {
+        let marked = state.items.iter().filter(|i| i.checked).count();
+        let input_line = search_input_line(&state.query, "type to filter…");
+        let inner_width = usize::from(area.width).saturating_sub(6).max(1);
+        let mut rows: Vec<Line> = Vec::new();
+        let mut selected_pos = 0usize;
+        let filtered = state.filtered_indices();
+        if filtered.is_empty() {
+            rows.push(Line::from(Span::styled(
+                format!("No servers match \"{}\".", state.query),
+                Style::default().fg(MUTED),
+            )));
+        }
+        for (pos, &i) in filtered.iter().enumerate() {
+            let item = &state.items[i];
+            let detail = if item.exists {
+                format!("configured — Space replaces · {}", item.display)
+            } else {
+                item.display.clone()
+            };
+            let detail = truncate_for_display_width(&detail, toggle_detail_room(inner_width));
+            if i == state.selected {
+                selected_pos = rows.len() + 1;
+            }
+            rows.extend(toggle_list_rows(
+                item.checked,
+                &item.name,
+                &detail,
+                if item.exists { ACCENT } else { MUTED },
+                i == state.selected,
+                inner_width,
+            ));
+            if pos + 1 < filtered.len() {
+                rows.push(Line::from(""));
+            }
+        }
+        let title = if state.project {
+            "Add MCP servers → ./.mcp.json"
+        } else {
+            "Add MCP servers"
+        };
+        render_toggle_list(
+            frame,
+            area,
+            ToggleListView {
+                title,
+                badge: Some((
+                    format!("{marked}/{} marked", state.items.len()),
+                    if marked > 0 { ACCENT } else { MUTED },
+                )),
+                input_line,
+                rows,
+                selected_pos,
+                detail: None,
+                footer: vec![
+                    ("↑↓", "move"),
+                    ("Space", "mark"),
+                    ("^A", "all"),
+                    ("Enter", "add"),
+                    ("Esc", "back"),
+                ],
+            },
+        );
+    }
+
     /// One-line detail for the selected `/skills` row: where the skill lives (home
     /// dir abbreviated to `~`) and, for a repo skill, a `project` tag — so the user
     /// knows where to edit it and that `d` won't delete it.

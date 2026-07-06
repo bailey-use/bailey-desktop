@@ -432,6 +432,16 @@ pub async fn add_user_server_value(name: &str, value: &Value) -> Result<(), Stri
     add_value_at(&path, name, value).await
 }
 
+/// Add (or replace) a server in the repo `.mcp.json` (project scope, `-p`).
+pub async fn add_project_server_value(cwd: &Path, name: &str, value: &Value) -> Result<(), String> {
+    add_value_at(&cwd.join(".mcp.json"), name, value).await
+}
+
+/// Remove a server from the repo `.mcp.json`. `Ok(false)` if it wasn't there.
+pub async fn remove_project_server(cwd: &Path, name: &str) -> Result<bool, String> {
+    remove_server_at(&cwd.join(".mcp.json"), name).await
+}
+
 async fn add_value_at(path: &Path, name: &str, value: &Value) -> Result<(), String> {
     let mut root = read_user_root_for_write(path)?;
     let servers = root

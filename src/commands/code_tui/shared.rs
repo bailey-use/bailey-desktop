@@ -278,7 +278,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
 pub(super) fn command_usage_hint(name: &str) -> Option<&'static str> {
     match name {
         // Richer than a placeholder — teaches the subcommand grammar.
-        "mcp" => Some("[add <command> [args…] | rm <name>]"),
+        "mcp" => Some("[add [-p] <command> [args…] | rm <name>]"),
         "skills" => Some("[add [-p] <name>|<github:owner/repo> | rm <name>]"),
         "create-skill" => Some("[what the skill should do]"),
         "goal" => Some("<objective> | stop"),

@@ -6481,6 +6481,32 @@ fn test_notice_spans_splits_live_url_from_indicator() {
 }
 
 #[tokio::test]
+async fn test_mcp_add_project_flag_writes_repo_config_and_grants_consent() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let dir = std::env::temp_dir().join(format!("aivo-mcp-project-add-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    app.real_cwd = dir.to_string_lossy().into_owned();
+
+    app.submit_mcp_add("-p echo hi".to_string()).await.unwrap();
+
+    // Written to the repo `.mcp.json`, not the user config.
+    let root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+    let servers = root["mcpServers"].as_object().unwrap();
+    assert!(
+        servers.values().any(|v| v["command"] == "echo"),
+        "project .mcp.json holds the added server: {root}"
+    );
+    // Typing the command IS the consent — run-once session approval, like `y`.
+    assert_eq!(app.project_mcp_consent, ProjectMcpConsent::Allowed);
+    assert!(app.pending_mcp_consent.is_none());
+    let notice = app.notice.as_ref().unwrap().1.clone();
+    assert!(notice.contains("./.mcp.json"), "notice: {notice}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn test_mcp_add_json_routes_and_reports_parse_error() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
@@ -9042,7 +9068,7 @@ fn test_composer_command_hint() {
     set(&mut app, "/mcp");
     assert!(
         app.composer_command_hint()
-            .is_some_and(|h| h.contains("add <command>")),
+            .is_some_and(|h| h.contains("add [-p] <command>")),
         "typing /mcp should ghost the add/rm syntax"
     );
     set(&mut app, "/mcp ");
@@ -9124,7 +9150,7 @@ fn test_mcp_ghost_hint_renders_in_composer() {
     }
     // The command and its ghost arg-hint share the composer line.
     assert!(
-        screen.contains("/mcp [add <command>"),
+        screen.contains("/mcp [add [-p] <command>"),
         "composer should show the inline ghost hint:\n{screen}"
     );
 }

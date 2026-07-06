@@ -56,7 +56,8 @@ impl McpCommand {
         row("add <command> [args…]", "Add a stdio server (name derived)");
         row("add <https://url>", "Add a remote Streamable HTTP server");
         row("add '<json>'", "Add from a pasted mcpServers JSON block");
-        row("rm <name>", "Remove a user-scope server");
+        row("add -p …", "…into the repo ./.mcp.json (project scope)");
+        row("rm [-p] <name>", "Remove a server (-p: from ./.mcp.json)");
         row(
             "import [tool] [name]",
             "Copy servers from claude/cursor/gemini/copilot/amp",
@@ -69,7 +70,7 @@ impl McpCommand {
         );
         println!(
             "  {}",
-            style::dim("./.mcp.json               project scope (edit that file by hand)")
+            style::dim("./.mcp.json               project scope (add -p / rm -p)")
         );
     }
 }
@@ -131,13 +132,44 @@ async fn list_action() -> Result<ExitCode> {
     Ok(ExitCode::Success)
 }
 
+/// Split a leading or trailing `-p`/`--project` off the add spec. Only the
+/// edges — clap can't own the flag here (`allow_hyphen_values` on the spec
+/// would swallow it), and a server's own mid-line `-p` arg must survive.
+fn split_project_flag(mut spec: Vec<String>) -> (Vec<String>, bool) {
+    let is_flag = |s: &String| s == "-p" || s == "--project";
+    if spec.first().is_some_and(is_flag) {
+        spec.remove(0);
+        (spec, true)
+    } else if spec.last().is_some_and(is_flag) {
+        spec.pop();
+        (spec, true)
+    } else {
+        (spec, false)
+    }
+}
+
 async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
-    const USAGE: &str = "usage: aivo mcp add <command [args…] | https://url | json>";
+    const USAGE: &str = "usage: aivo mcp add [-p] <command [args…] | https://url | json>";
+    let (spec, project) = split_project_flag(args.spec);
+    let args = McpAddArgs { spec };
     let mut existing: HashSet<String> = mcp::configured_servers(&cwd())
         .into_iter()
         .map(|s| s.name)
         .collect();
     let store = SessionStore::new();
+    let write_value = |name: String, value: serde_json::Value| async move {
+        let result = if project {
+            mcp::add_project_server_value(&cwd(), &name, &value).await
+        } else {
+            mcp::add_user_server_value(&name, &value).await
+        };
+        result.map_err(|e| anyhow!("failed to add `{name}`: {e}"))
+    };
+    let added_note = if project {
+        " → ./.mcp.json (project — commit it to share)"
+    } else {
+        ""
+    };
 
     // The shell already tokenized argv — multiple arguments are used verbatim
     // as `command args…` (re-joining and re-splitting would mangle args with
@@ -159,17 +191,16 @@ async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
             if let Some(json) = json_input {
                 let parsed = mcp::parse_mcp_json(&json)
                     .map_err(|e| anyhow!("couldn't parse MCP config: {e}"))?;
+                let mut added_stdio = false;
                 for (name_opt, value) in parsed {
                     let name = mcp::dedupe_name(
                         name_opt.unwrap_or_else(|| mcp::derive_name_from_value(&value)),
                         &existing,
                     );
-                    mcp::add_user_server_value(&name, &value)
-                        .await
-                        .map_err(|e| anyhow!("failed to add `{name}`: {e}"))?;
+                    write_value(name.clone(), value.clone()).await?;
                     // A freshly added server starts enabled, matching the TUI.
                     store.set_mcp_server_enabled(&name, true).await.ok();
-                    println!("Added MCP server `{name}`");
+                    println!("Added MCP server `{name}`{added_note}");
                     if value.get("url").is_some() {
                         println!(
                             "{}",
@@ -178,7 +209,11 @@ async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
                             )
                         );
                     }
+                    added_stdio |= value.get("command").is_some();
                     existing.insert(name);
+                }
+                if project && added_stdio {
+                    note_project_stdio_consent();
                 }
                 return Ok(ExitCode::Success);
             }
@@ -193,12 +228,27 @@ async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
     };
 
     let name = mcp::dedupe_name(mcp::derive_server_name(&command, &cmd_args), &existing);
-    mcp::add_user_server(&name, &command, &cmd_args)
-        .await
-        .map_err(|e| anyhow!("failed to add `{name}`: {e}"))?;
+    write_value(
+        name.clone(),
+        serde_json::json!({"command": command, "args": cmd_args}),
+    )
+    .await?;
     store.set_mcp_server_enabled(&name, true).await.ok();
-    println!("Added MCP server `{name}`");
+    println!("Added MCP server `{name}`{added_note}");
+    if project {
+        note_project_stdio_consent();
+    }
     Ok(ExitCode::Success)
+}
+
+/// Printed after a project-scope stdio add: the agent gates repo `.mcp.json`
+/// stdio servers behind a one-time consent card, so the add isn't mistaken
+/// for silent auto-run approval.
+fn note_project_stdio_consent() {
+    println!(
+        "{}",
+        style::dim("Project stdio servers ask for a one-time consent when the agent starts.")
+    );
 }
 
 async fn import_action(args: McpImportArgs) -> Result<ExitCode> {
@@ -324,6 +374,19 @@ fn note_unsupported_toml() {
 
 async fn remove_action(args: McpRemoveArgs) -> Result<ExitCode> {
     let name = args.name;
+    if args.project {
+        return match mcp::remove_project_server(&cwd(), &name).await {
+            Ok(true) => {
+                println!("Removed project MCP server `{name}` from ./.mcp.json");
+                Ok(ExitCode::Success)
+            }
+            Ok(false) => {
+                eprintln!("`{name}` is not in ./.mcp.json.");
+                Ok(ExitCode::UserError)
+            }
+            Err(e) => Err(anyhow!("failed to remove `{name}`: {e}")),
+        };
+    }
     let Some(server) = mcp::configured_servers(&cwd())
         .into_iter()
         .find(|s| s.name == name)
@@ -343,7 +406,7 @@ async fn remove_action(args: McpRemoveArgs) -> Result<ExitCode> {
             }
             Ok(false) => {
                 eprintln!(
-                    "`{name}` is defined in this repo's .mcp.json — edit that file to remove it."
+                    "`{name}` is defined in this repo's .mcp.json — remove it with `aivo mcp rm -p {name}`."
                 );
                 Ok(ExitCode::UserError)
             }

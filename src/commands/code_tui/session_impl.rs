@@ -1164,21 +1164,25 @@ is preserved."
 
     /// Parse the `/mcp` add-input (`command [args…]`, shell-quoted), DERIVE the
     /// server name from the command (the explicit name was redundant), write the
-    /// server to the user `mcp.json`, and refresh the overlay so the agent picks
-    /// it up. A parse problem stays in the overlay as a notice.
+    /// server to the user `mcp.json` — or the repo `.mcp.json` with `-p` — and
+    /// refresh the overlay so the agent picks it up. A parse problem stays in
+    /// the overlay as a notice.
     pub(super) async fn submit_mcp_add(&mut self, input: String) -> Result<()> {
+        // `-p`/`--project` at either edge targets the repo `.mcp.json` (same
+        // flag shape as `/skills add`).
+        let (input, project) = split_project_flag(&input);
         // A pasted `mcpServers` JSON block (Ctrl+V in the add field) — the form
         // every README hands you — is parsed directly; the name comes from the
         // JSON key (env and extra fields preserved).
         let trimmed = input.trim();
         if trimmed.starts_with('{') {
-            return self.submit_mcp_add_json(input).await;
+            return self.submit_mcp_add_json(input.clone(), project).await;
         }
         // A bare http(s) URL is a remote Streamable HTTP server — wrap it as a
         // `{url}` config (no JSON typing needed) and route through the same path,
         // so naming, dedup, and auto-authorize are shared.
         if let Some(json) = bare_url_to_config(trimmed) {
-            return self.submit_mcp_add_json(json).await;
+            return self.submit_mcp_add_json(json, project).await;
         }
         let (command, args) = match parse_mcp_add_input(&input) {
             Ok(parsed) => parsed,
@@ -1203,7 +1207,17 @@ is preserved."
             crate::agent::mcp::derive_server_name(&command, &args),
             &existing,
         );
-        if let Err(e) = crate::agent::mcp::add_user_server(&name, &command, &args).await {
+        let write = if project {
+            crate::agent::mcp::add_project_server_value(
+                std::path::Path::new(&cwd),
+                &name,
+                &serde_json::json!({"command": command, "args": args}),
+            )
+            .await
+        } else {
+            crate::agent::mcp::add_user_server(&name, &command, &args).await
+        };
+        if let Err(e) = write {
             self.notice = Some((ERROR, format!("Failed to add MCP server: {e}")));
             return Ok(());
         }
@@ -1213,15 +1227,32 @@ is preserved."
             .set_mcp_server_enabled(&name, true)
             .await
             .ok();
-        self.notice = Some((MUTED, format!("Added MCP server `{name}`")));
+        if project {
+            self.allow_self_added_project_stdio();
+            self.notice = Some((
+                MUTED,
+                format!("Added MCP server `{name}` → ./.mcp.json (project — commit it to share)"),
+            ));
+        } else {
+            self.notice = Some((MUTED, format!("Added MCP server `{name}`")));
+        }
         self.reset_mcp_after_config_change();
         self.open_mcp_overlay().await
+    }
+
+    /// The user just typed a project stdio server into `/mcp add -p` — that IS
+    /// the consent, so grant the run-once session approval (like pressing `y`).
+    /// Never persisted: the digest guard still re-prompts other sessions, and a
+    /// later hand-edit of `.mcp.json` re-prompts as usual.
+    fn allow_self_added_project_stdio(&mut self) {
+        self.project_mcp_consent = ProjectMcpConsent::Allowed;
+        self.pending_mcp_consent = None;
     }
 
     /// Add server(s) from a pasted `mcpServers` JSON block, preserving each
     /// entry's `env`/extra fields and taking the name from the JSON key (or
     /// deriving it for a bare `{command,…}`), de-duplicating against existing.
-    async fn submit_mcp_add_json(&mut self, input: String) -> Result<()> {
+    async fn submit_mcp_add_json(&mut self, input: String, project: bool) -> Result<()> {
         let parsed = match crate::agent::mcp::parse_mcp_json(&input) {
             Ok(p) => p,
             Err(e) => {
@@ -1240,12 +1271,23 @@ is preserved."
                 .map(|s| s.name)
                 .collect();
         let mut added = Vec::new();
+        let mut added_stdio = false;
         for (name_opt, value) in parsed {
             let name = dedupe_name(
                 name_opt.unwrap_or_else(|| crate::agent::mcp::derive_name_from_value(&value)),
                 &existing,
             );
-            if let Err(e) = crate::agent::mcp::add_user_server_value(&name, &value).await {
+            let write = if project {
+                crate::agent::mcp::add_project_server_value(
+                    std::path::Path::new(&cwd),
+                    &name,
+                    &value,
+                )
+                .await
+            } else {
+                crate::agent::mcp::add_user_server_value(&name, &value).await
+            };
+            if let Err(e) = write {
                 self.notice = Some((ERROR, format!("Failed to add `{name}`: {e}")));
                 self.reset_mcp_after_config_change();
                 return self.open_mcp_overlay().await;
@@ -1259,15 +1301,27 @@ is preserved."
             if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
                 self.pending_mcp_auth.insert(name.clone(), url.to_string());
             }
+            added_stdio |= value.get("command").is_some();
             existing.insert(name.clone());
             added.push(name);
+        }
+        if project && added_stdio {
+            self.allow_self_added_project_stdio();
         }
         let label = if added.len() == 1 {
             "MCP server"
         } else {
             "MCP servers"
         };
-        self.notice = Some((MUTED, format!("Added {label}: {}", added.join(", "))));
+        let suffix = if project {
+            " → ./.mcp.json (project)"
+        } else {
+            ""
+        };
+        self.notice = Some((
+            MUTED,
+            format!("Added {label}: {}{suffix}", added.join(", ")),
+        ));
         self.reset_mcp_after_config_change();
         self.open_mcp_overlay().await
     }

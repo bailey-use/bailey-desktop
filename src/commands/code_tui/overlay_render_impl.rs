@@ -1139,7 +1139,7 @@ impl CodeTuiApp {
         if state.adding.is_some() {
             rows.extend([
                 Line::from(Span::styled(
-                    "command args… or a https:// URL (name derived), or Ctrl+V a JSON block",
+                    "command args… or a https:// URL (name derived), or Ctrl+V a JSON block · -p → project .mcp.json",
                     Style::default().fg(MUTED),
                 )),
                 Line::from(Span::styled(

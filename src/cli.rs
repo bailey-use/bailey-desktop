@@ -343,6 +343,10 @@ pub struct McpRemoveArgs {
     /// Server name as shown by `aivo mcp list`
     #[arg(value_name = "NAME", value_parser = non_empty())]
     pub name: String,
+
+    /// Remove from the repo ./.mcp.json instead of the user config
+    #[arg(short = 'p', long = "project")]
+    pub project: bool,
 }
 
 #[derive(Args, Debug, Clone)]

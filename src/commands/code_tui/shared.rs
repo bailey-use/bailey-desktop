@@ -122,11 +122,17 @@ pub(super) const COMMAND_MENU_MAX_ROWS: usize = 7;
 pub(super) const PICKER_ROW_PREFIX_WIDTH: usize = 2;
 /// Lines a PageUp/PageDn moves the `/skills` `/mcp` detail drill-in.
 pub(super) const DETAIL_PAGE_LINES: u16 = 10;
-// Drag-copy wash: a dim warm olive (the brand yellow knocked back into the dark)
-// so a selection reads as brand-tinted rather than a cool steel block.
-pub(super) const SELECT_WARM: Color = Color::Rgb(58, 58, 40);
+/// Debounce so holding ↓ in `/resume` doesn't spawn a decrypt per row skimmed.
+pub(super) const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Tail of the decrypted history kept for the `/resume` preview pane.
+pub(super) const PREVIEW_MAX_MESSAGES: usize = 60;
+/// Preview-cache cap; beyond it the cache is cleared (rebuilt on demand).
+pub(super) const PREVIEW_CACHE_CAP: usize = 64;
+// Drag-copy wash: a cool slate a shade under the picker SELECT_BG, so a
+// selection reads as a quiet block in the same temperature as the bar.
+pub(super) const SELECT_WASH: Color = Color::Rgb(48, 52, 64);
 /// Brighter selection wash shown for the brief post-copy flash.
-pub(super) const SELECT_FLASH: Color = Color::Rgb(96, 98, 58);
+pub(super) const SELECT_FLASH: Color = Color::Rgb(86, 92, 110);
 
 #[derive(Clone, Copy)]
 pub(super) struct SlashCommandSpec {
@@ -424,10 +430,8 @@ impl LoadedSession {
     }
 }
 
-/// One discovered skill in the `/skills` overlay: name + a one-line advert,
-/// whether it's enabled (the full body still loads on demand when called), and
-/// where it lives (so the overlay can show the path and protect repo skills from
-/// deletion).
+/// One discovered skill in the `/skills` overlay. `description` is the FULL
+/// frontmatter text — rows and the `/` menu advert-truncate it at render time.
 #[derive(Clone, Debug)]
 pub(super) struct SkillToggle {
     pub(super) name: String,
@@ -435,7 +439,7 @@ pub(super) struct SkillToggle {
     pub(super) enabled: bool,
     pub(super) dir: std::path::PathBuf,
     pub(super) scope: crate::agent::skills::SkillScope,
-    /// The SKILL.md body, for the Enter drill-in preview (loaded at open time).
+    /// Full SKILL.md instructions, read at open time (discovery leaves them empty).
     pub(super) body: String,
 }
 
@@ -457,36 +461,35 @@ pub(super) struct SkillsOverlay {
 }
 
 impl SkillsOverlay {
-    /// Indices of `items` matching `query` (fuzzy over name + description), in
-    /// order. An empty query matches everything.
+    /// Indices of `items` matching `query`, best match first (see
+    /// [`ranked_indices`]). An empty query matches everything in list order.
     pub(super) fn filtered_indices(&self) -> Vec<usize> {
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| {
-                matches_fuzzy(&self.query, &format!("{} {}", it.name, it.description))
-            })
-            .map(|(i, _)| i)
-            .collect()
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.description.as_str())),
+        )
     }
 
     pub(super) fn select_prev(&mut self) {
         self.pending_delete = None;
+        self.detail_scroll = 0;
         move_within(&self.filtered_indices(), &mut self.selected, -1);
     }
 
     pub(super) fn select_next(&mut self) {
         self.pending_delete = None;
+        self.detail_scroll = 0;
         move_within(&self.filtered_indices(), &mut self.selected, 1);
     }
 
-    /// Re-anchor the selection to the first match after the query changed.
+    /// Re-anchor to the best-ranked match after the query changed, so
+    /// Enter/Space act on the top hit, not a stale survivor further down.
     pub(super) fn refilter(&mut self) {
         self.pending_delete = None;
-        let filtered = self.filtered_indices();
-        if !filtered.contains(&self.selected) {
-            self.selected = filtered.first().copied().unwrap_or(0);
-        }
+        self.detail_scroll = 0;
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
     }
 
     /// Whether the highlighted item is currently visible (matches the filter) —
@@ -552,33 +555,35 @@ pub(super) struct McpOverlay {
 }
 
 impl McpOverlay {
-    /// Indices of `items` matching `query` (fuzzy over name + status), in order.
+    /// Indices of `items` matching `query`, best match first (see
+    /// [`ranked_indices`]). An empty query matches everything in list order.
     pub(super) fn filtered_indices(&self) -> Vec<usize> {
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| matches_fuzzy(&self.query, &format!("{} {}", it.name, it.status)))
-            .map(|(i, _)| i)
-            .collect()
+        ranked_indices(
+            &self.query,
+            self.items
+                .iter()
+                .map(|it| (it.name.as_str(), it.status.as_str())),
+        )
     }
 
     pub(super) fn select_prev(&mut self) {
         self.pending_delete = None;
+        self.detail_scroll = 0;
         move_within(&self.filtered_indices(), &mut self.selected, -1);
     }
 
     pub(super) fn select_next(&mut self) {
         self.pending_delete = None;
+        self.detail_scroll = 0;
         move_within(&self.filtered_indices(), &mut self.selected, 1);
     }
 
-    /// Re-anchor the selection to the first match after the query changed.
+    /// Re-anchor to the best-ranked match after the query changed, so
+    /// Enter/Space act on the top hit, not a stale survivor further down.
     pub(super) fn refilter(&mut self) {
         self.pending_delete = None;
-        let filtered = self.filtered_indices();
-        if !filtered.contains(&self.selected) {
-            self.selected = filtered.first().copied().unwrap_or(0);
-        }
+        self.detail_scroll = 0;
+        self.selected = self.filtered_indices().first().copied().unwrap_or(0);
     }
 
     /// Whether the highlighted item is currently visible (matches the filter).
@@ -643,6 +648,31 @@ impl ConfigOverlay {
             self.selected = (self.selected + 1).min(self.items.len() - 1);
         }
     }
+}
+
+/// Filter + rank toggle-overlay rows: name matches (scored by `score_match`:
+/// prefix > substring > fuzzy) rank above rows only their detail text rescued,
+/// so an exact name hit can't drown under fuzzy description noise. Stable
+/// (list order) within equal ranks; empty query keeps everything in list order.
+fn ranked_indices<'a>(query: &str, rows: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<usize> {
+    // (name-vs-detail tier, name score): lower sorts first.
+    type FilterRank = (u8, (u8, usize, usize));
+    let mut ranked: Vec<(FilterRank, usize)> = rows
+        .enumerate()
+        .filter_map(|(index, (name, detail))| {
+            if query.is_empty() {
+                Some(((0, (0, 0, 0)), index))
+            } else if matches_fuzzy(query, name) {
+                Some(((0, crate::tui::score_match(query, name)), index))
+            } else if matches_fuzzy(query, &format!("{name} {detail}")) {
+                Some(((1, (0, 0, 0)), index))
+            } else {
+                None
+            }
+        })
+        .collect();
+    ranked.sort_by_key(|&(rank, _)| rank);
+    ranked.into_iter().map(|(_, index)| index).collect()
 }
 
 /// Move `selected` (an index into the full list) one step (`dir` = -1/+1) within
@@ -795,6 +825,20 @@ pub(super) struct PickerState {
     pub(super) selected: usize,
     pub(super) kind: PickerKind,
     pub(super) pending_delete: Option<DeleteConfirmTarget>,
+    /// Session-preview scroll, in lines UP from the bottom (0 = latest).
+    pub(super) preview_scroll: u16,
+    /// Session the scroll belongs to; a selection mismatch reads as 0 (re-anchor).
+    pub(super) preview_scroll_for: Option<String>,
+}
+
+/// Renderer→dispatch report: the clamped scroll to write back (renderers get a
+/// clone of the overlay) and the right detail pane's rect while split.
+#[derive(Default)]
+pub(super) struct OverlayRenderOut {
+    pub(super) detail_scroll: Option<u16>,
+    pub(super) detail_area: Option<Rect>,
+    /// Session id a `/resume` preview-scroll clamp belongs to.
+    pub(super) scroll_for: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -808,6 +852,17 @@ pub(super) struct PickerHitbox {
 pub(super) struct LoadingResume {
     pub(super) request_id: u64,
     pub(super) preview: SessionPreview,
+}
+
+/// A loaded `/resume` preview: the decrypted tail of one session's history.
+/// `updated_at` is the INDEX value captured at request time — not the file's,
+/// so index/file skew can't retrigger a load every tick.
+#[derive(Clone)]
+pub(super) struct PreviewEntry {
+    pub(super) updated_at: String,
+    pub(super) messages: Vec<ChatMessage>,
+    pub(super) truncated: bool,
+    pub(super) error: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -979,6 +1034,8 @@ impl PickerState {
             selected: 0,
             kind,
             pending_delete: None,
+            preview_scroll: 0,
+            preview_scroll_for: None,
         }
     }
 
@@ -996,6 +1053,8 @@ impl PickerState {
             selected: 0,
             kind,
             pending_delete: None,
+            preview_scroll: 0,
+            preview_scroll_for: None,
         }
     }
 
@@ -1371,6 +1430,12 @@ pub(super) enum RuntimeEvent {
         request_id: u64,
         result: std::result::Result<LoadedSession, String>,
     },
+    /// A `/resume` preview finished loading. Content-addressed by
+    /// `(session_id, updated_at)`: always cached, never "stale".
+    SessionPreviewLoaded {
+        session_id: String,
+        entry: PreviewEntry,
+    },
     /// A cursor-agent ACP session finished opening on a background task. The
     /// event loop stores it on the app so subsequent turns reuse it without
     /// paying the Node.js startup cost again.
@@ -1744,9 +1809,19 @@ pub(super) struct CodeTuiApp {
     pub(super) resume_request_id: u64,
     pub(super) loading_resume: Option<LoadingResume>,
     pub(super) resume_restore_state: Option<ResumeRestoreState>,
+    /// `/resume` preview cache: session id → history tail, valid while its
+    /// `updated_at` matches the index row's.
+    pub(super) session_preview_cache: std::collections::HashMap<String, PreviewEntry>,
+    /// Debounced preview load: spawned once `due` passes with the selection still there.
+    pub(super) session_preview_pending: Option<(String, Instant)>,
+    /// In-flight preview load; at most one at a time.
+    pub(super) session_preview_task: Option<(String, JoinHandle<()>)>,
     pub(super) reduce_motion: bool,
     pub(super) frame_tick: usize,
     pub(super) picker_hitbox: Option<PickerHitbox>,
+    /// Split overlay's right-pane rect from the last render (`None` = single-pane);
+    /// the key/mouse "split active" signal — a draw always precedes input.
+    pub(super) overlay_detail_area: Option<Rect>,
     pub(super) exit_confirm_pending: bool,
     /// Live `cursor-agent acp` connection scoped to the current chat session.
     /// `None` outside of cursor keys and before the first turn.

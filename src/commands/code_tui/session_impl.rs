@@ -514,11 +514,12 @@ is preserved."
             .into_iter()
             .map(|skill| SkillToggle {
                 enabled: !disabled.contains(&skill.name),
-                description: crate::agent::skills::advert_description(&skill.description),
+                // Discovery leaves the body empty (lazy); the detail pane needs it.
+                body: skill.instructions().into_owned(),
                 scope: crate::agent::skills::skill_scope(&skill.dir, cwd_path),
+                description: skill.description,
                 dir: skill.dir,
                 name: skill.name,
-                body: skill.body,
             })
             .collect();
         sort_skill_rows(&mut items);
@@ -1973,7 +1974,7 @@ pub(super) fn enabled_skill_commands(rows: &[SkillToggle]) -> Vec<SkillCommand> 
         .filter(|i| i.enabled)
         .map(|i| SkillCommand {
             name: i.name.clone(),
-            description: i.description.clone(),
+            description: crate::agent::skills::advert_description(&i.description),
         })
         .collect()
 }

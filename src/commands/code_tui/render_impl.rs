@@ -804,6 +804,7 @@ impl CodeTuiApp {
         self.picker_hitbox = None;
         self.transcript_hitbox = None;
         self.screen_region = None;
+        self.overlay_detail_area = None;
         let composer_area = self.render_main(frame, outer);
         if let Some(menu) = self.visible_command_menu() {
             let (area, placement) = command_menu_area(
@@ -819,7 +820,18 @@ impl CodeTuiApp {
 
         match self.overlay.clone() {
             Overlay::Picker(picker) => {
-                self.render_picker(frame, centered_rect(68, 72, body), &picker);
+                // Only the session picker gets the split (preview) layout.
+                let (area, split) = match picker.kind {
+                    PickerKind::Session => split_overlay_area(body, 86, 80, 68, 72),
+                    _ => (centered_rect(68, 72, body), false),
+                };
+                let out = self.render_picker(frame, area, &picker, split);
+                self.overlay_detail_area = out.detail_area;
+                if let (Some(clamped), Overlay::Picker(p)) = (out.detail_scroll, &mut self.overlay)
+                {
+                    p.preview_scroll = clamped;
+                    p.preview_scroll_for = out.scroll_for;
+                }
             }
             Overlay::Help { scroll } => {
                 let area = centered_rect(72, 88, body);
@@ -830,19 +842,32 @@ impl CodeTuiApp {
                 }
             }
             Overlay::Skills(skills) => {
-                let area = centered_rect(64, 80, body);
+                let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.screen_region = Some(overlay_content_rect(area));
-                let clamped = self.render_skills_overlay(frame, area, &skills);
-                if let (Some(c), Overlay::Skills(s)) = (clamped, &mut self.overlay) {
-                    s.detail_scroll = c;
+                let out = self.render_skills_overlay(frame, area, &skills, split);
+                self.overlay_detail_area = out.detail_area;
+                if let Overlay::Skills(s) = &mut self.overlay {
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
+                    // Canonicalize a drill-in that a resize carried into split mode.
+                    if split {
+                        s.viewing = None;
+                    }
                 }
             }
             Overlay::Mcp(mcp) => {
-                let area = centered_rect(64, 80, body);
+                let (area, split) = split_overlay_area(body, 84, 80, 64, 80);
                 self.screen_region = Some(overlay_content_rect(area));
-                let clamped = self.render_mcp_overlay(frame, area, &mcp);
-                if let (Some(c), Overlay::Mcp(s)) = (clamped, &mut self.overlay) {
-                    s.detail_scroll = c;
+                let out = self.render_mcp_overlay(frame, area, &mcp, split);
+                self.overlay_detail_area = out.detail_area;
+                if let Overlay::Mcp(s) = &mut self.overlay {
+                    if let Some(c) = out.detail_scroll {
+                        s.detail_scroll = c;
+                    }
+                    if split {
+                        s.viewing = None;
+                    }
                 }
             }
             Overlay::Config(config) => {
@@ -911,7 +936,7 @@ impl CodeTuiApp {
         let wash = if self.selection_flash_until.is_some() {
             SELECT_FLASH
         } else {
-            SELECT_WARM
+            SELECT_WASH
         };
         let (start, end) = normalized_selection(selection);
         let area = surface.area;
@@ -1859,7 +1884,7 @@ impl CodeTuiApp {
         let wash = if self.selection_flash_until.is_some() {
             SELECT_FLASH
         } else {
-            SELECT_WARM
+            SELECT_WASH
         };
         let (start, end) = normalized_selection(selection);
         let visible_start = hitbox.first_row;

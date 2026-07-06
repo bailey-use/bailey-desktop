@@ -457,6 +457,8 @@ impl CodeTuiApp {
     }
 
     fn apply_overlay_key(&mut self, key: KeyEvent) -> OverlayKeyAction {
+        // Split active last frame: the right pane owns the page keys, Tab drill-in is off.
+        let split = self.overlay_detail_area.is_some();
         match &mut self.overlay {
             Overlay::Help { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::F(1)) {
@@ -488,8 +490,8 @@ impl CodeTuiApp {
             }
             Overlay::Skills(state) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                // Detail drill-in: scroll through the body; Esc/Enter/Tab back out.
-                if state.viewing.is_some() {
+                // Narrow-only drill-in: scroll the body; Esc/Enter/Tab back out.
+                if state.viewing.is_some() && !split {
                     apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
                     if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab) {
                         state.viewing = None;
@@ -527,11 +529,12 @@ impl CodeTuiApp {
                     KeyCode::Char('p') if ctrl => state.select_prev(),
                     KeyCode::Down => state.select_next(),
                     KeyCode::Char('n') if ctrl => state.select_next(),
-                    KeyCode::Enter if state.has_selection() => {
+                    // Space toggles too — a dead key in a fuzzy filter, so it never types.
+                    KeyCode::Enter | KeyCode::Char(' ') if state.has_selection() => {
                         state.pending_delete = None;
                         return OverlayKeyAction::ToggleSkill(state.selected);
                     }
-                    KeyCode::Tab if state.has_selection() => {
+                    KeyCode::Tab if state.has_selection() && !split => {
                         state.pending_delete = None;
                         state.viewing = Some(state.selected);
                     }
@@ -547,11 +550,15 @@ impl CodeTuiApp {
                             return OverlayKeyAction::RemoveSkill(state.selected);
                         }
                     }
+                    // Page keys scroll the split's right detail pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
                     KeyCode::Backspace => {
                         state.query.pop();
                         state.refilter();
                     }
-                    KeyCode::Char(c) if !ctrl => {
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
                         state.query.push(c);
                         state.refilter();
                     }
@@ -561,8 +568,8 @@ impl CodeTuiApp {
             }
             Overlay::Mcp(state) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                // Detail drill-in: scroll through the tools; Esc/Enter/Tab back out.
-                if state.viewing.is_some() {
+                // Narrow-only drill-in: scroll the tools; Esc/Enter/Tab back out.
+                if state.viewing.is_some() && !split {
                     apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
                     if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Tab) {
                         state.viewing = None;
@@ -607,11 +614,12 @@ impl CodeTuiApp {
                     KeyCode::Char('p') if ctrl => state.select_prev(),
                     KeyCode::Down => state.select_next(),
                     KeyCode::Char('n') if ctrl => state.select_next(),
-                    KeyCode::Enter if state.has_selection() => {
+                    // Space toggles too — a dead key in a fuzzy filter, so it never types.
+                    KeyCode::Enter | KeyCode::Char(' ') if state.has_selection() => {
                         state.pending_delete = None;
                         return OverlayKeyAction::ToggleMcpServer(state.selected);
                     }
-                    KeyCode::Tab if state.has_selection() => {
+                    KeyCode::Tab if state.has_selection() && !split => {
                         state.pending_delete = None;
                         state.viewing = Some(state.selected);
                     }
@@ -636,11 +644,15 @@ impl CodeTuiApp {
                             return OverlayKeyAction::RemoveMcpServer(state.selected);
                         }
                     }
+                    // Page keys scroll the split's right detail pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End if split => {
+                        apply_detail_scroll(&mut state.detail_scroll, key, ctrl);
+                    }
                     KeyCode::Backspace => {
                         state.query.pop();
                         state.refilter();
                     }
-                    KeyCode::Char(c) if !ctrl => {
+                    KeyCode::Char(c) if !ctrl && c != ' ' => {
                         state.query.push(c);
                         state.refilter();
                     }
@@ -693,6 +705,24 @@ impl CodeTuiApp {
                         } else {
                             OverlayKeyAction::SubmitPicker(picker.selected)
                         }
+                    }
+                    // Page keys scroll the split session picker's preview pane.
+                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+                        if split && matches!(picker.kind, PickerKind::Session) =>
+                    {
+                        let sid =
+                            picker
+                                .filtered_items()
+                                .get(picker.selected)
+                                .and_then(|(_, item)| match &item.value {
+                                    PickerValue::Session(preview) => {
+                                        Some(preview.session_id.clone())
+                                    }
+                                    _ => None,
+                                });
+                        apply_preview_scroll(&mut picker.preview_scroll, key);
+                        picker.preview_scroll_for = sid;
+                        OverlayKeyAction::Handled
                     }
                     KeyCode::Char('d')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -945,6 +975,18 @@ impl CodeTuiApp {
 
         Ok(false)
     }
+}
+
+/// `/resume` preview scroll (lines up from the bottom): PageUp older, PageDown
+/// newer, Home oldest (`u16::MAX`, renderer-clamped), End latest.
+fn apply_preview_scroll(scroll_up: &mut u16, key: KeyEvent) {
+    *scroll_up = match key.code {
+        KeyCode::PageUp => scroll_up.saturating_add(DETAIL_PAGE_LINES),
+        KeyCode::PageDown => scroll_up.saturating_sub(DETAIL_PAGE_LINES),
+        KeyCode::Home => u16::MAX,
+        KeyCode::End => 0,
+        _ => *scroll_up,
+    };
 }
 
 /// Adjust a detail drill-in's scroll offset for a nav key (Up/Down, Ctrl+P/N,

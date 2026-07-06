@@ -1,14 +1,14 @@
 use super::*;
 
-// Selected-row background: a clean, deep brand olive (the accent yellow knocked
-// back into the dark) so a highlighted picker/menu row reads as lit by the
-// accent rather than army-drab — low blue keeps it from graying into mud.
-pub(super) const SELECT_BG: Color = Color::Rgb(80, 92, 36);
-// Primary text + chevron on the bar: near-white, bold — crisp on the olive.
-pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 244, 228);
-// Secondary text on the bar (endpoint URL, session time): a soft near-white,
-// still clearly readable but a touch under the bold-white primary label.
-const SELECT_ACCENT: Color = Color::Rgb(216, 220, 204);
+// Selected-row background: a cool slate — neutral but on the cold side, so it
+// reads as a clean raised surface on the dark terminals it sits on (a warm gray
+// here turns muddy against a navy/black background).
+pub(super) const SELECT_BG: Color = Color::Rgb(58, 62, 76);
+// Primary text + chevron on the bar: near-white, bold — crisp on the slate.
+pub(super) const SELECT_TEXT: Color = Color::Rgb(242, 243, 246);
+// Secondary text on the bar (endpoint URL, session time, toggle description): a
+// soft cool gray, clearly readable but under the bold-white primary label.
+pub(super) const SELECT_ACCENT: Color = Color::Rgb(196, 200, 210);
 
 fn picker_content_width(width: u16) -> usize {
     usize::from(width.max(1))
@@ -155,7 +155,7 @@ pub(super) fn command_menu_item_line(
     label_column_width: usize,
 ) -> Line<'static> {
     // The selected-row chevron sits on the dark transcript, not on SELECT_BG, so
-    // it uses a visible warm gray rather than the dim SELECT_WARM wash color.
+    // it uses a visible gray rather than the dim SELECT_WASH color.
     const SELECT_TEXT: Color = MUTED;
     const COLUMN_GAP: usize = 2;
 
@@ -358,7 +358,7 @@ pub(super) fn key_picker_item_line(key: &ApiKey, selected: bool, width: u16) -> 
             .bg(SELECT_BG)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
     };
     let endpoint_style = if selected {
         Style::default().fg(SELECT_ACCENT).bg(SELECT_BG)
@@ -390,8 +390,13 @@ pub(super) fn session_picker_item_lines(
     const DELETE_TEXT: Color = Color::Rgb(255, 240, 230);
     const DELETE_TIME: Color = Color::Rgb(255, 194, 170);
 
-    let time = format_session_time(&preview.updated_at);
     let content_width = picker_content_width(width);
+    // A narrow (split-left) pane can't spare 8 cols for "12:42 PM" — use the "5m" stamp.
+    let time = if content_width < 44 {
+        format_time_ago_short(&preview.updated_at)
+    } else {
+        format_session_time(&preview.updated_at)
+    };
     let time_width = display_width(&time);
     let preview_width = content_width
         .saturating_sub(time_width.saturating_add(2))
@@ -422,7 +427,7 @@ pub(super) fn session_picker_item_lines(
             .bg(active_bg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(ACCENT)
+        Style::default().fg(MUTED)
     };
     let fill_style = if selected {
         Style::default().bg(active_bg)
@@ -483,7 +488,7 @@ pub(super) fn render_session_picker_rows(
             all_rows.push((
                 Line::from(Span::styled(
                     group.clone(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
                 )),
                 Some(filtered_index),
                 false,
@@ -573,6 +578,53 @@ pub(super) fn picker_entry_lines(
                 Span::styled(" ".repeat(fill_width), fill_style),
             ])]
         }
+    }
+}
+
+/// Minimum shell-inner width for the two-pane split modals; narrower stays single-pane.
+pub(super) const SPLIT_MIN_INNER_WIDTH: u16 = 76;
+const SPLIT_LEFT_PCT: u16 = 40;
+
+pub(super) fn split_capable(area: Rect) -> bool {
+    area.width.saturating_sub(4) >= SPLIT_MIN_INNER_WIDTH
+}
+
+/// (left list, 3-col rule gutter, right detail) panes of a split overlay body.
+pub(super) fn split_columns(body: Rect) -> (Rect, Rect, Rect) {
+    let left_w = body.width * SPLIT_LEFT_PCT / 100;
+    let rule_w = 3u16.min(body.width.saturating_sub(left_w));
+    let right_w = body.width.saturating_sub(left_w + rule_w);
+    (
+        Rect {
+            width: left_w,
+            ..body
+        },
+        Rect {
+            x: body.x + left_w,
+            width: rule_w,
+            ..body
+        },
+        Rect {
+            x: body.x + left_w + rule_w,
+            width: right_w,
+            ..body
+        },
+    )
+}
+
+/// The overlay rect + whether the split layout fits (else the classic narrow rect).
+pub(super) fn split_overlay_area(
+    body: Rect,
+    wide_pct: u16,
+    wide_h_pct: u16,
+    narrow_pct: u16,
+    narrow_h_pct: u16,
+) -> (Rect, bool) {
+    let wide = centered_rect(wide_pct, wide_h_pct, body);
+    if split_capable(wide) {
+        (wide, true)
+    } else {
+        (centered_rect(narrow_pct, narrow_h_pct, body), false)
     }
 }
 

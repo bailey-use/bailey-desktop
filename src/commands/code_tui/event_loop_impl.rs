@@ -33,6 +33,20 @@ impl CodeTuiApp {
             RuntimeEvent::ResumeLoaded { request_id, result } => {
                 self.apply_resume_load_result(request_id, result).await?;
             }
+            RuntimeEvent::SessionPreviewLoaded { session_id, entry } => {
+                // Always cache — an entry for a no-longer-selected row is still correct.
+                if self.session_preview_cache.len() >= PREVIEW_CACHE_CAP {
+                    self.session_preview_cache.clear();
+                }
+                self.session_preview_cache.insert(session_id.clone(), entry);
+                if self
+                    .session_preview_task
+                    .as_ref()
+                    .is_some_and(|(sid, _)| *sid == session_id)
+                {
+                    self.session_preview_task = None;
+                }
+            }
             RuntimeEvent::CursorSessionOpened(session) => {
                 // Defensive: a /new or /key switch could land between the task
                 // starting `open()` and this event arriving. Only adopt the
@@ -1181,6 +1195,86 @@ impl CodeTuiApp {
         }
     }
 
+    /// Debounced `/resume` preview loader: after the selection rests on an
+    /// un-cached (or stale) session, spawn a background decrypt; `true` = repaint.
+    pub(super) fn tick_session_preview(&mut self) -> bool {
+        // Split session picker only (last-frame rect; the debounce absorbs the lag).
+        let wanted = match (&self.overlay, self.overlay_detail_area) {
+            (Overlay::Picker(picker), Some(_))
+                if matches!(picker.kind, PickerKind::Session) && !picker.loading =>
+            {
+                picker
+                    .filtered_items()
+                    .get(picker.selected)
+                    .and_then(|(_, item)| match &item.value {
+                        PickerValue::Session(preview) => {
+                            Some((preview.session_id.clone(), preview.updated_at.clone()))
+                        }
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let Some((session_id, updated_at)) = wanted else {
+            self.session_preview_pending = None;
+            return false;
+        };
+        // Valid cache entry (same index updated_at) → nothing to load.
+        if self
+            .session_preview_cache
+            .get(&session_id)
+            .is_some_and(|entry| entry.updated_at == updated_at)
+        {
+            self.session_preview_pending = None;
+            return false;
+        }
+        let due = match &self.session_preview_pending {
+            Some((sid, due)) if *sid == session_id => Instant::now() >= *due,
+            _ => {
+                // (Re)arm the debounce whenever the selection lands on a new row.
+                self.session_preview_pending =
+                    Some((session_id, Instant::now() + PREVIEW_DEBOUNCE));
+                return false;
+            }
+        };
+        if !due
+            || self
+                .session_preview_task
+                .as_ref()
+                .is_some_and(|(sid, task)| *sid == session_id && !task.is_finished())
+        {
+            return false;
+        }
+        self.session_preview_pending = None;
+
+        let session_store = self.session_store.clone();
+        let tx = self.tx.clone();
+        let sid = session_id.clone();
+        let task = tokio::spawn(async move {
+            let entry = match load_session_preview(&session_store, &sid, PREVIEW_MAX_MESSAGES).await
+            {
+                Ok((messages, truncated)) => PreviewEntry {
+                    updated_at,
+                    messages,
+                    truncated,
+                    error: None,
+                },
+                Err(err) => PreviewEntry {
+                    updated_at,
+                    messages: Vec::new(),
+                    truncated: false,
+                    error: Some(err),
+                },
+            };
+            let _ = tx.send(RuntimeEvent::SessionPreviewLoaded {
+                session_id: sid,
+                entry,
+            });
+        });
+        self.session_preview_task = Some((session_id, task));
+        true
+    }
+
     pub(super) async fn run(&mut self) -> Result<()> {
         let mut terminal = setup_terminal(chat_mouse_enabled())?;
         // Repaint only on change; an idle chat draws nothing.
@@ -1219,6 +1313,11 @@ impl CodeTuiApp {
 
             // Rotate the welcome tip on its interval (cheap at the idle cadence).
             if self.tick_welcome_tip() {
+                needs_redraw = true;
+            }
+
+            // Debounced `/resume` preview load once the selection rests on a row.
+            if self.tick_session_preview() {
                 needs_redraw = true;
             }
 
@@ -1275,14 +1374,20 @@ impl CodeTuiApp {
         // itself shuts down at process exit.
         let response_task = self.response_task.take();
         let resume_task = self.resume_task.take();
+        let preview_task = self.session_preview_task.take();
         let local_command = self.local_command.take();
         self.loading_resume = None;
         self.resume_restore_state = None;
+        self.session_preview_pending = None;
         if let Some(task) = response_task {
             task.abort();
             let _ = task.await;
         }
         if let Some(task) = resume_task {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some((_, task)) = preview_task {
             task.abort();
             let _ = task.await;
         }
@@ -2044,13 +2149,15 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Help { .. }, _) => Ok(Some(false)),
-            // The /skills and /mcp toggle lists scroll on the wheel the same way
-            // they do on ↑/↓: a drill-in scrolls its body, otherwise the wheel
-            // moves the selection (the list follows it), and add-input ignores it.
+            // Wheel: detail scroll in a drill-in or over the split's right pane,
+            // else selection move; add-input ignores it.
             (Overlay::Skills(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
                 if let Overlay::Skills(state) = &mut self.overlay {
-                    if state.viewing.is_some() {
+                    if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
                     } else if state.adding.is_none() {
                         if up {
@@ -2065,8 +2172,11 @@ impl CodeTuiApp {
             (Overlay::Skills(_), _) => Ok(Some(false)),
             (Overlay::Mcp(_), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                let over_detail = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
                 if let Overlay::Mcp(state) = &mut self.overlay {
-                    if state.viewing.is_some() {
+                    if state.viewing.is_some() || over_detail {
                         state.detail_scroll = wheel_scroll(state.detail_scroll, up);
                     } else if state.adding.is_none() {
                         if up {
@@ -2091,15 +2201,33 @@ impl CodeTuiApp {
                 Ok(Some(false))
             }
             (Overlay::Config(_), _) => Ok(Some(false)),
-            (Overlay::Picker(picker), MouseEventKind::ScrollUp) if !picker.loading => {
+            (Overlay::Picker(picker), MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+                if !picker.loading =>
+            {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                // Over the preview pane the wheel pages history (up = older); else selection.
+                let over_preview = self
+                    .overlay_detail_area
+                    .is_some_and(|area| rect_contains(area, (mouse.column, mouse.row)));
                 if let Overlay::Picker(picker) = &mut self.overlay {
-                    picker.select_prev();
-                }
-                Ok(Some(false))
-            }
-            (Overlay::Picker(picker), MouseEventKind::ScrollDown) if !picker.loading => {
-                if let Overlay::Picker(picker) = &mut self.overlay {
-                    picker.select_next();
+                    if over_preview && matches!(picker.kind, PickerKind::Session) {
+                        let sid =
+                            picker
+                                .filtered_items()
+                                .get(picker.selected)
+                                .and_then(|(_, item)| match &item.value {
+                                    PickerValue::Session(preview) => {
+                                        Some(preview.session_id.clone())
+                                    }
+                                    _ => None,
+                                });
+                        picker.preview_scroll = wheel_scroll(picker.preview_scroll, !up);
+                        picker.preview_scroll_for = sid;
+                    } else if up {
+                        picker.select_prev();
+                    } else {
+                        picker.select_next();
+                    }
                 }
                 Ok(Some(false))
             }

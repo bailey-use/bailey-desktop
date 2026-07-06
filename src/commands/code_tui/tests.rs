@@ -1162,9 +1162,13 @@ fn make_test_app(
         resume_request_id: 0,
         loading_resume: None,
         resume_restore_state: None,
+        session_preview_cache: std::collections::HashMap::new(),
+        session_preview_pending: None,
+        session_preview_task: None,
         reduce_motion: false,
         frame_tick: 0,
         picker_hitbox: None,
+        overlay_detail_area: None,
         exit_confirm_pending: false,
         cursor_acp_session: None,
         pending_agent_messages: None,
@@ -2917,6 +2921,8 @@ fn test_picker_visible_items_track_selection_for_single_line_rows() {
         selected: 4,
         kind: PickerKind::Session,
         pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
     };
 
     let visible = picker.visible_items(3);
@@ -2941,6 +2947,8 @@ fn test_picker_navigation_wraps() {
         selected: 0,
         kind: PickerKind::Session,
         pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
     };
 
     picker.select_prev();
@@ -2986,6 +2994,8 @@ fn test_picker_visible_items_respect_single_line_session_rows() {
         selected: 2,
         kind: PickerKind::Session,
         pending_delete: None,
+        preview_scroll: 0,
+        preview_scroll_for: None,
     };
 
     let visible = picker.visible_items(4);
@@ -6131,7 +6141,7 @@ fn test_highlight_does_not_wash_blank_cells_past_text() {
         let mut washed_cols = Vec::new();
         for x in area.x..area.x + area.width {
             let cell = buffer.cell((x, y)).unwrap();
-            if cell.bg == SELECT_WARM {
+            if cell.bg == SELECT_WASH {
                 washed_cols.push(x);
                 if !cell.symbol().trim().is_empty() {
                     last_text_col = Some(x);
@@ -6938,6 +6948,130 @@ async fn test_toggle_skill_persists_and_resets_engine() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// A name hit must outrank rows whose long description merely subsequence-
+/// matches, and typing re-anchors the selection to that top hit.
+#[test]
+fn test_skills_filter_ranks_name_matches_first() {
+    use crate::agent::skills::SkillScope;
+    let skill = |name: &str, description: &str| SkillToggle {
+        name: name.to_string(),
+        description: description.to_string(),
+        enabled: false,
+        dir: std::path::PathBuf::from("/tmp/x"),
+        scope: SkillScope::User,
+        body: String::new(),
+    };
+    let mut overlay = SkillsOverlay {
+        // "big old dear" contains b-o-l-d-e-r as a subsequence.
+        items: vec![
+            skill("alpha", "big old dear"),
+            skill("bolder", "amplify designs"),
+        ],
+        selected: 0,
+        query: String::new(),
+        adding: None,
+        pending_delete: None,
+        viewing: None,
+        detail_scroll: 0,
+    };
+
+    overlay.query = "bolder".to_string();
+    overlay.refilter();
+
+    assert_eq!(
+        overlay.filtered_indices(),
+        vec![1, 0],
+        "name match must rank above a description-only match"
+    );
+    assert_eq!(overlay.selected, 1, "typing re-anchors to the top hit");
+}
+
+/// Space is a dead key in a fuzzy filter, so it toggles instead of typing.
+#[tokio::test]
+async fn test_space_toggles_without_entering_filter() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Skills(skills_overlay_fixture());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    if let Overlay::Skills(s) = &app.overlay {
+        assert!(
+            !s.items[0].enabled,
+            "Space should toggle the selected skill"
+        );
+        assert!(s.query.is_empty(), "Space must never enter the filter");
+    } else {
+        panic!("skills overlay vanished");
+    }
+
+    // With no visible selection (filter matches nothing) Space is a no-op.
+    if let Overlay::Skills(s) = &mut app.overlay {
+        s.query = "zzz".to_string();
+        s.refilter();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    if let Overlay::Skills(s) = &app.overlay {
+        assert_eq!(s.query, "zzz");
+    }
+
+    app.overlay = Overlay::Mcp(mcp_overlay_fixture());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+        .await
+        .unwrap();
+    if let Overlay::Mcp(s) = &app.overlay {
+        assert!(
+            !s.items[0].enabled,
+            "Space should toggle the selected server"
+        );
+        assert!(s.query.is_empty());
+    } else {
+        panic!("mcp overlay vanished");
+    }
+}
+
+/// Discovery leaves `Skill::body` empty (lazy) and the advert truncates the
+/// description — the overlay must load/keep both in full for the detail pane.
+#[tokio::test]
+async fn test_open_skills_overlay_loads_full_body_and_description() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let dir = std::env::temp_dir().join(format!("aivo-skill-detail-{}", std::process::id()));
+    let skill_dir = dir.join(".agents").join("skills").join("fulltext");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: fulltext\ndescription: First sentence. Second sentence the advert would drop.\n---\nLine one of instructions.\nLine two of instructions.\n",
+    )
+    .unwrap();
+    app.real_cwd = dir.to_string_lossy().into_owned();
+
+    app.open_skills_overlay().await.unwrap();
+    let Overlay::Skills(state) = &app.overlay else {
+        panic!("skills overlay did not open");
+    };
+    let item = state
+        .items
+        .iter()
+        .find(|i| i.name == "fulltext")
+        .expect("skill discovered");
+    assert!(
+        item.description.contains("Second sentence"),
+        "full description should survive into the overlay: {}",
+        item.description
+    );
+    assert!(
+        item.body.contains("Line two of instructions"),
+        "SKILL.md body should be read at open time: {:?}",
+        item.body
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -7936,6 +8070,381 @@ async fn test_mcp_overlay_wheel_scrolls_like_arrows() {
         .await
         .unwrap();
     assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.detail_scroll == 3 && s.selected == 0));
+}
+
+fn test_screen(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+    let buf = terminal.backend().buffer().clone();
+    let area = *buf.area();
+    let mut screen = String::new();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            screen.push_str(buf[(x, y)].symbol());
+        }
+        screen.push('\n');
+    }
+    screen
+}
+
+fn session_picker_fixture() -> (PickerState, SessionPreview) {
+    let newest = SessionPreview {
+        key_id: "key-1".to_string(),
+        key_name: "prod".to_string(),
+        base_url: "https://api.example.com".to_string(),
+        session_id: "sess-new".to_string(),
+        raw_model: "claude".to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+        title: "Newest".to_string(),
+        preview_text: "Newest chat".to_string(),
+    };
+    let older = SessionPreview {
+        session_id: "sess-old".to_string(),
+        updated_at: (Utc::now() - ChronoDuration::days(2)).to_rfc3339(),
+        title: "Older".to_string(),
+        preview_text: "Older chat".to_string(),
+        ..newest.clone()
+    };
+    let picker = PickerState::ready(
+        "Sessions",
+        String::new(),
+        vec![
+            PickerEntry {
+                label: newest.title.clone(),
+                search_text: newest.search_text(),
+                value: PickerValue::Session(newest.clone()),
+            },
+            PickerEntry {
+                label: older.title.clone(),
+                search_text: older.search_text(),
+                value: PickerValue::Session(older),
+            },
+        ],
+        PickerKind::Session,
+    );
+    (picker, newest)
+}
+
+fn preview_chat_message(role: &str, content: &str) -> ChatMessage {
+    ChatMessage {
+        role: role.to_string(),
+        content: content.to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    }
+}
+
+#[test]
+fn test_skills_overlay_splits_on_wide_terminal() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Skills(skills_overlay_fixture());
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = test_screen(&terminal);
+
+    assert!(screen.contains("filter skills"), "missing list:\n{screen}");
+    assert!(
+        screen.contains("Instructions:") && screen.contains("Render the boards"),
+        "missing right-pane detail:\n{screen}"
+    );
+    assert!(
+        app.overlay_detail_area.is_some(),
+        "split should record the detail pane rect"
+    );
+}
+
+#[test]
+fn test_skills_overlay_narrow_keeps_single_pane_and_drill_in() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Skills(skills_overlay_fixture());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = test_screen(&terminal);
+    assert!(
+        !screen.contains("Instructions:"),
+        "narrow list mode must not show the detail pane:\n{screen}"
+    );
+    assert!(app.overlay_detail_area.is_none());
+
+    if let Overlay::Skills(state) = &mut app.overlay {
+        state.viewing = Some(0);
+    }
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = test_screen(&terminal);
+    assert!(
+        screen.contains("Instructions:") && screen.contains("Esc back"),
+        "narrow drill-in should render full-modal:\n{screen}"
+    );
+}
+
+#[tokio::test]
+async fn test_skills_split_page_keys_scroll_detail_and_tab_disabled() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Skills(skills_overlay_fixture());
+
+    // A draw arms `overlay_detail_area` (the split-active signal for keys).
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    assert!(app.overlay_detail_area.is_some());
+
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&app.overlay, Overlay::Skills(s) if s.detail_scroll == DETAIL_PAGE_LINES),
+        "PageDown should scroll the detail pane"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.viewing.is_none()));
+
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(&app.overlay, Overlay::Skills(s) if s.selected == 1 && s.detail_scroll == 0));
+}
+
+#[tokio::test]
+async fn test_mcp_split_wheel_routes_by_pane() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.overlay = Overlay::Mcp(mcp_overlay_fixture());
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let detail = app.overlay_detail_area.expect("split active");
+
+    let mut over_detail = wheel(MouseEventKind::ScrollDown);
+    over_detail.column = detail.x + 1;
+    over_detail.row = detail.y + 1;
+    app.handle_mouse(over_detail).await.unwrap();
+    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.detail_scroll == 3 && s.selected == 0));
+
+    app.handle_mouse(wheel(MouseEventKind::ScrollDown))
+        .await
+        .unwrap();
+    assert!(matches!(&app.overlay, Overlay::Mcp(s) if s.selected == 1 && s.detail_scroll == 0));
+}
+
+#[test]
+fn test_session_preview_lines_collapses_tool_runs() {
+    let messages = vec![
+        preview_chat_message("user", "hello there"),
+        preview_chat_message("assistant", "**hi** back"),
+        preview_chat_message("tool_call", "{\"name\":\"run_bash\"}"),
+        preview_chat_message("tool_result", "output"),
+        preview_chat_message("tool_call", "{\"name\":\"read_file\"}"),
+        preview_chat_message("assistant", "done"),
+    ];
+    let (lines, bars) = session_preview_lines(&messages, 60, true);
+    let plain: Vec<&str> = lines.iter().map(|l| l.plain.as_str()).collect();
+
+    assert!(
+        plain[0].contains("earlier messages not shown"),
+        "truncation banner missing: {plain:?}"
+    );
+    assert!(
+        plain.iter().any(|l| l.contains("⚙ 3 tool steps")),
+        "tool run should collapse to one line: {plain:?}"
+    );
+    assert!(
+        plain.iter().any(|l| l.contains("hi back")),
+        "assistant markdown missing: {plain:?}"
+    );
+    assert!(
+        plain.iter().any(|l| l.contains("hello there")),
+        "user message missing: {plain:?}"
+    );
+    let tool_row = plain
+        .iter()
+        .position(|l| l.contains("⚙ 3 tool steps"))
+        .unwrap();
+    assert_eq!(bars[tool_row], Some(TOOL));
+}
+
+#[tokio::test]
+async fn test_session_picker_preview_bottom_anchor_and_clamp() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (picker, newest) = session_picker_fixture();
+    app.overlay = Overlay::Picker(Box::new(picker));
+    let messages: Vec<ChatMessage> = (0..80)
+        .map(|i| {
+            preview_chat_message(
+                if i % 2 == 0 { "user" } else { "assistant" },
+                &format!("message number {i}"),
+            )
+        })
+        .collect();
+    app.session_preview_cache.insert(
+        newest.session_id.clone(),
+        PreviewEntry {
+            updated_at: newest.updated_at.clone(),
+            messages,
+            truncated: false,
+            error: None,
+        },
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = test_screen(&terminal);
+    assert!(
+        screen.contains("message number 79"),
+        "preview should anchor to the latest message:\n{screen}"
+    );
+    assert!(
+        !screen.contains("message number 0 "),
+        "oldest message should be scrolled out:\n{screen}"
+    );
+
+    // Home over-scrolls to u16::MAX; the renderer clamps to the oldest line.
+    app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let screen = test_screen(&terminal);
+    assert!(
+        screen.contains("message number 0 "),
+        "Home should land on the oldest loaded message:\n{screen}"
+    );
+    assert!(!screen.contains("message number 79"));
+    if let Overlay::Picker(p) = &app.overlay {
+        assert!(p.preview_scroll < u16::MAX);
+        assert_eq!(p.preview_scroll_for.as_deref(), Some("sess-new"));
+    } else {
+        panic!("picker vanished");
+    }
+}
+
+#[tokio::test]
+async fn test_session_preview_loaded_caches_even_when_not_selected() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (picker, _) = session_picker_fixture();
+    app.overlay = Overlay::Picker(Box::new(picker));
+
+    app.tx
+        .send(RuntimeEvent::SessionPreviewLoaded {
+            session_id: "sess-old".to_string(),
+            entry: PreviewEntry {
+                updated_at: "t1".to_string(),
+                messages: vec![preview_chat_message("user", "old hello")],
+                truncated: false,
+                error: None,
+            },
+        })
+        .unwrap();
+    assert!(app.handle_runtime_events().await.unwrap());
+    assert!(app.session_preview_cache.contains_key("sess-old"));
+}
+
+#[tokio::test]
+async fn test_tick_session_preview_debounce_and_invalidation() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (picker, newest) = session_picker_fixture();
+    app.overlay = Overlay::Picker(Box::new(picker));
+
+    // No split pane rendered yet → nothing scheduled.
+    assert!(!app.tick_session_preview());
+    assert!(app.session_preview_pending.is_none());
+
+    // Split active: the first tick arms the debounce, the next is not yet due.
+    app.overlay_detail_area = Some(Rect::new(0, 0, 40, 20));
+    assert!(!app.tick_session_preview());
+    assert!(app.session_preview_pending.is_some());
+    assert!(!app.tick_session_preview());
+    assert!(app.session_preview_task.is_none());
+
+    // Once due, exactly one load task spawns and the pending slot clears.
+    if let Some((_, due)) = &mut app.session_preview_pending {
+        *due = Instant::now() - Duration::from_millis(1);
+    }
+    assert!(app.tick_session_preview());
+    assert!(app.session_preview_task.is_some());
+    assert!(app.session_preview_pending.is_none());
+
+    // A valid cache entry (matching updated_at) suppresses any reload…
+    app.session_preview_task = None;
+    app.session_preview_cache.insert(
+        newest.session_id.clone(),
+        PreviewEntry {
+            updated_at: newest.updated_at.clone(),
+            messages: vec![],
+            truncated: false,
+            error: None,
+        },
+    );
+    assert!(!app.tick_session_preview());
+    assert!(app.session_preview_pending.is_none());
+
+    // …while a stale one (index row updated since) re-arms the debounce.
+    app.session_preview_cache
+        .get_mut(&newest.session_id)
+        .unwrap()
+        .updated_at = "stale".to_string();
+    assert!(!app.tick_session_preview());
+    assert!(app.session_preview_pending.is_some());
+}
+
+#[tokio::test]
+async fn test_session_picker_split_click_routes_left_rows_only() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let (picker, _) = session_picker_fixture();
+    app.overlay = Overlay::Picker(Box::new(picker));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let detail = app.overlay_detail_area.expect("split active");
+    let hitbox = app.picker_hitbox.clone().expect("hitbox recorded");
+
+    // A click inside the preview pane neither activates nor closes.
+    let mut click = wheel(MouseEventKind::Down(MouseButton::Left));
+    click.column = detail.x + 2;
+    click.row = detail.y + 2;
+    app.handle_mouse(click).await.unwrap();
+    assert!(matches!(&app.overlay, Overlay::Picker(_)));
+
+    // A click on a mapped list row resumes that session (picker closes).
+    let row = hitbox
+        .row_to_filtered_index
+        .iter()
+        .position(|idx| idx.is_some())
+        .expect("a clickable row") as u16;
+    let mut click = wheel(MouseEventKind::Down(MouseButton::Left));
+    click.column = hitbox.list_area.x + 1;
+    click.row = hitbox.list_area.y + row;
+    app.handle_mouse(click).await.unwrap();
+    assert!(
+        !matches!(&app.overlay, Overlay::Picker(_)),
+        "row click should activate the session"
+    );
+    assert!(app.loading_resume.is_some());
 }
 
 #[test]

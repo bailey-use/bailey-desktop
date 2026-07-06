@@ -57,10 +57,10 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         picker: &PickerState,
-    ) {
+        split: bool,
+    ) -> OverlayRenderOut {
         if matches!(picker.kind, PickerKind::Session) {
-            self.render_session_picker(frame, area, picker);
-            return;
+            return self.render_session_picker(frame, area, picker, split);
         }
 
         frame.render_widget(Clear, area);
@@ -117,7 +117,7 @@ impl CodeTuiApp {
         );
         let search_line = if picker.query.is_empty() {
             Line::from(vec![
-                Span::styled("/ ", Style::default().fg(ACCENT)),
+                Span::styled("/ ", Style::default().fg(MUTED)),
                 Span::styled(
                     picker_search_placeholder(&picker.kind),
                     Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
@@ -125,7 +125,7 @@ impl CodeTuiApp {
             ])
         } else {
             Line::from(vec![
-                Span::styled("/ ", Style::default().fg(ACCENT)),
+                Span::styled("/ ", Style::default().fg(MUTED)),
                 Span::styled(
                     picker.query.clone(),
                     Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -142,7 +142,7 @@ impl CodeTuiApp {
                 Paragraph::new("Loading available models…").style(Style::default().fg(MUTED)),
                 chunks[1],
             );
-            return;
+            return OverlayRenderOut::default();
         }
 
         let visible = picker.visible_items(usize::from(chunks[1].height));
@@ -185,6 +185,7 @@ impl CodeTuiApp {
                 .style(Style::default().fg(MUTED)),
             chunks[2],
         );
+        OverlayRenderOut::default()
     }
 
     pub(super) fn render_session_picker(
@@ -192,73 +193,75 @@ impl CodeTuiApp {
         frame: &mut Frame<'_>,
         area: Rect,
         picker: &PickerState,
-    ) {
-        frame.render_widget(Clear, area);
-        let shell = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(FAINT));
-        frame.render_widget(shell, area);
-
-        let inner = area.inner(ratatui::layout::Margin {
-            vertical: 1,
-            horizontal: 2,
-        });
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(6),
-                Constraint::Length(1),
-            ])
-            .split(inner);
-
-        let filtered_count = picker.filtered_items().len();
-        let total_count = picker.items.len();
-        let status_label = format!(
+        split: bool,
+    ) -> OverlayRenderOut {
+        // Same chrome as /skills and /mcp: title + count badge in the top border.
+        let badge = format!(
             "{} · esc",
-            format_session_match_count(filtered_count, total_count)
+            format_session_match_count(picker.filtered_items().len(), picker.items.len())
         );
-        let search_placeholder = if picker.query.is_empty() {
-            vec![Span::styled(
-                "filter chats, keys, models",
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-            )]
+        let inner = overlay_shell(frame, area, "Sessions", Some((badge, MUTED)));
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        // Split: list left, conversation preview right, full-width footer strip.
+        let (list_pane, preview_pane) = if split && inner.height > 1 {
+            let body = Rect {
+                height: inner.height - 1,
+                ..inner
+            };
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some(right))
         } else {
-            vec![Span::styled(
-                picker.query.clone(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            )]
+            (inner, None)
         };
-        let search_width = chunks[0].width.max(1);
-        let title_label = "Sessions";
-        let esc_width = display_width(&status_label) as u16;
-        let title_width = display_width(title_label) as u16;
-        let middle_padding = search_width.saturating_sub(title_width + esc_width).max(1);
-        let mut header_spans = vec![Span::styled(
-            title_label,
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-        )];
-        header_spans.push(Span::raw(" ".repeat(usize::from(middle_padding))));
-        header_spans.push(Span::styled(status_label, Style::default().fg(MUTED)));
-        frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
+        // Search row + a breathing gap, mirroring the toggle overlays' body.
+        let gap = u16::from(list_pane.height >= 8);
+        let chunks = if preview_pane.is_some() {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(gap),
+                    Constraint::Min(6),
+                ])
+                .split(list_pane)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(gap),
+                    Constraint::Min(6),
+                    Constraint::Length(1),
+                ])
+                .split(list_pane)
+        };
+        let footer_rect = if preview_pane.is_some() {
+            Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            }
+        } else {
+            chunks[3]
+        };
 
-        let search_line = Line::from(
-            std::iter::once(Span::styled("/ ", Style::default().fg(ACCENT)))
-                .chain(search_placeholder)
-                .collect::<Vec<_>>(),
-        );
         frame.render_widget(
-            Paragraph::new(search_line),
-            Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
+            Paragraph::new(search_input_line(
+                &picker.query,
+                "filter chats, keys, models",
+            )),
+            chunks[0],
         );
 
         let (lines, row_to_filtered_index) =
-            render_session_picker_rows(picker, usize::from(chunks[1].height), chunks[1].width);
+            render_session_picker_rows(picker, usize::from(chunks[2].height), chunks[2].width);
 
         self.picker_hitbox = Some(PickerHitbox {
             overlay_area: area,
-            list_area: chunks[1],
+            list_area: chunks[2],
             row_to_filtered_index,
         });
 
@@ -266,17 +269,61 @@ impl CodeTuiApp {
             Paragraph::new(Text::from(lines))
                 .style(Style::default().fg(TEXT))
                 .wrap(Wrap { trim: false }),
-            chunks[1],
+            chunks[2],
         );
         let footer_text = if picker.pending_delete.is_some() {
             "Enter or Ctrl+D confirm delete · Esc cancel"
+        } else if preview_pane.is_some() {
+            "Type to filter · Up/Down wrap · Enter open · PgUp preview · Ctrl+D delete"
         } else {
             "Type to filter · Up/Down wrap · Enter open · Ctrl+D delete"
         };
         frame.render_widget(
             Paragraph::new(footer_text).style(Style::default().fg(MUTED)),
-            chunks[2],
+            footer_rect,
         );
+
+        let Some(right) = preview_pane else {
+            return OverlayRenderOut::default();
+        };
+        let selected =
+            picker
+                .filtered_items()
+                .get(picker.selected)
+                .and_then(|(_, item)| match &item.value {
+                    PickerValue::Session(preview) => Some(preview.clone()),
+                    _ => None,
+                });
+        let Some(preview) = selected else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "no session selected",
+                    Style::default().fg(MUTED),
+                )),
+                right,
+            );
+            return OverlayRenderOut {
+                detail_area: Some(right),
+                ..Default::default()
+            };
+        };
+        // A stale entry (updated_at mismatch) reads as absent; the tick reloads it.
+        let entry = self
+            .session_preview_cache
+            .get(&preview.session_id)
+            .filter(|entry| entry.updated_at == preview.updated_at);
+        let scroll_up = if picker.preview_scroll_for.as_deref() == Some(preview.session_id.as_str())
+        {
+            picker.preview_scroll
+        } else {
+            0
+        };
+        let clamped = render_session_preview_pane(frame, right, &preview, entry, scroll_up);
+        OverlayRenderOut {
+            detail_scroll: Some(clamped),
+            detail_area: Some(right),
+            scroll_for: Some(preview.session_id),
+        }
     }
 
     /// `/help` overlay: an at-a-glance reference of every slash command (grouped
@@ -399,33 +446,36 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll, "Esc close")
     }
 
-    /// `/skills` overlay: a toggle list of the agent skills discovered for the
-    /// working dir. A `[✓]`/`[ ]` checkbox shows each skill's enabled state, with
-    /// the name on its own line and the (truncated) description below it; Tab
-    /// drills in for the full text. The chrome (rounded frame, on-count badge,
-    /// search line, footer hints) is shared with `/mcp` via [`render_toggle_list`]
-    /// so the two feel the same; the list scrolls to follow the selection.
-    /// Returns the clamped detail-scroll offset while a drill-in is open (so the
-    /// caller can persist it), else `None`.
+    /// `/skills` overlay: a checkbox toggle list of the discovered skills. Split
+    /// shows the highlighted skill's full text in the right pane; narrow keeps
+    /// the Tab drill-in. Chrome shared with `/mcp`.
     pub(super) fn render_skills_overlay(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         state: &SkillsOverlay,
-    ) -> Option<u16> {
-        // Enter drill-in: full description + body preview for the selected skill.
-        if let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
+        split: bool,
+    ) -> OverlayRenderOut {
+        // Narrow-only Tab drill-in; the split's right pane replaces it.
+        if !split && let Some(item) = state.viewing.and_then(|i| state.items.get(i)) {
             let inner = overlay_shell(frame, area, "Skills", None);
             if inner.height == 0 {
-                return Some(state.detail_scroll);
+                return OverlayRenderOut {
+                    detail_scroll: Some(state.detail_scroll),
+                    ..Default::default()
+                };
             }
-            return Some(self.render_skill_detail(
-                frame,
-                inner,
-                item,
-                usize::from(inner.width).max(1),
-                state.detail_scroll,
-            ));
+            return OverlayRenderOut {
+                detail_scroll: Some(self.render_skill_detail(
+                    frame,
+                    inner,
+                    item,
+                    usize::from(inner.width).max(1),
+                    state.detail_scroll,
+                    "Esc back",
+                )),
+                ..Default::default()
+            };
         }
 
         let filtered = state.filtered_indices();
@@ -445,6 +495,33 @@ impl CodeTuiApp {
             ))
         } else {
             search_input_line(&state.query, "filter skills")
+        };
+
+        let inner = overlay_shell(
+            frame,
+            area,
+            "Skills",
+            count_badge(state.adding.is_none(), enabled, state.items.len()),
+        );
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        // Split: two panes over a full-width footer strip (hints don't fit the left pane).
+        let (list_pane, split_panes) = if split && inner.height > 1 {
+            let footer_rect = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            let body = Rect {
+                height: inner.height - 1,
+                ..inner
+            };
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some((right, footer_rect)))
+        } else {
+            (inner, None)
         };
 
         let mut rows: Vec<Line> = Vec::new();
@@ -486,11 +563,14 @@ impl CodeTuiApp {
             )));
             footer = vec![("Esc", "close")];
         } else {
-            let inner_width = usize::from(area.width).saturating_sub(6).max(1);
+            let inner_width = usize::from(list_pane.width).saturating_sub(2).max(1);
             for (pos, &i) in filtered.iter().enumerate() {
                 let item = &state.items[i];
-                let desc =
-                    truncate_for_display_width(&item.description, toggle_detail_room(inner_width));
+                // Advert first: the stored description is full text, the row wants one line.
+                let desc = truncate_for_display_width(
+                    &crate::agent::skills::advert_description(&item.description),
+                    toggle_detail_room(inner_width),
+                );
                 if i == state.selected {
                     // Anchor scrolling to the item's second (description) line so
                     // both of its lines stay visible.
@@ -510,7 +590,7 @@ impl CodeTuiApp {
             }
             footer = vec![
                 ("↑↓", "move"),
-                ("Enter", "toggle"),
+                ("Space", "toggle"),
                 ("Tab", "view"),
                 ("^A", "add"),
                 ("^D", "remove"),
@@ -538,26 +618,77 @@ impl CodeTuiApp {
             selected_pos += 1; // the inserted row shifts the scroll anchor down one
         }
 
-        let detail = state
+        let selected_item = state
             .items
             .get(state.selected)
-            .filter(|_| state.adding.is_none() && filtered.contains(&state.selected))
-            .map(|item| (self.skill_detail_text(item), MUTED));
+            .filter(|_| state.adding.is_none() && filtered.contains(&state.selected));
+        // One-line detail only in narrow — the split's right pane carries the full version.
+        let detail = if split_panes.is_none() {
+            selected_item.map(|item| (self.skill_detail_text(item), MUTED))
+        } else {
+            None
+        };
+        // Split: Tab is gone (the pane is always on) — swap its hint for the scroll key.
+        let (body_footer, strip_footer): (Vec<_>, Vec<_>) = match split_panes {
+            Some(_) => (
+                Vec::new(),
+                footer
+                    .into_iter()
+                    .map(|hint| {
+                        if hint == ("Tab", "view") {
+                            ("PgDn", "scroll")
+                        } else {
+                            hint
+                        }
+                    })
+                    .collect(),
+            ),
+            None => (footer, Vec::new()),
+        };
 
-        render_toggle_list(
+        render_toggle_list_body(
             frame,
-            area,
+            list_pane,
             ToggleListView {
                 title: "Skills",
-                badge: count_badge(state.adding.is_none(), enabled, state.items.len()),
+                badge: None,
                 input_line,
                 rows,
                 selected_pos,
                 detail,
-                footer,
+                footer: body_footer,
             },
         );
-        None
+
+        let Some((right, footer_rect)) = split_panes else {
+            return OverlayRenderOut::default();
+        };
+        render_footer_hints(frame, footer_rect, &strip_footer);
+        let detail_scroll = match selected_item {
+            Some(item) => Some(self.render_skill_detail(
+                frame,
+                right,
+                item,
+                usize::from(right.width).max(1),
+                state.detail_scroll,
+                "",
+            )),
+            None => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "no skill selected",
+                        Style::default().fg(MUTED),
+                    )),
+                    right,
+                );
+                None
+            }
+        };
+        OverlayRenderOut {
+            detail_scroll,
+            detail_area: Some(right),
+            scroll_for: None,
+        }
     }
 
     /// `/config` overlay: a small fixed toggle list of chat preferences, sharing
@@ -629,32 +760,36 @@ impl CodeTuiApp {
         }
     }
 
-    /// `/mcp` overlay: a toggle list of the configured MCP servers. A `[✓]`/`[ ]`
-    /// checkbox shows the enabled state, with the server name on its own line and
-    /// its live status (tool count / failure / connecting, colored by health) on
-    /// the line below; Tab drills in for the full tool list. Shares its chrome and
-    /// layout with `/skills` via [`render_toggle_list`] so the two feel the same.
-    /// Returns the clamped detail-scroll offset while a drill-in is open (so the
-    /// caller can persist it), else `None`.
+    /// `/mcp` overlay: a checkbox toggle list of the configured servers, status
+    /// colored by health. Split shows the highlighted server's command + tools
+    /// in the right pane; narrow keeps the Tab drill-in. Chrome shared with `/skills`.
     pub(super) fn render_mcp_overlay(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         state: &McpOverlay,
-    ) -> Option<u16> {
-        // Enter drill-in: full tool list (or error) for the selected server.
-        if let Some(row) = state.viewing.and_then(|i| state.items.get(i)) {
+        split: bool,
+    ) -> OverlayRenderOut {
+        // Narrow-only Tab drill-in; the split's right pane replaces it.
+        if !split && let Some(row) = state.viewing.and_then(|i| state.items.get(i)) {
             let inner = overlay_shell(frame, area, "MCP servers", None);
             if inner.height == 0 {
-                return Some(state.detail_scroll);
+                return OverlayRenderOut {
+                    detail_scroll: Some(state.detail_scroll),
+                    ..Default::default()
+                };
             }
-            return Some(self.render_mcp_detail(
-                frame,
-                inner,
-                row,
-                usize::from(inner.width).max(1),
-                state.detail_scroll,
-            ));
+            return OverlayRenderOut {
+                detail_scroll: Some(self.render_mcp_detail(
+                    frame,
+                    inner,
+                    row,
+                    usize::from(inner.width).max(1),
+                    state.detail_scroll,
+                    "Esc back",
+                )),
+                ..Default::default()
+            };
         }
 
         let filtered = state.filtered_indices();
@@ -674,6 +809,33 @@ impl CodeTuiApp {
             ))
         } else {
             search_input_line(&state.query, "filter servers")
+        };
+
+        let inner = overlay_shell(
+            frame,
+            area,
+            "MCP servers",
+            count_badge(state.adding.is_none(), on, state.items.len()),
+        );
+        if inner.height == 0 {
+            return OverlayRenderOut::default();
+        }
+        // Split: two panes over a full-width footer strip (hints don't fit the left pane).
+        let (list_pane, split_panes) = if split && inner.height > 1 {
+            let footer_rect = Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            };
+            let body = Rect {
+                height: inner.height - 1,
+                ..inner
+            };
+            let (left, rule, right) = split_columns(body);
+            render_vertical_rule(frame, rule);
+            (left, Some((right, footer_rect)))
+        } else {
+            (inner, None)
         };
 
         let mut rows: Vec<Line> = Vec::new();
@@ -710,7 +872,7 @@ impl CodeTuiApp {
             )));
             footer = vec![("Esc", "close")];
         } else {
-            let inner_width = usize::from(area.width).saturating_sub(6).max(1);
+            let inner_width = usize::from(list_pane.width).saturating_sub(2).max(1);
             for (pos, &i) in filtered.iter().enumerate() {
                 let item = &state.items[i];
                 let status =
@@ -732,7 +894,7 @@ impl CodeTuiApp {
             }
             footer = vec![
                 ("↑↓", "move"),
-                ("Enter", "toggle"),
+                ("Space", "toggle"),
                 ("Tab", "view"),
                 ("^A", "add"),
                 ("^D", "rm"),
@@ -748,26 +910,77 @@ impl CodeTuiApp {
             )));
         }
 
-        let detail = state
+        let selected_row = state
             .items
             .get(state.selected)
-            .filter(|_| state.adding.is_none() && filtered.contains(&state.selected))
-            .map(|row| (self.mcp_detail_text(row), mcp_health_color(row.health)));
+            .filter(|_| state.adding.is_none() && filtered.contains(&state.selected));
+        // One-line detail only in narrow — the split's right pane carries the full version.
+        let detail = if split_panes.is_none() {
+            selected_row.map(|row| (self.mcp_detail_text(row), mcp_health_color(row.health)))
+        } else {
+            None
+        };
+        // Split: Tab is gone (the pane is always on) — swap its hint for the scroll key.
+        let (body_footer, strip_footer): (Vec<_>, Vec<_>) = match split_panes {
+            Some(_) => (
+                Vec::new(),
+                footer
+                    .into_iter()
+                    .map(|hint| {
+                        if hint == ("Tab", "view") {
+                            ("PgDn", "scroll")
+                        } else {
+                            hint
+                        }
+                    })
+                    .collect(),
+            ),
+            None => (footer, Vec::new()),
+        };
 
-        render_toggle_list(
+        render_toggle_list_body(
             frame,
-            area,
+            list_pane,
             ToggleListView {
                 title: "MCP servers",
-                badge: count_badge(state.adding.is_none(), on, state.items.len()),
+                badge: None,
                 input_line,
                 rows,
                 selected_pos,
                 detail,
-                footer,
+                footer: body_footer,
             },
         );
-        None
+
+        let Some((right, footer_rect)) = split_panes else {
+            return OverlayRenderOut::default();
+        };
+        render_footer_hints(frame, footer_rect, &strip_footer);
+        let detail_scroll = match selected_row {
+            Some(row) => Some(self.render_mcp_detail(
+                frame,
+                right,
+                row,
+                usize::from(right.width).max(1),
+                state.detail_scroll,
+                "",
+            )),
+            None => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "no server selected",
+                        Style::default().fg(MUTED),
+                    )),
+                    right,
+                );
+                None
+            }
+        };
+        OverlayRenderOut {
+            detail_scroll,
+            detail_area: Some(right),
+            scroll_for: None,
+        }
     }
 
     /// One-line detail for the selected `/mcp` row: its tool names when connected,
@@ -803,9 +1016,8 @@ impl CodeTuiApp {
         format!("{} · {}", row.name, parts.join(" · "))
     }
 
-    /// Enter drill-in for `/mcp`: the server's command, status, and full tool
-    /// list (name + wrapped description) when connected, or its full error.
-    /// Scrolls by `scroll` lines; returns the clamped scroll offset.
+    /// `/mcp` detail (split right pane / narrow drill-in): command, status, and
+    /// tool list or full error; returns the clamped scroll.
     fn render_mcp_detail(
         &self,
         frame: &mut Frame<'_>,
@@ -813,6 +1025,7 @@ impl CodeTuiApp {
         row: &McpServerRow,
         width: usize,
         scroll: u16,
+        esc_label: &str,
     ) -> u16 {
         use crate::agent::mcp::ServerScope;
         let scope = match row.scope {
@@ -822,7 +1035,7 @@ impl CodeTuiApp {
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 row.name.clone(),
-                Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  [{scope}]"), Style::default().fg(MUTED)),
         ])];
@@ -888,12 +1101,11 @@ impl CodeTuiApp {
                 Style::default().fg(MUTED),
             )));
         }
-        render_detail_lines(frame, area, lines, scroll, "Esc back")
+        render_detail_lines(frame, area, lines, scroll, esc_label)
     }
 
-    /// Enter drill-in for `/skills`: the skill's location, full description, and
-    /// the complete SKILL.md instructions (word-wrapped, indentation preserved).
-    /// Scrolls by `scroll` lines; returns the clamped scroll offset.
+    /// `/skills` detail (split right pane / narrow drill-in): location, full
+    /// description, and the SKILL.md instructions; returns the clamped scroll.
     fn render_skill_detail(
         &self,
         frame: &mut Frame<'_>,
@@ -901,6 +1113,7 @@ impl CodeTuiApp {
         item: &SkillToggle,
         width: usize,
         scroll: u16,
+        esc_label: &str,
     ) -> u16 {
         use crate::agent::skills::SkillScope;
         let scope = match item.scope {
@@ -911,7 +1124,7 @@ impl CodeTuiApp {
             Line::from(vec![
                 Span::styled(
                     item.name.clone(),
-                    Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  [{scope}{}]", if item.enabled { "" } else { " · off" }),
@@ -940,19 +1153,19 @@ impl CodeTuiApp {
                 Style::default().fg(FAINT),
             )));
         } else {
-            // Wrap each source line to the panel width (the leading "  " body
-            // indent plus any of the line's own indentation is preserved on wraps)
-            // so nothing is cut off the right edge.
-            for body_line in item.body.lines() {
-                for chunk in wrap_indented(body_line, width.saturating_sub(2)) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {chunk}"),
-                        Style::default().fg(FAINT),
-                    )));
+            // The body IS markdown — render it like the transcript, not dim raw lines.
+            lines.push(Line::from(""));
+            let mut body = render_markdown_lines(&item.body, width as u16);
+            while body.first().is_some_and(|l| l.plain.trim().is_empty()) {
+                body.remove(0);
+            }
+            for styled in body {
+                for row in wrap_styled_line(&styled.line.spans, width) {
+                    lines.push(row.line);
                 }
             }
         }
-        render_detail_lines(frame, area, lines, scroll, "Esc back")
+        render_detail_lines(frame, area, lines, scroll, esc_label)
     }
 }
 
@@ -986,7 +1199,7 @@ struct ToggleListView<'a> {
     footer: Vec<(&'a str, &'a str)>,
 }
 
-/// Draw the rounded modal frame with an accent title (left) and an optional
+/// Draw the rounded modal frame with a bold title (left) and an optional
 /// status badge (right) on the top border, returning the padded inner rect.
 fn overlay_shell(
     frame: &mut Frame<'_>,
@@ -1001,7 +1214,7 @@ fn overlay_shell(
         .border_style(Style::default().fg(FAINT))
         .title_top(Line::from(Span::styled(
             format!(" {title} "),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )));
     if let Some((label, color)) = badge {
         block = block.title_top(
@@ -1019,11 +1232,16 @@ fn overlay_shell(
     })
 }
 
-/// Render the shared toggle overlay: frame + input row + scrolling list +
-/// selected-item detail + footer hints. Both `/skills` and `/mcp` route through
-/// here so their chrome, spacing, and scroll behavior stay in lockstep.
-fn render_toggle_list(frame: &mut Frame<'_>, area: Rect, view: ToggleListView) {
-    let inner = overlay_shell(frame, area, view.title, view.badge);
+/// Shell + body for a whole-modal toggle overlay (`/config`); `/skills` and
+/// `/mcp` draw their own shell and call [`render_toggle_list_body`] directly.
+fn render_toggle_list(frame: &mut Frame<'_>, area: Rect, mut view: ToggleListView) {
+    let inner = overlay_shell(frame, area, view.title, view.badge.take());
+    render_toggle_list_body(frame, inner, view);
+}
+
+/// The toggle overlay's body (input row, list anchored to the selection, detail
+/// line, footer) inside an already-drawn shell; `view.title`/`badge` unused here.
+fn render_toggle_list_body(frame: &mut Frame<'_>, inner: Rect, view: ToggleListView) {
     if inner.height == 0 {
         return;
     }
@@ -1064,15 +1282,38 @@ fn render_toggle_list(frame: &mut Frame<'_>, area: Rect, view: ToggleListView) {
     }
 
     if footer_h == 1 {
-        frame.render_widget(
-            Paragraph::new(footer_hints(&view.footer)),
+        render_footer_hints(
+            frame,
             Rect {
                 y: inner.y + inner.height - 1,
                 height: 1,
                 ..inner
             },
+            &view.footer,
         );
     }
+}
+
+fn render_footer_hints(frame: &mut Frame<'_>, area: Rect, hints: &[(&str, &str)]) {
+    frame.render_widget(Paragraph::new(footer_hints(hints)), area);
+}
+
+/// The `│` divider between a split overlay's panes, centered in its gutter rect.
+fn render_vertical_rule(frame: &mut Frame<'_>, area: Rect) {
+    if area.width == 0 {
+        return;
+    }
+    let lines: Vec<Line> = (0..area.height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(FAINT))))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)),
+        Rect {
+            x: area.x + area.width / 2,
+            width: 1,
+            ..area
+        },
+    );
 }
 
 /// The two lines for one toggle-list item: a `[✓]`/`[ ]` checkbox plus the bold
@@ -1091,24 +1332,29 @@ fn toggle_list_rows(
     let check = if enabled { "[✓] " } else { "[ ] " };
     let indent = " ".repeat(TOGGLE_CHECKBOX_WIDTH);
     if selected {
-        let hl = Style::default().bg(SELECT_BG).fg(SELECT_TEXT);
+        // Keep hierarchy on the bar: bold name, softer description, accent ✓ survives.
+        let bar = Style::default().bg(SELECT_BG);
         vec![
-            Line::from(Span::styled(
-                pad_to_width(&format!("{check}{name}"), width),
-                hl,
-            )),
+            Line::from(vec![
+                Span::styled(check, bar.fg(if enabled { ACCENT } else { SELECT_ACCENT })),
+                Span::styled(
+                    pad_to_width(name, width.saturating_sub(TOGGLE_CHECKBOX_WIDTH)),
+                    bar.fg(SELECT_TEXT).add_modifier(Modifier::BOLD),
+                ),
+            ]),
             Line::from(Span::styled(
                 pad_to_width(&format!("{indent}{detail}"), width),
-                hl,
+                bar.fg(SELECT_ACCENT),
             )),
         ]
     } else if enabled {
         vec![
             Line::from(vec![
                 Span::styled(check, Style::default().fg(ACCENT)),
+                // Neutral name: the accent checkmark alone carries "enabled".
                 Span::styled(
                     name.to_string(),
-                    Style::default().fg(ASSISTANT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(Span::styled(
@@ -1117,11 +1363,12 @@ fn toggle_list_rows(
             )),
         ]
     } else {
+        // Name a step above the description so a long disabled tail stays scannable.
         vec![
-            Line::from(Span::styled(
-                format!("{check}{name}"),
-                Style::default().fg(FAINT),
-            )),
+            Line::from(vec![
+                Span::styled(check, Style::default().fg(FAINT)),
+                Span::styled(name.to_string(), Style::default().fg(MUTED)),
+            ]),
             Line::from(Span::styled(
                 format!("{indent}{detail}"),
                 Style::default().fg(FAINT),
@@ -1135,7 +1382,7 @@ fn toggle_list_rows(
 fn search_input_line(query: &str, placeholder: &str) -> Line<'static> {
     if query.is_empty() {
         Line::from(vec![
-            Span::styled("/ ", Style::default().fg(ACCENT)),
+            Span::styled("/ ", Style::default().fg(MUTED)),
             Span::styled(
                 placeholder.to_string(),
                 Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
@@ -1143,7 +1390,7 @@ fn search_input_line(query: &str, placeholder: &str) -> Line<'static> {
         ])
     } else {
         Line::from(vec![
-            Span::styled("/ ", Style::default().fg(ACCENT)),
+            Span::styled("/ ", Style::default().fg(MUTED)),
             Span::styled(
                 query.to_string(),
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -1280,6 +1527,125 @@ fn help_kv_row(label: &str, desc: &str, col: usize, label_style: Style) -> Line<
     ])
 }
 
+/// Right-pane `/resume` preview: title + meta header over the history tail,
+/// bottom-anchored; `scroll_up` counts lines up from the bottom, returned clamped.
+fn render_session_preview_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    preview: &SessionPreview,
+    entry: Option<&PreviewEntry>,
+    scroll_up: u16,
+) -> u16 {
+    if area.width == 0 || area.height == 0 {
+        return 0;
+    }
+    let width = usize::from(area.width);
+    let title = if preview.title.trim().is_empty() {
+        preview.session_id.as_str()
+    } else {
+        preview.title.as_str()
+    };
+    let header = vec![
+        Line::from(Span::styled(
+            truncate_for_display_width(title, width),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(resume_metadata_spans(preview, area.width)),
+        Line::from(Span::styled("─".repeat(width), Style::default().fg(FAINT))),
+    ];
+    let header_h = (header.len() as u16).min(area.height);
+    frame.render_widget(
+        Paragraph::new(Text::from(header)),
+        Rect {
+            height: header_h,
+            ..area
+        },
+    );
+    let body = Rect {
+        y: area.y + header_h,
+        height: area.height.saturating_sub(header_h),
+        ..area
+    };
+    if body.height == 0 {
+        return 0;
+    }
+
+    let Some(entry) = entry else {
+        frame.render_widget(
+            Paragraph::new(Span::styled("Loading preview…", Style::default().fg(MUTED))),
+            body,
+        );
+        return 0;
+    };
+    if let Some(err) = &entry.error {
+        let lines: Vec<Line> = wrap_chars(&format!("Couldn't load session: {err}"), width)
+            .into_iter()
+            .map(|chunk| Line::from(Span::styled(chunk, Style::default().fg(ERROR))))
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(lines)), body);
+        return 0;
+    }
+    if entry.messages.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("No messages yet", Style::default().fg(MUTED))),
+            body,
+        );
+        return 0;
+    }
+
+    // Wrap at width-2, then prefix each visual row with its 2-col role gutter.
+    let text_width = body.width.saturating_sub(2).max(1);
+    let (lines, bars) = session_preview_lines(&entry.messages, text_width, entry.truncated);
+    let wrapped = wrap_transcript(&lines, &bars, text_width);
+    let rows: Vec<Line> = wrapped
+        .text
+        .lines
+        .into_iter()
+        .zip(wrapped.bars.iter())
+        .map(|(line, bar)| {
+            let mut spans = vec![match bar {
+                Some(color) => Span::styled("▎ ", Style::default().fg(*color)),
+                None => Span::raw("  "),
+            }];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect();
+
+    // Bottom anchor: 0 pins the tail; render_detail_lines' clamp, upside down.
+    let total = rows.len();
+    let viewport = usize::from(body.height.saturating_sub(1)).max(1);
+    let max_up = total.saturating_sub(viewport).min(usize::from(u16::MAX)) as u16;
+    let scroll_up = scroll_up.min(max_up);
+    let top = max_up - scroll_up;
+    frame.render_widget(
+        Paragraph::new(Text::from(rows)).scroll((top, 0)),
+        Rect {
+            height: body.height.saturating_sub(1),
+            ..body
+        },
+    );
+    if max_up > 0 {
+        let first = usize::from(top) + 1;
+        let last = (usize::from(top) + viewport).min(total);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("{first}–{last}/{total}"),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled("   PgUp older", Style::default().fg(FAINT)),
+            ])),
+            Rect {
+                y: body.y + body.height - 1,
+                height: 1,
+                ..body
+            },
+        );
+    }
+    scroll_up
+}
+
 /// Render a scrollable Enter drill-in panel: `lines` in the body (the last row is
 /// a footer with the close hint (`esc_label`), scroll hint, and position),
 /// scrolled by `scroll` lines. Returns the scroll offset clamped to the real
@@ -1364,26 +1730,6 @@ pub(super) fn wrap_chars(text: &str, width: usize) -> Vec<String> {
         out.push(cur);
     }
     out
-}
-
-/// Word-wrap one source line to `width`, preserving its leading indentation and
-/// re-applying that indent to every continuation line (so wrapped list items and
-/// nested blocks stay aligned). A blank line stays a single blank line.
-fn wrap_indented(line: &str, width: usize) -> Vec<String> {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return vec![String::new()];
-    }
-    let indent = &line[..line.len() - trimmed.len()];
-    let avail = width.saturating_sub(display_width(indent)).max(1);
-    let chunks = wrap_chars(trimmed, avail);
-    if chunks.is_empty() {
-        return vec![indent.to_string()];
-    }
-    chunks
-        .into_iter()
-        .map(|chunk| format!("{indent}{chunk}"))
-        .collect()
 }
 
 /// Render an MCP server's tool list for the drill-in: each tool as a `•`-bulleted

@@ -43,6 +43,27 @@ pub(super) async fn load_resume_session(
     LoadedSession::from_state(session).map_err(|err| err.to_string())
 }
 
+/// The last `cap` messages of one session for the `/resume` preview (+ whether
+/// older were dropped); deliberately skips the `engine_messages` decrypt.
+pub(super) async fn load_session_preview(
+    session_store: &SessionStore,
+    session_id: &str,
+    cap: usize,
+) -> std::result::Result<(Vec<ChatMessage>, bool), String> {
+    let state = session_store
+        .get_code_session(session_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "Saved session is no longer available".to_string())?;
+    let mut messages = decrypt_to_chat_messages(&state).map_err(|err| err.to_string())?;
+    let truncated = messages.len() > cap;
+    if truncated {
+        let drop = messages.len() - cap;
+        messages.drain(..drop);
+    }
+    Ok((messages, truncated))
+}
+
 /// Per-directory recall view: entries typed in `cwd` plus legacy un-attributed
 /// ones (empty `cwd`), oldest-first, capped to the last `MAX_DRAFT_HISTORY`.
 pub(super) fn draft_history_view(all: &[DraftHistoryEntry], cwd: &str) -> Vec<String> {
@@ -258,10 +279,10 @@ pub(super) fn push_resume_metadata_segment(
 pub(super) fn resume_metadata_spans(preview: &SessionPreview, width: u16) -> Vec<Span<'static>> {
     let (time_value, key_value, model_value) = resume_metadata_values(preview, width);
     let mut spans = Vec::new();
-    push_resume_metadata_segment(&mut spans, time_value, ACCENT);
-    push_resume_metadata_segment(&mut spans, key_value, USER);
+    push_resume_metadata_segment(&mut spans, time_value, MUTED);
+    push_resume_metadata_segment(&mut spans, key_value, MUTED);
     if let Some(model_value) = model_value {
-        push_resume_metadata_segment(&mut spans, model_value, ASSISTANT);
+        push_resume_metadata_segment(&mut spans, model_value, MUTED);
     }
     spans
 }

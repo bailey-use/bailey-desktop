@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::agent::mcp;
-use crate::cli::{McpAddArgs, McpArgs, McpRemoveArgs, McpSubcommand};
+use crate::agent::{mcp, mcp_import};
+use crate::cli::{McpAddArgs, McpArgs, McpImportArgs, McpRemoveArgs, McpSubcommand};
 use crate::errors::ExitCode;
 use crate::services::session_store::SessionStore;
 use crate::style;
@@ -27,6 +27,7 @@ impl McpCommand {
             McpSubcommand::List => list_action().await,
             McpSubcommand::Add(a) => add_action(a).await,
             McpSubcommand::Remove(a) => remove_action(a).await,
+            McpSubcommand::Import(a) => import_action(a).await,
         };
         match result {
             Ok(code) => code,
@@ -56,6 +57,10 @@ impl McpCommand {
         row("add <https://url>", "Add a remote Streamable HTTP server");
         row("add '<json>'", "Add from a pasted mcpServers JSON block");
         row("rm <name>", "Remove a user-scope server");
+        row(
+            "import [tool] [name]",
+            "Copy servers from claude/cursor/gemini/copilot/amp",
+        );
         println!();
         println!("{}", style::bold("Files:"));
         println!(
@@ -194,6 +199,127 @@ async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
     store.set_mcp_server_enabled(&name, true).await.ok();
     println!("Added MCP server `{name}`");
     Ok(ExitCode::Success)
+}
+
+async fn import_action(args: McpImportArgs) -> Result<ExitCode> {
+    let sources = mcp_import::discover();
+    let existing: HashSet<String> = mcp::configured_servers(&cwd())
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+    let Some(tool) = args.tool.as_deref().map(str::to_lowercase) else {
+        // Listing mode: show everything found and where it came from.
+        if sources.is_empty() {
+            println!("No MCP servers found in other tools' configs.");
+        } else {
+            for src in &sources {
+                println!(
+                    "{}  {}",
+                    style::bold(src.tool),
+                    style::dim(crate::services::system_env::collapse_tilde(
+                        &src.path.display().to_string()
+                    )),
+                );
+                let name_w = src
+                    .servers
+                    .iter()
+                    .map(|s| s.name.chars().count())
+                    .max()
+                    .unwrap_or(4);
+                for s in &src.servers {
+                    let marker = if existing.contains(&s.name) {
+                        style::dim("  (already configured)").to_string()
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  {}  {}{marker}",
+                        style::cyan(format!("{:<name_w$}", s.name)),
+                        style::dim(&s.display),
+                    );
+                }
+            }
+            println!();
+            println!(
+                "{}",
+                style::dim(
+                    "Import with `aivo mcp import <tool> [name]`, or `aivo mcp import all`."
+                )
+            );
+        }
+        note_unsupported_toml();
+        return Ok(ExitCode::Success);
+    };
+
+    if let Some((_, rel)) = mcp_import::UNSUPPORTED_TOML
+        .iter()
+        .find(|(t, _)| *t == tool)
+    {
+        eprintln!(
+            "{tool} keeps its MCP servers in TOML (~/{rel}), which aivo can't import yet — add them with `aivo mcp add`."
+        );
+        return Ok(ExitCode::UserError);
+    }
+    let selected: Vec<_> = sources
+        .iter()
+        .filter(|s| tool == "all" || s.tool == tool)
+        .collect();
+    if selected.is_empty() {
+        eprintln!(
+            "No importable MCP servers found for `{tool}` (supported: claude, cursor, gemini, copilot, amp, all)."
+        );
+        return Ok(ExitCode::UserError);
+    }
+
+    let store = SessionStore::new();
+    let mut existing = existing;
+    let mut touched = 0usize;
+    for src in selected {
+        for s in &src.servers {
+            if args.name.as_deref().is_some_and(|only| only != s.name) {
+                continue;
+            }
+            touched += 1;
+            if existing.contains(&s.name) {
+                println!("Skipped `{}` — already configured", s.name);
+                continue;
+            }
+            mcp::add_user_server_value(&s.name, &s.config)
+                .await
+                .map_err(|e| anyhow!("failed to import `{}`: {e}", s.name))?;
+            // Imported servers start enabled, like any fresh add.
+            store.set_mcp_server_enabled(&s.name, true).await.ok();
+            existing.insert(s.name.clone());
+            println!("Imported `{}` from {}", s.name, src.tool);
+        }
+    }
+    if touched == 0 {
+        match args.name {
+            Some(name) => eprintln!("No server named `{name}` found in `{tool}`."),
+            None => eprintln!("Nothing to import from `{tool}`."),
+        }
+        return Ok(ExitCode::UserError);
+    }
+    Ok(ExitCode::Success)
+}
+
+/// Mention TOML-config tools that exist on disk but can't be imported, so
+/// their absence from the listing isn't mistaken for "no servers".
+fn note_unsupported_toml() {
+    let Some(home) = crate::services::system_env::home_dir() else {
+        return;
+    };
+    for (tool, rel) in mcp_import::UNSUPPORTED_TOML {
+        if home.join(rel).is_file() {
+            println!(
+                "{}",
+                style::dim(format!(
+                    "({tool} uses TOML (~/{rel}) — not importable yet; use `aivo mcp add`)"
+                ))
+            );
+        }
+    }
 }
 
 async fn remove_action(args: McpRemoveArgs) -> Result<ExitCode> {

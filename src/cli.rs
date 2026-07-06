@@ -324,6 +324,10 @@ pub enum McpSubcommand {
     /// Remove a user-scope server by name
     #[command(name = "rm", alias = "remove")]
     Remove(McpRemoveArgs),
+
+    /// List or copy MCP servers from other tools' configs (claude, cursor,
+    /// gemini, copilot, amp)
+    Import(McpImportArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -339,6 +343,18 @@ pub struct McpRemoveArgs {
     /// Server name as shown by `aivo mcp list`
     #[arg(value_name = "NAME", value_parser = non_empty())]
     pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpImportArgs {
+    /// Tool to import from (`claude`, `cursor`, `gemini`, `copilot`, `amp`,
+    /// or `all`); omit to list what's available
+    #[arg(value_name = "TOOL")]
+    pub tool: Option<String>,
+
+    /// Import only this server (default: every server the tool defines)
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

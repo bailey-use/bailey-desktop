@@ -14,6 +14,7 @@ pub mod grant_store;
 pub mod guards;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_import;
 pub mod notes;
 pub mod plan;
 pub mod protocol;

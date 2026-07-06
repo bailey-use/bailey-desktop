@@ -45,6 +45,15 @@ pub(crate) fn rewrite_cli_args(
         return rewritten;
     }
 
+    // `aivo code <mcp|skills> …` → the hidden clap command named "code mcp"/"code skills".
+    if raw_args[1] == "code"
+        && let Some(sub @ ("mcp" | "skills")) = raw_args.get(2).map(String::as_str)
+    {
+        let mut rewritten = vec![raw_args[0].clone(), format!("code {sub}")];
+        rewritten.extend_from_slice(&raw_args[3..]);
+        return rewritten;
+    }
+
     if matches!(raw_args[1].as_str(), "-p" | "--prompt" | "-x" | "--execute") {
         let mut rewritten = vec![raw_args[0].clone(), "code".to_string()];
         rewritten.extend_from_slice(&raw_args[1..]);
@@ -1533,6 +1542,52 @@ mod tests {
         assert_eq!(
             rewrite_cli_args(args(&["aivo", "ping"]), &no_bundles()),
             args(&["aivo", "keys", "ping"])
+        );
+    }
+
+    #[test]
+    fn rewrite_code_mcp_to_mcp_command() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "code", "mcp"]), &no_bundles()),
+            args(&["aivo", "code mcp"])
+        );
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "code", "mcp", "add", "-p", "npx", "-y", "srv"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "code mcp", "add", "-p", "npx", "-y", "srv"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "code", "mcp", "--help"]), &no_bundles()),
+            args(&["aivo", "code mcp", "--help"])
+        );
+    }
+
+    #[test]
+    fn rewrite_code_skills_to_skills_command() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "code", "skills"]), &no_bundles()),
+            args(&["aivo", "code skills"])
+        );
+        assert_eq!(
+            rewrite_cli_args(
+                args(&["aivo", "code", "skills", "install", "github:a/b", "--all"]),
+                &no_bundles()
+            ),
+            args(&["aivo", "code skills", "install", "github:a/b", "--all"])
+        );
+    }
+
+    #[test]
+    fn rewrite_code_without_mcp_unchanged() {
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "code"]), &no_bundles()),
+            args(&["aivo", "code"])
+        );
+        assert_eq!(
+            rewrite_cli_args(args(&["aivo", "code", "-p", "mcp"]), &no_bundles()),
+            args(&["aivo", "code", "-p", "mcp"])
         );
     }
 

@@ -2399,7 +2399,7 @@ is preserved."
 }
 
 // The add-line parsing and name dedup moved to `crate::agent::mcp` so
-// `aivo mcp add` shares them; re-exported for the call sites and tests here.
+// `aivo code mcp add` shares them; re-exported for the call sites and tests here.
 pub(super) use crate::agent::mcp::{bare_url_to_config, dedupe_name, parse_mcp_add_input};
 
 /// Stable key for the per-repo project-MCP allow-list: the canonicalized cwd

@@ -164,7 +164,7 @@ Type `/help` for the full list. Slash commands:
 - Session: `/new`, `/resume [query]`, `/rewind` (undo edits), `/copy [n]`, `/config`, `/share [stop]`, `/help`, `/exit`
 - Model & key: `/model [name]`, `/key [id|name]`, `/effort [level]`
 - Context: `/attach <path>`, `/detach <n>`, `/compact [fast]`
-- Skills & tools: `/skills`, `/create-skill`, `/mcp`
+- Skills & tools: `/skills`, `/create-skill`, `/mcp` (CLI twins: `aivo code skills`, `aivo code mcp`)
 - Autonomous: `/plan <objective>`, `/goal <objective>`
 
 Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
@@ -176,6 +176,44 @@ Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/
 `/config` toggles: Thinking, Auto-approve tools, aivo web search, Agent tools (off = plain chat,
 no tools). The agent can also change the live model/effort itself when you ask (it calls its
 `switch_model` / `set_effort` tools); a key change it hands back to you via `/key`.
+
+### Skills & MCP servers — `aivo code skills`, `aivo code mcp`
+
+CLI twins of `/skills` and `/mcp` for scripts and dotfiles; toggles are shared with the TUI.
+
+**Skills** are folders holding a `SKILL.md` (portable Agent Skills format) that the agent loads on
+demand. Discovered from the repo (`.agents/skills`, `.aivo/skills`, `.claude/skills`) and user
+dirs (`~/.agents/skills`, `~/.config/aivo/skills`, `~/.claude/skills`) — an existing Claude Code
+skill library works unchanged.
+
+```bash
+aivo code skills                    # list discovered skills (scope + on/off)
+aivo code skills cat <name>         # one skill in full: state, source, instructions
+aivo code skills install <source>   # github:owner/repo[@ref], github.com /tree/… URL, or local path
+aivo code skills install <source> <name>    # just one skill from a multi-skill source
+aivo code skills install <source> --all     # every skill found (existing names skip)
+aivo code skills install -p <source>        # into the repo ./.agents/skills (project scope)
+aivo code skills enable <name>      # enable/disable for the agent (aliases: on/off)
+aivo code skills rm <name>          # remove a user-scope skill (project skills: delete the folder)
+```
+
+**MCP servers** (stdio or Streamable HTTP, with OAuth) give the agent external tools. User scope
+lives in `~/.config/aivo/mcp.json`; a repo `.mcp.json` adds project scope. `${VAR}` /
+`${VAR:-default}` in a config expand from the environment at connect time.
+
+```bash
+aivo code mcp                       # list servers (scope + on/off + per-tool opt-outs)
+aivo code mcp cat <name>            # one server: transport, state, raw JSON config
+aivo code mcp add npx -y <pkg>      # stdio server (name derived from the command)
+aivo code mcp add https://…         # remote Streamable HTTP server
+aivo code mcp add '<json>'          # paste an mcpServers JSON block
+aivo code mcp add -p …              # into the repo ./.mcp.json (project scope)
+aivo code mcp enable <name>         # enable/disable for the agent (aliases: on/off)
+aivo code mcp rm [-p] <name>        # remove a server (-p: from ./.mcp.json)
+aivo code mcp import [tool] [name]  # copy servers from claude/cursor/gemini/copilot/amp configs
+```
+
+Per-tool toggles within a connected server live in the TUI (`/mcp`, `Ctrl+T`).
 
 ## Local models — `hf:` and `aivo hf`
 

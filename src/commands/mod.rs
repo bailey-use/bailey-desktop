@@ -100,6 +100,7 @@ pub mod plugins;
 pub mod run;
 pub mod serve;
 pub mod share;
+pub mod skills;
 pub mod start;
 pub mod stats;
 pub mod update;

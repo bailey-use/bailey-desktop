@@ -911,6 +911,18 @@ impl CodeCommand {
             style::dim("Type /help inside the TUI for slash commands and keybindings.")
         );
         println!();
+        println!("{}", style::bold("Subcommands:"));
+        println!(
+            "  {}{}",
+            style::cyan(format!("{:<26}", "mcp")),
+            style::dim("Manage MCP servers (aivo code mcp --help)")
+        );
+        println!(
+            "  {}{}",
+            style::cyan(format!("{:<26}", "skills")),
+            style::dim("Manage agent skills (aivo code skills --help)")
+        );
+        println!();
         println!("{}", style::bold("Options:"));
         let print_opt = |flag: &str, desc: &str| {
             println!(

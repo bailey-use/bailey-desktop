@@ -584,7 +584,7 @@ pub async fn remove_user_server(name: &str) -> Result<bool, String> {
 /// If `input` is a bare http(s) URL (a remote Streamable HTTP server), the
 /// `{url}` JSON config to add for it; `None` for anything else (a `{…}` block
 /// or a command line, handled on their own paths). Shared by the `/mcp` add
-/// field and `aivo mcp add`.
+/// field and `aivo code mcp add`.
 pub fn bare_url_to_config(input: &str) -> Option<String> {
     let t = input.trim();
     if t.starts_with("http://") || t.starts_with("https://") {

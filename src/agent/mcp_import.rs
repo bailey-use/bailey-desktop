@@ -1,5 +1,5 @@
 //! Discover MCP servers configured in OTHER coding agents' config files —
-//! read-only — so `aivo mcp import` can copy them into aivo's own mcp.json.
+//! read-only — so `aivo code mcp import` can copy them into aivo's own mcp.json.
 //! Codex/grok keep their servers in TOML; those are reported as unsupported
 //! rather than parsed (no toml dependency).
 

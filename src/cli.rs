@@ -91,8 +91,14 @@ pub enum Commands {
     #[command(alias = "plugin")]
     Plugins(PluginsArgs),
 
-    /// Manage the coding agent's MCP servers (list, add, rm)
+    /// Manage the coding agent's MCP servers (list, cat, add, enable/disable, rm, import)
+    // Space-named so clap usage strings read `aivo code mcp …`; only the rewrite emits the token.
+    #[command(name = "code mcp", hide = true)]
     Mcp(McpArgs),
+
+    /// Manage the coding agent's skills (list, cat, install, enable/disable, rm)
+    #[command(name = "code skills", hide = true)]
+    Skills(SkillsArgs),
 
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
@@ -303,9 +309,8 @@ pub enum PluginsSubcommand {
     Remove(PluginRemoveArgs),
 }
 
-/// Arguments for `aivo mcp`. No subcommand → defaults to `list`. The
-/// interactive twin is `/mcp` inside `aivo code`; both manage the user
-/// `~/.config/aivo/mcp.json` (project `.mcp.json` is read-only here).
+/// Arguments for `aivo code mcp` (pre-clap rewrite to the hidden top-level
+/// `mcp`). No subcommand → `list`; interactive twin: `/mcp` inside `aivo code`.
 #[derive(Args, Debug, Clone)]
 pub struct McpArgs {
     #[command(subcommand)]
@@ -318,8 +323,19 @@ pub enum McpSubcommand {
     #[command(alias = "ls")]
     List,
 
+    /// Show one server's full config and state
+    Cat(McpNameArgs),
+
     /// Add a server: `command [args…]`, an http(s):// URL, or a JSON block
     Add(McpAddArgs),
+
+    /// Enable a server for the agent
+    #[command(alias = "on")]
+    Enable(McpNameArgs),
+
+    /// Disable a server without removing it
+    #[command(alias = "off")]
+    Disable(McpNameArgs),
 
     /// Remove a user-scope server by name
     #[command(name = "rm", alias = "remove")]
@@ -339,8 +355,15 @@ pub struct McpAddArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct McpNameArgs {
+    /// Server name as shown by `aivo code mcp list`
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct McpRemoveArgs {
-    /// Server name as shown by `aivo mcp list`
+    /// Server name as shown by `aivo code mcp list`
     #[arg(value_name = "NAME", value_parser = non_empty())]
     pub name: String,
 
@@ -359,6 +382,67 @@ pub struct McpImportArgs {
     /// Import only this server (default: every server the tool defines)
     #[arg(value_name = "NAME")]
     pub name: Option<String>,
+}
+
+/// Arguments for `aivo code skills` (pre-clap rewrite to the hidden top-level
+/// `skills`). No subcommand → `list`; interactive twin: `/skills` inside `aivo code`.
+#[derive(Args, Debug, Clone)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub command: Option<SkillsSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SkillsSubcommand {
+    /// List discovered skills (project + user scope) with their state
+    #[command(alias = "ls")]
+    List,
+
+    /// Show one skill in full (state, source, description, instructions)
+    Cat(SkillsNameArgs),
+
+    /// Install skills from github:owner/repo, a github.com (tree) URL, or a
+    /// local path
+    Install(SkillsInstallArgs),
+
+    /// Enable a skill for the agent
+    #[command(alias = "on")]
+    Enable(SkillsNameArgs),
+
+    /// Disable a skill without removing it
+    #[command(alias = "off")]
+    Disable(SkillsNameArgs),
+
+    /// Remove a user-scope skill by name
+    #[command(name = "rm", alias = "remove")]
+    Remove(SkillsNameArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SkillsInstallArgs {
+    /// `github:owner/repo[@ref]`, a github.com repo or /tree/… folder URL,
+    /// or a local path
+    #[arg(value_name = "SOURCE", value_parser = non_empty())]
+    pub source: String,
+
+    /// Only install this skill (default: the sole skill, or list when several)
+    #[arg(value_name = "NAME", conflicts_with = "all")]
+    pub name: Option<String>,
+
+    /// Install every skill found at the source (already-installed names skip)
+    #[arg(long)]
+    pub all: bool,
+
+    /// Install into the repo ./.agents/skills instead of the user dir
+    #[arg(short = 'p', long = "project")]
+    pub project: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SkillsNameArgs {
+    /// Skill name as shown by `aivo code skills list`
+    #[arg(value_name = "NAME", value_parser = non_empty())]
+    pub name: String,
 }
 
 #[derive(Args, Debug, Clone)]

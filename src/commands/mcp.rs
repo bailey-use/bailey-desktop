@@ -1,5 +1,5 @@
-//! `aivo mcp` — manage the coding agent's MCP servers from the CLI (list/add/rm).
-//! The interactive twin is `/mcp` inside `aivo code`; both edit the user
+//! `aivo code mcp` — list/add/rm the coding agent's MCP servers from the CLI.
+//! Interactive twin: `/mcp` inside `aivo code`; both edit the user
 //! `~/.config/aivo/mcp.json` and read the repo `.mcp.json` (project scope).
 
 use std::collections::HashSet;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 
 use crate::agent::{mcp, mcp_import};
-use crate::cli::{McpAddArgs, McpArgs, McpImportArgs, McpRemoveArgs, McpSubcommand};
+use crate::cli::{McpAddArgs, McpArgs, McpImportArgs, McpNameArgs, McpRemoveArgs, McpSubcommand};
 use crate::errors::ExitCode;
 use crate::services::session_store::SessionStore;
 use crate::style;
@@ -25,7 +25,10 @@ impl McpCommand {
         let cmd = args.command.unwrap_or(McpSubcommand::List);
         let result = match cmd {
             McpSubcommand::List => list_action().await,
+            McpSubcommand::Cat(a) => cat_action(a).await,
             McpSubcommand::Add(a) => add_action(a).await,
+            McpSubcommand::Enable(a) => toggle_action(a, true).await,
+            McpSubcommand::Disable(a) => toggle_action(a, false).await,
             McpSubcommand::Remove(a) => remove_action(a).await,
             McpSubcommand::Import(a) => import_action(a).await,
         };
@@ -39,7 +42,7 @@ impl McpCommand {
     }
 
     pub fn print_help() {
-        println!("{} aivo mcp [SUBCOMMAND]", style::bold("Usage:"));
+        println!("{} aivo code mcp [SUBCOMMAND]", style::bold("Usage:"));
         println!();
         println!(
             "{}",
@@ -53,10 +56,15 @@ impl McpCommand {
             println!("  {}  {}", style::cyan(format!("{:<26}", a)), style::dim(b));
         };
         row("list", "Show configured servers (default)");
+        row("cat <name>", "Show one server's config and state");
         row("add <command> [args…]", "Add a stdio server (name derived)");
         row("add <https://url>", "Add a remote Streamable HTTP server");
         row("add '<json>'", "Add from a pasted mcpServers JSON block");
         row("add -p …", "…into the repo ./.mcp.json (project scope)");
+        row(
+            "enable|disable <name>",
+            "Turn a server on/off for the agent",
+        );
         row("rm [-p] <name>", "Remove a server (-p: from ./.mcp.json)");
         row(
             "import [tool] [name]",
@@ -85,7 +93,7 @@ async fn list_action() -> Result<ExitCode> {
         println!("No MCP servers configured.");
         println!(
             "{}",
-            style::dim("Add one with `aivo mcp add <command|url|json>`.")
+            style::dim("Add one with `aivo code mcp add <command|url|json>`.")
         );
         return Ok(ExitCode::Success);
     }
@@ -114,22 +122,129 @@ async fn list_action() -> Result<ExitCode> {
             .iter()
             .filter(|q| q.starts_with(&prefix))
             .count();
-        let state = if disabled.contains(&s.name) {
-            style::dim("off").to_string()
-        } else if off_tools > 0 {
-            format!("on {}", style::dim(format!("({off_tools} tools off)")))
+        let is_on = !disabled.contains(&s.name);
+        let state = if is_on {
+            style::bullet_symbol()
         } else {
-            "on".to_string()
+            style::empty_bullet_symbol()
+        };
+        let tools_note = if is_on && off_tools > 0 {
+            style::dim(format!(" ({off_tools} tools off)")).to_string()
+        } else {
+            String::new()
         };
         println!(
-            "{}  {}  {}  {}",
+            "{} {}  {}  {}{}",
+            state,
             style::cyan(format!("{:<name_w$}", s.name)),
             style::dim(scope),
-            state,
             style::dim(&s.command),
+            tools_note,
         );
     }
     Ok(ExitCode::Success)
+}
+
+async fn toggle_action(args: McpNameArgs, enable: bool) -> Result<ExitCode> {
+    let name = args.name;
+    if !mcp::configured_servers(&cwd())
+        .iter()
+        .any(|s| s.name == name)
+    {
+        eprintln!("No MCP server named `{name}`.");
+        return Ok(ExitCode::UserError);
+    }
+    SessionStore::new()
+        .set_mcp_server_enabled(&name, enable)
+        .await
+        .map_err(|e| anyhow!("failed to update server state: {e}"))?;
+    println!(
+        "{} MCP server `{name}`",
+        if enable { "Enabled" } else { "Disabled" }
+    );
+    Ok(ExitCode::Success)
+}
+
+async fn cat_action(args: McpNameArgs) -> Result<ExitCode> {
+    let cwd = cwd();
+    let name = args.name;
+    let Some(server) = mcp::configured_servers(&cwd)
+        .into_iter()
+        .find(|s| s.name == name)
+    else {
+        eprintln!("No MCP server named `{name}`.");
+        return Ok(ExitCode::UserError);
+    };
+    let store = SessionStore::new();
+    let disabled: HashSet<String> = store
+        .get_disabled_mcp_servers()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let prefix = mcp::qualified_name(&name, "");
+    let off_tools: Vec<String> = store
+        .get_disabled_mcp_tools()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|q| q.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    let (scope, path) = match server.scope {
+        mcp::ServerScope::User => (
+            "user",
+            mcp::user_config_path()
+                .unwrap_or_default()
+                .display()
+                .to_string(),
+        ),
+        mcp::ServerScope::Project => ("project", cwd.join(".mcp.json").display().to_string()),
+    };
+    println!("Name:       {}", style::cyan(&name));
+    println!(
+        "Scope:      {scope} ({})",
+        style::dim(crate::services::system_env::collapse_tilde(&path))
+    );
+    println!(
+        "Transport:  {}",
+        if server.remote { "http" } else { "stdio" }
+    );
+    let state = if disabled.contains(&name) {
+        style::dim("off").to_string()
+    } else {
+        "on".to_string()
+    };
+    println!("State:      {state}");
+    if !off_tools.is_empty() {
+        println!("Tools off:  {}", style::dim(off_tools.join(", ")));
+    }
+    if let Some(cfg) = raw_server_config(server.scope, &cwd, &name)
+        && let Ok(pretty) = serde_json::to_string_pretty(&cfg)
+    {
+        println!("Config:");
+        for line in pretty.lines() {
+            println!("  {}", style::dim(line));
+        }
+    }
+    Ok(ExitCode::Success)
+}
+
+/// The raw `mcpServers.<name>` JSON from the file that defines the server.
+fn raw_server_config(
+    scope: mcp::ServerScope,
+    cwd: &std::path::Path,
+    name: &str,
+) -> Option<serde_json::Value> {
+    let path = match scope {
+        mcp::ServerScope::User => mcp::user_config_path()?,
+        mcp::ServerScope::Project => cwd.join(".mcp.json"),
+    };
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("mcpServers")?
+        .get(name)
+        .cloned()
 }
 
 /// Split a leading or trailing `-p`/`--project` off the add spec. Only the
@@ -149,7 +264,7 @@ fn split_project_flag(mut spec: Vec<String>) -> (Vec<String>, bool) {
 }
 
 async fn add_action(args: McpAddArgs) -> Result<ExitCode> {
-    const USAGE: &str = "usage: aivo mcp add [-p] <command [args…] | https://url | json>";
+    const USAGE: &str = "usage: aivo code mcp add [-p] <command [args…] | https://url | json>";
     let (spec, project) = split_project_flag(args.spec);
     let args = McpAddArgs { spec };
     let mut existing: HashSet<String> = mcp::configured_servers(&cwd())
@@ -294,7 +409,7 @@ async fn import_action(args: McpImportArgs) -> Result<ExitCode> {
             println!(
                 "{}",
                 style::dim(
-                    "Import with `aivo mcp import <tool> [name]`, or `aivo mcp import all`."
+                    "Import with `aivo code mcp import <tool> [name]`, or `aivo code mcp import all`."
                 )
             );
         }
@@ -307,7 +422,7 @@ async fn import_action(args: McpImportArgs) -> Result<ExitCode> {
         .find(|(t, _)| *t == tool)
     {
         eprintln!(
-            "{tool} keeps its MCP servers in TOML (~/{rel}), which aivo can't import yet — add them with `aivo mcp add`."
+            "{tool} keeps its MCP servers in TOML (~/{rel}), which aivo can't import yet — add them with `aivo code mcp add`."
         );
         return Ok(ExitCode::UserError);
     }
@@ -365,7 +480,7 @@ fn note_unsupported_toml() {
             println!(
                 "{}",
                 style::dim(format!(
-                    "({tool} uses TOML (~/{rel}) — not importable yet; use `aivo mcp add`)"
+                    "({tool} uses TOML (~/{rel}) — not importable yet; use `aivo code mcp add`)"
                 ))
             );
         }
@@ -406,7 +521,7 @@ async fn remove_action(args: McpRemoveArgs) -> Result<ExitCode> {
             }
             Ok(false) => {
                 eprintln!(
-                    "`{name}` is defined in this repo's .mcp.json — remove it with `aivo mcp rm -p {name}`."
+                    "`{name}` is defined in this repo's .mcp.json — remove it with `aivo code mcp rm -p {name}`."
                 );
                 Ok(ExitCode::UserError)
             }

@@ -162,6 +162,15 @@ pub async fn run() -> ! {
         process::exit(code);
     }
 
+    // `mcp`/`skills` live under `aivo code`; reject the bare top-level forms.
+    if let Some(name @ ("mcp" | "skills")) = raw_args.get(1).map(String::as_str) {
+        eprintln!(
+            "{} unknown command `{name}` — use `aivo code {name}`",
+            style::red("Error:")
+        );
+        process::exit(1);
+    }
+
     let args = Cli::parse_from(rewrite_cli_args(raw_args, &bundle_index));
 
     // Handle --version and subcommand --help early, before any further service initialization.
@@ -206,6 +215,7 @@ pub async fn run() -> ! {
             Commands::Hf(_) => crate::commands::hf::HfCommand::print_help(),
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
+            Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -813,6 +823,11 @@ pub async fn run() -> ! {
             command.execute(mcp_args).await
         }
 
+        Commands::Skills(skills_args) => {
+            let command = crate::commands::skills::SkillsCommand::new();
+            command.execute(skills_args).await
+        }
+
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
@@ -902,7 +917,6 @@ fn print_help() {
     print_cmd("models", "List available models from the active provider");
     print_cmd("serve", "Start a local OpenAI-compatible API server");
     print_cmd("alias", "Create, list, or remove model aliases");
-    print_cmd("mcp", "Manage the coding agent's MCP servers");
     print_cmd("hf", "Manage cached HuggingFace GGUF files");
     print_cmd("logs", "Show recent local logs from code, run, and serve");
     print_cmd("stats", "Show usage statistics");
@@ -1045,6 +1059,8 @@ fn print_help_json() {
             { "alias": "use", "expands_to": ["keys", "use"] },
             { "alias": "ping", "expands_to": ["keys", "ping"] },
             { "alias": "share", "expands_to": ["logs", "share"] },
+            { "alias": "code mcp", "expands_to": ["code mcp"], "note": "MCP servers are managed under `aivo code`; resolves to the hidden command named \"code mcp\"" },
+            { "alias": "code skills", "expands_to": ["code skills"], "note": "Skills are managed under `aivo code`; resolves to the hidden command named \"code skills\"" },
             { "alias": "-p", "expands_to": ["code", "-p"] },
             { "alias": "-x", "expands_to": ["code", "-x"], "deprecated": true, "replaced_by": "-p" },
             { "alias": "<text>", "expands_to": ["code", "-p", "<text>"], "note": "Top-level arg that can't be a command name (whitespace, uppercase, punctuation, non-ASCII) → one-shot code prompt; bare [a-z0-9-] words fall through as subcommands" },

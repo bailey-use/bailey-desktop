@@ -2785,15 +2785,42 @@ fn test_transcript_intro_is_brand_only() {
     app.cwd = "/sandbox".to_string();
     app.real_cwd = "/tmp/project".to_string();
 
-    // The intro is the brand banner (wordmark + tagline) — model / base_url / cwd
-    // are not repeated here (the footer status bar shows them).
+    // Wide column: full "aivo code" mark, version trailing the baseline.
+    let version = format!("  v{}", crate::version::VERSION);
     assert_eq!(
-        app.transcript_intro_lines(),
+        app.transcript_intro_lines(80),
         vec![
-            "▄▀█ █ █░█ █▀█".to_string(),
-            "█▀█ █ ▀▄▀ █▄█".to_string(),
-            "your terminal coding agent".to_string(),
+            "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█".to_string(),
+            format!("█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄{version}"),
         ]
+    );
+}
+
+#[test]
+fn test_transcript_intro_narrow_falls_back_to_aivo() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = make_test_app(tx, rx);
+
+    // Too slim for the full mark and the version: bare "aivo", no wrap.
+    assert_eq!(
+        app.transcript_intro_lines(20),
+        vec!["▄▀█ █ █░█ █▀█".to_string(), "█▀█ █ ▀▄▀ █▄█".to_string()]
+    );
+    // Exactly the mark width keeps the full mark (version needs more room).
+    assert_eq!(
+        app.transcript_intro_lines(31)[0],
+        "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█"
+    );
+    let version = format!("v{}", crate::version::VERSION);
+    assert!(
+        app.transcript_intro_lines(80)[1].ends_with(&version),
+        "version should trail the wide banner"
+    );
+    assert!(
+        !app.transcript_intro_lines(20)
+            .iter()
+            .any(|l| l.contains(&version)),
+        "version should be dropped when the column is too narrow"
     );
 }
 
@@ -13028,7 +13055,8 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
         "multi-select hint missing:\n{screen}"
     );
 
-    // Digit 2 toggles clippy on but does not submit.
+    // Digit 2 toggles clippy (index 1) without submitting. Assert on state: a
+    // slim card can scroll the second option out of view.
     app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
         .await
         .unwrap();
@@ -13036,16 +13064,27 @@ async fn test_ask_card_multi_select_digit_toggles_box() {
         app.agent_ask.is_some(),
         "a digit toggles, it does not submit"
     );
+    assert_eq!(
+        app.agent_ask.as_ref().unwrap().checked,
+        vec![false, true, false],
+        "digit 2 checks the second box"
+    );
+
+    // Toggle the always-visible first option so a [✓] is on screen regardless
+    // of card height.
+    app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+        .await
+        .unwrap();
     let (screen, _rows) = render_full_screen(&mut app, 70, 20);
     assert!(
         screen.contains("[✓]"),
-        "the toggled box shows checked:\n{screen}"
+        "a toggled box shows checked:\n{screen}"
     );
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .await
         .unwrap();
-    assert_eq!(answer_rx.await.unwrap(), Ok("clippy".to_string()));
+    assert_eq!(answer_rx.await.unwrap(), Ok("fmt, clippy".to_string()));
 }
 
 /// The edit-review card renders the heading, the per-file diff, and the y/n keys.

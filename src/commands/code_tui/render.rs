@@ -402,42 +402,50 @@ pub(super) fn push_block(
     lines.extend(block);
 }
 
-/// The two-row half-block "AIVO" wordmark. Each glyph cell is a single-width
-/// box-drawing char, so the art is exactly 13 columns wide and lines up cleanly
-/// under any monospace font.
-pub(super) const BRAND_WORDMARK: [&str; 2] = ["▄▀█ █ █░█ █▀█", "█▀█ █ ▀▄▀ █▄█"];
-/// Welcome-screen tagline shown under the wordmark in the empty state.
-pub(super) const BRAND_TAGLINE: &str = "your terminal coding agent";
+/// The two-row half-block "aivo code" wordmark, 31 columns wide.
+pub(super) const BRAND_WORDMARK: [&str; 2] = [
+    "▄▀█ █ █░█ █▀█   █▀▀ █▀█ █▀▄ █▀█",
+    "█▀█ █ ▀▄▀ █▄█   █▄▄ █▄█ █▄▀ █▄▄",
+];
+/// Narrow "aivo" fallback for columns too slim for the full mark.
+pub(super) const BRAND_WORDMARK_NARROW: [&str; 2] = ["▄▀█ █ █░█ █▀█", "█▀█ █ ▀▄▀ █▄█"];
+pub(super) const BRAND_WORDMARK_WIDTH: u16 = 31;
+pub(super) const BRAND_WORDMARK_NARROW_WIDTH: u16 = 13;
 
-/// The brand wordmark as styled lines, painted in the accent color. Single
-/// source of truth for the empty state and the transcript-top intro so both
-/// always start at the same column (see `test_intro_column_stable_*`).
-pub(super) fn brand_wordmark_lines() -> Vec<StyledLine> {
-    BRAND_WORDMARK
-        .iter()
-        .map(|row| {
-            line_plain(
-                (*row).to_string(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )
-        })
-        .collect()
+fn brand_wordmark_for(width: u16) -> (&'static [&'static str; 2], u16) {
+    if width >= BRAND_WORDMARK_WIDTH {
+        (&BRAND_WORDMARK, BRAND_WORDMARK_WIDTH)
+    } else {
+        (&BRAND_WORDMARK_NARROW, BRAND_WORDMARK_NARROW_WIDTH)
+    }
 }
 
-pub(super) fn push_transcript_intro(lines: &mut Vec<StyledLine>) {
-    // Mirror the empty-state top gap so the banner keeps its top padding once a
-    // message lands — no vertical jump when the transcript takes over.
+/// Brand wordmark as accent styled lines, version trailing the baseline when it
+/// fits. Shared by the empty state and transcript intro so both start at the
+/// same column (see `test_intro_column_stable_*`); `width` is the inset column.
+pub(super) fn brand_wordmark_lines(width: u16) -> Vec<StyledLine> {
+    let mark_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let (mark, mark_width) = brand_wordmark_for(width);
+    // Shares the baseline row, so the banner stays two lines tall either way.
+    let version = format!("  v{}", crate::version::VERSION);
+    let bottom = if width >= mark_width + version.chars().count() as u16 {
+        line_with_plain(vec![
+            Span::styled(mark[1].to_string(), mark_style),
+            Span::styled(version, Style::default().fg(FAINT)),
+        ])
+    } else {
+        line_plain(mark[1].to_string(), mark_style)
+    };
+    vec![line_plain(mark[0].to_string(), mark_style), bottom]
+}
+
+pub(super) fn push_transcript_intro(lines: &mut Vec<StyledLine>, width: u16) {
+    // Match the empty-state top gap so the banner doesn't jump when the first
+    // message lands.
     for _ in 0..EMPTY_STATE_TOP_GAP {
         lines.push(blank_line());
     }
-    // Wordmark + tagline above a live conversation, mirroring the welcome
-    // screen so the banner survives the first message instead of being clipped
-    // to the bare wordmark. Model / base_url / cwd live in the footer status bar.
-    lines.extend(brand_wordmark_lines());
-    lines.push(line_plain(
-        BRAND_TAGLINE.to_string(),
-        Style::default().fg(MUTED),
-    ));
+    lines.extend(brand_wordmark_lines(width));
 }
 
 pub(super) fn should_add_message_spacing(previous_role: Option<&str>, next_role: &str) -> bool {

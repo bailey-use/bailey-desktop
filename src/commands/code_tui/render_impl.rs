@@ -120,7 +120,7 @@ impl CodeTuiApp {
             return RenderedTranscript::new(lines, bars);
         }
 
-        push_transcript_intro(&mut lines);
+        push_transcript_intro(&mut lines, text_width);
         push_message_spacing(&mut lines);
         bars.resize(lines.len(), None);
 
@@ -823,13 +823,13 @@ impl CodeTuiApp {
         (Text::from(text_lines), rows, bars)
     }
 
-    pub(super) fn transcript_intro_lines(&self) -> Vec<String> {
-        // Plain-text mirror of the empty-state banner (wordmark + tagline), used
-        // to reserve its height. Must stay in lockstep with `render_empty_state`.
-        // Model / base_url / cwd live in the footer (the persistent status bar).
-        let mut lines: Vec<String> = BRAND_WORDMARK.iter().map(|row| row.to_string()).collect();
-        lines.push(BRAND_TAGLINE.to_string());
-        lines
+    pub(super) fn transcript_intro_lines(&self, width: u16) -> Vec<String> {
+        // Plain mirror of the banner for height reservation; derived from the
+        // styled builder to stay in lockstep with `render_empty_state`.
+        brand_wordmark_lines(width)
+            .into_iter()
+            .map(|line| line.plain)
+            .collect()
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
@@ -2003,7 +2003,8 @@ impl CodeTuiApp {
             rows.extend(self.spinner_status_plain_lines(content_width));
             wrap_plain_lines(&rows, content_width).len() as u16
         } else {
-            let mut rows = self.transcript_intro_lines();
+            // Inset width, matching what `render_empty_state` draws into.
+            let mut rows = self.transcript_intro_lines(width.saturating_sub(ACCENT_GUTTER_WIDTH));
             // Reserve the chip + tip height too, matching `render_empty_state`.
             rows.extend(
                 self.welcome_status_lines()
@@ -2211,17 +2212,11 @@ impl CodeTuiApp {
                 Line::from(Span::styled(self.display_cwd(), Style::default().fg(FAINT))),
             ]
         } else {
-            // Two-row wordmark + a muted tagline. Mirrors `transcript_intro_lines`
-            // (height) and shares the wordmark with `push_transcript_intro`.
-            let mut lines: Vec<Line<'static>> = brand_wordmark_lines()
+            // `area` is the gutter-inset column, driving the full/narrow choice.
+            brand_wordmark_lines(area.width)
                 .into_iter()
                 .map(|sl| sl.line)
-                .collect();
-            lines.push(Line::from(Span::styled(
-                BRAND_TAGLINE,
-                Style::default().fg(MUTED),
-            )));
-            lines
+                .collect()
         };
 
         let mut lines = lines;

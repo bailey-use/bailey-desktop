@@ -391,6 +391,7 @@ pub async fn run() -> ! {
                     code_args.output_format,
                     code_args.max_steps,
                     code_args.max_output_tokens,
+                    code_args.auto_approve,
                 )
                 .await
         }

@@ -211,9 +211,12 @@ pub struct TurnCtx<'a> {
     pub serve_base: &'a str,
     pub auth: Option<&'a str>,
     pub cwd: &'a Path,
-    /// Auto-approve every mutating tool: the static CLI `-y` flag.
+    /// Waive the confirm tier only (headless `-e` baseline); the remote-mutation
+    /// gate still stands — unattended runs deploy only via `--auto-approve`.
     pub yes: bool,
-    /// Live auto-approve toggle (the chat TUI's Shift+Tab/Ctrl+O). Read fresh per
+    /// Static `--auto-approve`: auto-approve mode for runs with no live toggle.
+    pub auto_approve_all: bool,
+    /// Live auto-approve-mode toggle (the chat TUI's Shift+Tab). Read fresh per
     /// tool call so flipping it mid-turn takes effect on the *running* turn,
     /// unlike the `yes` snapshot. `None` outside the chat TUI.
     pub auto_approve: Option<&'a std::sync::atomic::AtomicBool>,
@@ -223,12 +226,18 @@ pub struct TurnCtx<'a> {
 }
 
 impl TurnCtx<'_> {
-    /// True when mutating tools run without a prompt — the `-y` flag or the live chat toggle.
-    pub fn auto_approve_enabled(&self) -> bool {
-        self.yes
+    /// Auto-approve mode (flag or live toggle): everything short of the
+    /// catastrophic/plan floors runs unprompted, remote mutations included.
+    pub fn auto_approve_mode(&self) -> bool {
+        self.auto_approve_all
             || self
                 .auto_approve
                 .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// True when the confirm tier runs without a prompt (`yes` or the mode).
+    pub fn auto_approve_enabled(&self) -> bool {
+        self.yes || self.auto_approve_mode()
     }
 
     /// True when edits should pause for review — the live toggle only (no `-y`).
@@ -1461,10 +1470,20 @@ questions.",
             // like `catastrophic`); provably read-only inspection is exempt.
             let plan_bash =
                 self.read_only && n == "run_bash" && !tools::is_readonly_command(&call.arguments);
-            // Remote mutation: also confirmed under auto-approve, but AlwaysAllow may
-            // remember it so a deploy loop isn't re-prompted each identical call.
-            let remote_side_effect =
-                !catastrophic && tools::is_remote_side_effect(n, &call.arguments);
+            // Remote mutation: only auto-approve mode waives it; AlwaysAllow
+            // remembers the command family so a deploy loop isn't re-prompted.
+            let remote_side_effect = !catastrophic
+                && !ctx.auto_approve_mode()
+                && tools::is_remote_side_effect(n, &call.arguments);
+            let remote_families = if remote_side_effect {
+                call.arguments
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .map(tools::remote_mutation_prefixes)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let allowed = if catastrophic || plan_bash {
                 let preview = tools::preview(n, &call.arguments);
                 // Allow and AlwaysAllow both run it once only — never remembered.
@@ -1472,12 +1491,19 @@ questions.",
                     ui.ask_permission(n, preview.as_deref()).await,
                     Decision::Deny
                 )
-            } else if remote_side_effect && !self.grants.covers(n, &call.arguments, ctx.cwd) {
+            } else if remote_side_effect
+                && !self.grants.covers(n, &call.arguments, ctx.cwd)
+                && !self.grants.covers_remote(&remote_families)
+            {
                 let preview = tools::preview(n, &call.arguments);
                 match ui.ask_permission(n, preview.as_deref()).await {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
-                        self.grants.remember(n, &call.arguments, ctx.cwd);
+                        if remote_families.is_empty() {
+                            self.grants.remember(n, &call.arguments, ctx.cwd);
+                        } else {
+                            self.grants.remember_remote(&remote_families);
+                        }
                         true
                     }
                     Decision::Deny => false,
@@ -2593,6 +2619,7 @@ mod tests {
             auth: None,
             cwd,
             yes: true,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         }
@@ -2613,6 +2640,7 @@ mod tests {
             auth: None,
             cwd,
             yes,
+            auto_approve_all: false,
             auto_approve: flag,
             review_edits: None,
         };
@@ -2805,6 +2833,7 @@ mod tests {
             auth: None,
             cwd: &dir,
             yes: false, // no auto-approve anywhere — the exemption alone applies
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         };
@@ -3318,10 +3347,10 @@ mod tests {
         assert_eq!(ui.ask_tools, vec!["run_bash"]);
     }
 
-    /// A remote mutation (`gh repo delete`) prompts even with auto-approve on; the
-    /// mock denies, so the outward-facing action never runs.
+    /// A remote mutation prompts even under `yes` (headless `-e` baseline):
+    /// only auto-approve mode waives the gate. The mock denies, so nothing runs.
     #[tokio::test]
-    async fn remote_side_effect_prompts_even_under_auto_approve() {
+    async fn remote_side_effect_prompts_under_yes_without_auto_approve_mode() {
         let dir = tmp();
         let bash = tool_call_sse(
             "run_bash",
@@ -3346,6 +3375,98 @@ mod tests {
 
         // Prompted despite auto-approve (deny keeps the delete from running).
         assert_eq!(ui.ask_tools, vec!["run_bash"]);
+    }
+
+    /// "Always allow" at the remote gate grants the command *family*, so a deploy
+    /// loop isn't re-prompted as arguments churn — while a sibling verb still asks.
+    /// `flyctl` is absent on every test runner, so approved calls just exit 127.
+    #[tokio::test]
+    async fn always_allow_on_remote_mutation_covers_the_family() {
+        let dir = tmp();
+        let port = spawn_sse_sequence(vec![
+            tool_call_sse(
+                "run_bash",
+                json!({ "command": "cd . && flyctl deploy --app one" }),
+            ),
+            tool_call_sse(
+                "run_bash",
+                json!({ "command": "flyctl deploy --app two --strategy canary" }),
+            ),
+            tool_call_sse(
+                "run_bash",
+                json!({ "command": "flyctl rollback --app one" }),
+            ),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            always_allow: true,
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("ship it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert_eq!(ui.asks, 2, "expected deploy once + rollback once");
+        assert_eq!(ui.tools, vec!["run_bash", "run_bash", "run_bash"]);
+    }
+
+    /// Auto-approve mode (static `--auto-approve`) waives the remote gate, but the
+    /// catastrophic floor still prompts (and the mock denies it).
+    #[tokio::test]
+    async fn auto_approve_mode_waives_remote_gate_but_not_catastrophic() {
+        let dir = tmp();
+        let port = spawn_sse_sequence(vec![
+            tool_call_sse("run_bash", json!({ "command": "flyctl deploy --now" })),
+            tool_call_sse("run_bash", json!({ "command": "rm -rf /" })),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            deny: true, // only the catastrophic call reaches a prompt — deny it
+            ..Default::default()
+        };
+        let ctx = TurnCtx {
+            auto_approve_all: true,
+            ..turn_ctx(&client, &base, &dir)
+        };
+        run_session(&mut engine, &ctx, Some("ship it".into()), &mut ui).await;
+
+        // The remote mutation ran unprompted; only `rm -rf /` asked.
+        assert_eq!(ui.ask_tools, vec!["run_bash"]);
+        assert_eq!(ui.asks, 1);
+    }
+
+    /// The live toggle is the same auto-approve mode: remote runs unprompted.
+    #[tokio::test]
+    async fn live_toggle_waives_remote_gate() {
+        let dir = tmp();
+        let port = spawn_sse_sequence(vec![
+            tool_call_sse("run_bash", json!({ "command": "flyctl deploy --now" })),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        let toggle = std::sync::atomic::AtomicBool::new(true);
+        let ctx = TurnCtx {
+            yes: false,
+            auto_approve: Some(&toggle),
+            ..turn_ctx(&client, &base, &dir)
+        };
+        run_session(&mut engine, &ctx, Some("ship it".into()), &mut ui).await;
+
+        assert_eq!(ui.asks, 0, "auto-approve mode must not prompt for remote");
+        assert_eq!(ui.tools, vec!["run_bash"]);
     }
 
     /// A paging loop varying an ignored arg (`limit`) makes a distinct `batch_sig` each
@@ -3413,6 +3534,7 @@ mod tests {
             auth: None,
             cwd: dir.as_path(),
             yes: false,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         };
@@ -3574,6 +3696,7 @@ mod tests {
             auth: None,
             cwd: &dir,
             yes: false,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         };
@@ -3624,6 +3747,7 @@ mod tests {
             auth: None,
             cwd: &dir,
             yes: false,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         };
@@ -3805,6 +3929,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
@@ -3846,6 +3971,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
@@ -3887,6 +4013,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("clean up".into()), &mut ui).await;
@@ -3940,6 +4067,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("overwrite it".into()), &mut ui).await;
@@ -3975,6 +4103,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("write out.txt".into()), &mut ui).await;
@@ -4268,6 +4397,7 @@ mod tests {
         };
         let ctx = TurnCtx {
             yes: false,
+            auto_approve_all: false,
             ..turn_ctx(&client, &base, &dir)
         };
         run_session(&mut engine, &ctx, Some("wipe it".into()), &mut ui).await;
@@ -5748,6 +5878,7 @@ mod tests {
             auth: None,
             cwd: dir.as_path(),
             yes: true, // auto-approve on, so no permission card competes with review
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: Some(&flag),
         };
@@ -5791,6 +5922,7 @@ mod tests {
             auth: None,
             cwd: dir.as_path(),
             yes: true,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: Some(&flag),
         };
@@ -5823,6 +5955,7 @@ mod tests {
             auth: None,
             cwd: dir.as_path(),
             yes: true,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: None,
         };
@@ -5855,6 +5988,7 @@ mod tests {
             auth: None,
             cwd: dir.as_path(),
             yes: true,
+            auto_approve_all: false,
             auto_approve: None,
             review_edits: Some(&flag),
         };

@@ -785,6 +785,7 @@ impl CodeTuiApp {
                 auth: Some(&auth),
                 cwd: std::path::Path::new(&cwd),
                 yes: false,
+                auto_approve_all: false, // the live toggle carries the mode
                 auto_approve: Some(&auto_approve),
                 review_edits: Some(&review_edits),
             };
@@ -922,6 +923,7 @@ impl CodeTuiApp {
                 auth: Some(&auth),
                 cwd: std::path::Path::new(&cwd),
                 yes: false,
+                auto_approve_all: false, // compaction runs no tools
                 auto_approve: None,
                 review_edits: None,
             };

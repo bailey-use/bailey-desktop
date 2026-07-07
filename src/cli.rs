@@ -1049,6 +1049,11 @@ pub struct CodeArgs {
     /// TUI). Needs a linked account (`aivo login`); toggle in-session with `/share`.
     #[arg(long)]
     pub share: bool,
+
+    /// Start in auto-approve mode: everything runs without a prompt, remote
+    /// mutations included; catastrophic commands still confirm.
+    #[arg(long = "auto-approve")]
+    pub auto_approve: bool,
 }
 
 /// Parse environment variable strings in the format KEY=VALUE

@@ -1810,11 +1810,11 @@ impl CodeTuiApp {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )
         } else if self.agent_auto_approve {
-            ("⚡ auto", Style::default().fg(WARNING))
+            ("⚡ auto-approve", Style::default().fg(WARNING))
         } else if self.agent_review_edits {
             ("✎ review", Style::default().fg(TOOL))
         } else {
-            ("default", Style::default().fg(MUTED))
+            ("normal", Style::default().fg(MUTED))
         };
         const CYCLE_HINT: &str = " (shift+tab)";
         // Left title on the rule. While recalling input history, show

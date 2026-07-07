@@ -420,6 +420,7 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        auto_approve: bool,
     ) -> ExitCode {
         match self
             .execute_internal(
@@ -438,6 +439,7 @@ impl CodeCommand {
                 output_format,
                 max_steps,
                 max_output_tokens,
+                auto_approve,
             )
             .await
         {
@@ -467,9 +469,13 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        auto_approve: bool,
     ) -> Result<ExitCode> {
         if (max_steps.is_some() || max_output_tokens.is_some()) && !agent_mode {
             anyhow::bail!("--max-steps and --max-output-tokens may only be used with -e/--exec");
+        }
+        if auto_approve && one_shot.is_some() && !agent_mode {
+            anyhow::bail!("--auto-approve has no effect with -p (no tools run)");
         }
 
         // Validate `--max-context` up front so a malformed value fails fast.
@@ -681,6 +687,7 @@ impl CodeCommand {
                         max_steps,
                         max_output_tokens,
                     },
+                    auto_approve,
                 )
                 .await;
             }
@@ -903,6 +910,7 @@ impl CodeCommand {
             initial_prompt,
             max_context,
             share,
+            auto_approve,
         })
         .await?;
 
@@ -982,6 +990,10 @@ impl CodeCommand {
         print_opt(
             "--dry-run",
             "Show resolved key/model/endpoint, don't connect",
+        );
+        print_opt(
+            "--auto-approve",
+            "Start in auto-approve mode (catastrophic still confirms)",
         );
         println!();
         println!("{}", style::bold("Examples:"));
@@ -2829,6 +2841,7 @@ mod tests {
                 None,
                 Some(1),
                 None,
+                false,
             )
             .await;
 

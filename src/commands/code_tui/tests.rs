@@ -3529,12 +3529,12 @@ fn test_permission_card_anchored_above_composer() {
         "card bottom must sit one row (the divider) above the composer:\n{screen}"
     );
     // The divider directly under the card is the full-width composer rule — now
-    // always carrying the mode badge (here "default", since a card only shows
+    // always carrying the mode badge (here "normal", since a card only shows
     // when auto-approve is off) — so the narrower card never leaves it poking
     // out past the card's right edge.
     let divider = &rows[bottom_border_row + 1];
     assert!(
-        divider.contains('─') && divider.contains("default"),
+        divider.contains('─') && divider.contains("normal"),
         "full-width composer rule (with the mode badge) must sit under the card:\n{screen}"
     );
 
@@ -4153,8 +4153,8 @@ fn test_hint_bar_reflects_state() {
         "auto badge on composer rule"
     );
     assert!(
-        full_screen(|a| a.agent_auto_approve = false).contains("default (shift+tab)"),
-        "default mode shown on composer rule (discoverable)"
+        full_screen(|a| a.agent_auto_approve = false).contains("normal (shift+tab)"),
+        "normal mode shown on composer rule (discoverable)"
     );
     assert!(
         full_screen(|a| a.agent_review_edits = true).contains('✎'),
@@ -5697,7 +5697,7 @@ async fn test_auto_approve_toggle_shows_toast_not_notice() {
     assert!(
         app.toast
             .as_ref()
-            .is_some_and(|t| t.text.contains("Auto mode")),
+            .is_some_and(|t| t.text.contains("Auto-approve mode")),
         "toggle should flash a toast"
     );
 
@@ -7746,7 +7746,7 @@ async fn test_plan_badge_on_composer_rule() {
 
     let off = app.composer_rule_line(80);
     assert!(!plain(&off).contains("plan"));
-    assert!(plain(&off).contains("default"), "default mode shown");
+    assert!(plain(&off).contains("normal"), "normal mode shown");
     // Every mode carries the cycle hint.
     assert!(plain(&off).contains("(shift+tab)"));
 
@@ -8399,7 +8399,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
 
     let off = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(!off.contains("goal"), "no goal badge when off: {off:?}");
-    assert!(off.contains("default"), "mode badge shows: {off:?}");
+    assert!(off.contains("normal"), "mode badge shows: {off:?}");
 
     app.goal_mode = Some(GoalState {
         objective: "ship it".to_string(),
@@ -8408,7 +8408,7 @@ fn test_composer_rule_shows_goal_step_indicator() {
     });
     let on = plain_text_from_spans(&app.composer_rule_line(80).spans);
     assert!(on.contains("goal 2/20"), "goal step indicator: {on:?}");
-    assert!(on.contains("default"), "mode badge stays: {on:?}");
+    assert!(on.contains("normal"), "mode badge stays: {on:?}");
     assert!(
         display_width(&on) <= 80,
         "rule fits width: {}",

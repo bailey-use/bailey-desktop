@@ -236,15 +236,15 @@ impl CodeTuiApp {
             agent_ask: None,
             agent_review: None,
             agent_plan_approval: None,
-            // The modes are exclusive; prefs saved by an older build could have
-            // both on — review (the safer one) wins on load.
-            agent_auto_approve: auto_approve && !review_edits,
+            // Modes are exclusive; stale prefs with both on → review wins.
+            // `--auto-approve` pre-sets the toggle (session-only, outranks review).
+            agent_auto_approve: params.auto_approve || (auto_approve && !review_edits),
             auto_approve_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                auto_approve && !review_edits,
+                params.auto_approve || (auto_approve && !review_edits),
             )),
-            agent_review_edits: review_edits,
+            agent_review_edits: review_edits && !params.auto_approve,
             review_edits_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                review_edits,
+                review_edits && !params.auto_approve,
             )),
             thinking_enabled,
             web_search_enabled,

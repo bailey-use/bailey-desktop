@@ -343,6 +343,8 @@ pub(crate) struct CodeTuiParams {
     pub max_context: Option<u64>,
     /// `--share`: start live sharing at launch (device-link verified beforehand).
     pub share: bool,
+    /// `--auto-approve`: pre-set the toggle at launch (session-only; Shift+Tab reverts).
+    pub auto_approve: bool,
 }
 
 #[derive(Clone)]

@@ -569,9 +569,9 @@ impl CodeTuiApp {
         }
     }
 
-    /// Shift+Tab: cycle the mutually-exclusive agent modes default → auto → plan
-    /// → review → default. Plan entry falls through to review mid-turn (the engine
-    /// can't be restricted while a turn holds it) or when the key lacks the agent.
+    /// Shift+Tab: cycle normal → auto-approve → plan → review → normal. Plan entry
+    /// falls through to review mid-turn (the engine can't be restricted while a
+    /// turn holds it) or when the key lacks the agent.
     pub(super) async fn cycle_agent_mode(&mut self) {
         if self.plan_mode {
             self.leave_plan_mode(false).await;
@@ -579,7 +579,7 @@ impl CodeTuiApp {
             self.show_toast("Review mode — every edit shows a diff to approve");
         } else if self.agent_review_edits {
             self.set_review_quiet(false);
-            self.show_toast("Default mode — only risky actions ask first");
+            self.show_toast("Normal mode — risky and remote-mutating actions ask first");
         } else if self.agent_auto_approve {
             self.set_auto_quiet(false);
             if !self.sending && self.enter_plan_mode().await {
@@ -590,7 +590,9 @@ impl CodeTuiApp {
             }
         } else {
             self.set_auto_quiet(true);
-            self.show_toast("Auto mode — the agent runs tools without asking");
+            self.show_toast(
+                "Auto-approve mode — everything runs without asking (catastrophic still confirms)",
+            );
         }
     }
 
@@ -615,9 +617,9 @@ impl CodeTuiApp {
     pub(super) fn set_auto_approve(&mut self, on: bool) {
         self.set_auto_quiet(on);
         self.show_toast(if on {
-            "Auto mode — the agent runs tools without asking"
+            "Auto-approve mode — everything runs without asking (catastrophic still confirms)"
         } else {
-            "Auto-approve off — risky actions ask first"
+            "Normal mode — risky and remote-mutating actions ask first"
         });
     }
 

@@ -22,6 +22,9 @@ enum GrantScope {
     Exact(String),
     /// A `run_bash` command sharing this `program subcommand` prefix (e.g. `git push`).
     CommandPrefix(String),
+    /// A remote-mutation family (`az repos pr update`); matched only by
+    /// [`GrantStore::covers_remote`], never the generic walk.
+    RemoteCmd(String),
     /// Any write whose target resolves under this directory.
     Dir(PathBuf),
     /// Any call to this tool by name (e.g. a trusted MCP tool `mcp__server__x`).
@@ -74,6 +77,25 @@ impl GrantStore {
             self.save();
         } else {
             self.session.push(scope);
+        }
+    }
+
+    /// Every remote-mutation family of a command already granted; empty never covers.
+    pub(crate) fn covers_remote(&self, prefixes: &[String]) -> bool {
+        !prefixes.is_empty()
+            && prefixes.iter().all(|p| {
+                self.all()
+                    .any(|g| matches!(g, GrantScope::RemoteCmd(k) if k == p))
+            })
+    }
+
+    /// "Always allow" for remote-mutation families. Session-only — an outward
+    /// write is never pre-approved in a later session.
+    pub(crate) fn remember_remote(&mut self, prefixes: &[String]) {
+        for p in prefixes {
+            if !self.covers_remote(std::slice::from_ref(p)) {
+                self.session.push(GrantScope::RemoteCmd(p.clone()));
+            }
         }
     }
 
@@ -172,6 +194,8 @@ fn scope_matches(scope: &GrantScope, name: &str, args: &Value, cwd: &Path, exact
     match scope {
         GrantScope::Exact(k) => k == exact,
         GrantScope::Tool(t) => t == name,
+        // covers_remote only — all-families semantics, not any-match.
+        GrantScope::RemoteCmd(_) => false,
         GrantScope::CommandPrefix(p) => {
             name == "run_bash"
                 && command_prefix(
@@ -213,6 +237,9 @@ const SUBCOMMAND_TOOLS: &[&str] = &[
     "terraform",
     "gh",
     "poetry",
+    "az",
+    "aws",
+    "gcloud",
 ];
 
 /// `program subcommand` for a subcommand-style command, else `None` (→ stay exact).
@@ -355,6 +382,53 @@ mod tests {
         g.remember("run_bash", &bash("git push origin main"), &cwd);
         // A command-prefix grant is session-only → the file is never created.
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn remote_grant_covers_the_family_and_only_the_family() {
+        let mut g = GrantStore::default();
+        let update = vec!["az repos pr update".to_string()];
+        assert!(!g.covers_remote(&update));
+        g.remember_remote(&update);
+        assert!(g.covers_remote(&update));
+        // A sibling verb is a different grant.
+        assert!(!g.covers_remote(&["az repos pr delete".to_string()]));
+        // Multi-family commands need every family granted, and empty never covers.
+        let both = vec!["az repos pr update".to_string(), "gh pr merge".to_string()];
+        assert!(!g.covers_remote(&both));
+        g.remember_remote(&both);
+        assert!(g.covers_remote(&both));
+        assert!(!g.covers_remote(&[]));
+    }
+
+    #[test]
+    fn remote_grant_never_leaks_into_generic_coverage_or_disk() {
+        let dir = tmp();
+        let path = dir.join("grants.json");
+        let cwd = tmp();
+        let mut g = GrantStore::load(path.clone());
+        g.remember_remote(&["az repos pr update".to_string()]);
+        // A remote grant must never approve a dangerous command via the generic walk.
+        assert!(!g.covers(
+            "run_bash",
+            &bash("az repos pr update --id 7 && rm -rf /"),
+            &cwd
+        ));
+        // Session-only: nothing reaches disk.
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cloud_clis_broaden_to_subcommand_prefix() {
+        assert_eq!(
+            command_prefix("az repos pr update --id 7"),
+            Some("az repos".into())
+        );
+        assert_eq!(command_prefix("aws s3 cp a s3://b"), Some("aws s3".into()));
+        assert_eq!(
+            command_prefix("gcloud compute instances list"),
+            Some("gcloud compute".into())
+        );
     }
 
     #[test]

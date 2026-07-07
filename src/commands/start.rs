@@ -473,6 +473,7 @@ impl StartCommand {
                 None,
                 None,
                 None,
+                false,
             )
             .await)
     }

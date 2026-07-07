@@ -1953,7 +1953,7 @@ const HELP_KEYBINDINGS: &[(&str, &[(&str, &str)])] = &[
         "Session",
         &[
             ("Ctrl+R", "resume a saved session"),
-            ("Shift+Tab", "toggle agent auto-approve"),
+            ("Shift+Tab", "cycle mode (normal/auto-approve/plan/review)"),
             ("Esc", "cancel / close overlay"),
             ("Ctrl+C", "exit (press twice to confirm)"),
         ],

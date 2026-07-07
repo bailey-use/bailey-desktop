@@ -985,34 +985,33 @@ const DASH_REMOTE_VERBS: &[&str] = &[
     "downgrade",
 ];
 
-/// Scan the subcommand path (non-flag tokens before the first `-flag`) for a
-/// mutating verb. Stopping at the first flag keeps a flag value (`--title
-/// "delete old"`) from tripping it.
-fn leading_subcommand_mutates(args: &[&str]) -> bool {
+/// Lowercased subcommand path up to and including the first `verb` hit — the
+/// grantable family (`az repos pr update`). Stops at the first flag so a flag
+/// value (`--title "delete old"`) can't trip it.
+fn verb_path(base: &str, args: &[&str], verb: impl Fn(&str) -> bool) -> Option<String> {
+    let mut path = base.to_string();
     for &tok in args {
         if tok.starts_with('-') {
             break;
         }
         let t = tok.to_ascii_lowercase();
-        if EXACT_REMOTE_VERBS.contains(&t.as_str()) {
-            return true;
-        }
-        if let Some((verb, rest)) = t.split_once('-')
-            && !rest.is_empty()
-            && DASH_REMOTE_VERBS.contains(&verb)
-        {
-            return true;
+        path.push(' ');
+        path.push_str(&t);
+        if verb(&t) {
+            return Some(path);
         }
     }
-    false
+    None
 }
 
-/// True when one of `verbs` heads the subcommand — for tools that are mostly local
-/// (`docker rm`, `npm install`), where only a short explicit set writes remotely.
-fn has_leading_verb(args: &[&str], verbs: &[&str]) -> bool {
-    args.iter()
-        .take_while(|a| !a.starts_with('-'))
-        .any(|a| verbs.iter().any(|v| a.eq_ignore_ascii_case(v)))
+/// Exact mutating verb or AWS-style `verb-noun` prefix — dash form only on a
+/// hyphenated token, so a bare `run` (`gh run list`) never trips it.
+fn cloud_verb(t: &str) -> bool {
+    if EXACT_REMOTE_VERBS.contains(&t) {
+        return true;
+    }
+    t.split_once('-')
+        .is_some_and(|(verb, rest)| !rest.is_empty() && DASH_REMOTE_VERBS.contains(&verb))
 }
 
 /// `curl` mutates on a mutating method (`-X POST`) or a request body (`-d`, `-F`,
@@ -1112,47 +1111,59 @@ fn gh_api_mutates(args: &[&str]) -> bool {
     false
 }
 
+/// Read-only; mutating with a grantable verb path; or mutating with none
+/// (curl bodies, `gh api -f`) — exact-grant only.
+enum RemoteSeg {
+    Read,
+    Opaque,
+    Verb(String),
+}
+
 /// Classify one already-split simple command by its program.
-fn segment_mutates_remote(base: &str, args: &[&str]) -> bool {
+fn remote_segment(base: &str, args: &[&str]) -> RemoteSeg {
+    use RemoteSeg::{Opaque, Read, Verb};
+    let flagged = |mutates: bool| if mutates { Opaque } else { Read };
+    let by_verbs = |verbs: &[&str]| match verb_path(base, args, |t| verbs.contains(&t)) {
+        Some(p) => Verb(p),
+        None => Read,
+    };
     match base {
-        "curl" => curl_is_mutating(args),
-        "wget" => wget_is_mutating(args),
-        "http" | "https" | "xh" | "xhs" => httpie_is_mutating(args),
-        "gh" | "glab" => leading_subcommand_mutates(args) || gh_api_mutates(args),
+        "curl" => flagged(curl_is_mutating(args)),
+        "wget" => flagged(wget_is_mutating(args)),
+        "http" | "https" | "xh" | "xhs" => flagged(httpie_is_mutating(args)),
+        "gh" | "glab" => match verb_path(base, args, cloud_verb) {
+            Some(p) => Verb(p),
+            None => flagged(gh_api_mutates(args)),
+        },
         "aws" | "gcloud" | "gsutil" | "az" | "oci" | "doctl" | "ibmcloud" | "kubectl" | "oc"
         | "terraform" | "tofu" | "terragrunt" | "pulumi" | "flux" | "argocd" | "eksctl" => {
-            leading_subcommand_mutates(args)
+            match verb_path(base, args, cloud_verb) {
+                Some(p) => Verb(p),
+                None => Read,
+            }
         }
         // Helm's `create`/`repo add` are local, so list its remote verbs explicitly.
-        "helm" => has_leading_verb(
-            args,
-            &[
-                "install",
-                "upgrade",
-                "uninstall",
-                "delete",
-                "rollback",
-                "push",
-            ],
-        ),
+        "helm" => by_verbs(&[
+            "install",
+            "upgrade",
+            "uninstall",
+            "delete",
+            "rollback",
+            "push",
+        ]),
         // Deploy / hosting CLIs push to prod.
         "vercel" | "netlify" | "flyctl" | "fly" | "railway" | "heroku" | "wrangler"
         | "supabase" | "firebase" | "eb" | "serverless" | "sls" | "now" | "surge" | "amplify"
-        | "convex" | "render" => has_leading_verb(
-            args,
-            &[
-                "deploy", "publish", "release", "up", "promote", "rollback", "ship", "push",
-            ],
-        ),
+        | "convex" | "render" => by_verbs(&[
+            "deploy", "publish", "release", "up", "promote", "rollback", "ship", "push",
+        ]),
         // Container / package registries: publishing is public + hard to retract.
-        "docker" | "podman" | "nerdctl" => has_leading_verb(args, &["push"]),
-        "npm" | "pnpm" | "yarn" | "bun" => {
-            has_leading_verb(args, &["publish", "unpublish", "deprecate"])
-        }
-        "cargo" => has_leading_verb(args, &["publish", "yank"]),
-        "gem" => has_leading_verb(args, &["push", "yank"]),
-        "twine" => has_leading_verb(args, &["upload", "register"]),
-        _ => false,
+        "docker" | "podman" | "nerdctl" => by_verbs(&["push"]),
+        "npm" | "pnpm" | "yarn" | "bun" => by_verbs(&["publish", "unpublish", "deprecate"]),
+        "cargo" => by_verbs(&["publish", "yank"]),
+        "gem" => by_verbs(&["push", "yank"]),
+        "twine" => by_verbs(&["upload", "register"]),
+        _ => Read,
     }
 }
 
@@ -1172,11 +1183,47 @@ pub fn bash_mutates_remote(cmd: &str) -> bool {
         {
             return true;
         }
-        if segment_mutates_remote(&base, &tokens[1..]) {
+        if !matches!(remote_segment(&base, &tokens[1..]), RemoteSeg::Read) {
             return true;
         }
     }
     false
+}
+
+/// Grantable family prefixes of every remote-mutating segment, or empty when any
+/// mutation has no verb path — callers then fall back to an exact grant.
+pub fn remote_mutation_prefixes(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !collect_remote_prefixes(cmd, &mut out) {
+        return Vec::new();
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `false` = an opaque mutation somewhere; no prefix set can represent the command.
+fn collect_remote_prefixes(cmd: &str, out: &mut Vec<String>) -> bool {
+    for seg in cmd.split(['\n', ';', '|', '&']) {
+        let all: Vec<&str> = seg.split_whitespace().collect();
+        let tokens = effective_command(&all);
+        let Some(&cmd0) = tokens.first() else {
+            continue;
+        };
+        let base = cmd0.rsplit('/').next().unwrap_or(cmd0).to_ascii_lowercase();
+        if INTERPRETERS.contains(&base.as_str())
+            && let Some(inner) = interpreter_inline_code(seg)
+            && !collect_remote_prefixes(&inner, out)
+        {
+            return false;
+        }
+        match remote_segment(&base, &tokens[1..]) {
+            RemoteSeg::Read => {}
+            RemoteSeg::Opaque => return false,
+            RemoteSeg::Verb(p) => out.push(p),
+        }
+    }
+    true
 }
 
 /// Split a command line into tokens, honoring single/double quotes and stripping
@@ -3786,6 +3833,62 @@ mod tests {
             "write_file",
             &json!({ "path": "a.txt", "content": "" })
         ));
+    }
+
+    #[test]
+    fn remote_prefixes_name_the_family_up_to_the_verb() {
+        assert_eq!(
+            remote_mutation_prefixes("az repos pr update --id 7 --status completed"),
+            vec!["az repos pr update"]
+        );
+        assert_eq!(
+            remote_mutation_prefixes("gh pr merge 42 --squash"),
+            vec!["gh pr merge"]
+        );
+        assert_eq!(
+            remote_mutation_prefixes("aws ec2 terminate-instances --instance-ids i-1"),
+            vec!["aws ec2 terminate-instances"]
+        );
+        assert_eq!(
+            remote_mutation_prefixes("docker push repo/img:tag"),
+            vec!["docker push"]
+        );
+        // The prefix survives a compound command: only the mutating segment names it.
+        assert_eq!(
+            remote_mutation_prefixes(
+                "cd /repo && BASE=$(git merge-base HEAD origin/dev) && \
+                 az boards work-item create --title \"fix: x\" --type Task"
+            ),
+            vec!["az boards work-item create"]
+        );
+        // See-through wrappers, including an interpreter's inline program.
+        assert_eq!(
+            remote_mutation_prefixes("sudo kubectl delete ns team"),
+            vec!["kubectl delete"]
+        );
+        assert_eq!(
+            remote_mutation_prefixes("sh -c 'az repos pr update --id 7'"),
+            vec!["az repos pr update"]
+        );
+        // Duplicated families collapse to one grant.
+        assert_eq!(
+            remote_mutation_prefixes("gh pr merge 1 && gh pr merge 2"),
+            vec!["gh pr merge"]
+        );
+    }
+
+    #[test]
+    fn remote_prefixes_refuse_opaque_mutations() {
+        // Flag-driven mutations have no verb path — exact grant only.
+        assert!(remote_mutation_prefixes("curl -X POST https://api/x -d '{}'").is_empty());
+        assert!(remote_mutation_prefixes("gh api repos/o/r/issues -f title=x").is_empty());
+        // One opaque segment poisons the whole command.
+        assert!(
+            remote_mutation_prefixes("az repos pr update --id 7 && curl -X POST https://api/x")
+                .is_empty()
+        );
+        assert!(remote_mutation_prefixes("gh pr list").is_empty());
+        assert!(remote_mutation_prefixes("az account show").is_empty());
     }
 
     #[test]

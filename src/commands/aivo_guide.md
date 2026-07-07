@@ -149,6 +149,10 @@ aivo code "<text>"            # TUI with the text sent as the first message
 --json                        raw provider JSON (with -p)
 --max-context <size>          override the context window (e.g. 200k)
 --dry-run                     show the resolved key/model/endpoint, don't connect
+--auto-approve                start in auto-approve mode: everything runs without
+                              a prompt, remote mutations (deploy/publish/PR merge)
+                              included; catastrophic commands still confirm. With
+                              -e this is how unattended runs get remote rights.
 ```
 
 ```bash
@@ -171,7 +175,7 @@ Type `/help` for the full list. Slash commands:
 Other input: `!cmd` runs a local shell command; `//` / `!!` escape to literal text.
 
 Keys: `Enter` send · `Ctrl+J` newline · `Tab` complete · `Ctrl+V` paste text/image ·
-`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` toggle auto-approve · `Ctrl+R` resume ·
+`Ctrl+X Ctrl+E` edit draft in $EDITOR · `Shift+Tab` cycle mode (normal/auto-approve/plan/review) · `Ctrl+R` resume ·
 `Ctrl+O` pager for a `!cmd` · `Esc` cancel/close · `Ctrl+C` twice to exit.
 
 `/config` toggles: Thinking, Auto-approve tools, aivo web search, Agent tools (off = plain chat,

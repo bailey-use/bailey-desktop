@@ -1,6 +1,7 @@
 //! Headless one-shot agent: `aivo code -e "<task>"` runs the real `AgentEngine`
-//! (tools + multi-step loop) to completion and exits. Auto-approves mutations;
-//! catastrophic commands and remote side effects (deploy/publish/DELETE) fail closed.
+//! (tools + multi-step loop) to completion and exits. Auto-approves the confirm
+//! tier; remote side effects fail closed without `--auto-approve`; catastrophic
+//! commands always fail closed.
 //!
 //! Output is `--output-format`-selected ([`OutputFormat`]):
 //! - `text` (default): answer → stdout, tool/step activity → stderr (human prose).
@@ -57,6 +58,7 @@ pub(crate) async fn run_one_shot_agent(
     context_window_override: Option<u64>,
     format: OutputFormat,
     limits: OneShotAgentLimits,
+    auto_approve: bool,
 ) -> anyhow::Result<ExitCode> {
     // Real launch dir (like the TUI's real_cwd), not chat's sandbox.
     let cwd = std::env::current_dir()
@@ -143,6 +145,7 @@ pub(crate) async fn run_one_shot_agent(
         auth: auth_opt.as_deref(),
         cwd: Path::new(&cwd),
         yes: true,
+        auto_approve_all: auto_approve,
         auto_approve: None,
         review_edits: None,
     };

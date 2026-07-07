@@ -446,7 +446,7 @@ impl CodeTuiApp {
         }
     }
 
-    /// Scroll the plan body by `delta` rows, clamped to its length.
+    /// Scroll the plan body by `delta` rows; render clamps and writes back.
     fn scroll_plan_approval(&mut self, delta: isize) {
         if let Some(pending) = self.agent_plan_approval.as_mut() {
             let max = (pending.body.len().saturating_sub(1)) as isize;
@@ -554,7 +554,7 @@ impl CodeTuiApp {
         }
     }
 
-    /// Scroll the review body by `delta` rows, clamped to its length.
+    /// Scroll the review body by `delta` rows; render clamps and writes back.
     fn scroll_review(&mut self, delta: isize) {
         if let Some(review) = self.agent_review.as_mut() {
             let max = (review.body.len().saturating_sub(1)) as isize;

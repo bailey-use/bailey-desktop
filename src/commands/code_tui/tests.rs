@@ -13147,6 +13147,84 @@ async fn test_review_card_arrows_scroll() {
     assert!(app.agent_review.is_some(), "scrolling does not resolve");
 }
 
+/// History pushes the composer to the bottom, giving cards a real viewport.
+fn push_review_test_history(app: &mut CodeTuiApp) {
+    for _ in 0..4 {
+        app.history.push(ChatMessage {
+            model: None,
+            role: "assistant".to_string(),
+            content: "working on it".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+}
+
+/// A diff taller than the screen must not push the y/n keys off the card.
+#[test]
+fn test_review_card_long_diff_keeps_keys_visible() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    push_review_test_history(&mut app);
+    let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::review::ReviewDecision>();
+    let body: Vec<ratatui::text::Line> = (0..100)
+        .map(|i| ratatui::text::Line::from(format!("diff line {i}")))
+        .collect();
+    app.agent_review = Some(PendingReview {
+        count: 1,
+        body,
+        scroll: 0,
+        reply,
+    });
+    let (screen, _rows) = render_full_screen(&mut app, 80, 24);
+    assert!(
+        screen.contains("approve") && screen.contains("reject"),
+        "y/n hints clipped off the overflowing card:\n{screen}"
+    );
+    assert!(
+        screen.contains("more (↑↓ scroll)"),
+        "overflow marker missing:\n{screen}"
+    );
+}
+
+/// Overscrolling past the bottom is a no-op — the card height never changes.
+#[tokio::test]
+async fn test_review_card_overscroll_clamps_stable_height() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    push_review_test_history(&mut app);
+    let (reply, _rx) = tokio::sync::oneshot::channel::<crate::agent::review::ReviewDecision>();
+    let body: Vec<ratatui::text::Line> = (0..100)
+        .map(|i| ratatui::text::Line::from(format!("diff line {i}")))
+        .collect();
+    app.agent_review = Some(PendingReview {
+        count: 1,
+        body,
+        scroll: 0,
+        reply,
+    });
+    for _ in 0..200 {
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+    }
+    let (bottom, _rows) = render_full_screen(&mut app, 80, 24);
+    let clamped = app.agent_review.as_ref().unwrap().scroll;
+    assert!(
+        usize::from(clamped) < 99,
+        "scroll clamps to the last page, not the last line (got {clamped})"
+    );
+    assert!(
+        bottom.contains("end of diff") && bottom.contains("approve"),
+        "bottom keeps the marker row and keys:\n{bottom}"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    let (after, _rows) = render_full_screen(&mut app, 80, 24);
+    assert_eq!(bottom, after, "scrolling past the bottom changes nothing");
+}
+
 /// Messages submitted while a turn is in flight queue in order — a second one
 /// must not silently clobber the first (the old single-slot behavior).
 #[tokio::test]

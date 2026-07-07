@@ -945,9 +945,15 @@ impl CodeTuiApp {
         } else if self.agent_ask.is_some() {
             self.render_ask_user_card(frame, composer_area, outer);
         } else if self.agent_plan_approval.is_some() {
-            self.render_plan_approval_card(frame, composer_area, outer);
+            let clamped = self.render_plan_approval_card(frame, composer_area, outer);
+            if let (Some(s), Some(p)) = (clamped, self.agent_plan_approval.as_mut()) {
+                p.scroll = s;
+            }
         } else if self.agent_review.is_some() {
-            self.render_review_card(frame, composer_area, outer);
+            let clamped = self.render_review_card(frame, composer_area, outer);
+            if let (Some(s), Some(r)) = (clamped, self.agent_review.as_mut()) {
+                r.scroll = s;
+            }
         }
 
         // Snapshot the finished screen so a drag can copy from anywhere on it,
@@ -1405,11 +1411,14 @@ impl CodeTuiApp {
     }
 
     /// The edit-review card: heading, the scrollable precomputed diff, and y/n keys.
-    /// Floats above the composer like the `ask_user` card.
-    fn render_review_card(&self, frame: &mut Frame<'_>, composer_area: Rect, frame_area: Rect) {
-        let Some(review) = self.agent_review.as_ref() else {
-            return;
-        };
+    /// Floats above the composer; returns the clamped scroll for write-back.
+    fn render_review_card(
+        &self,
+        frame: &mut Frame<'_>,
+        composer_area: Rect,
+        frame_area: Rect,
+    ) -> Option<u16> {
+        let review = self.agent_review.as_ref()?;
         let anchor = composer_area.y.saturating_sub(1);
         let max_total = anchor.saturating_sub(frame_area.y).max(1);
         let max_width = composer_area.width.min(frame_area.width).max(1);
@@ -1422,10 +1431,12 @@ impl CodeTuiApp {
         );
         let keys = review_keys_line();
 
-        // heading + blank + keys + 2 borders; the rest is the scrollable diff window.
-        let chrome = 5u16;
+        // heading + 2 blanks + keys + 2 borders + reserved overflow-marker row.
+        let chrome = 7u16;
         let body_budget = usize::from(max_total.saturating_sub(chrome)).max(1);
-        let scroll = usize::from(review.scroll).min(review.body.len().saturating_sub(1));
+        let overflow = review.body.len() > body_budget;
+        // Last-full-page clamp: keeps the card height stable at the bottom.
+        let scroll = usize::from(review.scroll).min(review.body.len().saturating_sub(body_budget));
         let visible = review.body.len().saturating_sub(scroll).min(body_budget);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1441,6 +1452,11 @@ impl CodeTuiApp {
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  … +{remaining} more (↑↓ scroll)"),
+                Style::default().fg(FAINT),
+            )));
+        } else if overflow {
+            lines.push(Line::from(Span::styled(
+                "  … end of diff",
                 Style::default().fg(FAINT),
             )));
         }
@@ -1469,19 +1485,19 @@ impl CodeTuiApp {
         });
         frame.render_widget(block, card);
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+        Some(u16::try_from(scroll).unwrap_or(u16::MAX))
     }
 
     /// The plan-approval card (`exit_plan_mode`): heading, the scrollable rendered
-    /// plan, and the three verdicts. Floats above the composer like the review card.
+    /// plan, and the three verdicts. Floats above the composer like the review card;
+    /// returns the clamped scroll for write-back.
     fn render_plan_approval_card(
         &self,
         frame: &mut Frame<'_>,
         composer_area: Rect,
         frame_area: Rect,
-    ) {
-        let Some(pending) = self.agent_plan_approval.as_ref() else {
-            return;
-        };
+    ) -> Option<u16> {
+        let pending = self.agent_plan_approval.as_ref()?;
         let anchor = composer_area.y.saturating_sub(1);
         let max_total = anchor.saturating_sub(frame_area.y).max(1);
         let max_width = composer_area.width.min(frame_area.width).max(1);
@@ -1491,7 +1507,9 @@ impl CodeTuiApp {
         // one more row is reserved for the "+N more" marker when the plan overflows.
         let chrome = 10u16;
         let body_budget = usize::from(max_total.saturating_sub(chrome)).max(1);
-        let scroll = usize::from(pending.scroll).min(pending.body.len().saturating_sub(1));
+        let overflow = pending.body.len() > body_budget;
+        let scroll =
+            usize::from(pending.scroll).min(pending.body.len().saturating_sub(body_budget));
         let visible = pending.body.len().saturating_sub(scroll).min(body_budget);
 
         let mut lines: Vec<Line<'static>> = Vec::new();
@@ -1507,6 +1525,11 @@ impl CodeTuiApp {
         if remaining > 0 {
             lines.push(Line::from(Span::styled(
                 format!("  … +{remaining} more (PgUp/PgDn scroll)"),
+                Style::default().fg(FAINT),
+            )));
+        } else if overflow {
+            lines.push(Line::from(Span::styled(
+                "  … end of plan",
                 Style::default().fg(FAINT),
             )));
         }
@@ -1560,6 +1583,7 @@ impl CodeTuiApp {
         });
         frame.render_widget(block, card);
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+        Some(u16::try_from(scroll).unwrap_or(u16::MAX))
     }
 
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {

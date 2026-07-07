@@ -40,11 +40,11 @@ pub(super) async fn load_resume_session(
         .map_err(|err| err.to_string())?
         .ok_or_else(|| "Saved session is no longer available".to_string())?;
 
-    LoadedSession::from_state(session).map_err(|err| err.to_string())
+    Ok(LoadedSession::from_state(session))
 }
 
 /// The last `cap` messages of one session for the `/resume` preview (+ whether
-/// older were dropped); deliberately skips the `engine_messages` decrypt.
+/// older were dropped).
 pub(super) async fn load_session_preview(
     session_store: &SessionStore,
     session_id: &str,
@@ -55,7 +55,7 @@ pub(super) async fn load_session_preview(
         .await
         .map_err(|err| err.to_string())?
         .ok_or_else(|| "Saved session is no longer available".to_string())?;
-    let mut messages = decrypt_to_chat_messages(&state).map_err(|err| err.to_string())?;
+    let mut messages = to_chat_messages(state.messages);
     let truncated = messages.len() > cap;
     if truncated {
         let drop = messages.len() - cap;

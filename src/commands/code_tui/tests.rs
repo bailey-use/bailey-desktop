@@ -11983,7 +11983,7 @@ async fn test_flush_for_exit_persists_partial_response_when_streaming() {
         .await
         .unwrap()
         .expect("session should be persisted on exit");
-    let messages = saved.decrypt_messages().unwrap();
+    let messages = saved.messages;
     assert_eq!(messages.len(), 2, "user prompt + partial reply should save");
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "tell me a story");
@@ -12023,7 +12023,7 @@ async fn test_flush_for_exit_persists_user_only_history() {
         .await
         .unwrap()
         .expect("session with only a user message should still persist on exit");
-    let messages = saved.decrypt_messages().unwrap();
+    let messages = saved.messages;
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, "user");
     assert_eq!(messages[0].content, "tell me a story");

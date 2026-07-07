@@ -6,7 +6,6 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-#[allow(unused_imports)]
 pub use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
 use crate::services::system_env;
 
@@ -784,30 +783,34 @@ pub struct CodeSessionState {
     pub base_url: String,
     pub cwd: String,
     pub model: String,
-    /// Raw encrypted blob. Call `decrypt_messages()` to get the actual messages.
+    /// Stored as a plain JSON array. Legacy sessions hold an `enc*:` encrypted
+    /// blob (machine/keyring-bound); the deserializer decrypts those on read.
+    /// An undecryptable blob is a hard load error — the file stays on disk
+    /// untouched rather than being clobbered by a later save.
     #[serde(deserialize_with = "deserialize_messages_field")]
-    pub messages: String,
-    /// Optional encrypted blob of the in-process agent engine's raw OpenAI-format
-    /// conversation (assistant `tool_calls` + `tool` results with ids), for exact
-    /// resume. Absent for non-agent chats and pre-feature sessions; a decrypt/parse
-    /// failure is treated as absent (resume falls back to the lossy text seed).
-    /// Call [`CodeSessionState::decrypt_engine_messages`].
+    pub messages: Vec<StoredChatMessage>,
+    /// Optional raw OpenAI-format conversation of the in-process agent engine
+    /// (assistant `tool_calls` + `tool` results with ids), for exact resume.
+    /// Absent for non-agent chats and pre-feature sessions. Legacy encrypted
+    /// blobs decrypt on read; a decrypt/parse failure is treated as absent
+    /// (resume falls back to the lossy text seed).
     #[serde(
         rename = "engineMessages",
         default,
+        deserialize_with = "deserialize_engine_messages_field",
         skip_serializing_if = "Option::is_none"
     )]
-    pub engine_messages: Option<String>,
+    pub engine_messages: Option<Vec<serde_json::Value>>,
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "createdAt", default)]
     pub created_at: String,
 }
 
-/// Deserializes the `messages` field, handling both the legacy array format and the current
-/// encrypted string format. Legacy sessions stored messages as a JSON array; they are
-/// re-encrypted on the fly so the field always holds an encrypted string after loading.
-fn deserialize_messages_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+/// Deserializes the `messages` field: a plain JSON array (current format), or a
+/// legacy `enc*:` encrypted JSON string that is decrypted on read. Decrypt
+/// failure is a hard error so an unreadable session is never rewritten empty.
+fn deserialize_messages_field<'de, D>(deserializer: D) -> Result<Vec<StoredChatMessage>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -816,44 +819,52 @@ where
 
     let value = Value::deserialize(deserializer)?;
     match value {
-        // Current format: already an encrypted string
-        Value::String(s) => Ok(s),
-        // Legacy format: plain JSON array of {role, content} objects — re-encrypt it
-        Value::Array(_) => {
-            let json = serde_json::to_string(&value).map_err(D::Error::custom)?;
-            encrypt(&json).map_err(D::Error::custom)
+        Value::Array(_) => serde_json::from_value(value).map_err(D::Error::custom),
+        Value::String(s) if s.is_empty() => Ok(vec![]),
+        Value::String(s) => {
+            let json = decrypt(&s).map_err(D::Error::custom)?;
+            serde_json::from_str(&json).map_err(D::Error::custom)
         }
         other => Err(D::Error::custom(format!(
-            "expected string or array for messages, got {}",
+            "expected array or string for messages, got {}",
             other
         ))),
     }
 }
 
-impl CodeSessionState {
-    /// Returns the number of messages. Returns 0 if empty or on decryption error.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn message_count(&self) -> usize {
-        self.decrypt_messages().map(|v| v.len()).unwrap_or(0)
-    }
+/// Deserializes `engineMessages`: a plain JSON array (current format), or a
+/// legacy encrypted string. Best-effort by contract — a corrupt or unreadable
+/// blob degrades to `None` (lossy text resume), never an error.
+fn deserialize_engine_messages_field<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<serde_json::Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
 
-    /// Decrypts and returns the stored messages.
-    pub fn decrypt_messages(&self) -> Result<Vec<StoredChatMessage>> {
-        if self.messages.is_empty() {
-            return Ok(vec![]);
-        }
-        let json = decrypt(&self.messages)?;
-        serde_json::from_str(&json).context("Failed to parse stored messages")
-    }
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Array(items)) => Some(items),
+        Some(Value::String(blob)) => decrypt(&blob)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        _ => None,
+    })
+}
 
-    /// Best-effort decrypt of the persisted agent-engine conversation for exact
-    /// resume. Returns `None` (never an error) when absent or unreadable — a lost
-    /// keyring or a schema mismatch degrades to a lossy text resume, never a brick.
-    pub fn decrypt_engine_messages(&self) -> Option<Vec<serde_json::Value>> {
-        let blob = self.engine_messages.as_ref()?;
-        let json = decrypt(blob).ok()?;
-        serde_json::from_str(&json).ok()
-    }
+/// Legacy inline sessions, per-entry lenient: one undecryptable or malformed
+/// entry must not brick the whole config (API key) load.
+fn deserialize_legacy_chat_sessions<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, CodeSessionState>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(id, value)| serde_json::from_value(value).ok().map(|s| (id, s)))
+        .collect())
 }
 
 /// Lightweight session metadata used in the index (no message content).
@@ -1041,7 +1052,12 @@ pub struct StoredConfig {
     pub last_selection: Option<LastSelection>,
     /// Legacy field — read from old configs but never written back.
     /// Sessions are now stored in individual files under sessions/.
-    #[serde(rename = "chat_sessions", default, skip_serializing)]
+    #[serde(
+        rename = "chat_sessions",
+        default,
+        skip_serializing,
+        deserialize_with = "deserialize_legacy_chat_sessions"
+    )]
     pub chat_sessions: HashMap<String, CodeSessionState>,
     /// Set to true when the user manually removes the aivo-starter key.
     /// Prevents auto-recreation until the user explicitly re-adds it.
@@ -3105,7 +3121,7 @@ mod tests {
         );
 
         let session = store.get_code_session("legacy").await.unwrap().unwrap();
-        assert_eq!(session.message_count(), 1);
+        assert_eq!(session.messages.len(), 1);
         assert_eq!(session.session_id, "legacy");
 
         store
@@ -3146,10 +3162,10 @@ mod tests {
         // Session content should NOT appear in config.json (it lives in session files)
         let raw = tokio::fs::read_to_string(&config_path).await.unwrap();
         assert!(!raw.contains("\"hello\""));
-        // Session file should exist and contain encrypted (not plaintext) content
+        // Session file should exist and hold the messages as plain readable JSON
         let session_path = store.session_file_path("legacy");
         let session_raw = tokio::fs::read_to_string(&session_path).await.unwrap();
-        assert!(!session_raw.contains("\"hello\""));
+        assert!(session_raw.contains("\"hello\""));
     }
 
     #[tokio::test]
@@ -3300,8 +3316,8 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_session_messages_migration_from_legacy_array() {
-        // Simulate a config.json written by the old code: messages is a JSON array
+    fn test_chat_session_messages_plain_array_roundtrips() {
+        // Current format (also the pre-encryption legacy format): a JSON array.
         let json = r#"{
             "sessionId": "sess1",
             "keyId": "key1",
@@ -3315,24 +3331,17 @@ mod tests {
             "updatedAt": "2024-01-01T00:00:00Z"
         }"#;
 
-        let session: CodeSessionState =
-            serde_json::from_str(json).expect("should migrate legacy array");
+        let session: CodeSessionState = serde_json::from_str(json).expect("should parse array");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "hello");
+        assert_eq!(session.messages[1].role, "assistant");
+        assert_eq!(session.messages[1].content, "hi there");
 
-        // After migration the field should be an encrypted string
-        assert!(
-            is_encrypted(&session.messages),
-            "messages should be re-encrypted"
-        );
-
-        // And decryption should yield the original messages
-        let messages = session
-            .decrypt_messages()
-            .expect("should decrypt migrated messages");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[0].content, "hello");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(messages[1].content, "hi there");
+        // Serializing writes the array back verbatim — never an encrypted blob.
+        let written = serde_json::to_value(&session).unwrap();
+        assert!(written["messages"].is_array());
+        assert_eq!(written["messages"][0]["content"], "hello");
     }
 
     #[test]
@@ -3351,8 +3360,10 @@ mod tests {
         assert_eq!(back.model.as_deref(), Some("m1"));
     }
 
+    /// Sessions written before the plaintext switch hold an `enc*:` string;
+    /// they must keep decrypting on read.
     #[test]
-    fn test_chat_session_messages_current_format_roundtrip() {
+    fn test_chat_session_legacy_encrypted_messages_decrypt_on_read() {
         let msgs = vec![
             StoredChatMessage {
                 model: None,
@@ -3382,48 +3393,92 @@ mod tests {
         );
 
         let session: CodeSessionState = serde_json::from_str(&session_json).unwrap();
-        let decoded = session.decrypt_messages().unwrap();
-        assert_eq!(decoded, msgs);
+        assert_eq!(session.messages, msgs);
+
+        // An empty legacy string is an empty conversation, not an error.
+        let empty_json = r#"{"sessionId":"s","keyId":"k","baseUrl":"u","cwd":"/","model":"m","messages":"","updatedAt":"2024-01-01T00:00:00Z"}"#;
+        let empty: CodeSessionState = serde_json::from_str(empty_json).unwrap();
+        assert!(empty.messages.is_empty());
     }
 
-    /// `decrypt_engine_messages` is best-effort: a corrupt or unreadable engine
-    /// blob (lost keyring, schema mismatch) must degrade to `None` — a lossy text
-    /// resume — never panic or brick the session. A valid blob still round-trips.
+    /// An undecryptable legacy blob is a HARD load error: the session file
+    /// stays on disk untouched instead of being silently loaded as empty and
+    /// clobbered by the next save.
     #[test]
-    fn test_decrypt_engine_messages_degrades_not_bricks() {
-        let make = |engine: Option<&str>| -> CodeSessionState {
+    fn test_chat_session_undecryptable_messages_fail_load() {
+        let json = r#"{"sessionId":"s","keyId":"k","baseUrl":"u","cwd":"/","model":"m","messages":"enc4:not-really-a-blob","updatedAt":"2024-01-01T00:00:00Z"}"#;
+        assert!(serde_json::from_str::<CodeSessionState>(json).is_err());
+    }
+
+    /// Legacy inline chat_sessions in config.json are per-entry lenient: an
+    /// undecryptable session must never brick the config (API key) load.
+    #[test]
+    fn test_legacy_inline_chat_sessions_skip_bad_entries() {
+        let json = r#"{
+            "api_keys": [],
+            "chat_sessions": {
+                "good": {
+                    "sessionId": "good", "keyId": "k", "baseUrl": "u",
+                    "cwd": "/", "model": "m",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "updatedAt": "2024-01-01T00:00:00Z"
+                },
+                "bad": {
+                    "sessionId": "bad", "keyId": "k", "baseUrl": "u",
+                    "cwd": "/", "model": "m",
+                    "messages": "enc4:garbage",
+                    "updatedAt": "2024-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        let config: StoredConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.chat_sessions.len(), 1);
+        assert!(config.chat_sessions.contains_key("good"));
+    }
+
+    /// `engineMessages` is best-effort: a corrupt or unreadable legacy blob
+    /// (lost keyring, schema mismatch) must degrade to `None` — a lossy text
+    /// resume — never panic or brick the session. A valid legacy encrypted
+    /// blob and the current plain-array format both round-trip.
+    #[test]
+    fn test_engine_messages_degrade_not_brick() {
+        let make = |engine: Option<serde_json::Value>| -> CodeSessionState {
             let mut v = serde_json::json!({
                 "sessionId": "s", "keyId": "k", "baseUrl": "u",
-                "cwd": "/", "model": "m", "messages": "",
+                "cwd": "/", "model": "m", "messages": [],
                 "updatedAt": "2024-01-01T00:00:00Z"
             });
             if let Some(e) = engine {
-                v["engineMessages"] = serde_json::Value::String(e.to_string());
+                v["engineMessages"] = e;
             }
             serde_json::from_value(v).unwrap()
         };
 
-        let absent = make(None);
-        assert!(absent.engine_messages.is_none());
-        assert!(absent.decrypt_engine_messages().is_none());
+        assert!(make(None).engine_messages.is_none());
 
         assert!(
-            make(Some("not-a-valid-blob"))
-                .decrypt_engine_messages()
+            make(Some("not-a-valid-blob".into()))
+                .engine_messages
                 .is_none(),
             "a corrupt engine blob must degrade to None, never brick"
         );
 
-        // A valid blob still round-trips.
         let payload = vec![
             serde_json::json!({"role": "user", "content": "hi"}),
             serde_json::json!({"role": "assistant", "tool_calls": [{"id": "t1"}]}),
         ];
-        let blob = encrypt(&serde_json::to_string(&payload).unwrap()).unwrap();
+
+        // Current format: plain array.
         assert_eq!(
-            make(Some(&blob)).decrypt_engine_messages().unwrap(),
+            make(Some(serde_json::Value::Array(payload.clone())))
+                .engine_messages
+                .unwrap(),
             payload
         );
+
+        // Legacy format: encrypted blob still decrypts.
+        let blob = encrypt(&serde_json::to_string(&payload).unwrap()).unwrap();
+        assert_eq!(make(Some(blob.into())).engine_messages.unwrap(), payload);
     }
 
     #[test]
@@ -3601,13 +3656,12 @@ mod tests {
         // Stats preserved
         assert_eq!(*config.stats.tool_counts.get("claude").unwrap(), 42);
 
-        // Legacy inline chat_sessions loaded (messages auto-encrypted)
+        // Legacy inline chat_sessions loaded (messages stay plaintext)
         let session = config.chat_sessions.get("sess-legacy").unwrap();
         assert_eq!(session.key_id, "a1b2c3");
-        let msgs = session.decrypt_messages().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].role, "user");
-        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "hello");
 
         // New fields default correctly
         assert!(!config.starter_key_dismissed);

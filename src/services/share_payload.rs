@@ -213,15 +213,14 @@ fn stringify_block_text(v: &Value) -> String {
 // aivo code extractor
 // ---------------------------------------------------------------------------
 
-/// Map a persisted `aivo code` session onto the share schema; surfaces the
-/// decryption error rather than producing an empty share.
+/// Map a persisted `aivo code` session onto the share schema. Legacy encrypted
+/// sessions are decrypted at load time, so a decryption error surfaces from the
+/// store rather than here.
 pub fn extract_chat_full(
     state: &CodeSessionState,
     project_root: Option<&str>,
 ) -> Result<SharePayload> {
-    let messages = state
-        .decrypt_messages()
-        .context("failed to decrypt chat session messages")?;
+    let messages = state.messages.clone();
 
     let created_at = parse_chat_timestamp(&state.created_at);
     let mut latest_ts: Option<DateTime<Utc>> = None;
@@ -1257,8 +1256,6 @@ mod tests {
 
     #[test]
     fn extract_chat_full_maps_messages_and_reasoning() {
-        use crate::services::session_crypto::encrypt;
-
         let messages = vec![
             StoredChatMessage {
                 model: None,
@@ -1279,7 +1276,6 @@ mod tests {
                 attachments: None,
             },
         ];
-        let encrypted = encrypt(&serde_json::to_string(&messages).unwrap()).unwrap();
 
         let state = CodeSessionState {
             session_id: "chat-abc".into(),
@@ -1287,7 +1283,7 @@ mod tests {
             base_url: "https://api.example.com".into(),
             cwd: "/Users/alice/project/aivo".into(),
             model: "gpt-4o".into(),
-            messages: encrypted,
+            messages,
             engine_messages: None,
             updated_at: "2026-04-01T10:01:00Z".into(),
             created_at: "2026-04-01T09:55:00Z".into(),
@@ -1322,8 +1318,6 @@ mod tests {
 
     #[test]
     fn extract_chat_full_emits_attachment_blocks() {
-        use crate::services::session_crypto::encrypt;
-
         let messages = vec![StoredChatMessage {
             model: None,
             role: "user".into(),
@@ -1354,7 +1348,7 @@ mod tests {
             base_url: "u".into(),
             cwd: "/tmp".into(),
             model: "m".into(),
-            messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            messages,
             engine_messages: None,
             updated_at: String::new(),
             created_at: String::new(),
@@ -1393,8 +1387,6 @@ mod tests {
 
     #[test]
     fn extract_chat_full_maps_per_message_model() {
-        use crate::services::session_crypto::encrypt;
-
         let msg = |model: Option<&str>, role: &str, content: &str| StoredChatMessage {
             model: model.map(str::to_string),
             role: role.into(),
@@ -1416,7 +1408,7 @@ mod tests {
             base_url: "u".into(),
             cwd: "/tmp".into(),
             model: "model-b".into(),
-            messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            messages,
             engine_messages: None,
             updated_at: String::new(),
             created_at: String::new(),
@@ -1430,8 +1422,6 @@ mod tests {
 
     #[test]
     fn extract_chat_full_maps_agent_tool_turns() {
-        use crate::services::session_crypto::encrypt;
-
         let messages = vec![
             StoredChatMessage {
                 model: None,
@@ -1494,7 +1484,7 @@ mod tests {
             base_url: "u".into(),
             cwd: "/tmp".into(),
             model: "m".into(),
-            messages: encrypt(&serde_json::to_string(&messages).unwrap()).unwrap(),
+            messages,
             engine_messages: None,
             updated_at: String::new(),
             created_at: String::new(),
@@ -1531,23 +1521,6 @@ mod tests {
             }
             other => panic!("expected failed tool result, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn extract_chat_full_surfaces_decryption_error() {
-        let state = CodeSessionState {
-            session_id: "s".into(),
-            key_id: "k".into(),
-            base_url: "u".into(),
-            cwd: String::new(),
-            model: "m".into(),
-            messages: "not-actually-encrypted".into(),
-            engine_messages: None,
-            updated_at: String::new(),
-            created_at: String::new(),
-        };
-        let err = extract_chat_full(&state, None).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("decrypt"));
     }
 
     #[tokio::test]

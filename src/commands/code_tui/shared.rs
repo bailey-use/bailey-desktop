@@ -357,11 +357,10 @@ pub(super) struct SessionPreview {
     pub(super) preview_text: String,
 }
 
-pub(super) fn decrypt_to_chat_messages(
-    state: &crate::services::session_store::CodeSessionState,
-) -> Result<Vec<ChatMessage>> {
-    let messages = state
-        .decrypt_messages()?
+pub(super) fn to_chat_messages(
+    messages: Vec<crate::services::session_store::StoredChatMessage>,
+) -> Vec<ChatMessage> {
+    messages
         .into_iter()
         .map(|m| ChatMessage {
             model: m.model,
@@ -370,8 +369,7 @@ pub(super) fn decrypt_to_chat_messages(
             reasoning_content: m.reasoning_content,
             attachments: m.attachments.unwrap_or_default(),
         })
-        .collect();
-    Ok(messages)
+        .collect()
 }
 
 impl SessionPreview {
@@ -417,19 +415,14 @@ pub(super) struct LoadedSession {
 }
 
 impl LoadedSession {
-    pub(super) fn from_state(
-        state: crate::services::session_store::CodeSessionState,
-    ) -> Result<Self> {
-        let messages = decrypt_to_chat_messages(&state)?;
-        let engine_messages = state.decrypt_engine_messages();
-
-        Ok(Self {
+    pub(super) fn from_state(state: crate::services::session_store::CodeSessionState) -> Self {
+        Self {
             key_id: state.key_id,
             session_id: state.session_id,
             raw_model: state.model,
-            messages,
-            engine_messages,
-        })
+            messages: to_chat_messages(state.messages),
+            engine_messages: state.engine_messages,
+        }
     }
 }
 

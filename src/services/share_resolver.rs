@@ -818,7 +818,6 @@ fn parse_log_timestamp(s: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::session_crypto::encrypt;
     use crate::services::session_store::{SessionTokens, StoredChatMessage};
     use tempfile::TempDir;
 
@@ -877,9 +876,6 @@ mod tests {
             timestamp: None,
             attachments: None,
         }];
-        let encrypted = encrypt(&serde_json::to_string(&messages).unwrap()).unwrap();
-        let _ = encrypted; // sanity: ensures crypto module is importable
-
         // SessionStore exposes save_code_session_with_id for the same purpose.
         ctx.session_store
             .save_code_session_with_id(

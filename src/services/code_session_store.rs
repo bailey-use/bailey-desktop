@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
 use crate::services::atomic_write::atomic_write_secure;
-use crate::services::session_crypto::encrypt;
 use crate::services::session_store::{
     ChatTokenWindow, CodeSessionState, ConfigContext, ConfigLockGuard, SessionIndex,
     SessionIndexEntry, SessionTokens, StoredChatMessage,
@@ -175,15 +174,8 @@ impl CodeSessionStore {
                 continue;
             }
 
-            // Compute title/preview by decrypting
-            let (title, preview) = if let Ok(messages) = session.decrypt_messages() {
-                (
-                    compute_session_title(&messages, &session.model),
-                    compute_session_preview(&messages, &session.model),
-                )
-            } else {
-                (session.model.clone(), String::new())
-            };
+            let title = compute_session_title(&session.messages, &session.model);
+            let preview = compute_session_preview(&session.messages, &session.model);
 
             self.save_session_file(session).await?;
 
@@ -303,14 +295,8 @@ impl CodeSessionStore {
             }
             let session_id = name.trim_end_matches(".json");
             if let Ok(state) = self.load_session_file(session_id).await {
-                let (title, preview) = if let Ok(messages) = state.decrypt_messages() {
-                    (
-                        compute_session_title(&messages, &state.model),
-                        compute_session_preview(&messages, &state.model),
-                    )
-                } else {
-                    (state.model.clone(), String::new())
-                };
+                let title = compute_session_title(&state.messages, &state.model);
+                let preview = compute_session_preview(&state.messages, &state.model);
 
                 entries.push(SessionIndexEntry {
                     session_id: state.session_id.clone(),
@@ -482,8 +468,6 @@ impl CodeSessionStore {
         self.migrate_sessions_if_needed().await?;
         let _lock = self.acquire_session_lock()?;
 
-        let json = serde_json::to_string(messages).context("Failed to serialize messages")?;
-        let encrypted = encrypt(&json)?;
         let now = Utc::now().to_rfc3339();
         let existing = self.load_session_file(session_id).await.ok();
         // Preserve created_at from existing session file; use now for new sessions.
@@ -502,7 +486,7 @@ impl CodeSessionStore {
             base_url: base_url.to_string(),
             cwd: cwd.to_string(),
             model: model.to_string(),
-            messages: encrypted,
+            messages: messages.to_vec(),
             engine_messages,
             updated_at: now.clone(),
             created_at: created_at.clone(),
@@ -568,9 +552,7 @@ impl CodeSessionStore {
         state.engine_messages = if engine_messages.is_empty() {
             None
         } else {
-            let json = serde_json::to_string(engine_messages)
-                .context("Failed to serialize engine messages")?;
-            Some(encrypt(&json)?)
+            Some(engine_messages.to_vec())
         };
         self.save_session_file(&state).await
     }
@@ -769,15 +751,14 @@ mod tests {
         assert_eq!(session.model, "gpt-4o");
         assert_eq!(session.key_id, key_id);
 
-        let messages = session.decrypt_messages().unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "hello world");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "hello world");
     }
 
     /// Durable resume: `save_agent_messages` stores the engine's raw transcript
-    /// (tool_calls + results with ids) encrypted; it round-trips via
-    /// `decrypt_engine_messages`, survives a later text-only save (heartbeat must
-    /// not wipe it), and is a no-op on a missing session.
+    /// (tool_calls + results with ids); it round-trips, survives a later
+    /// text-only save (heartbeat must not wipe it), and is a no-op on a
+    /// missing session.
     #[tokio::test]
     async fn engine_messages_roundtrip_and_survive_text_save() {
         let temp_dir = TempDir::new().unwrap();
@@ -831,7 +812,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .decrypt_engine_messages()
+            .engine_messages
             .unwrap();
         assert_eq!(restored.len(), 4);
         assert_eq!(restored[1]["tool_calls"][0]["id"], "call_1");
@@ -845,7 +826,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
-            .decrypt_engine_messages();
+            .engine_messages;
         assert_eq!(after.map(|m| m.len()), Some(4), "text save preserved it");
 
         // Missing session → no-op, not an error.

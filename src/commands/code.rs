@@ -1389,15 +1389,11 @@ async fn materialize_attachment(attachment: &MessageAttachment) -> Result<Messag
             } else {
                 match tokio::fs::read_to_string(path).await {
                     Ok(text) => AttachmentStorage::Inline { data: text },
-                    Err(_) => {
-                        // Binary file that isn't valid UTF-8 — base64 encode it
-                        let bytes = tokio::fs::read(path)
-                            .await
-                            .map_err(|err| anyhow::anyhow!("Failed to read '{}': {err}", path))?;
-                        AttachmentStorage::Inline {
-                            data: BASE64.encode(bytes),
-                        }
-                    }
+                    // base64 labeled text/plain would send a meaningless blob.
+                    Err(_) => anyhow::bail!(
+                        "'{}' looks like a binary file — attach images, PDFs, or text",
+                        attachment.name
+                    ),
                 }
             };
             Ok(MessageAttachment {

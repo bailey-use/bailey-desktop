@@ -140,6 +140,21 @@ impl CodeTuiApp {
     /// event loop on an in-flight turn's guard. Choosing an effort implies you
     /// want the model to think, so this also turns thinking on if it was off.
     pub(super) async fn apply_reasoning_effort(&mut self, level: String) {
+        // A stale picker can apply a level from a model the agent switched away
+        // from mid-turn — refuse instead of 400ing later turns.
+        if !self.model_reasoning_efforts.is_empty()
+            && !self.model_reasoning_efforts.contains(&level)
+        {
+            self.notice = Some((
+                ERROR,
+                format!(
+                    "'{level}' isn't a level for {} (choose: {})",
+                    self.model,
+                    self.model_reasoning_efforts.join(", ")
+                ),
+            ));
+            return;
+        }
         self.reasoning_effort = Some(level.clone());
         let _ = self
             .session_store
@@ -603,7 +618,7 @@ is preserved."
             return Ok(());
         };
         self.session_store.set_skill_enabled(&name, enabled).await?;
-        self.agent_engine = None;
+        self.request_engine_rebuild();
         // A disabled skill drops out of the `/` menu; an enabled one returns.
         if let Overlay::Skills(state) = &self.overlay {
             self.skill_commands = enabled_skill_commands(&state.items);
@@ -672,7 +687,7 @@ is preserved."
                 // A freshly scaffolded skill starts enabled, clearing any stale
                 // disabled flag left by a same-name skill removed earlier.
                 self.session_store.set_skill_enabled(&name, true).await.ok();
-                self.agent_engine = None;
+                self.request_engine_rebuild();
                 let mut notice = skill_add_success_notice(&name, &description, &path);
                 if project {
                     notice.push_str(PROJECT_SKILL_NOTE);
@@ -792,7 +807,7 @@ is preserved."
                     self.session_store.set_skill_enabled(name, true).await.ok();
                 }
                 if !report.installed.is_empty() || !report.updated.is_empty() {
-                    self.agent_engine = None;
+                    self.request_engine_rebuild();
                 }
                 self.notice = Some(install_report_notice(&source, project, &report));
             }
@@ -1010,7 +1025,7 @@ is preserved."
             Ok(()) => {
                 // Clear any leftover disabled flag so a re-add isn't stuck off.
                 self.session_store.set_skill_enabled(name, true).await.ok();
-                self.agent_engine = None;
+                self.request_engine_rebuild();
                 self.notice = Some((MUTED, format!("Removed skill `{name}`")));
             }
             Err(e) => self.notice = Some((ERROR, format!("Failed to remove skill: {e}"))),
@@ -1572,7 +1587,7 @@ is preserved."
         self.mcp_client = None;
         self.mcp_connecting = false;
         self.mcp_connect_progress.clear();
-        self.agent_engine = None;
+        self.request_engine_rebuild();
     }
 
     /// Status + health for one server, read from the current client snapshot.
@@ -1748,7 +1763,7 @@ is preserved."
             self.disabled_mcp_tools.insert(qualified);
         }
         // Specs are baked in at set_external_tools — rebuild on the next turn.
-        self.agent_engine = None;
+        self.request_engine_rebuild();
         Ok(())
     }
 
@@ -1860,7 +1875,7 @@ is preserved."
         self.mcp_connect_gen = self.mcp_connect_gen.wrapping_add(1);
         self.mcp_connecting = true;
         self.mcp_connect_progress.clear();
-        self.agent_engine = None;
+        self.request_engine_rebuild();
         self.spawn_mcp_connect(cwd, disabled, self.mcp_connect_gen, self.mcp_client.clone());
         self.refresh_mcp_overlay_status();
     }
@@ -2241,6 +2256,13 @@ is preserved."
         self.agent_ask = None;
         self.agent_review = None;
         self.agent_plan_approval = None;
+        // Plan/goal modes belong to the OLD conversation — a leaked plan card
+        // indexes the replaced history and `/plan go` would run the old plan.
+        self.plan_mode = false;
+        self.plan_exit_pending = false;
+        self.pending_plan = None;
+        self.plan_card_idx = None;
+        self.goal_mode = None;
         self.stop_agent_serve();
         self.session_id = session.session_id;
         // Re-seed the running token total from the stored entry so further turns

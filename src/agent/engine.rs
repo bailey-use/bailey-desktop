@@ -658,7 +658,13 @@ questions.",
     /// a depth-only scale with no off (aivo/starter, Anthropic) → `thinking:{type:"disabled"}`.
     fn thinking_request(&self) -> (Option<&str>, bool) {
         if self.thinking_enabled {
-            return (self.reasoning_effort.as_deref(), false);
+            // A level carried across a model switch may not exist here (→ 400);
+            // omit rather than guess.
+            let effort = self
+                .reasoning_effort
+                .as_deref()
+                .filter(|e| self.reasoning_efforts.is_empty() || self.effort_is_valid(e));
+            return (effort, false);
         }
         let capable = self.reasoning_capable
             || self.reasoning_effort.is_some()
@@ -3059,6 +3065,24 @@ mod tests {
         // Non-reasoning model: never requested.
         let plain = AgentEngine::new("/tmp", "gpt-4o", "", &[], &[], 0, 0);
         assert_eq!(plain.thinking_request(), (None, false));
+    }
+
+    #[test]
+    fn thinking_request_clamps_effort_to_catalog() {
+        // A level carried across a model switch that this model's catalog doesn't
+        // advertise is omitted (sending it would 400), not forwarded verbatim.
+        let mut engine = AgentEngine::new("/tmp", "o3", "", &[], &[], 0, 0);
+        engine.set_reasoning_effort("xhigh".into());
+        engine.set_reasoning_efforts(vec!["low".into(), "medium".into(), "high".into()]);
+        assert_eq!(engine.thinking_request(), (None, false));
+
+        engine.set_reasoning_effort("high".into());
+        assert_eq!(engine.thinking_request(), (Some("high"), false));
+
+        // No catalog → nothing to clamp against; the level passes through.
+        engine.set_reasoning_efforts(Vec::new());
+        engine.set_reasoning_effort("custom".into());
+        assert_eq!(engine.thinking_request(), (Some("custom"), false));
     }
 
     #[test]

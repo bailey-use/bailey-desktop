@@ -65,13 +65,18 @@ impl CodeTuiApp {
         let session_store = self.session_store.clone();
         let session_id = self.session_id.clone();
         let cwd = self.real_cwd.clone();
+        // Stamped so a stop//new//resume during the handshake makes this start stale.
+        let share_gen = self.live_share_gen;
         tokio::spawn(async move {
             // `/share` without a login gets a clear notice; `--share` gated pre-TUI.
             if !crate::commands::share::device_linked().await {
-                let _ = tx.send(RuntimeEvent::LiveShareReady(Err(
-                    "Sharing needs a linked account — run `aivo login`, then `/share` again."
-                        .to_string(),
-                )));
+                let _ = tx.send(RuntimeEvent::LiveShareReady {
+                    share_gen,
+                    result: Err(
+                        "Sharing needs a linked account — run `aivo login`, then `/share` again."
+                            .to_string(),
+                    ),
+                });
                 return;
             }
             let project_root = if cwd.is_empty() {
@@ -89,7 +94,7 @@ impl CodeTuiApp {
             let result = crate::services::share_live::start_live_share(session_id, ctx, true)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(RuntimeEvent::LiveShareReady(result));
+            let _ = tx.send(RuntimeEvent::LiveShareReady { share_gen, result });
         });
     }
 
@@ -108,20 +113,32 @@ impl CodeTuiApp {
         }
     }
 
-    /// Tear down the active share (if any), returning whether one was stopped.
+    /// Tear down the active share and invalidate any start still mid-handshake.
+    /// Returns whether anything was stopped.
     pub(super) fn stop_live_share(&mut self) -> bool {
+        self.live_share_gen = self.live_share_gen.wrapping_add(1);
+        let was_starting = std::mem::take(&mut self.live_share_starting);
         if let Some(handle) = self.live_share.take() {
             handle.stop();
             true
         } else {
-            false
+            was_starting
         }
     }
 
     pub(super) fn apply_live_share_ready(
         &mut self,
+        share_gen: u64,
         result: std::result::Result<crate::services::share_live::LiveShareHandle, String>,
     ) {
+        // Stale start (stopped//new//resumed mid-handshake): tear down, don't
+        // install; `live_share_starting` belongs to a newer start, if any.
+        if share_gen != self.live_share_gen {
+            if let Ok(handle) = result {
+                handle.stop();
+            }
+            return;
+        }
         self.live_share_starting = false;
         match result {
             Ok(handle) => {
@@ -130,6 +147,18 @@ impl CodeTuiApp {
                 self.announce_live_url(&url);
             }
             Err(msg) => self.notice = Some((ERROR, msg)),
+        }
+    }
+
+    /// Frame-tick check: a dead tunnel (no auto-reconnect) clears the badge and
+    /// its server/refresher instead of lying until the URL stops resolving.
+    pub(super) fn check_live_share_health(&mut self) {
+        if self.live_share.as_ref().is_some_and(|h| h.is_dead()) {
+            self.stop_live_share();
+            self.notice = Some((
+                ERROR,
+                "Share disconnected — /share to start a new one".to_string(),
+            ));
         }
     }
 }

@@ -1228,7 +1228,8 @@ fn make_test_app(
         mcp_connect_progress: std::collections::HashMap::new(),
         disabled_mcp_tools: std::collections::HashSet::new(),
         mcp_connect_gen: 0,
-        mcp_rebuild_pending: false,
+        engine_rebuild_pending: false,
+        live_share_gen: 0,
         pending_mcp_auth: std::collections::HashMap::new(),
         agent_serve: None,
         agent_permission: None,
@@ -5151,7 +5152,7 @@ async fn test_apply_mcp_connected_empty_keeps_engine() {
         app.agent_engine.is_some(),
         "an empty MCP result must not drop the engine"
     );
-    assert!(!app.mcp_rebuild_pending);
+    assert!(!app.engine_rebuild_pending);
 }
 
 #[tokio::test]
@@ -5284,20 +5285,20 @@ async fn test_stale_mcp_connect_is_dropped() {
 }
 
 #[test]
-fn test_maybe_apply_mcp_rebuild_drops_engine_when_pending() {
+fn test_maybe_apply_engine_rebuild_drops_engine_when_pending() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
     app.agent_engine = Some(dummy_agent_session());
-    app.mcp_rebuild_pending = true;
-    app.maybe_apply_mcp_rebuild();
+    app.engine_rebuild_pending = true;
+    app.maybe_apply_engine_rebuild();
     assert!(
         app.agent_engine.is_none(),
         "pending rebuild should drop engine"
     );
-    assert!(!app.mcp_rebuild_pending, "flag should clear");
+    assert!(!app.engine_rebuild_pending, "flag should clear");
     // Not pending → engine left alone.
     app.agent_engine = Some(dummy_agent_session());
-    app.maybe_apply_mcp_rebuild();
+    app.maybe_apply_engine_rebuild();
     assert!(app.agent_engine.is_some());
 }
 
@@ -6453,9 +6454,12 @@ fn test_apply_live_share_ready_ok_and_err() {
     let mut app = make_test_app(tx, rx);
 
     app.live_share_starting = true;
-    app.apply_live_share_ready(Ok(LiveShareHandle::for_test(
-        "https://s.getaivo.dev/v.html?t=ok",
-    )));
+    app.apply_live_share_ready(
+        app.live_share_gen,
+        Ok(LiveShareHandle::for_test(
+            "https://s.getaivo.dev/v.html?t=ok",
+        )),
+    );
     assert!(!app.live_share_starting);
     assert!(app.live_share.is_some());
     assert!(app.notice.as_ref().unwrap().1.contains("t=ok"));
@@ -6463,10 +6467,61 @@ fn test_apply_live_share_ready_ok_and_err() {
     // Failure: clears the starting flag, surfaces the reason, stores nothing.
     app.live_share = None;
     app.live_share_starting = true;
-    app.apply_live_share_ready(Err("no link".to_string()));
+    app.apply_live_share_ready(app.live_share_gen, Err("no link".to_string()));
     assert!(!app.live_share_starting);
     assert!(app.live_share.is_none());
     assert_eq!(app.notice.as_ref().unwrap().1, "no link");
+}
+
+/// A share start outlived by a stop//new//resume must not install its tunnel;
+/// a start under the fresh generation still lands.
+#[test]
+fn test_stale_live_share_ready_is_dropped() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.live_share_starting = true;
+    let stale_gen = app.live_share_gen;
+    assert!(
+        app.stop_live_share(),
+        "cancelling a mid-handshake start counts as a stop"
+    );
+    assert!(!app.live_share_starting);
+
+    app.apply_live_share_ready(stale_gen, Ok(LiveShareHandle::for_test("https://s/old")));
+    assert!(app.live_share.is_none(), "stale handle must not install");
+
+    // A new start under the bumped generation works.
+    app.live_share_starting = true;
+    app.apply_live_share_ready(
+        app.live_share_gen,
+        Ok(LiveShareHandle::for_test("https://s/new")),
+    );
+    assert!(app.live_share.is_some());
+}
+
+/// A dead tunnel (network drop — no auto-reconnect) clears the badge and its
+/// server on the next frame instead of showing a live share that no longer serves.
+#[test]
+fn test_dead_share_tunnel_clears_badge() {
+    use crate::services::share_live::LiveShareHandle;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    let handle = LiveShareHandle::for_test("https://s/z");
+    handle.mark_dead_for_test();
+    app.live_share = Some(handle);
+
+    app.check_live_share_health();
+
+    assert!(app.live_share.is_none());
+    assert!(app.notice.as_ref().unwrap().1.contains("disconnected"));
+
+    // No share → no-op (must not overwrite an unrelated notice).
+    app.notice = None;
+    app.check_live_share_health();
+    assert!(app.notice.is_none());
 }
 
 #[test]
@@ -8113,6 +8168,226 @@ async fn test_plan_entry_stops_goal_mode() {
     assert!(app.plan_mode, "plan mode is on");
     assert!(app.goal_mode.is_none(), "plan entry ends the goal loop");
     assert!(app.notice.as_ref().unwrap().1.contains("Goal mode stopped"));
+}
+
+/// A cancelled or interrupted `/compact` must not mark the NEXT turn as a
+/// compact (bogus "freed" notice, skipped logs, corrupted context stats).
+#[tokio::test]
+async fn test_teardown_clears_compact_before() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    // ESC / /new / resume / key-switch route (cancel).
+    app.sending = true;
+    app.compact_before = Some(50_000);
+    app.cancel_inflight_request(CancelKind::Discard);
+    assert_eq!(app.compact_before, None, "cancel clears the compact flag");
+
+    // Interrupt-with-partial-text route (skips cancel_inflight_request).
+    app.sending = true;
+    app.compact_before = Some(50_000);
+    app.pending_response = "partial".to_string();
+    app.interrupt_inflight_request().await.unwrap();
+    assert_eq!(
+        app.compact_before, None,
+        "interrupt clears the compact flag"
+    );
+}
+
+/// A conversation-only rewind after `/resume` must drop the stashed durable
+/// transcript, or the next turn restores the full pre-rewind conversation.
+#[tokio::test]
+async fn test_conversation_only_rewind_drops_pending_transcript() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "first ask".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+    app.pending_agent_messages = Some(vec![
+        serde_json::json!({"role": "user", "content": "first ask"}),
+        serde_json::json!({"role": "assistant", "content": "rewound-away reply"}),
+    ]);
+
+    app.rewind_to_turn(0, None).await.unwrap();
+
+    assert!(
+        app.pending_agent_messages.is_none(),
+        "the pre-rewind transcript must not seed the next engine"
+    );
+    assert!(app.history.is_empty());
+    assert_eq!(app.draft, "first ask", "prompt restored for edit/resend");
+}
+
+/// Resuming must not leak the old session's plan/goal modes: a stale plan card
+/// would index the replaced history and `/plan go` would run the old plan.
+#[tokio::test]
+async fn test_resume_resets_plan_and_goal_state() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.plan_mode = true;
+    app.plan_exit_pending = true;
+    app.pending_plan = Some("old session's plan".to_string());
+    app.plan_card_idx = Some(3);
+    app.goal_mode = Some(GoalState {
+        objective: "old goal".to_string(),
+        iteration: 2,
+        max: 20,
+    });
+
+    let session = LoadedSession {
+        key_id: app.key.id.clone(),
+        session_id: "resumed".to_string(),
+        raw_model: "claude".to_string(),
+        messages: vec![],
+        engine_messages: None,
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert!(!app.plan_mode, "plan mode belongs to the old session");
+    assert!(!app.plan_exit_pending);
+    assert!(
+        app.pending_plan.is_none(),
+        "old plan must not be /plan go-able"
+    );
+    assert!(
+        app.plan_card_idx.is_none(),
+        "card index points at replaced history"
+    );
+    assert!(app.goal_mode.is_none());
+}
+
+/// Mid-turn tool-set changes (skill/MCP toggles, async skill installs) defer the
+/// engine drop to turn end — an immediate drop loses the turn's usage + transcript.
+#[test]
+fn test_request_engine_rebuild_defers_while_sending() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+
+    app.sending = true;
+    app.request_engine_rebuild();
+    assert!(
+        app.engine_rebuild_pending,
+        "deferred while a turn is in flight"
+    );
+
+    app.sending = false;
+    app.maybe_apply_engine_rebuild();
+    assert!(!app.engine_rebuild_pending, "applied at turn end");
+
+    // Idle: applies immediately, no pending flag.
+    app.request_engine_rebuild();
+    assert!(!app.engine_rebuild_pending);
+}
+
+/// A level not offered by the current model is refused at apply time — a stale
+/// effort picker across an agent-driven model switch must not 400 later turns.
+#[tokio::test]
+async fn test_apply_reasoning_effort_rejects_foreign_level() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.model = "m".to_string();
+    app.model_reasoning_efforts = vec!["low".to_string(), "high".to_string()];
+
+    app.apply_reasoning_effort("xhigh".to_string()).await;
+    assert!(app.reasoning_effort.is_none(), "foreign level refused");
+    assert!(app.notice.as_ref().unwrap().1.contains("isn't a level"));
+
+    app.apply_reasoning_effort("high".to_string()).await;
+    assert_eq!(app.reasoning_effort.as_deref(), Some("high"));
+}
+
+/// Draining a queued message records nothing — every queue site already recorded
+/// the recallable form, and a queued skill's expanded body must not enter ↑/↓.
+#[tokio::test]
+async fn test_drained_queued_message_not_recorded_in_draft_history() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Non-agent key (OAuth) keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "claude-oauth".to_string();
+
+    app.queued_messages
+        .push("Use the \"x\" skill. Follow these instructions:\n\n…pages…".to_string());
+    app.drain_queued_message().await.unwrap();
+
+    assert!(
+        app.draft_history.is_empty(),
+        "expanded machine text must not enter recall"
+    );
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content.starts_with("Use the")),
+        "the queued message still went out"
+    );
+}
+
+/// `/copy 0` is a usage error and out-of-range names the real count, instead of
+/// claiming no reply exists.
+#[tokio::test]
+async fn test_copy_rejects_zero_and_reports_range() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "only reply".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    let err = app.copy_reply_to_clipboard(Some(0)).unwrap_err();
+    assert!(err.to_string().contains("Usage"), "{err}");
+
+    let err = app.copy_reply_to_clipboard(Some(5)).unwrap_err();
+    assert!(err.to_string().contains("Only 1 reply"), "{err}");
+}
+
+/// `/plan go` sends machine text — it must not swallow a draft or staged
+/// attachment the user prepared mid-planning (same treatment as `/goal`).
+#[tokio::test]
+async fn test_plan_go_preserves_composer_draft() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Non-agent key (OAuth) keeps the send on the lightweight plain-chat path.
+    app.key.base_url = "claude-oauth".to_string();
+    app.pending_plan = Some("the plan".to_string());
+    app.draft = "note to self".to_string();
+    app.cursor = 4;
+
+    app.run_plan_command(Some("go".to_string())).await;
+
+    assert!(app.sending, "the go message went out");
+    assert_eq!(app.draft, "note to self", "draft survives the dispatch");
+    assert_eq!(app.cursor, 4);
+}
+
+/// A non-UTF8 file under a text mime (unknown extension) is refused with a clear
+/// error instead of being sent as a base64 blob labeled text/plain.
+#[tokio::test]
+async fn test_dispatch_refuses_binary_text_attachment() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("blob.bin");
+    std::fs::write(&path, [0xffu8, 0xfe, 0x01, 0x00]).unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.draft_attachments.push(MessageAttachment {
+        name: "blob.bin".to_string(),
+        mime_type: "text/plain".to_string(),
+        storage: AttachmentStorage::FileRef {
+            path: path.to_string_lossy().into_owned(),
+        },
+    });
+
+    let err = app
+        .dispatch_user_message("look at this".to_string(), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("binary"), "{err}");
 }
 
 /// The composer rule shows a live `/goal` step indicator (and the auto-approve

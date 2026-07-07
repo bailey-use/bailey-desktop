@@ -23,6 +23,7 @@ const URL_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct LiveShareHandle {
     url: String,
     shutdown: ShutdownSignal,
+    dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LiveShareHandle {
@@ -33,6 +34,11 @@ impl LiveShareHandle {
     pub fn stop(&self) {
         self.shutdown.fire();
     }
+
+    /// True once the tunnel task has exited (no auto-reconnect) — no longer serving.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -41,7 +47,12 @@ impl LiveShareHandle {
         Self {
             url: url.into(),
             shutdown: ShutdownSignal::new(),
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn mark_dead_for_test(&self) {
+        self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -73,12 +84,23 @@ pub async fn start_live_share(
 
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
     let tunnel_shutdown = shutdown.clone();
+    // No auto-reconnect: flag tunnel exit so the TUI can clear its badge.
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dead_flag = dead.clone();
     let tunnel = tokio::spawn(async move {
-        share_tunnel::run_tunnel(local_base, TunnelUi::Headless { url_tx }, tunnel_shutdown).await
+        let result =
+            share_tunnel::run_tunnel(local_base, TunnelUi::Headless { url_tx }, tunnel_shutdown)
+                .await;
+        dead_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
     });
 
     match tokio::time::timeout(URL_TIMEOUT, url_rx).await {
-        Ok(Ok(url)) => Ok(LiveShareHandle { url, shutdown }),
+        Ok(Ok(url)) => Ok(LiveShareHandle {
+            url,
+            shutdown,
+            dead,
+        }),
         // Sender dropped → tunnel died mid-handshake; surface its error.
         Ok(Err(_)) => {
             shutdown.fire();

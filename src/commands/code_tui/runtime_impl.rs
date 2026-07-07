@@ -406,10 +406,12 @@ impl CodeTuiApp {
 
     /// After a turn ends, send the oldest message queued mid-turn (if any). One
     /// per turn-end, so each queued message becomes its own user turn in order.
+    /// Records nothing — queue sites already recorded the recallable form, and a
+    /// queued skill's expanded body must not land in ↑/↓ recall.
     pub(super) async fn drain_queued_message(&mut self) -> Result<()> {
         if !self.sending && !self.queued_messages.is_empty() {
             let queued = self.queued_messages.remove(0);
-            self.send_user_message(queued).await?;
+            self.dispatch_user_message(queued, None).await?;
         }
         Ok(())
     }
@@ -854,7 +856,14 @@ impl CodeTuiApp {
             return;
         }
         let Some(session) = self.agent_engine.as_ref() else {
-            self.notice = Some((MUTED, "nothing to compact yet".to_string()));
+            // Post-resume/rebuild the conversation re-seeds on the next turn —
+            // nothing to fold NOW; don't claim there's nothing to compact.
+            let msg = if self.history.is_empty() && self.pending_agent_messages.is_none() {
+                "nothing to compact yet"
+            } else {
+                "no live conversation to compact — send a message first, then /compact"
+            };
+            self.notice = Some((MUTED, msg.to_string()));
             return;
         };
         let engine = session.engine.clone();
@@ -1409,9 +1418,10 @@ impl CodeTuiApp {
             _ => {
                 // No matching checkpoint (predates the engine, trimmed/compacted, or
                 // non-agent): drop the engine so the next turn re-seeds from the
-                // trimmed history, and clear the durable transcript so a resume
-                // doesn't restore the pre-rewind conversation.
+                // trimmed history, and clear the durable transcript — persisted AND
+                // pending, or a resumed session restores the pre-rewind conversation.
                 self.agent_engine = None;
+                self.pending_agent_messages = None;
                 let _ = self
                     .session_store
                     .save_agent_messages(&self.session_id, &[])
@@ -1486,17 +1496,26 @@ impl CodeTuiApp {
 
     /// `/copy [n]`: copy the Nth-latest assistant reply (default most recent) to
     /// the system clipboard.
-    fn copy_reply_to_clipboard(&mut self, n: Option<usize>) -> Result<()> {
-        let nth = n.unwrap_or(1).max(1);
-        let reply = self
+    pub(super) fn copy_reply_to_clipboard(&mut self, n: Option<usize>) -> Result<()> {
+        if n == Some(0) {
+            anyhow::bail!("Usage: /copy [n] — n counts back from the latest reply, starting at 1");
+        }
+        let nth = n.unwrap_or(1);
+        let replies = self
             .history
             .iter()
             .rev()
-            .filter(|m| m.role == "assistant" && !m.content.trim().is_empty())
-            .nth(nth - 1)
-            .map(|m| m.content.clone());
+            .filter(|m| m.role == "assistant" && !m.content.trim().is_empty());
+        let reply = replies.clone().nth(nth - 1).map(|m| m.content.clone());
         let Some(reply) = reply else {
-            anyhow::bail!("No assistant reply to copy yet");
+            let count = replies.count();
+            if count == 0 {
+                anyhow::bail!("No assistant reply to copy yet");
+            }
+            anyhow::bail!(
+                "Only {count} repl{} to copy",
+                if count == 1 { "y" } else { "ies" }
+            );
         };
         write_system_clipboard(&reply)?;
         let label = if nth == 1 {
@@ -1756,10 +1775,19 @@ impl CodeTuiApp {
                 }
                 // Same session — the plan is already in the engine's history.
                 self.leave_plan_mode(true).await;
-                if let Err(e) = self
+                // Machine text — stash the composer so the dispatch can't swallow
+                // a mid-planning draft or staged attachment (as `/goal` does).
+                let draft = std::mem::take(&mut self.draft);
+                let cursor = self.cursor;
+                let attachments = std::mem::take(&mut self.draft_attachments);
+                let sent = self
                     .dispatch_user_message(plan_go_message(rest), None)
-                    .await
-                {
+                    .await;
+                self.draft = draft;
+                self.cursor = cursor;
+                self.draft_attachments = attachments;
+                self.sync_command_menu_state();
+                if let Err(e) = sent {
                     self.notice = Some((ERROR, e.to_string()));
                     return;
                 }
@@ -1920,6 +1948,8 @@ impl CodeTuiApp {
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
         // The interrupt-with-partial path clears it separately, before this runs.
         self.goal_mode = None;
+        // A cancelled /compact must not mark the NEXT turn as a compact.
+        self.compact_before = None;
         // Plan mode persists across an interrupt (it's a session mode). Apply a
         // deferred discard-exit opportunistically; if the turn task still holds
         // the lock, the flag stays set and the next dispatch/turn-end applies it.
@@ -1999,6 +2029,8 @@ impl CodeTuiApp {
         // through here; the partial-text path below doesn't call
         // `cancel_inflight_request`, so clear it up front for both).
         let goal_was_active = self.goal_mode.take().is_some();
+        // Same for /compact (the partial-text path skips `cancel_inflight_request`).
+        self.compact_before = None;
         // Reveal any buffered text so the full received reply is kept, and drop
         // a deferred finish — we're committing the partial turn ourselves.
         self.drain_incoming_buffer();

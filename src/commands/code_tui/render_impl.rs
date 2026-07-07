@@ -835,6 +835,7 @@ impl CodeTuiApp {
     pub(super) fn render(&mut self, frame: &mut Frame<'_>) {
         self.tick_selection_flash();
         self.refresh_git_branch();
+        self.check_live_share_health();
         let outer = frame.area();
         self.picker_hitbox = None;
         self.transcript_hitbox = None;

@@ -240,7 +240,9 @@ impl CodeTuiApp {
                 self.apply_skill_install_pick(source, project, staged)
                     .await?
             }
-            RuntimeEvent::LiveShareReady(result) => self.apply_live_share_ready(result),
+            RuntimeEvent::LiveShareReady { share_gen, result } => {
+                self.apply_live_share_ready(share_gen, result)
+            }
         }
         Ok(())
     }
@@ -599,19 +601,24 @@ impl CodeTuiApp {
         if !has_tools {
             return; // no servers / no mcp.json — nothing to attach
         }
+        self.request_engine_rebuild();
+    }
+
+    /// Drop the engine so the next turn rebuilds with the changed tool set —
+    /// deferred mid-turn (an immediate drop skips `take_turn_usage` + persist).
+    pub(super) fn request_engine_rebuild(&mut self) {
         if self.sending {
-            self.mcp_rebuild_pending = true;
+            self.engine_rebuild_pending = true;
         } else {
-            self.agent_engine = None; // next turn rebuilds with the MCP tools
+            self.agent_engine = None;
         }
     }
 
-    /// Drop the engine so the next turn rebuilds it with the freshly-connected MCP
-    /// tools. Called after a turn finishes (the deferred half of
-    /// `apply_mcp_connected`).
-    pub(super) fn maybe_apply_mcp_rebuild(&mut self) {
-        if self.mcp_rebuild_pending {
-            self.mcp_rebuild_pending = false;
+    /// The deferred half of [`Self::request_engine_rebuild`], run after a turn
+    /// finishes.
+    pub(super) fn maybe_apply_engine_rebuild(&mut self) {
+        if self.engine_rebuild_pending {
+            self.engine_rebuild_pending = false;
             self.agent_engine = None;
         }
     }
@@ -715,9 +722,9 @@ impl CodeTuiApp {
             let turn = session.engine.lock().await.take_turn_usage();
             self.session_tokens = self.session_tokens.merge(turn);
         }
-        // If MCP tools landed mid-turn, drop the engine now so the next turn
-        // rebuilds with them (must happen while not sending).
-        self.maybe_apply_mcp_rebuild();
+        // If the tool set changed mid-turn, drop the engine now so the next turn
+        // rebuilds with it (must happen while not sending).
+        self.maybe_apply_engine_rebuild();
         self.persist_history().await?;
         // A compact adds no user/assistant message; logging would duplicate the prior row.
         if compact_before.is_none() {
@@ -916,6 +923,8 @@ impl CodeTuiApp {
         self.sending = false;
         self.request_started_at = None;
         self.pending_submit = None;
+        // A dead compact turn must not mark the NEXT turn as a compact.
+        self.compact_before = None;
         self.agent_permission = None;
         self.agent_ask = None;
         self.agent_review = None;
@@ -945,7 +954,15 @@ impl CodeTuiApp {
         self.sending = false;
         self.request_started_at = None;
         self.response_task = None;
-        self.format = format;
+        // The turn's format belongs to the model that ran it — don't clobber a
+        // mid-turn /model switch's freshly seeded format.
+        if self
+            .turn_model
+            .as_deref()
+            .is_none_or(|m| m == self.raw_model)
+        {
+            self.format = format;
+        }
 
         match result {
             Ok(turn) => self.finish_successful_response(turn).await?,

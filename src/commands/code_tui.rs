@@ -229,7 +229,7 @@ impl CodeTuiApp {
             mcp_connect_progress: std::collections::HashMap::new(),
             disabled_mcp_tools: std::collections::HashSet::new(),
             mcp_connect_gen: 0,
-            mcp_rebuild_pending: false,
+            engine_rebuild_pending: false,
             pending_mcp_auth: std::collections::HashMap::new(),
             agent_serve: None,
             agent_permission: None,
@@ -273,6 +273,7 @@ impl CodeTuiApp {
             staged_skill_install: None,
             live_share: None,
             live_share_starting: false,
+            live_share_gen: 0,
             live_requested: false,
         })
     }

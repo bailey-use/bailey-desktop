@@ -12,6 +12,7 @@ pub mod engine;
 pub mod file_tracker;
 pub mod grant_store;
 pub mod guards;
+pub mod jobs;
 pub mod lsp;
 pub mod mcp;
 pub mod mcp_import;

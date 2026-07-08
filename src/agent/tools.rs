@@ -177,12 +177,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         spec(
             "run_bash",
-            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags, or background a server with `&`.",
+            "Run a shell command in the working directory. Each call is a fresh shell (cd does not persist). Runs non-interactively with no TTY: interactive programs (editors, `ssh`/`sudo` prompts, TUIs) are refused, and long-running ones are killed at the timeout — use non-interactive flags. To start a server, watcher, or anything long-running, pass `background: true`: the command is detached and this returns immediately with a job id and log file; poll or stop it with `check_job`.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600)"}
+                    "timeout": {"type": "integer", "description": "Seconds before the command is killed (default 120, max 600). Ignored with background."},
+                    "background": {"type": "boolean", "description": "Run detached in the background and return a job id + log file immediately (for servers/watchers). Poll or stop it with check_job."}
                 },
                 "required": ["command"]
             }),
@@ -300,6 +301,8 @@ pub fn is_read_only(name: &str) -> bool {
             | "set_effort"
             // Interactive prompt — reads the user's answer, touches nothing.
             | "ask_user"
+            // Job control on a process the agent itself started; never touches files.
+            | "check_job"
     )
 }
 
@@ -1496,12 +1499,18 @@ fn cap_head(s: String) -> String {
 /// Cap keeping the TAIL — for shell output, where the error/result is at the end
 /// (pi's truncateTail). Dropping the head would hide the very thing you need.
 fn cap_tail(s: String) -> String {
+    cap_tail_with(s, MAX_OUTPUT, MAX_OUTPUT_LINES)
+}
+
+/// [`cap_tail`] with explicit limits, so background-job log tails can keep a smaller
+/// window than foreground `run_bash`.
+pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(MAX_OUTPUT_LINES);
+    let start = lines.len().saturating_sub(max_lines);
     let mut out = lines[start..].join("\n");
     let mut truncated = start > 0;
-    if out.len() > MAX_OUTPUT {
-        let mut from = out.len() - MAX_OUTPUT;
+    if out.len() > max_bytes {
+        let mut from = out.len() - max_bytes;
         while !out.is_char_boundary(from) {
             from += 1;
         }
@@ -2280,8 +2289,9 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
                      interactive input (a password, prompt, or editor), a REPL, or a \
                      long-running server/watcher that never exits on its own, it can't run \
                      under the agent's non-interactive shell — use a non-interactive form, \
-                     start it in the background (append ` &`), or ask the user to run it. If \
-                     it's just slow, retry with a larger `timeout` (max {BASH_MAX_TIMEOUT}).",
+                     re-run it with `background: true` and poll it with `check_job`, or ask \
+                     the user to run it. If it's just slow, retry with a larger `timeout` \
+                     (max {BASH_MAX_TIMEOUT}).",
                 )));
             }
         };

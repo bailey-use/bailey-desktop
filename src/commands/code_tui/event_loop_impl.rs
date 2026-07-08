@@ -129,6 +129,12 @@ impl CodeTuiApp {
             RuntimeEvent::AgentNotice(text) => {
                 // A connection-retry notice means we're recovering, not thinking.
                 self.retrying = text.contains("retrying");
+                // Guard-stops are MUTED, not errors — remember one for the /goal continuation.
+                if text == crate::agent::engine::STOP_NO_PROGRESS
+                    || text == crate::agent::engine::STOP_TOOL_FAILURE
+                {
+                    self.goal_guard_stop = Some(text.clone());
+                }
                 self.notice = Some((MUTED, text));
             }
             RuntimeEvent::AgentError(text) => self.notice = Some((ERROR, text)),
@@ -1370,15 +1376,27 @@ impl CodeTuiApp {
             if self.tick_typewriter() {
                 needs_redraw = true;
             }
-            if self.run_deferred_finish_if_ready().await? {
-                needs_redraw = true;
+            // `break Err` (not `?`) so the post-loop teardown (kill_all, restore_terminal) still runs.
+            match self.run_deferred_finish_if_ready().await {
+                Ok(true) => needs_redraw = true,
+                Ok(false) => {}
+                Err(err) => break Err(err),
             }
             // Watchdog: recover a turn left stuck "sending" by a task that died silently.
-            if self.recover_dead_response_task().await? {
-                needs_redraw = true;
+            match self.recover_dead_response_task().await {
+                Ok(true) => needs_redraw = true,
+                Ok(false) => {}
+                Err(err) => break Err(err),
             }
 
             self.tick_status_throttle();
+
+            // Refresh the cached job count once per tick (this reaps), so render just reads a field.
+            let jobs_running = self.jobs.running_count();
+            if jobs_running != self.jobs_running {
+                self.jobs_running = jobs_running;
+                needs_redraw = true;
+            }
 
             // Rotate the welcome tip on its interval (cheap at the idle cadence).
             if self.tick_welcome_tip() {
@@ -1470,6 +1488,8 @@ impl CodeTuiApp {
             run.task.abort();
             let _ = run.task.await;
         }
+        // Background jobs must not outlive the TUI.
+        let _ = self.jobs.kill_all().await;
         restore_terminal(terminal)?;
         run_result
     }

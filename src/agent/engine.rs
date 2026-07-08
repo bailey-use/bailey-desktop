@@ -4,7 +4,8 @@
 //! Rendering/permission go through `AgentUi` (terminal, `--json`, chat TUI).
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
@@ -12,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::agent::ask;
 use crate::agent::guards::{self, batch_sig, page_read_key};
+use crate::agent::jobs;
 use crate::agent::notes;
 use crate::agent::plan::{self, PlanItem};
 use crate::agent::plan_mode;
@@ -53,6 +55,13 @@ const MAX_COMPLETION_NUDGES: usize = 2;
 const MAX_SELFCORRECT_ATTEMPTS: usize = 3;
 const VERIFY_FAILED_PREFIX: &str = "The project's checks are failing, so the task isn't done. \
 Fix the cause and continue — don't stop until they pass:";
+/// Prefix of the artifact-pointer line; compaction preserves it so the parent can
+/// `read_file` a cleared sub-agent report back.
+pub(crate) const ARTIFACT_POINTER_PREFIX: &str = "[full report saved: ";
+/// Guard-stop notices the `/goal` loop matches on to steer past a dead end.
+pub(crate) const STOP_NO_PROGRESS: &str =
+    "stopping: the model repeated the same action with no progress";
+pub(crate) const STOP_TOOL_FAILURE: &str = "stopping: a tool call kept failing the same way";
 const COMPLETION_NUDGE: &str = "That may not be finished. If the task is genuinely complete, \
 briefly confirm what you did and verified, then stop. Otherwise keep going — don't stop until \
 it's done or you're truly blocked (then say exactly what's blocking you).";
@@ -307,9 +316,10 @@ pub struct AgentEngine {
     /// Files touched this session (insertion order, deduped, capped). Maintained
     /// incrementally so it survives summarization; pinned into every compaction.
     pub(crate) touched_files: Vec<String>,
-    /// Durable scratchpad: `take_note` entries. Pinned verbatim into compaction and
-    /// rebuilt from the log on resume, so they outlive turns/summaries. Capped at [`MAX_NOTES`].
-    pub(crate) notes: Vec<String>,
+    /// Durable scratchpad: `take_note` entries, merged deterministically (reuse an id
+    /// to revise, dedup exact text). Pinned verbatim into compaction and rebuilt from
+    /// the log on resume, so they outlive turns/summaries. Capped at [`MAX_NOTES`].
+    pub(crate) notes: Vec<notes::Note>,
     /// Provider-measured token split (prompt/completion/cache) for the LAST turn,
     /// summed across steps. The chat TUI drains it (`take_turn_usage`) for `aivo stats`. Reset per turn.
     turn_usage: SessionTokens,
@@ -320,6 +330,10 @@ pub struct AgentEngine {
     /// Tree-level snapshot/restore via a shadow git store. `None` until `/rewind` is
     /// enabled (top-level chat only). See [`crate::agent::checkpoint`].
     checkpoint_store: Option<crate::agent::checkpoint::CheckpointStore>,
+    /// Per-session dir for durable sub-agent reports; `None` = feature off.
+    artifacts_dir: Option<PathBuf>,
+    /// Artifact filename counter; atomic — concurrent fan-out runs under `&self`.
+    artifact_seq: AtomicUsize,
     /// `reasoning_effort` for a reasoning-capable model, else `None` (the field 400s
     /// some providers). Defaults from the snapshot; changed live by `/effort`.
     reasoning_effort: Option<String>,
@@ -359,6 +373,8 @@ pub struct AgentEngine {
     file_tracker: crate::agent::file_tracker::FileTracker,
     /// Opt-in LSP diagnostics-after-edit (`AIVO_AGENT_LSP=1`); `None` = disabled.
     lsp: Option<crate::agent::lsp::LspManager>,
+    /// App-owned background-job table; `None` → `check_job` unadvertised.
+    jobs: Option<crate::agent::jobs::SharedJobs>,
 }
 
 /// Live `aivo code` session facts injected into the system prompt so the agent can answer
@@ -446,6 +462,8 @@ impl AgentEngine {
             turn_usage: SessionTokens::default(),
             checkpoints: Vec::new(),
             checkpoint_store: None,
+            artifacts_dir: None,
+            artifact_seq: AtomicUsize::new(1),
             reasoning_effort: default_reasoning_effort(model),
             reasoning_efforts: Vec::new(),
             thinking_enabled: true,
@@ -462,6 +480,7 @@ impl AgentEngine {
             prefix_fp: None,
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
+            jobs: None,
         }
     }
 
@@ -474,6 +493,30 @@ impl AgentEngine {
     /// loading any grants already saved there. Without this the store is session-only.
     pub fn set_grants_path(&mut self, config_dir: &Path) {
         self.grants = crate::agent::grant_store::GrantStore::load(config_dir.join("grants.json"));
+    }
+
+    /// Persist sub-agent reports under `dir` so a long delegation survives compaction.
+    /// Resumes numbering past existing reports so a rebuilt engine can't overwrite one.
+    pub fn set_artifacts_dir(&mut self, dir: PathBuf) {
+        let next = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| parse_artifact_seq(&e.file_name().to_string_lossy()))
+            .max()
+            .map_or(1, |n| n + 1);
+        self.artifact_seq = AtomicUsize::new(next);
+        self.artifacts_dir = Some(dir);
+    }
+
+    /// Wire the background-job table and advertise `check_job`. Idempotent.
+    pub fn set_jobs(&mut self, jobs: crate::agent::jobs::SharedJobs) {
+        let first = self.jobs.is_none();
+        self.jobs = Some(jobs);
+        if first {
+            self.tools_openai
+                .push(tool_to_openai(crate::agent::jobs::check_job_tool_spec()));
+        }
     }
 
     /// Enable LSP diagnostics-after-edit rooted at `cwd` when `AIVO_AGENT_LSP` is set —
@@ -610,10 +653,11 @@ questions.",
         self.require_completion = true;
     }
 
-    /// Enable post-edit self-verification (opt-in): on a declared-done turn, run the
+    /// Enable/disable post-edit self-verification: on a declared-done turn, run the
     /// project's validator and feed failures back so the model fixes them. See [`verify`].
-    pub fn set_self_correct(&mut self) {
-        self.self_correct = true;
+    /// Takes a bool so goal mode can toggle it per turn on a reused engine.
+    pub fn set_self_correct(&mut self, on: bool) {
+        self.self_correct = on;
     }
 
     /// Set the `reasoning_effort` level (`/effort`). Only meaningful for reasoning models.
@@ -890,11 +934,9 @@ questions.",
                     }
                 }
                 "take_note" => {
+                    // Same deterministic merge as the live path, so resume can't drift from it.
                     if let Ok(note) = notes::parse_note(&args) {
-                        if self.notes.len() >= MAX_NOTES {
-                            self.notes.remove(0);
-                        }
-                        self.notes.push(note);
+                        notes::merge_note(&mut self.notes, note, MAX_NOTES);
                     }
                 }
                 _ => {}
@@ -1344,7 +1386,7 @@ questions.",
             tokens += batch_tokens;
 
             if repeats + 1 >= REPEAT_LIMIT || page_repeats + 1 >= REPEAT_LIMIT {
-                ui.notify("stopping: the model repeated the same action with no progress");
+                ui.notify(STOP_NO_PROGRESS);
                 converged = true;
                 break;
             }
@@ -1352,7 +1394,7 @@ questions.",
             // Same-signature tool-failure guard: hint the schema, then hard-stop a loop.
             match failure_guard.observe(&failures) {
                 guards::FailureAction::Stop => {
-                    ui.notify("stopping: a tool call kept failing the same way");
+                    ui.notify(STOP_TOOL_FAILURE);
                     converged = true;
                     break;
                 }
@@ -1684,15 +1726,13 @@ questions.",
                     Err(e) => Err(e),
                 }
             } else if n == "take_note" {
-                // Durable scratchpad (capped, oldest dropped). Held in the engine, so it runs in the ordered pass.
+                // Durable scratchpad (deterministic merge, capped oldest-first). Held in the engine, so it runs in the ordered pass.
                 match notes::parse_note(&call.arguments) {
-                    Ok(note) => {
-                        if self.notes.len() >= MAX_NOTES {
-                            self.notes.remove(0);
-                        }
-                        self.notes.push(note);
-                        Ok(format!("Noted ({} saved).", self.notes.len()))
-                    }
+                    Ok(note) => Ok(match notes::merge_note(&mut self.notes, note, MAX_NOTES) {
+                        notes::MergeOutcome::Added(n) => format!("Noted ({n} saved)."),
+                        notes::MergeOutcome::Updated(id) => format!("Updated note '{id}'."),
+                        notes::MergeOutcome::Refreshed => "Already noted (refreshed).".to_string(),
+                    }),
                     Err(e) => Err(e),
                 }
             } else if n == "switch_model" {
@@ -1742,10 +1782,46 @@ planning is off) — continue with the task."
             } else if let Some(ext) = self.external.clone().filter(|e| e.handles(&call.name)) {
                 // External tool — keyed on its raw advertised name (`mcp__*`), never normalized (matches the shadow check).
                 ext.call(&call.name, &call.arguments).await
+            } else if n == "run_bash" && jobs::wants_background(&call.arguments) {
+                // Detached job — no escalation flow (a spawn returns before a sandbox block shows).
+                match (
+                    &self.jobs,
+                    call.arguments.get("command").and_then(|v| v.as_str()),
+                ) {
+                    (Some(t), Some(cmd)) => t.spawn(cmd, ctx.cwd),
+                    (None, _) => Err(
+                        "background jobs aren't available in this run mode — run the \
+command in the foreground (drop `background`)."
+                            .into(),
+                    ),
+                    (_, None) => Err("missing required string argument `command`".into()),
+                }
             } else if n == "run_bash" {
                 // Run confined; a sandbox write-block offers an in-session escape hatch instead of a dead-end error.
                 self.run_bash_with_escalation(ctx, ui, &call.arguments)
                     .await
+            } else if n == "check_job" {
+                match &self.jobs {
+                    Some(t) => {
+                        let id = call
+                            .arguments
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if call
+                            .arguments
+                            .get("kill")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            t.kill(id).await
+                        } else {
+                            t.check(id)
+                        }
+                    }
+                    None => Err("no background jobs in this run mode.".into()),
+                }
             } else {
                 tools::execute(n, &call.arguments, ctx.cwd).await
             };
@@ -2037,6 +2113,10 @@ Re-run the full command without write confinement?",
         if let Some(ext) = &self.external {
             sub.set_external_tools(ext.clone());
         }
+        // Share the job table so a sub-agent-started server stays pollable by the parent.
+        if let Some(jobs) = &self.jobs {
+            sub.set_jobs(jobs.clone());
+        }
         // Fold in the specialist's role + scope. After MCP wiring so a `tools` allow-list applies to the full offered set.
         if let Some(p) = profile {
             sub.apply_profile(p);
@@ -2061,7 +2141,81 @@ Re-run the full command without write confinement?",
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(ctx, &mut ui, task.to_string())).await;
-        Ok((ui.result_message(), ui.tokens))
+        let mut msg = ui.result_message();
+        // Gate on the STORED length (not the bare answer) so the tail can't push it over
+        // the clear threshold and get cleared without a pointer.
+        if let Some(dir) = &self.artifacts_dir
+            && msg.len() > crate::agent::compaction::TOOL_RESULT_CLEAR_MIN
+            && let Some(path) = self
+                .save_subagent_report(dir, task, &ui.agent_name, model, ui.steps, ui.answer())
+                .await
+        {
+            msg.push_str(&format!(
+                "\n\n{ARTIFACT_POINTER_PREFIX}{} — re-read it with read_file if this result is cleared]",
+                path.display()
+            ));
+        }
+        Ok((msg, ui.tokens))
+    }
+
+    /// Write a sub-agent report (`sub-<seq>-<slug>.md`); `None` on IO failure (never fails the turn).
+    async fn save_subagent_report(
+        &self,
+        dir: &Path,
+        task: &str,
+        agent: &str,
+        model: &str,
+        steps: usize,
+        answer: &str,
+    ) -> Option<PathBuf> {
+        tokio::fs::create_dir_all(dir).await.ok()?;
+        let seq = self.artifact_seq.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("sub-{seq:03}-{}.md", slug_for_artifact(task)));
+        let agent = if agent.trim().is_empty() {
+            "generic"
+        } else {
+            agent.trim()
+        };
+        let task_line: String = task
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect();
+        let content = format!(
+            "# Sub-agent report\n- task: {task_line}\n- agent: {agent} · model: {model} · steps: {steps} · date: {}\n---\n{answer}\n",
+            self.date
+        );
+        tokio::fs::write(&path, content).await.ok()?;
+        Some(path)
+    }
+}
+
+/// The numeric sequence from a `sub-<NNN>-<slug>.md` artifact filename, if it is one.
+fn parse_artifact_seq(name: &str) -> Option<usize> {
+    name.strip_prefix("sub-")?.split('-').next()?.parse().ok()
+}
+
+/// Filesystem-safe slug from a task's first 40 chars; empty → `report`.
+fn slug_for_artifact(task: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in task.chars().take(40) {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "report".to_string()
+    } else {
+        slug
     }
 }
 
@@ -4345,7 +4499,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(engine.notes, vec!["the parser is in lexer.rs".to_string()]);
+        assert_eq!(engine.notes.len(), 1);
+        assert_eq!(engine.notes[0].text, "the parser is in lexer.rs");
+        assert!(engine.notes[0].id.is_none());
         // No permission prompt was raised for the note.
         assert_eq!(ui.asks, 0);
         // The confirmation came back as the tool result.
@@ -4466,6 +4622,208 @@ mod tests {
         );
     }
 
+    /// A long sub-agent report is written to the artifacts dir and the parent's tool
+    /// result gains a pointer line, so the work survives compaction.
+    #[tokio::test]
+    async fn subagent_report_saved_and_pointered() {
+        let dir = tmp();
+        let artifacts = tmp();
+        let call = tool_call_sse("subagent", json!({"task": "summarize the engine module"}));
+        let long = "SUBRESULT ".repeat(200); // > TOOL_RESULT_CLEAR_MIN
+        let sub_final = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content": long}}]})
+        );
+        let port = spawn_sse_sequence(vec![call, sub_final, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(
+            &dir.display().to_string(),
+            "m",
+            "2026-07-08",
+            &[],
+            &[],
+            0,
+            0,
+        );
+        engine.set_artifacts_dir(artifacts.clone());
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate it".into()),
+            &mut ui,
+        )
+        .await;
+
+        // Exactly one report file, named sub-001-*.md, carrying the sub answer.
+        let files: Vec<_> = std::fs::read_dir(&artifacts)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "one report expected");
+        let name = files[0].file_name().to_string_lossy().into_owned();
+        assert!(name.starts_with("sub-001-"), "unexpected name: {name}");
+        let body = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(body.contains("SUBRESULT"), "report missing the sub answer");
+        assert!(body.contains("# Sub-agent report"), "report missing header");
+        // The parent's tool result carries the pointer.
+        let has_pointer = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains(ARTIFACT_POINTER_PREFIX))
+        });
+        assert!(has_pointer, "pointer missing from the tool result");
+    }
+
+    #[test]
+    fn parse_artifact_seq_reads_the_number() {
+        assert_eq!(parse_artifact_seq("sub-001-foo.md"), Some(1));
+        assert_eq!(parse_artifact_seq("sub-042-a-b-c.md"), Some(42));
+        assert_eq!(parse_artifact_seq("notes.md"), None);
+        assert_eq!(parse_artifact_seq("sub-x.md"), None);
+    }
+
+    /// A rebuilt engine on the SAME artifacts dir resumes numbering instead of overwriting.
+    #[tokio::test]
+    async fn subagent_report_numbering_survives_rebuild() {
+        let dir = tmp();
+        let artifacts = tmp();
+        let long = "SUBRESULT ".repeat(200);
+        let sub_final = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content": long}}]})
+        );
+        let run = |port: u16, artifacts: PathBuf, dir: PathBuf| async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base = format!("http://127.0.0.1:{port}");
+            let mut engine = AgentEngine::new(
+                &dir.display().to_string(),
+                "m",
+                "2026-07-08",
+                &[],
+                &[],
+                0,
+                0,
+            );
+            engine.set_artifacts_dir(artifacts);
+            let mut ui = CapturingUi::default();
+            run_session(
+                &mut engine,
+                &turn_ctx(&client, &base, &dir),
+                Some("delegate it".into()),
+                &mut ui,
+            )
+            .await;
+        };
+        let call = tool_call_sse("subagent", json!({"task": "summarize the engine module"}));
+        // Engine A.
+        let port = spawn_sse_sequence(vec![
+            call.clone(),
+            sub_final.clone(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        run(port, artifacts.clone(), dir.clone()).await;
+        // Engine B — fresh engine, SAME artifacts dir, same task slug.
+        let port = spawn_sse_sequence(vec![call, sub_final, FINAL_TEXT_SSE.to_string()]);
+        run(port, artifacts.clone(), dir.clone()).await;
+
+        let files: Vec<String> = std::fs::read_dir(&artifacts)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "two distinct reports, no overwrite: {files:?}"
+        );
+        assert!(files.iter().any(|f| f.starts_with("sub-001-")));
+        assert!(files.iter().any(|f| f.starts_with("sub-002-")));
+    }
+
+    /// A short sub-agent answer isn't worth a file — nothing is written and no pointer added.
+    #[tokio::test]
+    async fn subagent_short_answer_writes_nothing() {
+        let dir = tmp();
+        let artifacts = tmp();
+        let call = tool_call_sse("subagent", json!({"task": "quick check"}));
+        let sub_final = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content": "short answer"}}]})
+        );
+        let port = spawn_sse_sequence(vec![call, sub_final, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(
+            &dir.display().to_string(),
+            "m",
+            "2026-07-08",
+            &[],
+            &[],
+            0,
+            0,
+        );
+        engine.set_artifacts_dir(artifacts.clone());
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate it".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            std::fs::read_dir(&artifacts).unwrap().next().is_none(),
+            "no report should be written for a short answer"
+        );
+        let has_pointer = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains(ARTIFACT_POINTER_PREFIX))
+        });
+        assert!(!has_pointer, "no pointer expected for a short answer");
+    }
+
+    /// With no artifacts dir (headless/tests), the sub-agent result keeps today's exact
+    /// format: the `[sub-agent: N step(s)]` tail, no pointer.
+    #[tokio::test]
+    async fn subagent_no_artifacts_dir_unchanged() {
+        let dir = tmp();
+        let call = tool_call_sse("subagent", json!({"task": "investigate"}));
+        let long = "SUBRESULT ".repeat(200);
+        let sub_final = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{"content": long}}]})
+        );
+        let port = spawn_sse_sequence(vec![call, sub_final, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate it".into()),
+            &mut ui,
+        )
+        .await;
+
+        let has_pointer = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains(ARTIFACT_POINTER_PREFIX))
+        });
+        assert!(!has_pointer, "no artifacts dir → no pointer");
+        let has_tail = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[sub-agent:"))
+        });
+        assert!(has_tail, "the classic sub-agent step tail should remain");
+    }
+
     /// The engine sums each step's provider-measured token split across a turn and surfaces it via `take_turn_usage`.
     #[tokio::test]
     async fn turn_usage_accumulates_split_across_steps() {
@@ -4519,6 +4877,304 @@ mod tests {
         assert!(
             !msg2.contains("compacting"),
             "notice leaked into a good answer"
+        );
+    }
+
+    #[test]
+    fn set_self_correct_toggles_the_flag() {
+        let mut engine = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        assert!(!engine.self_correct, "off by default");
+        engine.set_self_correct(true);
+        assert!(engine.self_correct, "enabled");
+        engine.set_self_correct(false);
+        assert!(
+            !engine.self_correct,
+            "disabled again (goal mode toggles off)"
+        );
+    }
+
+    /// With self-correct on, a declared-done turn can't converge over a red suite: the
+    /// failure is fed back (VERIFY_FAILED_PREFIX) until the model makes it pass.
+    /// Unix-only: relies on `sh run_tests.sh` (absent on the Windows runner → inconclusive).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selfcorrect_blocks_done_until_green() {
+        let dir = tmp();
+        // run_tests.sh fails until the marker file `passing` exists.
+        std::fs::write(
+            dir.join("run_tests.sh"),
+            "[ -f passing ] && exit 0 || exit 1\n",
+        )
+        .unwrap();
+
+        // 1) text "done" → validator fails → nudge; 2) write the marker; 3) "done" → passes.
+        let write = tool_call_sse("write_file", json!({"path": "passing", "content": "ok"}));
+        let port = spawn_sse_sequence(vec![
+            FINAL_TEXT_SSE.to_string(),
+            write,
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_self_correct(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("make the tests pass".into()),
+            &mut ui,
+        )
+        .await;
+
+        // The failure was fed back exactly once, then the suite went green.
+        let vf = engine
+            .messages
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains(VERIFY_FAILED_PREFIX))
+            })
+            .count();
+        assert_eq!(vf, 1, "verify failure fed back exactly once");
+        assert!(dir.join("passing").exists(), "the marker write ran");
+        assert!(
+            ui.notices.iter().any(|n| n.contains("run_tests.sh failed")),
+            "expected a failing-suite notice: {:?}",
+            ui.notices
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("verified: run_tests.sh passed")),
+            "expected a passing-suite notice: {:?}",
+            ui.notices
+        );
+    }
+
+    // --- background jobs (Phase 4) ---
+
+    #[test]
+    fn set_jobs_advertises_check_job() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        let has = |e: &AgentEngine| {
+            e.tools_openai
+                .iter()
+                .any(|t| t["function"]["name"] == "check_job")
+        };
+        assert!(!has(&e), "no check_job before a table is wired");
+        e.set_jobs(jobs::JobTable::new(None));
+        assert!(has(&e), "check_job advertised after set_jobs");
+        // Idempotent: a second call must not double-advertise.
+        e.set_jobs(jobs::JobTable::new(None));
+        let count = e
+            .tools_openai
+            .iter()
+            .filter(|t| t["function"]["name"] == "check_job")
+            .count();
+        assert_eq!(count, 1, "check_job advertised exactly once");
+    }
+
+    /// A `run_bash {background:true}` routes to the job table and returns a job id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_run_bash_returns_job_id() {
+        let dir = tmp();
+        let call = tool_call_sse(
+            "run_bash",
+            json!({"command": "echo hi", "background": true}),
+        );
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(jobs::JobTable::new(Some(dir.join("jobs"))));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("start it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("started background job j1"))
+            }),
+            "expected a job-started tool result"
+        );
+    }
+
+    /// Without a job table, a background request errs with actionable guidance (never panics).
+    #[tokio::test]
+    async fn background_without_job_table_errs_with_guidance() {
+        let dir = tmp();
+        let call = tool_call_sse(
+            "run_bash",
+            json!({"command": "sleep 1", "background": true}),
+        );
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // No set_jobs.
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("start it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("background jobs aren't available"))
+            }),
+            "expected a guidance error"
+        );
+    }
+
+    /// `check_job {kill:true}` terminates a running job via the engine dispatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_job_kill_terminates() {
+        let dir = tmp();
+        let table = jobs::JobTable::new(Some(dir.join("jobs")));
+        let bg = tool_call_sse(
+            "run_bash",
+            json!({"command": "sleep 30", "background": true}),
+        );
+        let kill = tool_call_sse("check_job", json!({"id": "j1", "kill": true}));
+        let port = spawn_sse_sequence(vec![bg, kill, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(table.clone());
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("start then stop it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("killed job j1"))
+            }),
+            "expected a kill confirmation"
+        );
+        assert_eq!(table.running_count(), 0, "job should be gone");
+    }
+
+    /// `check_job` needs no permission and runs even in plan mode (job control on a
+    /// process the agent started, never a file write).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn check_job_survives_plan_mode_and_runs_unprompted() {
+        let dir = tmp();
+        let table = jobs::JobTable::new(Some(dir.join("jobs")));
+        table.spawn("sleep 30", &dir).unwrap();
+        let call = tool_call_sse("check_job", json!({"id": "j1"}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(table.clone());
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("check it".into()),
+            &mut ui,
+        )
+        .await;
+        assert_eq!(
+            ui.asks, 0,
+            "check_job needs no permission, even in plan mode"
+        );
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("job j1: running"))
+            }),
+            "check_job should have run and reported the job"
+        );
+        let _ = table.kill_all().await;
+    }
+
+    /// A background `run_bash` in plan mode still hits the plan-bash confirmation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_bash_still_gated_in_plan_mode() {
+        let dir = tmp();
+        let table = jobs::JobTable::new(Some(dir.join("jobs")));
+        let call = tool_call_sse(
+            "run_bash",
+            json!({"command": "sleep 30", "background": true}),
+        );
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(table.clone());
+        engine.set_plan_mode(true);
+        let mut ui = CapturingUi {
+            deny: true,
+            ..Default::default()
+        };
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("start a server".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(ui.asks >= 1, "plan-mode background bash must prompt");
+        assert_eq!(table.running_count(), 0, "denied → nothing spawned");
+    }
+
+    /// A sub-agent inherits the parent's job table (it can poll/kill the parent's jobs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subagent_engine_inherits_job_table() {
+        let dir = tmp();
+        let table = jobs::JobTable::new(Some(dir.join("jobs")));
+        table.spawn("sleep 30", &dir).unwrap();
+        let parent_call = tool_call_sse("subagent", json!({"task": "stop job j1"}));
+        let sub_kill = tool_call_sse("check_job", json!({"id": "j1", "kill": true}));
+        let port = spawn_sse_sequence(vec![
+            parent_call,
+            sub_kill,
+            FINAL_TEXT_SSE.to_string(), // sub converges
+            FINAL_TEXT_SSE.to_string(), // parent converges
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(table.clone());
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate the stop".into()),
+            &mut ui,
+        )
+        .await;
+        // The sub killed j1 → it must have had the shared table.
+        assert_eq!(
+            table.running_count(),
+            0,
+            "sub-agent should have killed the parent's job"
         );
     }
 
@@ -5428,7 +6084,10 @@ mod tests {
         engine.last_summary = Some("stale".to_string());
         engine.plan = plan::parse_plan(&json!({"plan":[{"step":"x","status":"pending"}]})).unwrap();
         engine.touched_files = vec!["a.rs".to_string()];
-        engine.notes = vec!["a finding".to_string()];
+        engine.notes = vec![notes::Note {
+            id: None,
+            text: "a finding".to_string(),
+        }];
         engine.reset();
         assert!(engine.last_summary.is_none());
         assert!(engine.plan.is_empty());
@@ -5465,18 +6124,99 @@ mod tests {
         assert_eq!(e.stale_tool_result_savings(cut), 0, "idempotent");
     }
 
+    /// Clearing a bulky sub-agent tool result keeps its artifact-pointer line so the
+    /// parent can re-read the report; the pass is idempotent.
+    #[test]
+    fn clear_stale_keeps_artifact_pointer() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        let pointer = format!("{ARTIFACT_POINTER_PREFIX}/tmp/sub-001-x.md — re-read it]");
+        let big = format!("{}\n\n{pointer}", "x".repeat(5000));
+        e.messages.push(json!({"role":"user","content":"go"}));
+        e.messages.push(json!({"role":"assistant","tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"subagent","arguments":"{}"}}]}));
+        e.messages
+            .push(json!({"role":"tool","tool_call_id":"c1","content": big}));
+        e.messages.push(json!({"role":"user","content":"more"}));
+
+        let cut = 4;
+        e.clear_stale_tool_results(cut);
+        let content = e.messages[3]["content"].as_str().unwrap().to_string();
+        assert_eq!(
+            content,
+            format!("{TOOL_RESULT_CLEARED}\n{pointer}"),
+            "stub should retain the pointer line"
+        );
+        // Second pass is a no-op (stub + pointer < TOOL_RESULT_CLEAR_MIN).
+        e.clear_stale_tool_results(cut);
+        assert_eq!(e.messages[3]["content"].as_str().unwrap(), content);
+    }
+
+    /// Clearing keeps the REAL (trailing) pointer, not a decoy line in the answer body.
+    #[test]
+    fn clear_stale_keeps_trailing_pointer_not_a_decoy_body_line() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        let decoy = format!("{ARTIFACT_POINTER_PREFIX}/decoy.md] (quoted inside the answer)");
+        let real = format!("{ARTIFACT_POINTER_PREFIX}/tmp/sub-001-x.md — re-read it]");
+        let big = format!(
+            "{}\n{decoy}\n{}\n\n{real}",
+            "x".repeat(2000),
+            "y".repeat(2000)
+        );
+        e.messages.push(json!({"role":"user","content":"go"}));
+        e.messages.push(json!({"role":"assistant","tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"subagent","arguments":"{}"}}]}));
+        e.messages
+            .push(json!({"role":"tool","tool_call_id":"c1","content": big}));
+        e.messages.push(json!({"role":"user","content":"more"}));
+
+        e.clear_stale_tool_results(4);
+        assert_eq!(
+            e.messages[3]["content"].as_str().unwrap(),
+            format!("{TOOL_RESULT_CLEARED}\n{real}"),
+            "the trailing real pointer must win over the decoy"
+        );
+    }
+
+    /// A bulky tool result without a pointer clears to the plain stub (regression guard).
+    #[test]
+    fn clear_stale_without_pointer_unchanged() {
+        let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
+        e.messages.push(json!({"role":"user","content":"go"}));
+        e.messages.push(json!({"role":"assistant","tool_calls":[
+            {"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}));
+        e.messages
+            .push(json!({"role":"tool","tool_call_id":"c1","content": "y".repeat(5000)}));
+        e.messages.push(json!({"role":"user","content":"more"}));
+
+        e.clear_stale_tool_results(4);
+        assert_eq!(e.messages[3]["content"], TOOL_RESULT_CLEARED);
+    }
+
     /// `take_note` content rides into a compaction via the pinned block; the cap trims files before notes (notes kept, plan whole).
     #[test]
     fn notes_pin_into_compaction_block() {
         let mut e = AgentEngine::new("/tmp", "m", "", &[], &[], 0, 0);
         e.plan =
             plan::parse_plan(&json!({"plan":[{"step":"keep me","status":"pending"}]})).unwrap();
-        e.notes = vec!["decided on X".to_string(), "Y 500s — avoid".to_string()];
+        e.notes = vec![
+            notes::Note {
+                id: None,
+                text: "decided on X".to_string(),
+            },
+            notes::Note {
+                id: Some("dead-end".to_string()),
+                text: "Y 500s — avoid".to_string(),
+            },
+        ];
         e.touched_files = (0..600).map(|i| format!("src/seg/file_{i}.rs")).collect();
         let block = e.render_pinned_block();
         assert!(estimate_str_tokens(&block) <= PINNED_MAX_TOKENS);
         assert!(block.contains("## Notes"));
         assert!(block.contains("decided on X"));
+        assert!(
+            block.contains("- (dead-end) Y 500s"),
+            "id rendered for update targeting"
+        );
         assert!(block.contains("keep me"), "plan kept whole");
         assert!(!block.contains("file_0.rs"), "files trimmed before notes");
     }
@@ -5507,7 +6247,71 @@ mod tests {
         assert_eq!(restored.plan.len(), 2);
         assert_eq!(restored.plan[1].status, plan::PlanStatus::InProgress);
         assert_eq!(restored.touched_files, vec!["src/x.rs".to_string()]);
-        assert_eq!(restored.notes, vec!["x uses async".to_string()]);
+        assert_eq!(restored.notes.len(), 1);
+        assert_eq!(restored.notes[0].text, "x uses async");
+    }
+
+    /// The three merge outcomes surface distinct tool-result confirmations, and a
+    /// resumed transcript reproduces the merged notes (live/resume parity).
+    #[tokio::test]
+    async fn take_note_merge_outcomes_and_resume_parity() {
+        let dir = tmp();
+        let calls = batch_tool_call_sse(&[
+            (
+                "c1",
+                "take_note",
+                json!({"note": "use sessions", "id": "auth"}),
+            ), // Added
+            ("c2", "take_note", json!({"note": "a finding"})), // Added
+            ("c3", "take_note", json!({"note": "use JWT", "id": "auth"})), // Updated(auth)
+            ("c4", "take_note", json!({"note": "A   FINDING"})), // Refreshed (dup)
+        ]);
+        let port = spawn_sse_sequence(vec![calls, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("note stuff".into()),
+            &mut ui,
+        )
+        .await;
+
+        // Each call's confirmation reflects its outcome, in order.
+        let tool_results: Vec<String> = engine
+            .messages
+            .iter()
+            .filter(|m| role(m) == "tool")
+            .filter_map(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(
+            tool_results,
+            vec![
+                "Noted (1 saved).".to_string(),
+                "Noted (2 saved).".to_string(),
+                "Updated note 'auth'.".to_string(),
+                "Already noted (refreshed).".to_string(),
+            ]
+        );
+        // Two notes remain: the id-updated one and the deduped finding.
+        assert_eq!(engine.notes.len(), 2);
+        assert_eq!(engine.notes[0].text, "use JWT");
+        assert_eq!(engine.notes[0].id.as_deref(), Some("auth"));
+        assert_eq!(engine.notes[1].text, "a finding");
+
+        // Resume from the same transcript reproduces the merged notes.
+        let convo = engine.export_conversation();
+        let mut restored = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        restored.restore_conversation(convo);
+        assert_eq!(restored.notes.len(), 2);
+        assert_eq!(restored.notes[0].text, "use JWT");
+        assert_eq!(restored.notes[1].text, "a finding");
     }
 
     /// A dangling-tool_calls assistant (interrupted mid-tool) is repaired before the next turn: each unanswered call id gets a synthetic result.

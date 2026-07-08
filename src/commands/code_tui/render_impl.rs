@@ -1946,6 +1946,15 @@ impl CodeTuiApp {
         } else {
             (String::new(), Style::default(), 0usize)
         };
+        // Left-cluster badge for running jobs (count cached + reaped per event-loop tick).
+        let jobs_running = self.jobs_running;
+        let jobs_text = if jobs_running > 0 {
+            let s = if jobs_running == 1 { "" } else { "s" };
+            format!(" ✦ {jobs_running} job{s} ")
+        } else {
+            String::new()
+        };
+        let jobs_w = display_width(&jobs_text);
         let trailing = 2usize;
         // Badge + faint cycle hint, one space of padding each side.
         let badge_w = display_width(badge) + display_width(CYCLE_HINT) + 2;
@@ -1954,17 +1963,20 @@ impl CodeTuiApp {
         } else {
             left_lead + display_width(&left_text)
         };
-        if width <= left_w + badge_w + trailing + 2 {
-            // Too narrow to inset it all — keep just the mode badge (drop the hint).
+        if width <= left_w + jobs_w + badge_w + trailing + 2 {
+            // Too narrow to inset it all — keep just the mode badge.
             return Line::from(Span::styled(badge.to_string(), badge_style));
         }
-        let fill = width - left_w - badge_w - trailing;
-        let mut spans = Vec::with_capacity(6);
+        let fill = width - left_w - jobs_w - badge_w - trailing;
+        let mut spans = Vec::with_capacity(7);
         if !left_text.is_empty() {
             if left_lead > 0 {
                 spans.push(Span::styled("─".repeat(left_lead), rule_style));
             }
             spans.push(Span::styled(left_text, left_style));
+        }
+        if !jobs_text.is_empty() {
+            spans.push(Span::styled(jobs_text, Style::default().fg(TOOL)));
         }
         spans.push(Span::styled("─".repeat(fill), rule_style));
         spans.push(Span::styled(format!(" {badge}"), badge_style));

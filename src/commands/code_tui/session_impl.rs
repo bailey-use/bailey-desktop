@@ -2265,6 +2265,12 @@ is preserved."
         self.goal_mode = None;
         self.stop_agent_serve();
         self.session_id = session.session_id;
+        // Re-root NEW background-job logs under the resumed session's artifacts dir.
+        self.jobs.set_logs_root(
+            self.session_store
+                .session_artifacts_dir(&self.session_id)
+                .join("jobs"),
+        );
         // Re-seed the running token total from the stored entry so further turns
         // accumulate on top of it (the index save overwrites with the cumulative).
         self.session_tokens = self

@@ -142,6 +142,11 @@ impl CodeTuiApp {
         self.draft_history_index = state.draft_history_index;
         self.draft_history_stash = state.draft_history_stash;
         self.session_id = state.session_id;
+        self.jobs.set_logs_root(
+            self.session_store
+                .session_artifacts_dir(&self.session_id)
+                .join("jobs"),
+        );
         self.notice = state.notice;
         self.pending_response = state.pending_response;
         self.pending_reasoning = state.pending_reasoning;

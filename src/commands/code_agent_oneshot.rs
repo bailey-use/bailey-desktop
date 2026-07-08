@@ -96,7 +96,7 @@ pub(crate) async fn run_one_shot_agent(
     engine.set_require_completion();
     // Opt-in: run the project's validator on a declared-done turn and self-correct failures.
     if env_or("AIVO_AGENT_SELF_CORRECT", 0u8) != 0 {
-        engine.set_self_correct();
+        engine.set_self_correct(true);
     }
     if crate::services::provider_profile::is_aivo_starter_base(&key.base_url) {
         engine.set_first_party();
@@ -105,6 +105,9 @@ pub(crate) async fn run_one_shot_agent(
     engine.set_subagents(&subagents);
     // Persistent grant store: remembered "always allow"s survive across runs.
     engine.set_grants_path(session_store.config_dir());
+    // Background-job table (temp logs — one-shots have no session dir); killed at run end.
+    let jobs = crate::agent::jobs::JobTable::new(None);
+    engine.set_jobs(jobs.clone());
     // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
     engine.maybe_enable_lsp(Path::new(&cwd));
 
@@ -160,6 +163,9 @@ pub(crate) async fn run_one_shot_agent(
             false
         }
     };
+    // Unattended run: never leave a background job running past exit; drop its temp logs.
+    let _ = jobs.kill_all().await;
+    let _ = tokio::fs::remove_dir_all(jobs.logs_root()).await;
     let exit = if !completed {
         ExitCode::ToolExit(130)
     } else {

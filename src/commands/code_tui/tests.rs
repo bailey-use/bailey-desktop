@@ -1448,6 +1448,7 @@ fn make_test_app(
         cursor_acp_session: None,
         pending_agent_messages: None,
         goal_mode: None,
+        goal_guard_stop: None,
         plan_mode: false,
         plan_exit_pending: false,
         pending_plan: None,
@@ -1484,6 +1485,8 @@ fn make_test_app(
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
         local_command: None,
+        jobs: crate::agent::jobs::JobTable::new(None),
+        jobs_running: 0,
         local_outputs: std::collections::HashMap::new(),
         expanded_output: std::collections::HashSet::new(),
         expanded_thinking: std::collections::HashSet::new(),
@@ -8350,6 +8353,121 @@ async fn test_goal_continuation_preserves_composer_draft() {
     );
     assert!(app.goal_mode.is_none(), "plain-chat route disarms the loop");
     assert!(app.notice.as_ref().unwrap().1.contains("plain chat"));
+}
+
+/// A guard-stopped turn steers the next `/goal` continuation: the message tells the
+/// model not to retry the dead end, and the stored guard-stop is consumed.
+#[tokio::test]
+async fn test_goal_guard_stop_enriches_continuation() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.key.base_url = "claude-oauth".to_string();
+    app.goal_mode = Some(GoalState {
+        objective: "x".to_string(),
+        iteration: 1,
+        max: 20,
+    });
+    app.goal_guard_stop = Some(crate::agent::engine::STOP_NO_PROGRESS.to_string());
+    app.history.push(ChatMessage {
+        model: None,
+        role: "assistant".to_string(),
+        content: "still working".to_string(),
+        reasoning_content: None,
+        attachments: vec![],
+    });
+
+    app.maybe_continue_goal().await.unwrap();
+
+    let last = app.history.last().unwrap();
+    assert_eq!(last.role, "user");
+    assert!(
+        last.content.starts_with("[Previous turn stopped early:"),
+        "guard-stop should enrich the continuation: {}",
+        last.content
+    );
+    assert!(
+        last.content.contains("Continue toward the goal"),
+        "the base continuation still rides along: {}",
+        last.content
+    );
+    assert!(
+        app.goal_guard_stop.is_none(),
+        "the guard-stop is consumed, not resent next turn"
+    );
+}
+
+/// Starting a fresh `/goal` clears any stale guard-stop from a prior loop.
+#[tokio::test]
+async fn test_goal_guard_stop_cleared_on_new_goal() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    // Force the plain-chat route (image in history, vision unknown) to keep the
+    // dispatch lightweight; the guard-stop clear happens before dispatch either way.
+    app.model_image_input = None;
+    app.history.push(ChatMessage {
+        model: None,
+        role: "user".to_string(),
+        content: "look".to_string(),
+        reasoning_content: None,
+        attachments: vec![MessageAttachment {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            storage: AttachmentStorage::Inline {
+                data: "iVBOR".to_string(),
+            },
+        }],
+    });
+    app.goal_guard_stop = Some(crate::agent::engine::STOP_TOOL_FAILURE.to_string());
+
+    app.run_goal_command(Some("do the thing".to_string())).await;
+
+    assert!(
+        app.goal_guard_stop.is_none(),
+        "a fresh goal must not carry a stale guard-stop"
+    );
+}
+
+/// A running background job shows a `✦ N job(s)` badge in the composer rule.
+#[cfg(unix)]
+#[tokio::test]
+async fn jobs_badge_shows_running_count() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    let cwd = std::env::temp_dir();
+    app.jobs.spawn("sleep 30", &cwd).unwrap();
+    // The event loop caches this each tick; refresh it directly for the test.
+    app.jobs_running = app.jobs.running_count();
+    let line = app.composer_rule_line(120);
+    let plain = plain_text_from_spans(&line.spans);
+    assert!(plain.contains("✦ 1 job"), "badge missing: {plain}");
+    let _ = app.jobs.kill_all().await;
+}
+
+/// With no running jobs, the composer rule carries no jobs badge (guards width math).
+#[test]
+fn jobs_badge_absent_when_idle() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = make_test_app(tx, rx);
+    let line = app.composer_rule_line(120);
+    let plain = plain_text_from_spans(&line.spans);
+    assert!(!plain.contains("✦"), "no jobs → no badge: {plain}");
+}
+
+/// `/new` re-roots NEW background-job logs under the fresh session's artifacts dir.
+#[cfg(unix)]
+#[tokio::test]
+async fn new_session_reroots_job_logs() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.start_new_chat();
+    let new_id = app.session_id.clone();
+    assert!(!new_id.is_empty(), "a new session id was minted");
+    let out = app.jobs.spawn("echo hi", &std::env::temp_dir()).unwrap();
+    assert!(
+        out.contains(&new_id),
+        "job log should be under the new session dir: {out}"
+    );
+    let _ = app.jobs.kill_all().await;
 }
 
 /// `/goal` where dispatch falls back to plain chat (image in history, vision

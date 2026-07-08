@@ -223,7 +223,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "goal",
         help_label: "/goal <objective>",
-        description: "work autonomously toward a goal until done",
+        description: "work autonomously toward a goal, verifying tests each step, until done",
         takes_argument: true,
     },
     SlashCommandSpec {
@@ -2161,6 +2161,8 @@ pub(super) struct CodeTuiApp {
     /// agent turns; cleared on completion, the iteration cap, `/goal stop`, an
     /// interrupt, `/new`, resume, or a key/model switch.
     pub(super) goal_mode: Option<GoalState>,
+    /// Last turn's engine guard-stop, consumed by the `/goal` continuation to steer past a dead end.
+    pub(super) goal_guard_stop: Option<String>,
     /// Plan mode is on: read-only, persists across turns/interrupts until the plan
     /// is approved or `/plan stop`.
     pub(super) plan_mode: bool,
@@ -2282,6 +2284,10 @@ pub(super) struct CodeTuiApp {
     /// An in-flight `!cmd` local shell run streaming output into the transcript,
     /// or `None`. Separate from `sending` (model turns) so the two don't entangle.
     pub(super) local_command: Option<LocalCommandRun>,
+    /// App-owned background-job table; never rebuilt (jobs survive `/new`/switches), killed at exit.
+    pub(super) jobs: crate::agent::jobs::SharedJobs,
+    /// Running-job count, refreshed once per event-loop tick (which reaps); render reads this field.
+    pub(super) jobs_running: usize,
     /// FULL output of each finished `!cmd`, keyed by the history index of its
     /// `local_command` entry — the source an expanded block renders from (the
     /// transcript and on-disk session keep only a bounded preview). In-memory only,

@@ -2113,6 +2113,11 @@ impl SessionStore {
         self.sessions.session_file_path(session_id)
     }
 
+    /// Per-session directory for durable agent artifacts (sub-agent reports, job logs).
+    pub fn session_artifacts_dir(&self, session_id: &str) -> PathBuf {
+        self.sessions.session_artifacts_dir(session_id)
+    }
+
     pub async fn get_code_session(&self, session_id: &str) -> Result<Option<CodeSessionState>> {
         self.sessions.get_code_session(session_id).await
     }

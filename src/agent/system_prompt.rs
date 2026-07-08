@@ -90,10 +90,13 @@ never lingers as unfinished. It shows the user your progress. Don't bother for t
 requests.\n\n\
 For a long, multi-step task, use `take_note` to jot down decisions, findings, and dead-ends as \
 you go — notes persist verbatim even after older conversation is compacted away, so they keep you \
-oriented across many steps. Skip it for quick work.\n\n\
+oriented across many steps. Reuse a note's `id` to revise it (decisions change) instead of \
+stacking near-duplicates. Skip it for quick work.\n\n\
 For a large, self-contained chunk of work — a deep investigation that would clutter your context, or \
 something a stronger model should handle — you can hand it to a fresh sub-agent with `subagent` (pass \
-`model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools."
+`model` to use a stronger model) and build on its result. For ordinary steps, just use your own tools. \
+A sub-agent's report may be saved to a file (its result says where) — re-read that file with \
+`read_file` instead of re-running the investigation if the result has been cleared from context."
     );
     let os = match std::env::consts::OS {
         "macos" => "macOS",

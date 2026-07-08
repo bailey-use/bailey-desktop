@@ -12,7 +12,7 @@ const GOAL_DEFAULT_MAX_ITERS: usize = 20;
 const GOAL_PREAMBLE: &str = "[Goal mode] Work autonomously toward this objective, doing as many \
 steps as it takes — build directly without pausing to confirm the plan first. When the objective \
 is FULLY achieved, reply with exactly `GOAL COMPLETE` on its own line. If anything remains, keep \
-going.";
+going. Use `take_note` for key decisions and dead-ends so they survive context compaction.";
 /// Self-checking continuation sent between goal turns.
 const GOAL_CONTINUE: &str = "Continue toward the goal. If the objective is now fully met, reply \
 with exactly `GOAL COMPLETE` and nothing else; otherwise do the next step.";
@@ -44,6 +44,16 @@ fn signals_goal_complete(text: &str) -> bool {
             .trim_matches(|c: char| matches!(c, '`' | '*' | '_' | '.' | '!' | ' '))
             .eq_ignore_ascii_case("GOAL COMPLETE")
     })
+}
+
+/// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns (parity with one-shot).
+fn env_self_correct() -> bool {
+    std::env::var("AIVO_AGENT_SELF_CORRECT").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Goal mode verifies at declared-done by default; `AIVO_GOAL_VERIFY=0` opts out.
+fn goal_verify_enabled() -> bool {
+    std::env::var("AIVO_GOAL_VERIFY").map_or(true, |v| v != "0")
 }
 
 /// Build the message a `/<skill> [args]` invocation sends to the model. If the
@@ -559,10 +569,14 @@ impl CodeTuiApp {
     async fn spawn_agent_turn(&mut self, input: String, attachments: Vec<MessageAttachment>) {
         use crate::agent::engine::{AgentEngine, TurnCtx};
 
-        // Sync an existing engine to the session mode before the turn — applies a
-        // mode switch deferred while the previous turn held the engine lock.
+        // Self-verify at declared-done: opt-in normally, default-on under goal mode.
+        let self_correct =
+            env_self_correct() || (self.goal_mode.is_some() && goal_verify_enabled());
+        // Sync a reused engine to the session mode + self-correct toggle before the turn.
         if let Some(session) = self.agent_engine.as_ref() {
-            session.engine.lock().await.set_plan_mode(self.plan_mode);
+            let mut engine = session.engine.lock().await;
+            engine.set_plan_mode(self.plan_mode);
+            engine.set_self_correct(self_correct);
         }
         self.plan_exit_pending = false;
         // The agent works in the real launch directory — NOT chat's sandbox
@@ -637,6 +651,7 @@ impl CodeTuiApp {
             // Interactive: the agent confirms before a big build. (Plan mode is
             // applied LAST, below, so it strips from the fully assembled tool list.)
             engine.set_confirm_before_build();
+            engine.set_self_correct(self_correct);
             // Interactive chat only — headless (`-e`) and sub-agents build engines elsewhere.
             engine.set_chat_session_context(crate::agent::engine::ChatSessionContext {
                 model_label: self.raw_model.clone(),
@@ -654,6 +669,9 @@ impl CodeTuiApp {
             engine.set_subagents(&subagents);
             // Persistent grant store so "always allow"s survive across sessions.
             engine.set_grants_path(self.session_store.config_dir());
+            // Durable sub-agent reports under this session's artifacts dir (survive compaction).
+            engine.set_artifacts_dir(self.session_store.session_artifacts_dir(&self.session_id));
+            engine.set_jobs(self.jobs.clone());
             // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
             engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
             // Carry prior conversation in, best fidelity first: a resumed session's
@@ -1616,6 +1634,8 @@ impl CodeTuiApp {
                     iteration: 1,
                     max: goal_max_iterations(),
                 });
+                // Fresh objective: no stale guard-stop from a prior loop.
+                self.goal_guard_stop = None;
                 let first = format!("{GOAL_PREAMBLE}\n\nObjective: {objective}");
                 // The model receives the expanded preamble, but draft history must
                 // record only the typed `/goal <objective>` (done by `submit_draft`),
@@ -1676,6 +1696,8 @@ impl CodeTuiApp {
             return Ok(());
         }
         if self.sending {
+            // A queued message drives the next turn; drop the superseded guard-stop.
+            self.goal_guard_stop = None;
             return Ok(());
         }
         let Some(goal) = self.goal_mode.as_mut() else {
@@ -1693,14 +1715,20 @@ impl CodeTuiApp {
             ));
             return Ok(());
         }
+        // A guard-stopped turn steers the next one away from the dead end.
+        let continuation = match self.goal_guard_stop.take() {
+            Some(stop) => format!(
+                "[Previous turn stopped early: {stop}. Do NOT retry the same approach — pick a \
+different one, and record the dead end with take_note.]\n\n{GOAL_CONTINUE}"
+            ),
+            None => GOAL_CONTINUE.to_string(),
+        };
         // Machine text: record nothing (↑/↓ recall) and stash the composer so the
         // dispatch can't wipe a mid-turn draft or attach the user's staged files.
         let draft = std::mem::take(&mut self.draft);
         let cursor = self.cursor;
         let attachments = std::mem::take(&mut self.draft_attachments);
-        let sent = self
-            .dispatch_user_message(GOAL_CONTINUE.to_string(), None)
-            .await;
+        let sent = self.dispatch_user_message(continuation, None).await;
         self.draft = draft;
         self.cursor = cursor;
         self.draft_attachments = attachments;
@@ -1926,6 +1954,12 @@ impl CodeTuiApp {
         self.sending = false;
         self.request_started_at = None;
         self.session_id = new_code_session_id();
+        // New session → re-root NEW jobs' logs (running jobs keep their absolute paths).
+        self.jobs.set_logs_root(
+            self.session_store
+                .session_artifacts_dir(&self.session_id)
+                .join("jobs"),
+        );
         self.format = seeded_chat_format(&self.key, &self.raw_model);
         self.last_usage = None;
         self.context_tokens = 0;
@@ -1962,6 +1996,7 @@ impl CodeTuiApp {
         // autonomous /goal loop, so it can't auto-continue after the dropped turn.
         // The interrupt-with-partial path clears it separately, before this runs.
         self.goal_mode = None;
+        self.goal_guard_stop = None;
         // A cancelled /compact must not mark the NEXT turn as a compact.
         self.compact_before = None;
         // Plan mode persists across an interrupt (it's a session mode). Apply a

@@ -75,6 +75,11 @@ impl CodeSessionStore {
         self.sessions_dir().join(format!("{session_id}.json"))
     }
 
+    /// Per-session artifact directory (sub-agent reports, job logs). Created lazily by writers.
+    pub(crate) fn session_artifacts_dir(&self, session_id: &str) -> PathBuf {
+        self.sessions_dir().join("artifacts").join(session_id)
+    }
+
     fn index_path(&self) -> PathBuf {
         self.sessions_dir().join("index.json")
     }
@@ -263,10 +268,11 @@ impl CodeSessionStore {
             }
         }
 
-        // Delete session files
+        // Delete session files (and any durable artifacts alongside them).
         for session_id in &to_delete {
             let path = self.session_file_path(session_id);
             let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
         }
 
         // Prune index
@@ -631,6 +637,8 @@ impl CodeSessionStore {
                 .await
                 .with_context(|| format!("Failed to delete session file: {:?}", path))?;
         }
+        // Best-effort: drop the session's durable artifacts (never fail the delete).
+        let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
 
         let mut index = self.load_index().await.unwrap_or_default();
         let before = index.entries.len();
@@ -654,6 +662,7 @@ impl CodeSessionStore {
             .collect();
         for session_id in &to_delete {
             let _ = tokio::fs::remove_file(self.session_file_path(session_id)).await;
+            let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
         }
         index.entries.retain(|e| e.key_id != key_id);
         if !to_delete.is_empty() {
@@ -864,6 +873,65 @@ mod tests {
         // Deleting again returns false
         let deleted = store.delete_chat_session("sess1").await.unwrap();
         assert!(!deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_artifacts_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "hello",
+                "hello",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        // Drop a dummy artifact under the session's artifacts dir.
+        let art = store.session_artifacts_dir("sess1");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("sub-001-x.md"), "report").unwrap();
+        assert!(art.exists());
+
+        store.delete_chat_session("sess1").await.unwrap();
+        assert!(!art.exists(), "artifacts dir should be pruned on delete");
+    }
+
+    #[tokio::test]
+    async fn prune_removes_artifacts_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "hello",
+                "hello",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        let art = store.session_artifacts_dir("sess1");
+        std::fs::create_dir_all(&art).unwrap();
+        std::fs::write(art.join("sub-001-x.md"), "report").unwrap();
+
+        store.remove_sessions_for_key(&key_id).await.unwrap();
+        assert!(
+            !art.exists(),
+            "artifacts dir should be pruned when the key's sessions are removed"
+        );
     }
 
     #[tokio::test]

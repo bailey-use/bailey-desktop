@@ -5,6 +5,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::agent::engine::{AgentEngine, AgentUi, DEFAULT_CONTEXT_WINDOW, TurnCtx};
+use crate::agent::notes::Note;
 use crate::agent::plan;
 use crate::agent::protocol::ChatRequest;
 use crate::agent::request::{role, serialize_transcript, truncate_str};
@@ -18,8 +19,8 @@ use crate::agent::tokens::{
 /// Tokens held back from the window for the response + tool schemas.
 pub(crate) const COMPACT_RESERVE: usize = 16_000;
 /// A `tool` result longer than this (chars) is eligible for clearing once it ages
-/// out of the recent window; smaller results aren't worth the churn.
-const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
+/// out of the recent window. Also the engine's "worth saving to an artifact" threshold.
+pub(crate) const TOOL_RESULT_CLEAR_MIN: usize = 1_000;
 /// Stub for a cleared tool result. Below [`TOOL_RESULT_CLEAR_MIN`] so clearing is
 /// idempotent; the message + `tool_call_id` stay so assistant↔tool pairing holds.
 pub(crate) const TOOL_RESULT_CLEARED: &str = "[earlier tool output cleared to save context]";
@@ -220,8 +221,8 @@ impl AgentEngine {
         (before, self.estimated_context_tokens())
     }
 
-    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD
-    /// `tool` message over the threshold, the bytes dropped when stubbed.
+    /// Tokens (chars/4) reclaimable by [`clear_stale_tool_results`]: for each OLD `tool`
+    /// message over the threshold, the bytes dropped (a retained pointer line is excluded).
     pub(crate) fn stale_tool_result_savings(&self, cut: usize) -> usize {
         self.messages
             .get(1..cut)
@@ -230,7 +231,11 @@ impl AgentEngine {
             .filter(|m| role(m) == "tool")
             .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
             .filter(|s| s.len() > TOOL_RESULT_CLEAR_MIN)
-            .map(|s| s.len().saturating_sub(TOOL_RESULT_CLEARED.len()) / 4)
+            .map(|s| {
+                let retained =
+                    TOOL_RESULT_CLEARED.len() + artifact_pointer_line(s).map_or(0, |p| p.len() + 1);
+                s.len().saturating_sub(retained) / 4
+            })
             .sum()
     }
 
@@ -249,7 +254,16 @@ impl AgentEngine {
                 .and_then(|c| c.as_str())
                 .map_or(0, str::len);
             if len > TOOL_RESULT_CLEAR_MIN {
-                m["content"] = json!(TOOL_RESULT_CLEARED);
+                // Keep any artifact-pointer line so the parent can re-read the saved report.
+                let pointer = m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .and_then(artifact_pointer_line)
+                    .map(str::to_string);
+                m["content"] = match pointer {
+                    Some(p) => json!(format!("{TOOL_RESULT_CLEARED}\n{p}")),
+                    None => json!(TOOL_RESULT_CLEARED),
+                };
             }
         }
     }
@@ -348,7 +362,7 @@ impl AgentEngine {
     /// trimmed to `PINNED_MAX_TOKENS` (plan kept whole, files trimmed oldest-first). Empty when nothing to pin.
     pub(crate) fn render_pinned_block(&self) -> String {
         let plan_block = plan::pinned_block(&self.plan);
-        let mut notes: &[String] = &self.notes;
+        let mut notes: &[Note] = &self.notes;
         let mut files: &[String] = &self.touched_files;
         loop {
             let block = compose_pinned(&plan_block, notes, files);
@@ -416,9 +430,18 @@ impl AgentEngine {
     }
 }
 
+/// The artifact-pointer line, if any — the LAST match, since the real pointer is
+/// appended at the end (a body line starting with the prefix must not shadow it).
+fn artifact_pointer_line(content: &str) -> Option<&str> {
+    content
+        .lines()
+        .rev()
+        .find(|l| l.starts_with(crate::agent::engine::ARTIFACT_POINTER_PREFIX))
+}
+
 /// Render the pinned working set for a compaction: `## Pinned Plan`, `## Notes`,
 /// `## Files touched`. Each section omitted when empty; "" when all are.
-pub(crate) fn compose_pinned(plan_block: &str, notes: &[String], files: &[String]) -> String {
+pub(crate) fn compose_pinned(plan_block: &str, notes: &[Note], files: &[String]) -> String {
     let mut out = String::new();
     if !plan_block.is_empty() {
         out.push_str("## Pinned Plan\n");
@@ -430,9 +453,11 @@ pub(crate) fn compose_pinned(plan_block: &str, notes: &[String], files: &[String
         }
         out.push_str("## Notes\n");
         for n in notes {
-            out.push_str("- ");
-            out.push_str(n);
-            out.push('\n');
+            // id shown so the model can target an in-place update.
+            match &n.id {
+                Some(id) => out.push_str(&format!("- ({id}) {}\n", n.text)),
+                None => out.push_str(&format!("- {}\n", n.text)),
+            }
         }
         out = out.trim_end().to_string();
     }

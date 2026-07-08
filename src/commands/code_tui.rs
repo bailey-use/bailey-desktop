@@ -125,6 +125,13 @@ impl CodeTuiApp {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs() as usize % WELCOME_TIPS.len())
             .unwrap_or(0);
+        // Job logs under the session's artifacts dir; re-rooted on `/new`/resume.
+        let jobs = crate::agent::jobs::JobTable::new(Some(
+            params
+                .session_store
+                .session_artifacts_dir(&params.initial_session)
+                .join("jobs"),
+        ));
         Ok(Self {
             session_store: params.session_store,
             cache: params.cache,
@@ -220,6 +227,7 @@ impl CodeTuiApp {
             cursor_acp_session: None,
             pending_agent_messages: None,
             goal_mode: None,
+            goal_guard_stop: None,
             plan_mode: false,
             plan_exit_pending: false,
             pending_plan: None,
@@ -264,6 +272,8 @@ impl CodeTuiApp {
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
             local_command: None,
+            jobs,
+            jobs_running: 0,
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),

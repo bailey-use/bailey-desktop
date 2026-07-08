@@ -839,6 +839,9 @@ pub struct UpdateArgs {
     /// Refresh model data from models.dev (context windows, capabilities); leaves the binary alone
     #[arg(long)]
     pub sync_model_data: bool,
+    /// Internal marker for the sudo re-run: quiets the preamble, blocks re-elevation.
+    #[arg(long, hide = true)]
+    pub sudo_elevated: bool,
 }
 
 /// Arguments for the info command

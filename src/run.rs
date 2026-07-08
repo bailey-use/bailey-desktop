@@ -908,7 +908,9 @@ pub async fn run() -> ! {
                 if update_args.sync_model_data {
                     command.execute_sync_model_data().await
                 } else {
-                    command.execute(update_args.force).await
+                    command
+                        .execute(update_args.force, update_args.sudo_elevated)
+                        .await
                 }
             }
             Err(e) => {

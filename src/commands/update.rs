@@ -1,5 +1,6 @@
 //! UpdateCommand handler for CLI self-update functionality.
 use std::env;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -82,8 +83,8 @@ impl UpdateCommand {
 
     /// Executes the update command (binary only — model data is refreshed
     /// separately via `aivo update --sync-model-data`).
-    pub async fn execute(&self, force: bool) -> ExitCode {
-        match self.execute_internal(force).await {
+    pub async fn execute(&self, force: bool, elevated: bool) -> ExitCode {
+        match self.execute_internal(force, elevated).await {
             Ok(code) => code,
             Err(e) => {
                 self.handle_error(e);
@@ -116,7 +117,7 @@ impl UpdateCommand {
         }
     }
 
-    async fn execute_internal(&self, force: bool) -> Result<ExitCode> {
+    async fn execute_internal(&self, force: bool, elevated: bool) -> Result<ExitCode> {
         if !force {
             let install_path = get_install_path()?;
             if let Some(manager) = detect_managed_install(&install_path) {
@@ -151,7 +152,10 @@ impl UpdateCommand {
             }
         }
 
-        println!("{} Checking for updates...", style::arrow_symbol());
+        // The elevated re-run inherits the parent's preamble output.
+        if !elevated {
+            println!("{} Checking for updates...", style::arrow_symbol());
+        }
 
         let current_version = crate::version::VERSION;
         let latest_version = self.get_latest_version().await?;
@@ -165,11 +169,23 @@ impl UpdateCommand {
             return Ok(ExitCode::Success);
         }
 
-        println!("  Current: {}", style::dim(current_version));
-        println!("  Latest:  {}", style::green(&latest_version));
+        if !elevated {
+            println!("  Current: {}", style::dim(current_version));
+            println!("  Latest:  {}", style::green(&latest_version));
+        }
 
-        // Fail before any download when the binary can't be replaced in place.
-        check_install_dir_writable(&get_install_path()?)?;
+        // Fail before any download when the binary can't be replaced in place;
+        // on a root-owned dir, re-run under sudo instead of aborting.
+        let install_path = get_install_path()?;
+        if let Err(e) = check_install_dir_writable(&install_path) {
+            if !elevated
+                && is_permission_denied(&e)
+                && let Some(code) = reexec_with_sudo(&install_path, force)
+            {
+                return Ok(code);
+            }
+            return Err(e);
+        }
 
         let binary_name = get_binary_name()?;
         let base_url = format!("{}/v{}", DOWNLOAD_BASE, latest_version);
@@ -534,11 +550,16 @@ impl UpdateCommand {
         if is_permission_denied(&error) {
             #[cfg(not(windows))]
             if resolve_command_path("sudo").is_some() {
+                // Absolute path: sudoers `secure_path` often omits
+                // /usr/local/bin, so bare `sudo aivo` is "command not found".
+                let exe = get_install_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "aivo".to_string());
                 eprintln!(
                     "{} Re-run with elevated permissions:",
                     style::yellow("Suggestion:")
                 );
-                eprintln!("  {}", style::green("sudo aivo update"));
+                eprintln!("  {}", style::green(format!("sudo {exe} update")));
             } else {
                 eprintln!(
                     "{} Reinstall to a directory you can write to:",
@@ -800,6 +821,72 @@ fn is_permission_denied(error: &anyhow::Error) -> bool {
 fn resolve_command_path(program: &str) -> Option<PathBuf> {
     let dirs = collect_path_dirs();
     find_in_dirs(program, &dirs)
+}
+
+/// Elevation gate, split out for testing. `AIVO_PATH` vetoes because sudo's env
+/// reset would drop it, sending the child at the wrong binary. `sudo` presence
+/// is checked lazily by the caller so a failed gate skips the PATH scan.
+#[cfg(not(windows))]
+fn should_attempt_elevation(is_root: bool, has_aivo_path: bool, is_tty: bool) -> bool {
+    !is_root && !has_aivo_path && is_tty
+}
+
+/// Re-run `aivo update` under `sudo` for a root-owned install dir, mirroring
+/// install.sh's `sudo mv`. `Some(code)` when it elevated, `None` when it can't —
+/// the caller then falls back to the permission-denied error. `!is_root` doubles
+/// as the loop guard: the elevated child is root and can't re-enter here.
+#[cfg(not(windows))]
+fn reexec_with_sudo(exe: &Path, force: bool) -> Option<ExitCode> {
+    if !should_attempt_elevation(
+        unsafe { libc::geteuid() } == 0,
+        env::var_os("AIVO_PATH").is_some(),
+        std::io::stdin().is_terminal(),
+    ) {
+        return None;
+    }
+    let sudo = resolve_command_path("sudo")?;
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    println!(
+        "  {}",
+        style::dim(format!("needs sudo to write {}", dir.display()))
+    );
+
+    match Command::new(sudo)
+        .args(sudo_update_args(exe, force))
+        .status()
+    {
+        // The child is another aivo process; its exit code already IS an ExitCode.
+        Ok(status) => Some(match status.code() {
+            Some(0) => ExitCode::Success,
+            Some(n) => ExitCode::ToolExit(n),
+            None => ExitCode::UserError,
+        }),
+        Err(e) => {
+            eprintln!(
+                "{} Failed to elevate with sudo: {}",
+                style::red("Error:"),
+                e
+            );
+            Some(ExitCode::UserError)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn reexec_with_sudo(_exe: &Path, _force: bool) -> Option<ExitCode> {
+    None
+}
+
+/// `--sudo-elevated` marks the re-run: suppresses the duplicate preamble and
+/// blocks re-elevation.
+#[cfg(not(windows))]
+fn sudo_update_args(exe: &Path, force: bool) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut argv: Vec<OsString> = vec![exe.into(), "update".into(), "--sudo-elevated".into()];
+    if force {
+        argv.push("--force".into());
+    }
+    argv
 }
 
 fn normalize_install_path(path: &Path) -> String {
@@ -1229,6 +1316,38 @@ Pi5pASxJ8C5JIeBSzqSS09rJdnjExlwHgQeJ1MRy0Q5oZAhtB+TFk65XQbkSwv8hbpGICsVCjCq/3cmu
         let other_io =
             anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert!(!is_permission_denied(&other_io));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn elevation_gate_requires_all_conditions() {
+        assert!(should_attempt_elevation(false, false, true));
+        assert!(!should_attempt_elevation(true, false, true)); // already root
+        assert!(!should_attempt_elevation(false, true, true)); // AIVO_PATH override
+        assert!(!should_attempt_elevation(false, false, false)); // no terminal
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sudo_argv_reruns_update_with_marker() {
+        let exe = Path::new("/usr/local/bin/aivo");
+        assert_eq!(
+            sudo_update_args(exe, false),
+            vec![
+                std::ffi::OsString::from("/usr/local/bin/aivo"),
+                "update".into(),
+                "--sudo-elevated".into(),
+            ]
+        );
+        assert_eq!(
+            sudo_update_args(exe, true),
+            vec![
+                std::ffi::OsString::from("/usr/local/bin/aivo"),
+                "update".into(),
+                "--sudo-elevated".into(),
+                "--force".into(),
+            ]
+        );
     }
 
     #[test]

@@ -877,11 +877,11 @@ impl CodeTuiApp {
                     *scroll = clamped;
                 }
             }
-            Overlay::Context { scroll } => {
+            Overlay::Context { report, scroll } => {
                 let area = centered_rect(72, 88, body);
                 self.screen_region = Some(overlay_content_rect(area));
-                let clamped = self.render_context_overlay(frame, area, scroll);
-                if let Overlay::Context { scroll } = &mut self.overlay {
+                let clamped = self.render_context_overlay(frame, area, &report, scroll);
+                if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     *scroll = clamped;
                 }
             }

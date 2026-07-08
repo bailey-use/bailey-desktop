@@ -453,12 +453,13 @@ impl CodeTuiApp {
         render_detail_lines(frame, inner, lines, scroll, "Esc close")
     }
 
-    /// `/context` overlay: read-only scrollable view of the injected block —
-    /// summary header over the wrapped body.
+    /// `/context` overlay: fill bar + segment legend + free space, then the injected
+    /// `-c` block's full text beneath a divider when one was supplied.
     pub(super) fn render_context_overlay(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
+        report: &crate::agent::engine::ContextReport,
         scroll: u16,
     ) -> u16 {
         frame.render_widget(Clear, area);
@@ -467,7 +468,7 @@ impl CodeTuiApp {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(FAINT))
             .title(Span::styled(
-                "Injected context",
+                "Context",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ));
         frame.render_widget(shell, area);
@@ -478,28 +479,153 @@ impl CodeTuiApp {
         });
         let width = usize::from(inner.width).max(1);
 
-        let mut lines: Vec<Line> = Vec::new();
-        if let Some(summary) = &self.injected_context_summary {
-            lines.push(Line::from(Span::styled(
-                summary.clone(),
-                Style::default().fg(MUTED),
-            )));
+        let window = u64::from(report.context_window);
+        let known = window > 0;
+        let used = report.used();
+
+        // Injected sits next to the system prompt it's folded into.
+        let mut segs: Vec<(String, u64, Color)> = Vec::new();
+        segs.push(("System prompt".to_string(), report.system_prompt, ASSISTANT));
+        if report.injected_context > 0 {
+            segs.push((
+                "Injected context".to_string(),
+                report.injected_context,
+                WARNING,
+            ));
         }
+        segs.push((format!("Tools · {}", report.tool_count), report.tools, TOOL));
+        if report.mcp_tool_count > 0 {
+            segs.push((
+                format!("MCP tools · {}", report.mcp_tool_count),
+                report.mcp_tools,
+                USER,
+            ));
+        }
+        segs.push((
+            format!("Messages · {}", report.message_count),
+            report.messages,
+            ACCENT,
+        ));
+
+        let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            "Background awareness only — the model won't reference this unless it's relevant.",
-            Style::default().fg(FAINT),
+            self.raw_model.clone(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
-        // Preserve blank lines; word-wrap the rest.
-        let text = self.injected_context.as_deref().unwrap_or("");
-        for raw in text.split('\n') {
-            if raw.trim().is_empty() {
-                lines.push(Line::from(""));
-                continue;
+        if known {
+            let pct = used.saturating_mul(100) / window.max(1);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} / {} · {}%",
+                    format_token_count_value(used),
+                    format_token_count_value(window),
+                    pct
+                ),
+                Style::default()
+                    .fg(context_fill_color(pct))
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} tokens · context window unknown",
+                    format_token_count_value(used)
+                ),
+                Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            )));
+        }
+
+        lines.push(context_fill_bar(&segs, used, window, width.clamp(8, 52)));
+        lines.push(Line::from(""));
+
+        let label_w = segs
+            .iter()
+            .map(|(l, _, _)| l.len())
+            .chain(std::iter::once("Free".len()))
+            .max()
+            .unwrap_or(12);
+        let pct_of = |tokens: u64| -> String {
+            if !known {
+                return "—".to_string();
             }
-            for wrapped in wrap_chars(raw, width) {
-                lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+            let pct = tokens.saturating_mul(100) / window.max(1);
+            if pct == 0 && tokens > 0 {
+                "<1%".to_string()
+            } else {
+                format!("{pct}%")
+            }
+        };
+        for (label, tokens, color) in &segs {
+            lines.push(context_legend_row(
+                "■",
+                label,
+                *tokens,
+                &pct_of(*tokens),
+                *color,
+                label_w,
+            ));
+        }
+        if known {
+            let free = report.free();
+            lines.push(context_legend_row(
+                "□",
+                "Free",
+                free,
+                &pct_of(free),
+                FAINT,
+                label_w,
+            ));
+        }
+
+        // Anchor the estimates to the footer's last measured total when there is one.
+        if let Some(usage) = self.last_usage {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "Last turn measured {} tokens · figures above are estimates",
+                    format_token_count_value(usage.total_tokens())
+                ),
+                Style::default().fg(FAINT),
+            )));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Figures are estimates (chars/4); the model's real fill may differ.",
+                Style::default().fg(FAINT),
+            )));
+        }
+
+        if let Some(text) = self.injected_context.as_deref() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width),
+                Style::default().fg(FAINT),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Injected context",
+                Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+            )));
+            if let Some(summary) = &self.injected_context_summary {
+                lines.push(Line::from(Span::styled(
+                    summary.clone(),
+                    Style::default().fg(MUTED),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "Background awareness only — the model won't reference this unless it's relevant.",
+                Style::default().fg(FAINT),
+            )));
+            lines.push(Line::from(""));
+            for raw in text.split('\n') {
+                if raw.trim().is_empty() {
+                    lines.push(Line::from(""));
+                    continue;
+                }
+                for wrapped in wrap_chars(raw, width) {
+                    lines.push(Line::from(Span::styled(wrapped, Style::default().fg(TEXT))));
+                }
             }
         }
 
@@ -2299,6 +2425,57 @@ fn mcp_health_color(health: McpHealth) -> Color {
         McpHealth::Idle => MUTED,
         McpHealth::Disabled => FAINT,
     }
+}
+
+/// `/context` fill bar: colored blocks per segment (share of `window`, else `used`),
+/// faint blocks for the free tail. Non-zero segments get at least one block.
+fn context_fill_bar(
+    segs: &[(String, u64, Color)],
+    used: u64,
+    window: u64,
+    bar_w: usize,
+) -> Line<'static> {
+    let total = if window > 0 { window } else { used.max(1) };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cells = 0usize;
+    for (_, tokens, color) in segs {
+        if *tokens == 0 {
+            continue;
+        }
+        let mut c = ((u128::from(*tokens) * bar_w as u128) / u128::from(total)) as usize;
+        c = c.max(1).min(bar_w.saturating_sub(cells));
+        if c == 0 {
+            continue;
+        }
+        cells += c;
+        spans.push(Span::styled("█".repeat(c), Style::default().fg(*color)));
+    }
+    let free = bar_w.saturating_sub(cells);
+    if free > 0 {
+        spans.push(Span::styled("░".repeat(free), Style::default().fg(FAINT)));
+    }
+    Line::from(spans)
+}
+
+/// One legend row for `/context`: `marker · label · right-aligned tokens · share`.
+fn context_legend_row(
+    marker: &str,
+    label: &str,
+    tokens: u64,
+    pct: &str,
+    color: Color,
+    label_w: usize,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ".to_string(), Style::default()),
+        Span::styled(format!("{marker} "), Style::default().fg(color)),
+        Span::styled(pad_to_width(label, label_w), Style::default().fg(TEXT)),
+        Span::styled(
+            format!("  {:>7}", format_token_count_value(tokens)),
+            Style::default().fg(MUTED),
+        ),
+        Span::styled(format!("  {pct:>4}"), Style::default().fg(FAINT)),
+    ])
 }
 
 /// Right-pad `s` with spaces to `width` display columns so a styled row's

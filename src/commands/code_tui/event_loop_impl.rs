@@ -2311,7 +2311,7 @@ impl CodeTuiApp {
             (Overlay::Help { .. }, _) => Ok(Some(false)),
             (Overlay::Context { .. }, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) => {
                 let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
-                if let Overlay::Context { scroll } = &mut self.overlay {
+                if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     *scroll = wheel_scroll(*scroll, up);
                 }
                 Ok(Some(false))

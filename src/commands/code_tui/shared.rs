@@ -253,7 +253,7 @@ pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "context",
         help_label: "/context",
-        description: "show the context injected with -c/--context",
+        description: "break down what's filling the context window this session",
         takes_argument: false,
     },
     SlashCommandSpec {
@@ -1030,8 +1030,9 @@ pub(super) enum Overlay {
     McpPaste(McpPasteOverlay),
     /// `/config` — a small fixed list of chat preferences, toggleable.
     Config(ConfigOverlay),
-    /// `/context` — read-only scrollable view of the injected `-c` block.
+    /// `/context` — the context-window breakdown, over the injected `-c` text.
     Context {
+        report: Box<crate::agent::engine::ContextReport>,
         scroll: u16,
     },
     Picker(Box<PickerState>),

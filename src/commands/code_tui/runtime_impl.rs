@@ -1188,7 +1188,7 @@ impl CodeTuiApp {
                 Ok(false)
             }
             SlashCommand::Context => {
-                self.open_context_overlay();
+                self.open_context_overlay().await;
                 Ok(false)
             }
             SlashCommand::Share(arg) => {

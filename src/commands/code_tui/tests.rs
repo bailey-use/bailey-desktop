@@ -6664,33 +6664,35 @@ fn test_parse_slash_context() {
     );
 }
 
-/// `/context` opens the viewer only when a `-c` block was injected; otherwise it
-/// leaves a notice explaining how to add one.
+/// `/context` always opens the breakdown, folding in the injected `-c` section when present.
 #[tokio::test]
-async fn test_context_overlay_requires_injection() {
+async fn test_context_overlay_shows_breakdown() {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = make_test_app(tx, rx);
 
-    // Nothing injected: a notice, no overlay.
-    app.open_context_overlay();
-    assert!(matches!(app.overlay, Overlay::None));
+    // Nothing injected: the breakdown still opens.
+    app.open_context_overlay().await;
+    assert!(matches!(app.overlay, Overlay::Context { scroll: 0, .. }));
+    let (screen, _) = render_full_screen(&mut app, 90, 30);
+    assert!(screen.contains("Context"), "title:\n{screen}");
+    assert!(screen.contains("System prompt"), "segments:\n{screen}");
+    assert!(screen.contains("Tools"), "segments:\n{screen}");
     assert!(
-        app.notice
-            .as_ref()
-            .is_some_and(|(_, msg)| msg.contains("No context injected")),
-        "notice: {:?}",
-        app.notice
+        !screen.contains("Injected context"),
+        "no injection expected:\n{screen}"
     );
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .await
+        .unwrap();
+    assert!(matches!(app.overlay, Overlay::None));
 
-    // With an injected block, the viewer opens.
+    // With an injected block, the breakdown also carries the injected section + body.
     app.injected_context = Some("# aivo context\n\n**Topic:** prior work".to_string());
     app.injected_context_summary = Some("injected ~9 tokens from claude session abc (2m)".into());
-    app.open_context_overlay();
-    assert!(matches!(app.overlay, Overlay::Context { scroll: 0 }));
-
-    // It renders the summary header and the injected body, and Esc closes it.
-    let (screen, _) = render_full_screen(&mut app, 90, 30);
-    assert!(screen.contains("Injected context"), "title:\n{screen}");
+    app.open_context_overlay().await;
+    assert!(matches!(app.overlay, Overlay::Context { scroll: 0, .. }));
+    let (screen, _) = render_full_screen(&mut app, 90, 44);
+    assert!(screen.contains("Injected context"), "section:\n{screen}");
     assert!(
         screen.contains("injected ~9 tokens from claude session abc"),
         "summary header:\n{screen}"

@@ -28,7 +28,7 @@ use crate::agent::secrets_guard;
 use crate::agent::skills::{self, Skill};
 use crate::agent::subagents::{self, Subagent};
 use crate::agent::system_prompt::system_prompt;
-use crate::agent::tokens::{content_to_parts, estimate_tokens, usage_tokens};
+use crate::agent::tokens::{content_to_parts, estimate_str_tokens, estimate_tokens, usage_tokens};
 use crate::agent::{serve_client, tool_repair, tools, verify};
 use crate::services::serve_router::extract_usage_from_value;
 use crate::services::session_store::SessionTokens;
@@ -390,6 +390,38 @@ pub struct AgentEngine {
     lsp: Option<crate::agent::lsp::LspManager>,
     /// App-owned background-job table; `None` → `check_job` unadvertised.
     jobs: Option<crate::agent::jobs::SharedJobs>,
+    /// chars/4 tokens of the `-c` block folded into the system prompt, so
+    /// `context_report` can split it back out.
+    injected_context_tokens: usize,
+}
+
+/// Calibrated chars/4 breakdown of what fills the context window, for `/context`.
+#[derive(Clone, Debug, Default)]
+pub struct ContextReport {
+    /// Context window in tokens (0 = unknown).
+    pub context_window: u32,
+    /// System message minus the injected `-c` block.
+    pub system_prompt: u64,
+    /// The injected `-c` block (0 when none).
+    pub injected_context: u64,
+    pub tools: u64,
+    pub tool_count: usize,
+    pub mcp_tools: u64,
+    pub mcp_tool_count: usize,
+    /// Transcript: every message after the system prompt.
+    pub messages: u64,
+    pub message_count: usize,
+    pub calibration: f64,
+}
+
+impl ContextReport {
+    pub fn used(&self) -> u64 {
+        self.system_prompt + self.injected_context + self.tools + self.mcp_tools + self.messages
+    }
+
+    pub fn free(&self) -> u64 {
+        u64::from(self.context_window).saturating_sub(self.used())
+    }
 }
 
 /// Live `aivo code` session facts injected into the system prompt so the agent can answer
@@ -497,6 +529,7 @@ impl AgentEngine {
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
             jobs: None,
+            injected_context_tokens: 0,
         }
     }
 
@@ -832,6 +865,7 @@ questions.",
         if text.is_empty() {
             return;
         }
+        self.injected_context_tokens += estimate_str_tokens(text);
         if let Some(sys) = self.messages.first_mut() {
             let cur = sys
                 .get("content")
@@ -1086,6 +1120,39 @@ questions.",
         let msg_chars: usize = self.messages.iter().map(|m| m.to_string().len()).sum();
         let tool_chars: usize = self.tools_openai.iter().map(|t| t.to_string().len()).sum();
         ((msg_chars + tool_chars) / 4) as u64
+    }
+
+    /// Calibrated composition snapshot for the `/context` viewer.
+    pub fn context_report(&self) -> ContextReport {
+        let cal = self.token_calibration;
+        let calib = |tokens: usize| (tokens as f64 * cal) as u64;
+
+        // `messages[0]` is the system message, with the `-c` block folded in.
+        let sys_full = estimate_tokens(&self.messages[..self.messages.len().min(1)]);
+        let injected = self.injected_context_tokens.min(sys_full);
+
+        let mcp_specs = self
+            .external
+            .as_ref()
+            .map(|e| e.specs())
+            .unwrap_or_default();
+        let mcp_tok = estimate_tokens(&mcp_specs);
+        let mcp_tool_count = mcp_specs.len();
+        let tools_full = estimate_tokens(&self.tools_openai);
+        let transcript = &self.messages[self.messages.len().min(1)..];
+
+        ContextReport {
+            context_window: self.context_window,
+            system_prompt: calib(sys_full.saturating_sub(injected)),
+            injected_context: calib(injected),
+            tools: calib(tools_full.saturating_sub(mcp_tok)),
+            tool_count: self.tools_openai.len().saturating_sub(mcp_tool_count),
+            mcp_tools: calib(mcp_tok),
+            mcp_tool_count,
+            messages: calib(estimate_tokens(transcript)),
+            message_count: transcript.len(),
+            calibration: cal,
+        }
     }
 
     /// Under `AIVO_DEBUG`, warn when the cached prefix (system prompt + tools) drifts.
@@ -2591,6 +2658,50 @@ mod tests {
                 .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("web_search")),
             "gemini must not carry the native web_search server tool"
         );
+    }
+
+    #[test]
+    fn context_report_splits_system_tools_and_transcript() {
+        let mut e = AgentEngine::new(
+            "/tmp/proj",
+            "deepseek-v4",
+            "2026-01-01",
+            &[],
+            &[],
+            200_000,
+            0,
+        );
+        let base = e.context_report();
+        assert_eq!(base.context_window, 200_000);
+        assert!(base.system_prompt > 0, "system prompt counted");
+        assert!(base.tools > 0, "built-in tools counted");
+        assert!(base.tool_count > 0, "built-in tools enumerated");
+        assert_eq!(base.injected_context, 0, "no -c block yet");
+        assert_eq!(base.mcp_tools, 0);
+        assert_eq!(base.mcp_tool_count, 0);
+        assert_eq!(base.messages, 0, "no transcript yet");
+        assert_eq!(base.message_count, 0);
+        assert_eq!(base.used(), base.system_prompt + base.tools);
+        assert!(base.free() > 0, "window leaves headroom");
+
+        // A `-c` block splits out without inflating the base (only rounding drift).
+        let injected = format!("PRIOR SESSION CONTEXT: {}", "x".repeat(4_000));
+        e.append_system_context(&injected);
+        let with_ctx = e.context_report();
+        assert!(with_ctx.injected_context >= 900, "≈4k chars/4 ≈ 1k tokens");
+        assert!(
+            with_ctx.system_prompt.abs_diff(base.system_prompt) <= 5,
+            "base system prompt unchanged by the append: {} vs {}",
+            with_ctx.system_prompt,
+            base.system_prompt
+        );
+
+        // A transcript turn lands in `messages`, not system/tools.
+        e.seed_history([("user".to_string(), "hello there".to_string())]);
+        let with_msg = e.context_report();
+        assert!(with_msg.messages > 0, "transcript counted");
+        assert_eq!(with_msg.message_count, 1);
+        assert!(with_msg.system_prompt.abs_diff(base.system_prompt) <= 5);
     }
 
     #[derive(Default)]

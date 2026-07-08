@@ -798,7 +798,7 @@ impl CodeTuiApp {
             Overlay::Context { .. } => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                     self.overlay = Overlay::None;
-                } else if let Overlay::Context { scroll } = &mut self.overlay {
+                } else if let Overlay::Context { scroll, .. } = &mut self.overlay {
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     apply_detail_scroll(scroll, key, ctrl);
                 }

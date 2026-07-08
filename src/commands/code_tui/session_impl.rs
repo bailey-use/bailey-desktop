@@ -422,17 +422,73 @@ is preserved."
         self.overlay = Overlay::Help { scroll: 0 };
     }
 
-    /// `/context`: view the injected `-c` block, or a notice when none was.
-    pub(super) fn open_context_overlay(&mut self) {
-        if self.injected_context.is_none() {
-            self.notice = Some((
-                MUTED,
-                "No context injected — launch with `aivo code -c` to add prior-session context"
-                    .to_string(),
-            ));
-            return;
+    /// `/context`: the context-window breakdown viewer.
+    pub(super) async fn open_context_overlay(&mut self) {
+        let report = self.compute_context_report().await;
+        self.overlay = Overlay::Context {
+            report: Box::new(report),
+            scroll: 0,
+        };
+    }
+
+    /// The live engine's report when built and idle; else a preview. `try_lock` (not
+    /// `lock`) because `/context` runs mid-turn and the response task holds the engine.
+    async fn compute_context_report(&self) -> crate::agent::engine::ContextReport {
+        if let Some(session) = self.agent_engine.as_ref()
+            && let Ok(engine) = session.engine.try_lock()
+        {
+            return engine.context_report();
         }
-        self.overlay = Overlay::Context { scroll: 0 };
+        self.preview_context_report().await
+    }
+
+    /// A throwaway engine mirroring the send path's ingredients, for before the first
+    /// turn (or while the live one is busy). Read-only: only already-connected MCP counts.
+    async fn preview_context_report(&self) -> crate::agent::engine::ContextReport {
+        use crate::agent::engine::AgentEngine;
+        let real_cwd = if self.real_cwd.is_empty() {
+            ".".to_string()
+        } else {
+            self.real_cwd.clone()
+        };
+        let cwd = std::path::Path::new(&real_cwd);
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let guides = crate::agent::system_prompt::discover_project_guides(cwd);
+        let mut skills = crate::agent::skills::discover_skills(cwd);
+        if let Ok(disabled) = self.session_store.get_disabled_skills().await {
+            let disabled: std::collections::HashSet<String> = disabled.into_iter().collect();
+            skills.retain(|s| !disabled.contains(&s.name));
+        }
+        let window = self.context_window.min(u32::MAX as u64) as u32;
+        let mut engine =
+            AgentEngine::new(&real_cwd, &self.model, &date, &guides, &skills, window, 0);
+        let subagents =
+            crate::agent::subagents::discover_subagents(self.session_store.config_dir());
+        engine.set_subagents(&subagents);
+        if let Some(ctx) = self.injected_context.as_deref() {
+            engine.append_system_context(ctx);
+        }
+        // Only already-connected servers are in context; mirror the Ctrl+T filter.
+        if let Some(client) = &self.mcp_client
+            && client.has_tools()
+        {
+            let disabled: std::collections::HashSet<String> = self
+                .session_store
+                .get_disabled_mcp_tools()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if disabled.is_empty() {
+                engine.set_external_tools(client.clone());
+            } else {
+                engine.set_external_tools(std::sync::Arc::new(
+                    crate::agent::mcp::FilteredTools::new(client.clone(), disabled),
+                ));
+            }
+        }
+        engine.seed_history(super::runtime_impl::agent_seed_turns(&self.history));
+        engine.context_report()
     }
 
     /// `/config`: a small toggle list of chat preferences, seeded from the live

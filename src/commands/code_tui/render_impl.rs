@@ -2476,13 +2476,15 @@ impl CodeTuiApp {
     }
 
     pub(super) fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        // Right side: context meter + effort tier, each in its own hue → separate spans.
+        // Right side: the context meter (which warms toward the window limit) and,
+        // when thinking is on, the effort tier. The effort is a static setting, so
+        // it stays quiet MUTED — only the meter's warning/error warmth draws the eye.
         let (meter_label, meter_color) = self.footer_status_label();
         let mut right_spans: Vec<Span<'static>> =
             vec![Span::styled(meter_label, Style::default().fg(meter_color))];
         if let Some(effort) = self.footer_effort_label() {
             right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
-            right_spans.push(Span::styled(effort, Style::default().fg(TOOL)));
+            right_spans.push(Span::styled(effort, Style::default().fg(MUTED)));
         }
         let right_label_width: u16 = right_spans
             .iter()
@@ -2514,18 +2516,16 @@ impl CodeTuiApp {
             self.git_branch.as_deref(),
             left_width.saturating_sub(badge_w),
         );
-        // Status-line hierarchy instead of one flat gray: the model name (first
-        // segment) carries the brand accent as the identity anchor, the ` · `
-        // glue recedes to FAINT, and the host/cwd context stays MUTED.
+        // Status-line: the model name and host/cwd context share one MUTED hue,
+        // with the ` · ` glue receding to FAINT between segments.
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (index, segment) in left_text.split(" · ").enumerate() {
             if index > 0 {
                 spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
             }
-            let color = if index == 0 { ACCENT } else { MUTED };
             spans.push(Span::styled(
                 segment.to_string(),
-                Style::default().fg(color),
+                Style::default().fg(MUTED),
             ));
             // Badges sit right after the model (first segment).
             if index == 0 {

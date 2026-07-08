@@ -724,7 +724,7 @@ impl CodeTuiApp {
             self.context_tokens = context_tokens;
             self.context_is_estimate = false;
         } else {
-            self.context_tokens = estimate_context_tokens(&self.history);
+            self.context_tokens = self.estimated_context_used();
             self.context_is_estimate = true;
         }
         self.last_usage = None;

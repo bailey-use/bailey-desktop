@@ -2165,7 +2165,7 @@ pieces and keep going"
             reasoning_content,
             attachments: vec![],
         });
-        self.context_tokens = estimate_context_tokens(&self.history);
+        self.context_tokens = self.estimated_context_used();
         self.context_is_estimate = true;
         self.last_usage = None;
         self.persist_history().await?;

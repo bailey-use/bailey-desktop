@@ -491,6 +491,17 @@ is preserved."
         engine.context_report()
     }
 
+    /// Idle context fill for the footer: the live engine's report total (what
+    /// `/context` shows) so the two agree, else a chars/4 transcript estimate.
+    pub(super) fn estimated_context_used(&self) -> u64 {
+        if let Some(session) = self.agent_engine.as_ref()
+            && let Ok(engine) = session.engine.try_lock()
+        {
+            return engine.context_report().used();
+        }
+        estimate_context_tokens(&self.history)
+    }
+
     /// `/config`: a small toggle list of chat preferences, seeded from the live
     /// state. The list is fixed (no filter/add/remove) and each row flips on
     /// Enter/Space.
@@ -2399,7 +2410,8 @@ is preserved."
         self.pending_submit = None;
         self.format = seeded_chat_format(&self.key, &session.raw_model);
         self.last_usage = None;
-        self.context_tokens = estimate_context_tokens(&self.history);
+        // `agent_engine` cleared above → history-estimate fallback until first turn.
+        self.context_tokens = self.estimated_context_used();
         self.follow_output = true;
         self.transcript_scroll = 0;
         self.raw_model = session.raw_model.clone();

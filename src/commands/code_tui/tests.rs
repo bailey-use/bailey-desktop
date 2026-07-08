@@ -4404,7 +4404,13 @@ fn test_hint_bar_reflects_state() {
         screen
     }
 
-    assert!(bottom_row(|_| {}).contains("commands"), "idle hint bar");
+    // Idle: no key hints; the footer is one row (the status line + context meter).
+    let idle = bottom_row(|_| {});
+    assert!(idle.contains("tokens"), "idle status line: {idle:?}");
+    assert!(
+        !idle.contains("commands"),
+        "idle key hints retired: {idle:?}"
+    );
     assert!(
         bottom_row(|a| a.sending = true).contains("interrupt"),
         "sending hint bar"
@@ -4434,15 +4440,15 @@ fn test_hint_bar_reflects_state() {
         bottom_row(|a| a.queued_messages = vec!["next".to_string()]).contains("queued"),
         "queued indicator"
     );
-    // The effort badge shows only when thinking is on for a thinking-capable model with levels.
+    // Effort tier (bare value) shows on the status line only when thinking is on.
     assert!(
         bottom_row(|a| {
             a.thinking_enabled = true;
             a.model_supports_thinking = true;
             a.model_reasoning_efforts = vec!["high".to_string()];
         })
-        .contains("effort"),
-        "effort badge shown when thinking on"
+        .contains("high"),
+        "effort tier shown when thinking on"
     );
     assert!(
         !bottom_row(|a| {
@@ -4450,8 +4456,8 @@ fn test_hint_bar_reflects_state() {
             a.model_supports_thinking = true;
             a.model_reasoning_efforts = vec!["high".to_string()];
         })
-        .contains("effort"),
-        "effort badge hidden when thinking off"
+        .contains("high"),
+        "effort tier hidden when thinking off"
     );
 }
 
@@ -5737,8 +5743,8 @@ fn test_render_main_uses_full_height_for_long_transcript() {
         })
         .unwrap();
 
-    // Bottom of the composer = terminal height (12) minus the 2-row footer.
-    assert_eq!(composer_area.y + composer_area.height, 10);
+    // Composer bottom = height (12) minus the footer (1 row when idle, as here).
+    assert_eq!(composer_area.y + composer_area.height, 11);
     assert_eq!(app.transcript_hitbox.as_ref().unwrap().area.y, 0);
     // 80 cols minus the 2-col accent gutter; the overflow transcript keeps full
     // width now that no scrollbar column is reserved.

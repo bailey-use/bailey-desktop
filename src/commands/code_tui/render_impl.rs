@@ -1670,8 +1670,8 @@ impl CodeTuiApp {
 
     pub(super) fn render_main(&mut self, frame: &mut Frame<'_>, area: Rect) -> Rect {
         let composer_height = self.composer_height(area.width);
-        // Two rows: the status line + the contextual shortcut hint bar.
-        let footer_height = 2u16;
+        // Status line always; hint bar adds a second row only when it has content.
+        let footer_height = if self.hint_bar_has_content() { 2 } else { 1 };
         // The pinned plan/task-list panel sits between the transcript and the
         // composer (a faint top rule + the wrapped checklist), so progress stays
         // visible instead of scrolling away under later tool calls. Sized from the
@@ -1881,13 +1881,14 @@ impl CodeTuiApp {
             frame.set_cursor_position((cursor_x, cursor_y));
         }
 
-        // Footer block: status line on top, contextual hint bar at the bottom.
         let footer_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Length(1)])
             .split(footer_outer);
         self.render_footer(frame, footer_rows[0]);
-        self.render_hint_bar(frame, footer_rows[1]);
+        if footer_rows[1].height > 0 {
+            self.render_hint_bar(frame, footer_rows[1]);
+        }
         composer_area
     }
 
@@ -2475,8 +2476,18 @@ impl CodeTuiApp {
     }
 
     pub(super) fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let (right_label, right_color) = self.footer_status_label();
-        let right_label_width = display_width(&right_label) as u16;
+        // Right side: context meter + effort tier, each in its own hue → separate spans.
+        let (meter_label, meter_color) = self.footer_status_label();
+        let mut right_spans: Vec<Span<'static>> =
+            vec![Span::styled(meter_label, Style::default().fg(meter_color))];
+        if let Some(effort) = self.footer_effort_label() {
+            right_spans.push(Span::styled(" · ", Style::default().fg(FAINT)));
+            right_spans.push(Span::styled(effort, Style::default().fg(TOOL)));
+        }
+        let right_label_width: u16 = right_spans
+            .iter()
+            .map(|s| display_width(s.content.as_ref()) as u16)
+            .sum();
         let left_width = if right_label_width == 0 {
             area.width
         } else {
@@ -2532,7 +2543,7 @@ impl CodeTuiApp {
         let pad = left_width.saturating_sub(left_len);
         if right_label_width > 0 {
             spans.push(Span::raw(" ".repeat(usize::from(pad) + 1)));
-            spans.push(Span::styled(right_label, Style::default().fg(right_color)));
+            spans.extend(right_spans);
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
@@ -2576,9 +2587,7 @@ impl CodeTuiApp {
         } else if self.sending {
             vec![("esc", "interrupt"), ("type", "queue next")]
         } else {
-            let mut idle = vec![("/", "commands"), ("↑", "history")];
-            idle.push(("^C", "exit"));
-            idle
+            Vec::new() // Idle: no key hints; the footer is a single status-line row.
         };
         let mut spans = Vec::new();
         for (idx, (keycap, label)) in pairs.iter().enumerate() {
@@ -2594,39 +2603,33 @@ impl CodeTuiApp {
         spans
     }
 
-    /// Right-hand state indicators. Just the queued-message dot now — the
-    /// auto-approve mode badge lives on the composer rule (see
-    /// [`Self::composer_rule_line`]) so a permission-bypass mode can't be dropped
-    /// when a narrow terminal squeezes this bar.
-    fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        // Effort: Cursor's tier comes from the model id; otherwise the effective
-        // level the engine sends (only while thinking is on, so they can't disagree).
+    /// Whether the hint bar has content — key hints or a queued dot. Idle → false.
+    fn hint_bar_has_content(&self) -> bool {
+        !self.hint_key_spans().is_empty() || !self.hint_indicator_spans().is_empty()
+    }
+
+    /// Effort tier for the status line: Cursor's from the model id, else the engine's
+    /// effective level (only while thinking is on, so the two can't disagree).
+    pub(super) fn footer_effort_label(&self) -> Option<String> {
         if let Some(label) = self.cursor_effort_label.as_deref() {
-            spans.push(Span::styled(
-                format!("effort: {label}"),
-                Style::default().fg(TOOL),
-            ));
-        } else if self.thinking_enabled
-            && self.model_supports_thinking
-            && let Some(level) = self.effective_reasoning_effort()
-        {
-            spans.push(Span::styled(
-                format!("effort: {level}"),
-                Style::default().fg(TOOL),
-            ));
+            Some(label.to_string())
+        } else if self.thinking_enabled && self.model_supports_thinking {
+            self.effective_reasoning_effort()
+        } else {
+            None
         }
+    }
+
+    /// Right-hand hint-bar indicator: just the queued-message dot.
+    fn hint_indicator_spans(&self) -> Vec<Span<'static>> {
         let queued = self.queued_messages.len() + self.queued_commands.len();
-        if queued > 0 {
-            if !spans.is_empty() {
-                spans.push(Span::styled("   ".to_string(), Style::default().fg(FAINT)));
-            }
-            spans.push(Span::styled(
-                format!("● {queued} queued"),
-                Style::default().fg(ACCENT),
-            ));
+        if queued == 0 {
+            return Vec::new();
         }
-        spans
+        vec![Span::styled(
+            format!("● {queued} queued"),
+            Style::default().fg(ACCENT),
+        )]
     }
 
     /// Present-tense label for the in-flight tool step (e.g. `running grep`), or

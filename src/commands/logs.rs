@@ -1445,7 +1445,11 @@ async fn fetch_native_rows(
         // context picker uses a separate IngestOptions with this off.
         include_short_first_user: true,
     };
-    let mut all = context_ingest::ingest_native_sessions_global(opts).await?;
+    // Only search matching and `--json` read `last_response`; when neither
+    // does, the ingester head-parses each session file instead of the full
+    // (often multi-MB) transcript.
+    let need_last_response = args.search.is_some() || args.json;
+    let mut all = context_ingest::ingest_native_sessions_global(opts, need_last_response).await?;
     all.retain(|t| native_passes_filters(t, args, cwd_filter.as_deref()));
     Ok(all)
 }

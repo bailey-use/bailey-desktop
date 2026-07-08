@@ -202,9 +202,15 @@ async fn ingest_project_inner(
 /// listing. Each source is fanned out concurrently and capped per
 /// `opts.max_per_source`. Threads are merged, age-filtered, sorted desc by
 /// `updated_at`.
-pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Thread>> {
+pub async fn ingest_native_sessions_global(
+    opts: IngestOptions,
+    need_last_response: bool,
+) -> Result<Vec<Thread>> {
     let cap = opts.max_per_source;
     let permissive = opts.include_short_first_user;
+    // Head-only parse unless a caller needs `last_response`. See
+    // `extract_claude_thread_headline`.
+    let headline = !need_last_response;
     // Push the time cutoff down to the file walks: each per-source ingester
     // drops jsonl files whose mtime is already older than the cutoff before
     // touching them. mtime ≥ last-message-ts for an append-only jsonl, so a
@@ -212,10 +218,10 @@ pub async fn ingest_native_sessions_global(opts: IngestOptions) -> Result<Vec<Th
     let cutoff = effective_cutoff(&opts);
     let cutoff_st = cutoff.map(SystemTime::from);
     let (claude, codex, gemini, pi, opencode) = tokio::join!(
-        ingest_claude_global(cap, cutoff_st, permissive),
-        ingest_codex_global(cap, cutoff_st, permissive),
+        ingest_claude_global(cap, cutoff_st, permissive, headline),
+        ingest_codex_global(cap, cutoff_st, permissive, headline),
         ingest_gemini_global(cap, cutoff_st, permissive),
-        ingest_pi_global(cap, cutoff_st, permissive),
+        ingest_pi_global(cap, cutoff_st, permissive, headline),
         ingest_opencode_global(cap, cutoff, permissive),
     );
 
@@ -241,6 +247,7 @@ async fn ingest_claude_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
     permissive: bool,
+    headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
@@ -283,13 +290,18 @@ async fn ingest_claude_global(
     all_paths.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let mut out = Vec::new();
-    for (path, _) in all_paths {
+    for (path, mtime) in all_paths {
         if let Some(n) = cap
             && out.len() >= n
         {
             break;
         }
-        if let Some(thread) = extract_claude_thread(&path, permissive).await {
+        let thread = if headline {
+            extract_claude_thread_headline(&path, mtime, permissive).await
+        } else {
+            extract_claude_thread(&path, permissive).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -300,6 +312,7 @@ async fn ingest_codex_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
     permissive: bool,
+    headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
@@ -316,7 +329,12 @@ async fn ingest_codex_global(
         {
             break;
         }
-        if let Some(thread) = extract_codex_thread_any(&path, permissive).await {
+        let thread = if headline {
+            extract_codex_thread_headline(&path, permissive).await
+        } else {
+            extract_codex_thread_any(&path, permissive).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -396,6 +414,71 @@ async fn extract_codex_thread_any(path: &Path, permissive: bool) -> Option<Threa
     })
 }
 
+/// Head-only codex extractor; see `extract_claude_thread_headline`.
+async fn extract_codex_thread_headline(path: &Path, permissive: bool) -> Option<Thread> {
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut first_user: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind == "session_meta"
+            && let Some(payload) = v.get("payload")
+        {
+            if let Some(id) = payload.get("id").and_then(|s| s.as_str()) {
+                session_id = Some(id.to_string());
+            }
+            if let Some(cwd) = payload.get("cwd").and_then(|s| s.as_str()) {
+                session_cwd = Some(cwd.to_string());
+            }
+        }
+        if first_user.is_none()
+            && kind == "response_item"
+            && let Some(payload) = v.get("payload")
+            && payload.get("type").and_then(|t| t.as_str()) == Some("message")
+            && payload.get("role").and_then(|s| s.as_str()) == Some("user")
+        {
+            let raw = extract_codex_message_text(payload).unwrap_or_default();
+            first_user = pick_first_user_turn(&raw, permissive);
+        }
+        if session_id.is_some() && first_user.is_some() {
+            break;
+        }
+    }
+
+    let updated_at = fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from)
+        .unwrap_or_else(Utc::now);
+    Some(Thread {
+        cli: "codex".into(),
+        session_id: session_id?,
+        source_path: path.to_string_lossy().to_string(),
+        topic: first_user?,
+        last_response: String::new(),
+        updated_at,
+        cwd: session_cwd,
+    })
+}
+
 async fn ingest_gemini_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
@@ -457,6 +540,7 @@ async fn ingest_pi_global(
     cap: Option<usize>,
     after: Option<SystemTime>,
     permissive: bool,
+    headline: bool,
 ) -> Vec<Thread> {
     let Some(home) = system_env::home_dir() else {
         return Vec::new();
@@ -496,13 +580,18 @@ async fn ingest_pi_global(
     all_paths.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let mut out = Vec::new();
-    for (path, _) in all_paths {
+    for (path, mtime) in all_paths {
         if let Some(n) = cap
             && out.len() >= n
         {
             break;
         }
-        if let Some(thread) = extract_pi_thread(&path, permissive).await {
+        let thread = if headline {
+            extract_pi_thread_headline(&path, mtime, permissive).await
+        } else {
+            extract_pi_thread(&path, permissive).await
+        };
+        if let Some(thread) = thread {
             out.push(thread);
         }
     }
@@ -1301,6 +1390,63 @@ async fn extract_pi_thread(path: &Path, permissive: bool) -> Option<Thread> {
     })
 }
 
+/// Head-only pi extractor; see `extract_claude_thread_headline`.
+async fn extract_pi_thread_headline(
+    path: &Path,
+    mtime: SystemTime,
+    permissive: bool,
+) -> Option<Thread> {
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
+    let mut lines = BufReader::new(file).lines();
+
+    let mut session_id: Option<String> = None;
+    let mut first_user: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if session_id.is_none()
+            && kind == "session"
+            && let Some(id) = v.get("id").and_then(|s| s.as_str())
+        {
+            session_id = Some(id.to_string());
+        }
+        if first_user.is_none()
+            && kind == "message"
+            && let Some(message) = v.get("message")
+            && message.get("role").and_then(|s| s.as_str()) == Some("user")
+        {
+            let raw = extract_pi_text(message).unwrap_or_default();
+            first_user = pick_first_user_turn(&raw, permissive);
+        }
+        if session_id.is_some() && first_user.is_some() {
+            break;
+        }
+    }
+
+    Some(Thread {
+        cli: "pi".into(),
+        session_id: session_id?,
+        source_path: path.to_string_lossy().to_string(),
+        topic: first_user?,
+        last_response: String::new(),
+        updated_at: DateTime::<Utc>::from(mtime),
+        cwd: decode_pi_cwd(path),
+    })
+}
+
 /// Enumerate pi session files under the project's encoded cwd dir without
 /// applying `extract_pi_thread`'s substantive-turn filter. Returns one stub
 /// per parseable file with `session_id`, `source_path`, `cwd`, and
@@ -1925,6 +2071,74 @@ async fn extract_claude_thread(path: &Path, permissive: bool) -> Option<Thread> 
         topic: first_user?,
         last_response: last_assistant.unwrap_or_default(),
         updated_at: last_timestamp.unwrap_or_else(Utc::now),
+        cwd: event_cwd.or_else(|| decode_claude_cwd(path)),
+    })
+}
+
+/// Listing-optimized: stops once session id + cwd + first user turn are read,
+/// since the `aivo logs` view shows only the topic + time — parsing the whole
+/// (often multi-MB) transcript for `last_response` + the trailing timestamp is
+/// waste. `updated_at` uses the walk's file mtime (≥ last-message-ts for an
+/// append-only jsonl); search/`--json` callers use `extract_claude_thread`.
+async fn extract_claude_thread_headline(
+    path: &Path,
+    mtime: SystemTime,
+    permissive: bool,
+) -> Option<Thread> {
+    let file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(err) => {
+            warn_unreadable_session(path, &err.to_string());
+            return None;
+        }
+    };
+    let mut lines = BufReader::new(file).lines();
+
+    let mut first_user: Option<String> = None;
+    let mut session_id: Option<String> = None;
+    let mut event_cwd: Option<String> = None;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if session_id.is_none()
+            && let Some(sid) = v.get("sessionId").and_then(|s| s.as_str())
+        {
+            session_id = Some(sid.to_string());
+        }
+        if event_cwd.is_none()
+            && let Some(c) = v.get("cwd").and_then(|s| s.as_str())
+            && !c.is_empty()
+        {
+            event_cwd = Some(c.to_string());
+        }
+        if first_user.is_none()
+            && !v
+                .get("isSidechain")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+            && v.get("type").and_then(|t| t.as_str()) == Some("user")
+        {
+            let raw = extract_claude_text(v.get("message")).unwrap_or_default();
+            first_user = pick_first_user_turn(&raw, permissive);
+        }
+        if first_user.is_some() && session_id.is_some() && event_cwd.is_some() {
+            break;
+        }
+    }
+
+    Some(Thread {
+        cli: "claude".into(),
+        session_id: session_id?,
+        source_path: path.to_string_lossy().to_string(),
+        topic: first_user?,
+        last_response: String::new(),
+        updated_at: DateTime::<Utc>::from(mtime),
         cwd: event_cwd.or_else(|| decode_claude_cwd(path)),
     })
 }

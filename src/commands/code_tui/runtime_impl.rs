@@ -2045,10 +2045,10 @@ pieces and keep going"
         self.pending_plan = None;
         self.plan_card_idx = None;
         self.notice = None;
-        // Drop the cursor-agent session so the next turn opens a fresh ACP
-        // session — cursor's server-side chat context shouldn't bleed across
-        // /new.
+        // Drop the cursor session (no context bleed across /new), then
+        // re-prewarm so the next message's connect overlaps typing.
         self.cursor_acp_session = None;
+        self.prewarm_cursor_session();
         // Drop the agent engine + serve so a fresh chat starts with no context.
         self.agent_engine = None;
         // A fresh chat must not inherit a resumed session's pending transcript.

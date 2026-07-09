@@ -724,7 +724,7 @@ impl CodeTuiApp {
             self.context_tokens = context_tokens;
             self.context_is_estimate = false;
         } else {
-            self.context_tokens = self.estimated_context_used();
+            self.context_tokens = self.estimated_context_used().await;
             self.context_is_estimate = true;
         }
         self.last_usage = None;
@@ -1107,7 +1107,7 @@ impl CodeTuiApp {
         self.context_tokens = if turn.usage.is_some() {
             usage.total_tokens()
         } else {
-            estimate_context_tokens(&self.history)
+            self.estimated_context_used().await
         };
         // cursor ACP returns no usage → the figure is a transcript estimate.
         self.context_is_estimate = turn.usage.is_none();

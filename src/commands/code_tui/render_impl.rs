@@ -2636,7 +2636,7 @@ impl CodeTuiApp {
     /// until that lands we grow a chars/4 estimate of the transcript plus the text
     /// streamed so far, so the fill still moves for providers that only report
     /// usage at the end of the turn. Idle: the last turn's measured total.
-    fn context_fill(&self) -> (u64, bool) {
+    pub(super) fn context_fill(&self) -> (u64, bool) {
         if self.sending {
             if let Some(usage) = self.live_usage {
                 return (usage.total_tokens(), false);

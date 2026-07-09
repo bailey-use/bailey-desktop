@@ -479,6 +479,14 @@ impl CodeTuiApp {
         });
         let width = usize::from(inner.width).max(1);
 
+        // Anchor the split to the footer's measured fill so the two match.
+        let (fill, is_estimate) = self.context_fill();
+        let mut report = report.clone();
+        if !is_estimate {
+            report.rescale(fill);
+        }
+        let report = &report;
+
         let window = u64::from(report.context_window);
         let known = window > 0;
         let used = report.used();
@@ -579,23 +587,13 @@ impl CodeTuiApp {
             ));
         }
 
-        // Anchor the estimates to the footer's last measured total when there is one.
-        if let Some(usage) = self.last_usage {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "Last turn measured {} tokens · figures above are estimates",
-                    format_token_count_value(usage.total_tokens())
-                ),
-                Style::default().fg(FAINT),
-            )));
+        lines.push(Line::from(""));
+        let note = if is_estimate {
+            "Figures are estimates (chars/4); the model's real fill may differ."
         } else {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Figures are estimates (chars/4); the model's real fill may differ.",
-                Style::default().fg(FAINT),
-            )));
-        }
+            "Total is the last measured prompt; the split is a chars/4 estimate."
+        };
+        lines.push(Line::from(Span::styled(note, Style::default().fg(FAINT))));
 
         if let Some(text) = self.injected_context.as_deref() {
             lines.push(Line::from(""));

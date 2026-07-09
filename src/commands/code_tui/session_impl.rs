@@ -552,15 +552,10 @@ is preserved."
         engine.context_report()
     }
 
-    /// Idle context fill for the footer: the live engine's report total (what
-    /// `/context` shows) so the two agree, else a chars/4 transcript estimate.
-    pub(super) fn estimated_context_used(&self) -> u64 {
-        if let Some(session) = self.agent_engine.as_ref()
-            && let Ok(engine) = session.engine.try_lock()
-        {
-            return engine.context_report().used();
-        }
-        estimate_context_tokens(&self.history)
+    /// Idle footer fill: the exact total `/context` shows, via the same
+    /// `compute_context_report`, so the two never disagree.
+    pub(super) async fn estimated_context_used(&self) -> u64 {
+        self.compute_context_report().await.used()
     }
 
     /// `/config`: a small toggle list of chat preferences, seeded from the live
@@ -2471,8 +2466,6 @@ is preserved."
         self.pending_submit = None;
         self.format = seeded_chat_format(&self.key, &session.raw_model);
         self.last_usage = None;
-        // `agent_engine` cleared above → history-estimate fallback until first turn.
-        self.context_tokens = self.estimated_context_used();
         self.follow_output = true;
         self.transcript_scroll = 0;
         self.raw_model = session.raw_model.clone();
@@ -2480,6 +2473,9 @@ is preserved."
             CodeCommand::transform_model_for_provider(&self.key.base_url, &session.raw_model);
         self.billed_model = None;
         self.refresh_context_window().await;
+        // After model/window are set, so the preview mirrors the resumed session.
+        self.context_tokens = self.estimated_context_used().await;
+        self.context_is_estimate = true;
         // Session-local: no persist, so viewing an old chat can't reset the key's
         // default model. Only explicit `/model` and `/key` persist.
         Ok(())

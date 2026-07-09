@@ -422,6 +422,22 @@ impl ContextReport {
     pub fn free(&self) -> u64 {
         u64::from(self.context_window).saturating_sub(self.used())
     }
+
+    /// Scale the chars/4 split so `used()` matches `target` (the measured
+    /// prompt), keeping each share — the safety calibration is clamped `>= 1.0`
+    /// and can't deflate chars/4's ~2x over-count of JSON tool defs.
+    pub fn rescale(&mut self, target: u64) {
+        let used = self.used();
+        if used == 0 || target == 0 {
+            return;
+        }
+        let scale = |v: u64| ((u128::from(v) * u128::from(target)) / u128::from(used)) as u64;
+        self.system_prompt = scale(self.system_prompt);
+        self.injected_context = scale(self.injected_context);
+        self.tools = scale(self.tools);
+        self.mcp_tools = scale(self.mcp_tools);
+        self.messages = scale(self.messages);
+    }
 }
 
 /// Live `aivo code` session facts injected into the system prompt so the agent can answer
@@ -2702,6 +2718,29 @@ mod tests {
         assert!(with_msg.messages > 0, "transcript counted");
         assert_eq!(with_msg.message_count, 1);
         assert!(with_msg.system_prompt.abs_diff(base.system_prompt) <= 5);
+    }
+
+    #[test]
+    fn context_report_rescale_anchors_total_and_keeps_proportions() {
+        let mut r = ContextReport {
+            context_window: 100_000,
+            system_prompt: 6_000,
+            tools: 4_000,
+            messages: 2_000,
+            ..Default::default()
+        };
+        assert_eq!(r.used(), 12_000);
+        r.rescale(6_000);
+        assert!(
+            r.used().abs_diff(6_000) <= 2,
+            "total ≈ target: {}",
+            r.used()
+        );
+        assert!(r.system_prompt.abs_diff(3_000) <= 1, "shares preserved");
+        assert!(r.tools.abs_diff(2_000) <= 1);
+        assert!(r.messages.abs_diff(1_000) <= 1);
+        r.rescale(0); // no-op, never blank the breakdown
+        assert!(r.used() > 0);
     }
 
     #[derive(Default)]

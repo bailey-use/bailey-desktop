@@ -1169,6 +1169,8 @@ impl CodeTuiApp {
         });
         let key = self.key.clone();
         let requested_model = (!self.raw_model.is_empty()).then(|| self.raw_model.clone());
+        // A fresh open (prewarm/`/new`) comes up in `agent`; re-apply plan below.
+        let want_plan_mode = self.cursor_plan_mode;
         let cwd = self.cursor_workspace_cwd();
         let tx = self.tx.clone();
         let format = self.format.clone();
@@ -1215,6 +1217,9 @@ impl CodeTuiApp {
                             // opened on one the user has since changed.
                             if let Some(m) = &requested_model {
                                 let _ = session.set_model(m).await;
+                            }
+                            if want_plan_mode {
+                                let _ = session.set_mode("plan").await;
                             }
                             let handles = (
                                 session.client_handle(),
@@ -2014,6 +2019,12 @@ pieces and keep going"
             Some((h, r)) => (h, r.trim()),
             None => (arg, ""),
         };
+        // Cursor runs its own agent: `/plan` maps to cursor's ACP mode, not the
+        // in-process engine's plan machinery.
+        if self.key.is_cursor_acp() {
+            self.run_cursor_plan_command(head, rest, arg).await;
+            return;
+        }
         match head {
             "go" | "run" | "execute" => {
                 if self.sending {
@@ -2121,6 +2132,102 @@ pieces and keep going"
         }
     }
 
+    /// `/plan` for cursor: drives cursor's ACP `plan` mode via `session/set_mode`.
+    /// No drafted-plan buffer — cursor owns its plan file and raises its own
+    /// `cursor/create_plan` approval card.
+    async fn run_cursor_plan_command(&mut self, head: &str, rest: &str, full: &str) {
+        match head {
+            "stop" | "cancel" | "discard" | "off" => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some("stop".to_string())), "/plan stop");
+                    return;
+                }
+                if !self.cursor_plan_mode {
+                    self.notice = Some((MUTED, "Plan mode isn't on".to_string()));
+                    return;
+                }
+                self.set_cursor_mode(false).await;
+                self.notice = Some((
+                    MUTED,
+                    "Plan mode off — cursor is back in agent mode".to_string(),
+                ));
+            }
+            "go" | "run" | "execute" => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some(full.to_string())), "/plan go");
+                    return;
+                }
+                self.set_cursor_mode(false).await;
+                if rest.is_empty() {
+                    self.notice = Some((
+                        MUTED,
+                        "Back in agent mode — send the go-ahead to execute the plan".to_string(),
+                    ));
+                } else if let Err(e) = self.dispatch_user_message(rest.to_string(), None).await {
+                    self.notice = Some((ERROR, e.to_string()));
+                }
+            }
+            "" | "on" => {
+                if self.cursor_plan_mode {
+                    self.notice = Some((
+                        MUTED,
+                        "Plan mode is on — describe what to plan, or /plan stop to leave"
+                            .to_string(),
+                    ));
+                    return;
+                }
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(None), "/plan");
+                    return;
+                }
+                if self.set_cursor_mode(true).await {
+                    self.notice = Some((
+                        MUTED,
+                        "Plan mode — cursor plans read-only and asks you to approve".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                if self.sending {
+                    self.queue_command(SlashCommand::Plan(Some(full.to_string())), "/plan");
+                    return;
+                }
+                if !self.cursor_plan_mode && !self.set_cursor_mode(true).await {
+                    return;
+                }
+                if let Err(e) = self.dispatch_user_message(full.to_string(), None).await {
+                    self.notice = Some((ERROR, e.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Switch the cursor session to `plan`/`agent`. Records the desired mode (a
+    /// later prewarm/`/new` open re-applies it) and applies it now if a session is
+    /// live. `false` only when a live session reports the mode unavailable.
+    async fn set_cursor_mode(&mut self, plan: bool) -> bool {
+        self.cursor_plan_mode = plan;
+        let mode = if plan { "plan" } else { "agent" };
+        let Some(session) = self.cursor_acp_session.as_mut() else {
+            return true;
+        };
+        match session.set_mode(mode).await {
+            Ok(true) => true,
+            Ok(false) => {
+                self.cursor_plan_mode = false;
+                self.notice = Some((
+                    ERROR,
+                    format!("cursor didn't offer a '{mode}' mode for this session"),
+                ));
+                false
+            }
+            Err(e) => {
+                self.notice = Some((ERROR, format!("Couldn't switch cursor mode: {e}")));
+                true
+            }
+        }
+    }
+
     /// After a plan-mode turn that ended WITHOUT an approval, stash the agent's
     /// last reply as the drafted plan (for `/plan go`) and frame it as the plan
     /// card. Plan mode and the read-only engine persist. No-op otherwise.
@@ -2188,6 +2295,7 @@ pieces and keep going"
         // Drop the cursor session (no context bleed across /new), then
         // re-prewarm so the next message's connect overlaps typing.
         self.cursor_acp_session = None;
+        self.cursor_plan_mode = false; // fresh session opens in `agent`
         self.prewarm_cursor_session();
         // Drop the agent engine + serve so a fresh chat starts with no context.
         self.agent_engine = None;

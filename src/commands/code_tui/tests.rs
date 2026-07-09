@@ -1460,6 +1460,7 @@ fn make_test_app(
         pending_external_edit: false,
         cursor_acp_session: None,
         cursor_prewarm: None,
+        cursor_plan_mode: false,
         pending_agent_messages: None,
         goal_mode: None,
         goal_guard_stop: None,

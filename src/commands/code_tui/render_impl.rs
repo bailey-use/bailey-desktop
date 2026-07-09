@@ -1951,15 +1951,17 @@ impl CodeTuiApp {
         // In `!cmd` shell mode the prompt's top line picks up the magenta shell
         // hue; in plan mode the whole rule tints ACCENT so the read-only session is
         // unmistakable. Shell wins (the tinted draft must match).
+        // Plan mode from either backend: in-process engine or cursor's ACP mode.
+        let plan_mode = self.plan_mode || self.cursor_plan_mode;
         let rule_style = if self.draft_is_shell_command() {
             Style::default().fg(SHELL)
-        } else if self.plan_mode {
+        } else if plan_mode {
             Style::default().fg(ACCENT)
         } else {
             Style::default().fg(FAINT)
         };
         // The mode badge — one slot, since the four modes are exclusive.
-        let (badge, badge_style) = if self.plan_mode {
+        let (badge, badge_style) = if plan_mode {
             (
                 "◇ plan",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),

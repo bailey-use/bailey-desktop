@@ -2191,6 +2191,10 @@ pub(super) struct CodeTuiApp {
             std::result::Result<crate::services::cursor_acp::CursorAcpSession, String>,
         >,
     >,
+    /// Desired cursor ACP mode: `true` = `plan` (emits `cursor/create_plan`),
+    /// `false` = `agent`. Applied via `session/set_mode`, re-applied on re-open.
+    /// Cursor keys only.
+    pub(super) cursor_plan_mode: bool,
     /// A resumed session's durable agent transcript (raw OpenAI messages with
     /// tool_calls + results), awaiting the next engine build to be restored
     /// verbatim (exact tool history). Consumed (`take`) on build; `None` otherwise.

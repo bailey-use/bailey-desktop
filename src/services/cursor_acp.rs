@@ -1225,6 +1225,10 @@ pub struct CursorAcpSession {
     session_id: String,
     model_id: Option<String>,
     models: Value,
+    /// `session/new` `modes` (`availableModes` + `currentModeId`); `Null` if none.
+    modes: Value,
+    /// Active mode id (`agent`/`plan`/`ask`); lets `set_mode` skip no-op switches.
+    current_mode: Option<String>,
     prompt_capabilities: PromptCapabilities,
     model_pick_preference: ModelPickPreference,
 }
@@ -1402,11 +1406,19 @@ impl CursorAcpSession {
             .and_then(Value::as_str)
             .map(str::to_string);
 
+        let modes = new_session.get("modes").cloned().unwrap_or(Value::Null);
+        let current_mode = modes
+            .get("currentModeId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
         Ok(Self {
             client,
             session_id,
             model_id: active_model,
             models,
+            modes,
+            current_mode,
             prompt_capabilities,
             model_pick_preference,
         })
@@ -1461,6 +1473,27 @@ impl CursorAcpSession {
             .await
             .context("cursor-agent session/set_model failed")?;
         self.model_id = Some(model_id);
+        Ok(true)
+    }
+
+    /// Switch cursor's mode (`agent`/`plan`/`ask`) via `session/set_mode`. Plan
+    /// mode is what makes cursor emit `cursor/create_plan`. `Ok(false)` when
+    /// `mode_id` isn't advertised — a no-op the caller must surface, else the UI lies.
+    pub async fn set_mode(&mut self, mode_id: &str) -> Result<bool> {
+        if !mode_available(&self.modes, mode_id) {
+            return Ok(false);
+        }
+        if self.current_mode.as_deref() == Some(mode_id) {
+            return Ok(true);
+        }
+        self.client
+            .request(
+                "session/set_mode",
+                json!({"sessionId": self.session_id, "modeId": mode_id}),
+            )
+            .await
+            .context("cursor-agent session/set_mode failed")?;
+        self.current_mode = Some(mode_id.to_string());
         Ok(true)
     }
 
@@ -1768,6 +1801,17 @@ fn compact_result(text: &str) -> String {
     }
 }
 
+/// True when `mode_id` is in `modes.availableModes`. No advertised list → allow
+/// (let cursor accept/reject) rather than block on a missing field.
+fn mode_available(modes: &Value, mode_id: &str) -> bool {
+    match modes.get("availableModes").and_then(Value::as_array) {
+        Some(arr) => arr
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(mode_id)),
+        None => true,
+    }
+}
+
 /// Look up the encoded modelId for `requested` against an ACP `models` object
 /// (the `models` field of a `session/new` response). Match by user-facing
 /// `name` (what `aivo models` shows). With `requested=None` returns
@@ -1835,6 +1879,27 @@ fn pick_prefer_no_thinking(list: &[Value], requested: &str) -> Option<String> {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn mode_available_matches_session_new_modes_shape() {
+        let modes = json!({
+            "availableModes": [
+                {"id": "agent", "name": "Agent"},
+                {"id": "plan", "name": "Plan"},
+                {"id": "ask", "name": "Ask"}
+            ],
+            "currentModeId": "agent"
+        });
+        assert!(mode_available(&modes, "plan"));
+        assert!(mode_available(&modes, "agent"));
+        assert!(!mode_available(&modes, "multitask"));
+    }
+
+    #[test]
+    fn mode_available_allows_switch_when_no_modes_advertised() {
+        assert!(mode_available(&Value::Null, "plan"));
+        assert!(mode_available(&json!({}), "agent"));
+    }
 
     #[test]
     fn parse_cursor_ask_request_reads_questions_options_and_multi() {

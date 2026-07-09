@@ -1473,7 +1473,9 @@ pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
 
 /// Cap keeping the HEAD — for file reads / listings, where the start matters.
 fn cap_head(s: String) -> String {
-    let mut truncated = s.lines().count() > MAX_OUTPUT_LINES;
+    let total_lines = s.lines().count();
+    let total_bytes = s.len();
+    let mut truncated = total_lines > MAX_OUTPUT_LINES;
     let mut out = if truncated {
         s.lines()
             .take(MAX_OUTPUT_LINES)
@@ -1491,7 +1493,12 @@ fn cap_head(s: String) -> String {
         truncated = true;
     }
     if truncated {
-        out.push_str("\n… (output truncated)");
+        let kept_lines = out.lines().count();
+        let kept_bytes = out.len();
+        out.push_str(&format!(
+            "\n… (output truncated: showing the first {kept_lines} of {total_lines} lines, \
+{kept_bytes} of {total_bytes} bytes — narrow the request to see the rest)"
+        ));
     }
     out
 }
@@ -1502,10 +1509,22 @@ fn cap_tail(s: String) -> String {
     cap_tail_with(s, MAX_OUTPUT, MAX_OUTPUT_LINES)
 }
 
+/// Best-effort spill of untruncated shell output to a temp log.
+fn spill_full_output(out: &str) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("aivo-bash-{}-{id}.log", std::process::id()));
+    std::fs::write(&path, out).ok()?;
+    Some(path)
+}
+
 /// [`cap_tail`] with explicit limits, so background-job log tails can keep a smaller
 /// window than foreground `run_bash`.
 pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
+    let total_lines = lines.len();
+    let total_bytes = s.len();
     let start = lines.len().saturating_sub(max_lines);
     let mut out = lines[start..].join("\n");
     let mut truncated = start > 0;
@@ -1518,7 +1537,12 @@ pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> St
         truncated = true;
     }
     if truncated {
-        out = format!("… (earlier output truncated)\n{out}");
+        let kept_lines = out.lines().count();
+        let kept_bytes = out.len();
+        out = format!(
+            "… (earlier output truncated: showing the last {kept_lines} of {total_lines} lines, \
+{kept_bytes} of {total_bytes} bytes)\n{out}"
+        );
     }
     out
 }
@@ -2327,8 +2351,18 @@ confinement for the whole session, relaunch aivo with AIVO_AGENT_NO_SANDBOX=1.]"
     if out.is_empty() {
         out.push_str("(no output)");
     }
+    let result = if out.len() > MAX_OUTPUT || out.lines().count() > MAX_OUTPUT_LINES {
+        let spilled = spill_full_output(&out);
+        let mut capped = cap_tail(out);
+        if let Some(path) = spilled {
+            capped.push_str(&format!("\n[full output: {}]", path.display()));
+        }
+        capped
+    } else {
+        out
+    };
     BashOutcome {
-        result: Ok(cap_tail(out)),
+        result: Ok(result),
         sandbox_blocked,
     }
 }
@@ -3237,6 +3271,25 @@ mod tests {
         assert!(ok.contains("hi"));
         let bad = run_bash(&json!({"command":"exit 3"}), &dir).await.unwrap();
         assert!(bad.contains("[exit 3]"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_spills_full_output_past_the_cap() {
+        let dir = tmp();
+        let out = run_bash(&json!({"command":"seq 1 3000"}), &dir)
+            .await
+            .unwrap();
+        assert!(out.contains("truncated") && out.contains("3000"));
+        let path = out
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("[full output: "))
+            .and_then(|l| l.strip_suffix(']'))
+            .expect("spill note present");
+        let full = std::fs::read_to_string(path).unwrap();
+        assert!(full.starts_with("1\n") && full.contains("\n3000"));
+        let _ = std::fs::remove_file(path);
     }
 
     /// The seatbelt sandbox lets a command write inside the workspace but blocks

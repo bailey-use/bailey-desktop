@@ -14,9 +14,13 @@
 //!   {"text": "Fixed the subtraction bug and verified the tests print ok."}
 //! ]
 //! ```
+//!
+//! `AIVO_FAKE_CAPTURE=<path>` appends each request body as one JSON line, so
+//! tests can assert what the engine sent per call.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -79,19 +83,70 @@ pub fn load_script(path: &str) -> Result<Vec<String>, String> {
     parse_script(&raw)
 }
 
-/// Best-effort read of the client request so it isn't blocked writing when we reply.
-/// One read is enough: we never use the content, and for a loopback request the
-/// headers (and any small body) arrive together; anything unread is discarded on
-/// close. Mirrors the proven test SSE stub (`spawn_sse_sequence`).
-fn drain_request(sock: &mut TcpStream) {
-    let mut buf = [0u8; 16384];
-    let _ = sock.read(&mut buf);
+/// Read headers + `Content-Length` body so the client is never blocked writing;
+/// timeout-bounded so a malformed request can't hang the server.
+fn read_request(sock: &mut TcpStream) -> String {
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    let mut header_end = None;
+    loop {
+        match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+        if header_end.is_none() {
+            header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+        }
+        if let Some(end) = header_end
+            && buf.len() >= end + content_length(&buf[..end])
+        {
+            break;
+        }
+    }
+    match header_end {
+        Some(end) => String::from_utf8_lossy(&buf[end..]).into_owned(),
+        None => String::new(),
+    }
+}
+
+/// `Content-Length` from raw headers; 0 when absent.
+fn content_length(headers: &[u8]) -> usize {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+fn append_capture(path: &Path, body: &str) {
+    let line = match serde_json::from_str::<Value>(body) {
+        Ok(v) => v.to_string(),
+        Err(_) => json!({ "unparsed": body }).to_string(),
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
 }
 
 /// Start a background scripted-model server; returns its loopback port. Replays
 /// `bodies` in order (one per request), repeating a terminal answer afterward.
 /// The thread is detached and dies with the process — fine for a one-shot `-e` run.
 pub fn start(bodies: Vec<String>) -> std::io::Result<u16> {
+    let capture = std::env::var("AIVO_FAKE_CAPTURE").ok().map(PathBuf::from);
+    start_with_capture(bodies, capture)
+}
+
+/// [`start`] with an explicit capture path (env-race-free for in-process tests).
+pub fn start_with_capture(bodies: Vec<String>, capture: Option<PathBuf>) -> std::io::Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let trace = std::env::var("AIVO_FAKE_TRACE").is_ok();
@@ -105,7 +160,10 @@ pub fn start(bodies: Vec<String>) -> std::io::Result<u16> {
             if trace {
                 eprintln!("[fake_model] accepted request {i}");
             }
-            drain_request(&mut sock);
+            let request_body = read_request(&mut sock);
+            if let Some(path) = &capture {
+                append_capture(path, &request_body);
+            }
             let body = bodies.get(i).unwrap_or(&terminal);
             if trace {
                 eprintln!(
@@ -154,15 +212,48 @@ mod tests {
 
     /// Drive the real server over a loopback socket and read back the raw response.
     fn raw_post(port: u16) -> String {
+        raw_post_body(port, "{}")
+    }
+
+    fn raw_post_body(port: u16, body: &str) -> String {
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.write_all(
-            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
         )
         .unwrap();
         s.flush().unwrap();
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn capture_records_each_request_body_in_order() {
+        let bodies = parse_script(r#"[{"text": "one"}, {"text": "two"}]"#).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("aivo-fake-capture-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let port = start_with_capture(bodies, Some(path.clone())).unwrap();
+
+        raw_post_body(
+            port,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        raw_post_body(port, r#"{"model":"m","messages":[1,2]}"#);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["messages"][0]["content"], "hi");
+        assert_eq!(lines[1]["messages"], json!([1, 2]));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

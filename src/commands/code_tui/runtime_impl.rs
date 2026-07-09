@@ -392,20 +392,32 @@ impl CodeTuiApp {
         Ok(())
     }
 
-    /// Stash a message typed during an in-flight turn; sent when the turn ends.
-    /// Appends to a FIFO so several can queue without clobbering each other.
+    /// Stash a message typed mid-turn: an engine run steers it, anything else
+    /// queues for turn end.
     fn queue_message(&mut self, input: String) {
         if input.trim().is_empty() {
             return;
         }
         self.record_draft_history(&input);
-        self.queued_messages.push(input);
+        // Serve up + not `/compact` (which runs no batches) = a steerable run.
+        if self.agent_serve.is_some() && self.compact_before.is_none() {
+            self.steering_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(input);
+            self.notice = Some((
+                MUTED,
+                "Queued — the agent picks it up after the current tool step".to_string(),
+            ));
+        } else {
+            self.queued_messages.push(input);
+            self.notice = Some((MUTED, self.queued_notice()));
+        }
         self.draft.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
-        self.notice = Some((MUTED, self.queued_notice()));
     }
 
     /// Notice text for the queue, reflecting how many are waiting.
@@ -413,6 +425,26 @@ impl CodeTuiApp {
         match self.queued_messages.len() {
             0 | 1 => "Queued — sends when the current turn finishes".to_string(),
             n => format!("Queued ({n} waiting) — sent one per turn, in order"),
+        }
+    }
+
+    pub(super) fn clear_steering_queue(&mut self) {
+        self.steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Move unconsumed interjections to the front of the follow-up queue.
+    pub(super) fn reclaim_unsent_steering(&mut self) {
+        let drained: Vec<String> = self
+            .steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for (i, message) in drained.into_iter().enumerate() {
+            self.queued_messages.insert(i, message);
         }
     }
 
@@ -759,6 +791,7 @@ impl CodeTuiApp {
         // toggle takes effect on this running turn's permission gate.
         let auto_approve = self.auto_approve_flag.clone();
         let review_edits = self.review_edits_flag.clone();
+        let steering = self.steering_queue.clone();
         // The context window may have resolved AFTER the engine was built (a model
         // only known via the background catalog warm). Carry the latest value in
         // so the engine can fill a still-missing window and start compacting,
@@ -815,6 +848,7 @@ impl CodeTuiApp {
             let mut ui = ChatAgentUi {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
+                steering,
             };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
@@ -953,6 +987,7 @@ impl CodeTuiApp {
             let mut ui = ChatAgentUi {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
+                steering: SteeringQueue::default(),
             };
             let started = Instant::now();
             let mut engine = engine.lock().await;
@@ -2347,6 +2382,7 @@ pieces and keep going"
         self.agent_review = None;
         self.agent_plan_approval = None;
         self.queued_messages.clear();
+        self.clear_steering_queue();
         self.queued_commands.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
@@ -2435,6 +2471,7 @@ pieces and keep going"
         self.agent_review = None;
         self.agent_plan_approval = None;
         self.queued_messages.clear();
+        self.clear_steering_queue();
         self.queued_commands.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
@@ -2697,6 +2734,7 @@ struct ChatAgentUi {
     tx: UnboundedSender<RuntimeEvent>,
     /// Workspace root, for resolving an edit's `path` in the pre-edit probe.
     cwd: std::path::PathBuf,
+    steering: SteeringQueue,
 }
 
 impl crate::agent::engine::AgentUi for ChatAgentUi {
@@ -2718,6 +2756,20 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
 
     fn discard_streamed_segment(&mut self) {
         self.tx.send(RuntimeEvent::AgentDiscardSegment).ok();
+    }
+
+    fn drain_steering(&mut self) -> Vec<String> {
+        let drained: Vec<String> = self
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        // Same channel as tool results, so the transcript commit lands in order.
+        for text in &drained {
+            self.tx.send(RuntimeEvent::AgentSteered(text.clone())).ok();
+        }
+        drained
     }
 
     fn context_usage(&mut self, tokens: u64, measured: bool) {

@@ -1711,6 +1711,9 @@ pub(super) enum DeferredFinish {
     },
 }
 
+/// Composer→engine steering handoff; `std::sync` mutex — never held across an await.
+pub(super) type SteeringQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 pub(super) enum RuntimeEvent {
     Delta(ChatResponseChunk),
     Finished {
@@ -1762,6 +1765,8 @@ pub(super) enum RuntimeEvent {
     /// The agent's just-streamed output was a tool call written as text: drop the
     /// uncommitted segment so the markup never reaches the scrollback.
     AgentDiscardSegment,
+    /// The engine consumed a mid-turn interjection — commit it at the injection point.
+    AgentSteered(String),
     /// A background MCP connect finished. Carries the client (possibly empty) and
     /// the generation it started under; the event loop caches it and rebuilds the
     /// engine if it brought tools, but drops a result from a stale generation.
@@ -2318,6 +2323,9 @@ pub(super) struct CodeTuiApp {
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.
     pub(super) queued_messages: Vec<String>,
+    /// Mid-turn steering handoff to the engine task; leftovers reclaim into
+    /// `queued_messages` at turn end, cleared with it on interrupt/cancel.
+    pub(super) steering_queue: SteeringQueue,
     /// Slash commands typed while a turn was in flight that need the engine idle
     /// (`/compact`, `/rewind`, `/goal`, `/plan`), in submit order; executed as the
     /// turn finishes, before any queued message. Cleared with `queued_messages` on

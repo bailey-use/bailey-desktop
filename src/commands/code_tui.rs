@@ -284,6 +284,7 @@ impl CodeTuiApp {
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
+            steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,

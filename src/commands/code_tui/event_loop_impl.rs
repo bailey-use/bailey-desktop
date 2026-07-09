@@ -80,6 +80,7 @@ impl CodeTuiApp {
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
+            RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
@@ -649,6 +650,20 @@ impl CodeTuiApp {
         // reading scrolled-up output isn't snapped to the bottom each step.
     }
 
+    /// Commit a consumed interjection at its injection point (events arrive in
+    /// engine order).
+    pub(super) fn apply_agent_steered(&mut self, text: String) {
+        self.flush_pending_assistant();
+        self.history.push(ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: text,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        self.notice = Some((MUTED, "Interjection delivered".to_string()));
+    }
+
     /// Render an `update_plan` call as a SINGLE checklist card. The model resends
     /// the full plan on every call, so the transcript keeps just one card: each
     /// update drops the previous one and re-appends the latest at the current
@@ -758,6 +773,7 @@ impl CodeTuiApp {
         }
         // Before a queued message can flip `sending` and skip the capture.
         self.capture_plan_draft();
+        self.reclaim_unsent_steering();
         // Commands queued mid-turn run first (a queued `/plan go` needs the plan
         // captured above; a queued `/compact` should fold before the next message).
         self.drain_queued_commands().await;

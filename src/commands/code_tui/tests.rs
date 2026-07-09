@@ -1496,6 +1496,7 @@ fn make_test_app(
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
+        steering_queue: SteeringQueue::default(),
         queued_commands: Vec::new(),
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
@@ -8861,6 +8862,40 @@ async fn test_drained_queued_message_not_recorded_in_draft_history() {
             .last()
             .is_some_and(|m| m.role == "user" && m.content.starts_with("Use the")),
         "the queued message still went out"
+    );
+}
+
+#[tokio::test]
+async fn test_mid_turn_message_steers_then_reclaims_or_commits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.agent_serve = Some((
+        tokio::spawn(async { Ok(()) }),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    app.draft = "actually use tabs".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+    assert!(
+        app.queued_messages.is_empty(),
+        "engine turns steer, not queue"
+    );
+    {
+        let steering = app.steering_queue.lock().unwrap();
+        assert_eq!(steering.as_slice(), ["actually use tabs".to_string()]);
+    }
+
+    app.reclaim_unsent_steering();
+    assert_eq!(app.queued_messages, vec!["actually use tabs".to_string()]);
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+
+    app.apply_agent_steered("also add a test".to_string());
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == "also add a test")
     );
 }
 

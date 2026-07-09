@@ -119,6 +119,11 @@ pub trait AgentUi: Send {
     fn read_user_input(&mut self) -> Option<String> {
         None
     }
+    /// Mid-turn messages, drained after each tool batch. Default none so a
+    /// sub-agent can't consume the parent's queue.
+    fn drain_steering(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn assistant_text(&mut self, delta: &str);
     /// A streamed reasoning/thinking delta (separate from the visible reply). Default no-op.
     fn assistant_reasoning(&mut self, _delta: &str) {}
@@ -1532,6 +1537,8 @@ questions.",
                 }
                 guards::FailureAction::None => {}
             }
+
+            self.inject_steering(ui);
         }
 
         if !converged {
@@ -1557,6 +1564,28 @@ questions.",
         };
         if let Some(cp) = self.checkpoints.last_mut() {
             cp.changed = changed;
+        }
+    }
+
+    /// Fold interjections into the last tool result — a fresh user turn after
+    /// tool results 400s the Anthropic bridge.
+    fn inject_steering(&mut self, ui: &mut dyn AgentUi) {
+        let steering = ui.drain_steering();
+        if steering.is_empty() {
+            return;
+        }
+        let block = format!(
+            "<user_interjection>\n{}\n</user_interjection>\nThe user sent this while you were \
+working. Factor it in before continuing — it may change what to do next.",
+            steering.join("\n\n")
+        );
+        if let Some(last) = self.messages.last_mut()
+            && last.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(c) = last.get("content").and_then(Value::as_str)
+        {
+            last["content"] = json!(format!("{c}\n\n{block}"));
+        } else {
+            self.push_text_turn("user", block);
         }
     }
 
@@ -2766,8 +2795,12 @@ mod tests {
         plan_decision: Option<crate::agent::protocol::PlanDecision>,
         /// The plan text of each `approve_plan` call, in order.
         approved_plans: Vec<String>,
+        steering: Vec<String>,
     }
     impl AgentUi for CapturingUi {
+        fn drain_steering(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.steering)
+        }
         fn assistant_text(&mut self, t: &str) {
             self.text.push_str(t);
         }
@@ -3987,6 +4020,48 @@ mod tests {
             .expect("a user message");
         let parts = user["content"].as_array().expect("array content");
         assert!(parts.iter().any(|p| p["type"] == "image_url"));
+    }
+
+    #[tokio::test]
+    async fn steering_folds_into_the_last_tool_result_at_the_batch_boundary() {
+        let dir = tmp();
+        let ls = tool_call_sse("list_dir", json!({ "path": "." }));
+        let port = spawn_sse_sequence(vec![ls, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            steering: vec!["actually, focus on the README".to_string()],
+            ..Default::default()
+        };
+        engine
+            .run_turn(
+                &turn_ctx(&client, &base, &dir),
+                &mut ui,
+                "look around".into(),
+            )
+            .await;
+        assert!(ui.steering.is_empty(), "the queue must be drained");
+        let tool_msg = engine
+            .messages
+            .iter()
+            .rfind(|m| m["role"] == "tool")
+            .expect("a tool result");
+        let content = tool_msg["content"].as_str().unwrap();
+        assert!(
+            content.contains("<user_interjection>")
+                && content.contains("actually, focus on the README"),
+            "interjection must ride the tool result: {content}"
+        );
+        let roles: Vec<&str> = engine
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !roles.windows(2).any(|w| w == ["tool", "user"]),
+            "no bare user turn after tool results: {roles:?}"
+        );
     }
 
     #[test]

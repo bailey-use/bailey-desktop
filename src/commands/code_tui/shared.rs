@@ -153,6 +153,11 @@ impl SlashCommandSpec {
     }
 }
 
+/// Hidden `alias -> canonical` map; typing an alias surfaces its canonical
+/// command. Keep in sync with the alias arms in `parse_slash_command`.
+pub(super) const SLASH_ALIASES: &[(&str, &str)] =
+    &[("quit", "exit"), ("undo", "rewind"), ("unwind", "rewind")];
+
 pub(super) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "new",

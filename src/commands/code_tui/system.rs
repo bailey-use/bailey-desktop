@@ -682,7 +682,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
 
     match command {
         "new" => Ok(SlashCommand::New),
-        "exit" => Ok(SlashCommand::Exit),
+        "exit" | "quit" => Ok(SlashCommand::Exit),
         "resume" => Ok(SlashCommand::Resume(argument)),
         "model" => Ok(SlashCommand::Model(argument)),
         "key" => Ok(SlashCommand::Key(argument)),
@@ -709,8 +709,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand> {
         "plan" => Ok(SlashCommand::Plan(argument)),
         "effort" => Ok(SlashCommand::Effort(argument)),
         "create-skill" => Ok(SlashCommand::CreateSkill(argument)),
-        // `undo` kept as a hidden alias for muscle memory; only `/rewind` is advertised.
-        "rewind" | "undo" => Ok(SlashCommand::Rewind),
+        "rewind" | "undo" | "unwind" => Ok(SlashCommand::Rewind),
         "config" => Ok(SlashCommand::Config),
         "compact" => Ok(SlashCommand::Compact {
             fast: argument.as_deref() == Some("fast"),

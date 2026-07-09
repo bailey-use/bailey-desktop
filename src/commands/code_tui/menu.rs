@@ -24,7 +24,7 @@ pub(super) fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpe
     let mut prefix_matches = Vec::new();
     let mut fuzzy_matches = Vec::new();
     for command in SLASH_COMMANDS {
-        if command.name.starts_with(query) {
+        if command.name.starts_with(query) || is_alias_target(query, command.name) {
             prefix_matches.push(command);
         } else if matches_fuzzy(query, command.name) {
             fuzzy_matches.push(command);
@@ -32,6 +32,14 @@ pub(super) fn filter_slash_commands(query: &str) -> Vec<&'static SlashCommandSpe
     }
     prefix_matches.extend(fuzzy_matches);
     prefix_matches
+}
+
+/// Whether `query` is a prefix of an alias pointing at `command_name` (so `/qu`
+/// surfaces `/exit`).
+fn is_alias_target(query: &str, command_name: &str) -> bool {
+    SLASH_ALIASES
+        .iter()
+        .any(|(alias, target)| *target == command_name && alias.starts_with(query))
 }
 
 /// Filter discovered skill slash commands by `query` (the text after `/`), prefix

@@ -63,6 +63,12 @@ type RequestTimings = Arc<std::sync::Mutex<HashMap<u64, Instant>>>;
 pub type PermissionFn =
     Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, PermissionDecision> + Send + Sync>;
 
+/// Handler for cursor's server-initiated `cursor/*` extension methods.
+/// `Some(result)` replies with that JSON-RPC `result`; `None` falls through to
+/// `-32601`. Shares [`PermissionFn`]'s reader contract for blocking handlers.
+pub type ExtMethodFn =
+    Arc<dyn Fn(String, Value) -> futures::future::BoxFuture<'static, Option<Value>> + Send + Sync>;
+
 /// One of the two `outcome.outcome` shapes the ACP spec defines for
 /// `session/request_permission` replies. The encoder picks a matching
 /// `optionId` from the `options` array carried in the request — preferring
@@ -116,8 +122,18 @@ impl AcpClient {
     }
 
     pub async fn spawn_with_permission_policy(
+        cmd: Command,
+        permission_fn: PermissionFn,
+    ) -> Result<Self> {
+        Self::spawn_with_handlers(cmd, permission_fn, None).await
+    }
+
+    /// Like [`spawn_with_permission_policy`] but also installs an
+    /// [`ExtMethodFn`] for cursor's server-initiated `cursor/*` methods.
+    pub async fn spawn_with_handlers(
         mut cmd: Command,
         permission_fn: PermissionFn,
+        ext_method_fn: Option<ExtMethodFn>,
     ) -> Result<Self> {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -150,6 +166,7 @@ impl AcpClient {
             writer.clone(),
             request_timings.clone(),
             permission_fn,
+            ext_method_fn,
         );
         let stderr_drain = spawn_stderr_drain(BufReader::new(stderr), stderr_tail.clone());
 
@@ -330,6 +347,7 @@ fn spawn_reader(
     writer: Writer,
     request_timings: RequestTimings,
     permission_fn: PermissionFn,
+    ext_method_fn: Option<ExtMethodFn>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut line = String::new();
@@ -353,7 +371,15 @@ fn spawn_reader(
             // requests have no paired start, so duration stays `None`.
             let duration_ms = inbound_duration_ms(&value, &request_timings);
             log_acp_frame(Direction::Inbound, &value, duration_ms).await;
-            dispatch_inbound(value, &pending, &sessions, &writer, &permission_fn).await;
+            dispatch_inbound(
+                value,
+                &pending,
+                &sessions,
+                &writer,
+                &permission_fn,
+                &ext_method_fn,
+            )
+            .await;
         }
 
         // EOF: surface a clear error to anyone still waiting, and drop any
@@ -393,6 +419,7 @@ async fn dispatch_inbound(
     sessions: &SessionMap,
     writer: &Writer,
     permission_fn: &PermissionFn,
+    ext_method_fn: &Option<ExtMethodFn>,
 ) {
     // Keep the id as a raw `Value`: server-initiated requests may carry a
     // string/negative id (JSON-RPC-legal) that must be echoed verbatim —
@@ -420,16 +447,25 @@ async fn dispatch_inbound(
             let _ = write_frame(writer, &resp, None).await;
         }
         (Some(id), Some(method)) => {
-            // Unimplemented server-initiated requests (fs/*, terminal/*):
-            // reject with method-not-found, echoing the id verbatim.
-            let resp = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("aivo ACP client does not implement `{method}`"),
-                },
-            });
+            // Extension handler gets first crack; declining falls through to -32601.
+            let handled = match ext_method_fn {
+                Some(ext) => {
+                    let params = value.get("params").cloned().unwrap_or(Value::Null);
+                    ext(method.to_string(), params).await
+                }
+                None => None,
+            };
+            let resp = match handled {
+                Some(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                None => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": format!("aivo ACP client does not implement `{method}`"),
+                    },
+                }),
+            };
             let _ = write_frame(writer, &resp, None).await;
         }
         (None, None) => {}
@@ -1111,6 +1147,68 @@ read line; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
         // -32601 reply. Then issue a request; the fake echoes our reply on
         // its stdout, but since the id (42) doesn't match anything pending,
         // it's dropped. The follow-up request must still complete.
+        let r = tokio::time::timeout(Duration::from_secs(3), client.request("ping", json!({})))
+            .await
+            .expect("request timed out")
+            .expect("request failed");
+        assert_eq!(r["ok"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn invokes_ask_question_handler_and_replies_with_its_result() {
+        use std::sync::Mutex as StdMutex;
+        // Consume our reply + the ping (order-independent), then answer the ping.
+        // Don't echo: the generic ext arm would re-dispatch an echoed ping.
+        let cmd = fake_acp_script(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"aq1","method":"cursor/ask_question","params":{"questions":[{"id":"q1","prompt":"pick","options":[{"id":"o1","label":"A"}],"allowMultiple":false}]}}'
+read our_reply
+read ping_req
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
+        );
+        let seen: Arc<StdMutex<Option<(String, Value)>>> = Arc::new(StdMutex::new(None));
+        let seen_in = seen.clone();
+        let ext_fn: ExtMethodFn = Arc::new(move |method: String, params: Value| {
+            let seen = seen_in.clone();
+            Box::pin(async move {
+                *seen.lock().unwrap() = Some((method, params));
+                Some(
+                    json!({"outcome": {"outcome": "answered", "answers": [{"questionId": "q1", "selectedOptionIds": ["o1"]}]}}),
+                )
+            })
+        });
+        let permission: PermissionFn = Arc::new(|_| Box::pin(async { PermissionDecision::Reject }));
+        let client = AcpClient::spawn_with_handlers(cmd, permission, Some(ext_fn))
+            .await
+            .unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(3), client.request("ping", json!({})))
+            .await
+            .expect("request timed out")
+            .expect("request failed");
+        assert_eq!(r["ok"], json!(true));
+        let (method, params) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("ext-method handler must have been invoked");
+        assert_eq!(method, "cursor/ask_question");
+        assert_eq!(params["questions"][0]["id"], "q1");
+    }
+
+    #[tokio::test]
+    async fn ext_method_handler_declining_falls_back_to_method_not_found() {
+        // Handler returns None → aivo must still reply -32601.
+        let cmd = fake_acp_script(
+            r#"printf '%s\n' '{"jsonrpc":"2.0","id":"x1","method":"cursor/generate_image","params":{}}'
+read our_reply
+read ping_req
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'"#,
+        );
+        let ext_fn: ExtMethodFn =
+            Arc::new(|_method: String, _params: Value| Box::pin(async { None }));
+        let permission: PermissionFn = Arc::new(|_| Box::pin(async { PermissionDecision::Reject }));
+        let client = AcpClient::spawn_with_handlers(cmd, permission, Some(ext_fn))
+            .await
+            .unwrap();
         let r = tokio::time::timeout(Duration::from_secs(3), client.request("ping", json!({})))
             .await
             .expect("request timed out")

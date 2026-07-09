@@ -14,7 +14,7 @@ use tokio::process::Command;
 
 use crate::agent::protocol::Decision;
 use crate::services::acp_client::{
-    AcpClient, PermissionDecision, PermissionFn, PromptEvent, PromptStream,
+    AcpClient, ExtMethodFn, PermissionDecision, PermissionFn, PromptEvent, PromptStream,
 };
 use crate::services::cursor_home_shadow::CursorShadow;
 use crate::services::session_store::{ApiKey, AttachmentStorage, MessageAttachment};
@@ -111,6 +111,250 @@ pub struct CursorPermissionRequest {
 pub type CursorPermissionPrompt = Arc<
     dyn Fn(CursorPermissionRequest) -> futures::future::BoxFuture<'static, Decision> + Send + Sync,
 >;
+
+/// A cursor `cursor/ask_question` question. `options` are `(id, label)`; the
+/// answer comes back as selected option ids (cursor carries no free text here).
+pub struct CursorAskQuestion {
+    pub id: String,
+    pub prompt: String,
+    pub options: Vec<(String, String)>,
+    pub allow_multiple: bool,
+}
+
+pub struct CursorAskRequest {
+    pub questions: Vec<CursorAskQuestion>,
+}
+
+pub struct CursorAskAnswer {
+    pub question_id: String,
+    pub selected_option_ids: Vec<String>,
+}
+
+pub enum CursorAskOutcome {
+    Answered(Vec<CursorAskAnswer>),
+    Cancelled,
+}
+
+/// TUI hook for `cursor/ask_question`; `None` leaves it unimplemented.
+pub type CursorAskQuestionPrompt = Arc<
+    dyn Fn(CursorAskRequest) -> futures::future::BoxFuture<'static, CursorAskOutcome> + Send + Sync,
+>;
+
+/// Params: `{toolCallId, title, questions:[{id, prompt, options:[{id,label}], allowMultiple}]}`.
+fn parse_cursor_ask_request(params: &Value) -> CursorAskRequest {
+    let questions = params
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|q| CursorAskQuestion {
+                    id: str_field(q, "id"),
+                    prompt: str_field(q, "prompt"),
+                    options: q
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .map(|opts| {
+                            opts.iter()
+                                .map(|o| (str_field(o, "id"), str_field(o, "label")))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    allow_multiple: q
+                        .get("allowMultiple")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CursorAskRequest { questions }
+}
+
+fn str_field(v: &Value, key: &str) -> String {
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Result: `{outcome:{outcome:"answered",answers:[{questionId,selectedOptionIds}]}}` or `…"cancelled"`.
+fn cursor_ask_outcome_to_result(outcome: CursorAskOutcome) -> Value {
+    match outcome {
+        CursorAskOutcome::Answered(answers) => {
+            let answers: Vec<Value> = answers
+                .into_iter()
+                .map(|a| {
+                    json!({"questionId": a.question_id, "selectedOptionIds": a.selected_option_ids})
+                })
+                .collect();
+            json!({"outcome": {"outcome": "answered", "answers": answers}})
+        }
+        CursorAskOutcome::Cancelled => json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
+
+/// A `cursor/update_todos` item; `status` is cursor's raw string.
+#[derive(Clone)]
+pub struct CursorTodo {
+    pub id: String,
+    pub content: String,
+    pub status: String,
+}
+
+/// A `cursor/update_todos` push; `merge` folds `todos` in by `id`, else replaces.
+pub struct CursorTodosUpdate {
+    pub todos: Vec<CursorTodo>,
+    pub merge: bool,
+}
+
+/// Non-blocking sink for `cursor/update_todos` (returns immediately).
+pub type CursorTodosSink = Arc<dyn Fn(CursorTodosUpdate) + Send + Sync>;
+
+pub struct CursorPlanPhase {
+    pub name: String,
+    pub todos: Vec<CursorTodo>,
+}
+
+/// A `cursor/create_plan` plan; `plan` is the model's markdown body.
+pub struct CursorPlanRequest {
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub plan: String,
+    pub todos: Vec<CursorTodo>,
+    pub phases: Vec<CursorPlanPhase>,
+}
+
+pub enum CursorPlanOutcome {
+    Accepted,
+    Rejected(String),
+    Cancelled,
+}
+
+/// TUI hook for `cursor/create_plan`; `None` leaves it unimplemented.
+pub type CursorPlanPrompt = Arc<
+    dyn Fn(CursorPlanRequest) -> futures::future::BoxFuture<'static, CursorPlanOutcome>
+        + Send
+        + Sync,
+>;
+
+/// TUI-supplied hooks for cursor's `cursor/*` extension methods; each optional.
+#[derive(Default, Clone)]
+pub struct CursorInteractionHooks {
+    pub ask_question: Option<CursorAskQuestionPrompt>,
+    pub update_todos: Option<CursorTodosSink>,
+    pub create_plan: Option<CursorPlanPrompt>,
+}
+
+impl CursorInteractionHooks {
+    fn is_empty(&self) -> bool {
+        self.ask_question.is_none() && self.update_todos.is_none() && self.create_plan.is_none()
+    }
+}
+
+/// One [`ExtMethodFn`] dispatching each `cursor/*` method to its hook; `None` when unset.
+fn build_ext_method_fn(hooks: CursorInteractionHooks) -> Option<ExtMethodFn> {
+    if hooks.is_empty() {
+        return None;
+    }
+    Some(Arc::new(move |method: String, params: Value| {
+        let hooks = hooks.clone();
+        Box::pin(async move {
+            match method.as_str() {
+                "cursor/ask_question" => {
+                    let prompt = hooks.ask_question.as_ref()?;
+                    let outcome = prompt(parse_cursor_ask_request(&params)).await;
+                    Some(cursor_ask_outcome_to_result(outcome))
+                }
+                "cursor/update_todos" => {
+                    let sink = hooks.update_todos.as_ref()?;
+                    sink(parse_cursor_todos_update(&params));
+                    Some(json!({}))
+                }
+                "cursor/create_plan" => {
+                    let prompt = hooks.create_plan.as_ref()?;
+                    let outcome = prompt(parse_cursor_plan_request(&params)).await;
+                    Some(cursor_plan_outcome_to_result(outcome))
+                }
+                _ => None,
+            }
+        })
+    }))
+}
+
+/// Parse a `[{id, content, status}]` array, dropping items missing id/content.
+fn parse_cursor_todo_array(value: Option<&Value>) -> Vec<CursorTodo> {
+    value
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    Some(CursorTodo {
+                        id: t.get("id").and_then(Value::as_str)?.to_string(),
+                        content: t.get("content").and_then(Value::as_str)?.to_string(),
+                        status: t
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("pending")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Params: `{toolCallId, todos:[{id, content, status}], merge}`.
+fn parse_cursor_todos_update(params: &Value) -> CursorTodosUpdate {
+    CursorTodosUpdate {
+        todos: parse_cursor_todo_array(params.get("todos")),
+        merge: params
+            .get("merge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// Params: `{toolCallId, name?, overview?, plan, todos:[…], isProject?, phases:[{name, todos:[…]}]}`.
+fn parse_cursor_plan_request(params: &Value) -> CursorPlanRequest {
+    let opt_str = |k: &str| {
+        params
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let phases = params
+        .get("phases")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|p| CursorPlanPhase {
+                    name: str_field(p, "name"),
+                    todos: parse_cursor_todo_array(p.get("todos")),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    CursorPlanRequest {
+        name: opt_str("name"),
+        overview: opt_str("overview"),
+        plan: str_field(params, "plan"),
+        todos: parse_cursor_todo_array(params.get("todos")),
+        phases,
+    }
+}
+
+/// Result: `{outcome:{outcome:"accepted"|"rejected"|"cancelled", reason?}}` (no planUri → cursor saves its own).
+fn cursor_plan_outcome_to_result(outcome: CursorPlanOutcome) -> Value {
+    match outcome {
+        CursorPlanOutcome::Accepted => json!({"outcome": {"outcome": "accepted"}}),
+        CursorPlanOutcome::Rejected(reason) => {
+            json!({"outcome": {"outcome": "rejected", "reason": reason}})
+        }
+        CursorPlanOutcome::Cancelled => json!({"outcome": {"outcome": "cancelled"}}),
+    }
+}
 
 /// Turn an ACP `session/request_permission` `params` object into a card request.
 /// cursor carries the human description in `toolCall.title` (with a `kind` like
@@ -1035,6 +1279,7 @@ impl CursorAcpSession {
             ModelPickPreference::Default,
             None,
             None,
+            CursorInteractionHooks::default(),
         )
         .await
     }
@@ -1057,6 +1302,7 @@ impl CursorAcpSession {
             ModelPickPreference::Default,
             None,
             None,
+            CursorInteractionHooks::default(),
         )
         .await
     }
@@ -1065,6 +1311,7 @@ impl CursorAcpSession {
     /// preference. Tool execution follows the env-var default permission policy
     /// (allow by default; set `AIVO_CURSOR_ALLOW_TOOLS=0` for conversation-only —
     /// see [`CURSOR_ALLOW_TOOLS_ENV`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_with_options(
         key: &ApiKey,
         requested_model: Option<&str>,
@@ -1073,6 +1320,7 @@ impl CursorAcpSession {
         model_pick_preference: ModelPickPreference,
         auto_approve: Option<Arc<AtomicBool>>,
         permission_prompt: Option<CursorPermissionPrompt>,
+        hooks: CursorInteractionHooks,
     ) -> Result<Self> {
         ensure_cursor_agent_installed()?;
         let mut cmd = cursor_agent_command_for_key(key)?;
@@ -1096,7 +1344,9 @@ impl CursorAcpSession {
                 resolve_cursor_permission(&params, auto.as_deref(), prompt.as_ref()).await
             })
         });
-        let client = Arc::new(AcpClient::spawn_with_permission_policy(cmd, permission_fn).await?);
+        let ext_method_fn = build_ext_method_fn(hooks);
+        let client =
+            Arc::new(AcpClient::spawn_with_handlers(cmd, permission_fn, ext_method_fn).await?);
 
         let init = client
             .request(
@@ -1264,6 +1514,7 @@ where
         ModelPickPreference::PreferNoThinking,
         Some(one_shot_tools_off),
         None,
+        CursorInteractionHooks::default(),
     )
     .await?;
     ensure_image_attachments_supported(session.prompt_capabilities(), attachments)?;
@@ -1584,6 +1835,139 @@ fn pick_prefer_no_thinking(list: &[Value], requested: &str) -> Option<String> {
 mod tests {
     use super::*;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn parse_cursor_ask_request_reads_questions_options_and_multi() {
+        // Wire shape cursor-agent's ACP ask-question handler sends.
+        let params = json!({
+            "toolCallId": "tc_1",
+            "title": "Clarifying Questions",
+            "questions": [{
+                "id": "q1",
+                "prompt": "Which paths should the rename touch?",
+                "options": [
+                    {"id": "o1", "label": "src/ only"},
+                    {"id": "o2", "label": "everything"}
+                ],
+                "allowMultiple": true
+            }]
+        });
+        let req = parse_cursor_ask_request(&params);
+        assert_eq!(req.questions.len(), 1);
+        let q = &req.questions[0];
+        assert_eq!(q.id, "q1");
+        assert_eq!(q.prompt, "Which paths should the rename touch?");
+        assert!(q.allow_multiple);
+        assert_eq!(
+            q.options,
+            vec![
+                ("o1".to_string(), "src/ only".to_string()),
+                ("o2".to_string(), "everything".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_cursor_ask_request_tolerates_missing_fields() {
+        // No questions array, sparse question object: never panics, fills blanks.
+        assert!(parse_cursor_ask_request(&json!({})).questions.is_empty());
+        let req = parse_cursor_ask_request(&json!({"questions": [{"prompt": "hi"}]}));
+        assert_eq!(req.questions.len(), 1);
+        assert_eq!(req.questions[0].prompt, "hi");
+        assert!(req.questions[0].id.is_empty());
+        assert!(req.questions[0].options.is_empty());
+        assert!(!req.questions[0].allow_multiple);
+    }
+
+    #[test]
+    fn cursor_ask_outcome_answered_serializes_to_selected_option_ids() {
+        let result =
+            cursor_ask_outcome_to_result(CursorAskOutcome::Answered(vec![CursorAskAnswer {
+                question_id: "q1".into(),
+                selected_option_ids: vec!["o2".into()],
+            }]));
+        assert_eq!(result["outcome"]["outcome"], "answered");
+        assert_eq!(result["outcome"]["answers"][0]["questionId"], "q1");
+        assert_eq!(
+            result["outcome"]["answers"][0]["selectedOptionIds"],
+            json!(["o2"])
+        );
+    }
+
+    #[test]
+    fn cursor_ask_outcome_cancelled_serializes_to_cancelled() {
+        let result = cursor_ask_outcome_to_result(CursorAskOutcome::Cancelled);
+        assert_eq!(result["outcome"]["outcome"], "cancelled");
+        assert!(result["outcome"].get("answers").is_none());
+    }
+
+    #[test]
+    fn parse_cursor_todos_update_reads_items_and_merge() {
+        // Wire shape cursor-agent's update-todos notification sends.
+        let params = json!({
+            "toolCallId": "tc_1",
+            "todos": [
+                {"id": "t1", "content": "wire the bridge", "status": "in_progress"},
+                {"id": "t2", "content": "add tests", "status": "pending"}
+            ],
+            "merge": true
+        });
+        let update = parse_cursor_todos_update(&params);
+        assert!(update.merge);
+        assert_eq!(update.todos.len(), 2);
+        assert_eq!(update.todos[0].id, "t1");
+        assert_eq!(update.todos[0].content, "wire the bridge");
+        assert_eq!(update.todos[0].status, "in_progress");
+    }
+
+    #[test]
+    fn parse_cursor_todos_update_defaults_merge_and_drops_malformed() {
+        let update = parse_cursor_todos_update(&json!({
+            "todos": [{"id": "t1", "content": "ok"}, {"content": "no id"}]
+        }));
+        assert!(!update.merge); // absent → false (replace)
+        assert_eq!(update.todos.len(), 1); // the id-less item is dropped
+        assert_eq!(update.todos[0].status, "pending"); // absent status → pending
+    }
+
+    #[test]
+    fn parse_cursor_plan_request_reads_fields_todos_and_phases() {
+        let params = json!({
+            "toolCallId": "tc_1",
+            "name": "Rename the bridge",
+            "overview": "Split the ACP glue",
+            "plan": "Step through each call site.",
+            "todos": [{"id": "t1", "content": "grep sites", "status": "completed"}],
+            "isProject": false,
+            "phases": [{
+                "name": "Phase 1",
+                "todos": [{"id": "p1", "content": "wire types", "status": "in_progress"}]
+            }]
+        });
+        let req = parse_cursor_plan_request(&params);
+        assert_eq!(req.name.as_deref(), Some("Rename the bridge"));
+        assert_eq!(req.overview.as_deref(), Some("Split the ACP glue"));
+        assert_eq!(req.plan, "Step through each call site.");
+        assert_eq!(req.todos.len(), 1);
+        assert_eq!(req.phases.len(), 1);
+        assert_eq!(req.phases[0].name, "Phase 1");
+        assert_eq!(req.phases[0].todos[0].content, "wire types");
+    }
+
+    #[test]
+    fn cursor_plan_outcome_serializes_each_variant() {
+        assert_eq!(
+            cursor_plan_outcome_to_result(CursorPlanOutcome::Accepted)["outcome"]["outcome"],
+            "accepted"
+        );
+        let rejected = cursor_plan_outcome_to_result(CursorPlanOutcome::Rejected("nope".into()));
+        assert_eq!(rejected["outcome"]["outcome"], "rejected");
+        assert_eq!(rejected["outcome"]["reason"], "nope");
+        assert_eq!(
+            cursor_plan_outcome_to_result(CursorPlanOutcome::Cancelled)["outcome"]["outcome"],
+            "cancelled"
+        );
+    }
 
     #[test]
     fn parse_cursor_model_decomposes_effort_suffixes() {

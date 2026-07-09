@@ -986,6 +986,135 @@ impl CodeTuiApp {
         })
     }
 
+    /// `cursor/ask_question`: show each question on the `ask_user` card (free
+    /// text off) and map the picked label(s) back to cursor option ids.
+    fn cursor_ask_question_prompt(&self) -> cursor_acp::CursorAskQuestionPrompt {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |req: cursor_acp::CursorAskRequest| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let mut answers = Vec::new();
+                for q in req.questions {
+                    // No options → answerable only as free text, which cursor can't carry.
+                    if q.options.is_empty() {
+                        continue;
+                    }
+                    let options: Vec<crate::agent::ask::AskOption> = q
+                        .options
+                        .iter()
+                        .map(|(_, label)| crate::agent::ask::AskOption {
+                            label: label.clone(),
+                            description: None,
+                        })
+                        .collect();
+                    let (reply, rx) = tokio::sync::oneshot::channel();
+                    if tx
+                        .send(RuntimeEvent::AgentAskUser {
+                            question: q.prompt.clone(),
+                            options,
+                            allow_free_text: false,
+                            multi_select: q.allow_multiple,
+                            reply,
+                        })
+                        .is_err()
+                    {
+                        return cursor_acp::CursorAskOutcome::Cancelled;
+                    }
+                    match rx.await {
+                        Ok(Ok(answer)) => {
+                            let selected_option_ids =
+                                select_ids_for_answer(&answer, &q.options, q.allow_multiple);
+                            answers.push(cursor_acp::CursorAskAnswer {
+                                question_id: q.id.clone(),
+                                selected_option_ids,
+                            });
+                        }
+                        _ => return cursor_acp::CursorAskOutcome::Cancelled, // dismissed/dropped
+                    }
+                }
+                if answers.is_empty() {
+                    cursor_acp::CursorAskOutcome::Cancelled
+                } else {
+                    cursor_acp::CursorAskOutcome::Answered(answers)
+                }
+            })
+        })
+    }
+
+    /// Interactive hooks for cursor's `cursor/*` methods, built fresh per open
+    /// (each carries its own state, e.g. the todo merge buffer).
+    fn cursor_interaction_hooks(&self) -> cursor_acp::CursorInteractionHooks {
+        cursor_acp::CursorInteractionHooks {
+            ask_question: Some(self.cursor_ask_question_prompt()),
+            update_todos: Some(self.cursor_todos_sink()),
+            create_plan: Some(self.cursor_plan_prompt()),
+        }
+    }
+
+    /// `cursor/create_plan`: render the plan as markdown, reuse the
+    /// `AgentPlanApproval` card, map the verdict to cursor's outcome.
+    fn cursor_plan_prompt(&self) -> cursor_acp::CursorPlanPrompt {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |req: cursor_acp::CursorPlanRequest| {
+            let tx = tx.clone();
+            Box::pin(async move {
+                let markdown = render_cursor_plan_markdown(&req);
+                let (reply, rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(RuntimeEvent::AgentPlanApproval {
+                        plan: markdown,
+                        reply,
+                    })
+                    .is_err()
+                {
+                    return cursor_acp::CursorPlanOutcome::Cancelled;
+                }
+                use crate::agent::protocol::PlanDecision;
+                match rx.await {
+                    Ok(Ok(PlanDecision::Approve)) => cursor_acp::CursorPlanOutcome::Accepted,
+                    // Feedback rides back as the rejection reason so the model can revise.
+                    Ok(Ok(PlanDecision::KeepPlanning { feedback })) => {
+                        cursor_acp::CursorPlanOutcome::Rejected(
+                            feedback.unwrap_or_else(|| "Keep planning".to_string()),
+                        )
+                    }
+                    _ => cursor_acp::CursorPlanOutcome::Cancelled, // discard/dismiss/drop
+                }
+            })
+        })
+    }
+
+    /// `cursor/update_todos`: merge pushes into a closure-local buffer (resets on
+    /// re-open) and render through the existing `AgentPlan` plan-card pipeline.
+    fn cursor_todos_sink(&self) -> cursor_acp::CursorTodosSink {
+        let tx = self.tx.clone();
+        let buffer =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<cursor_acp::CursorTodo>::new()));
+        std::sync::Arc::new(move |update: cursor_acp::CursorTodosUpdate| {
+            let items = {
+                let mut list = buffer.lock().unwrap();
+                if !update.merge {
+                    list.clear();
+                }
+                for todo in update.todos {
+                    match list.iter_mut().find(|t| t.id == todo.id) {
+                        Some(existing) => *existing = todo,
+                        None => list.push(todo),
+                    }
+                }
+                list.iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "step": t.content,
+                            "status": map_cursor_todo_status(&t.status),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let _ = tx.send(RuntimeEvent::AgentPlan(serde_json::Value::Array(items)));
+        })
+    }
+
     /// The dir cursor-agent runs its tools in: the real launch dir, else the
     /// sandbox (tests).
     fn cursor_workspace_cwd(&self) -> String {
@@ -1013,10 +1142,18 @@ impl CodeTuiApp {
         let cwd = self.cursor_workspace_cwd();
         let auto_approve = self.auto_approve_flag.clone();
         let permission_prompt = self.cursor_permission_prompt();
+        let hooks = self.cursor_interaction_hooks();
         self.cursor_prewarm = Some(tokio::spawn(async move {
-            open_cursor_session(key, requested_model, cwd, auto_approve, permission_prompt)
-                .await
-                .map_err(|e| e.to_string())
+            open_cursor_session(
+                key,
+                requested_model,
+                cwd,
+                auto_approve,
+                permission_prompt,
+                hooks,
+            )
+            .await
+            .map_err(|e| e.to_string())
         }));
     }
 
@@ -1037,6 +1174,7 @@ impl CodeTuiApp {
         let format = self.format.clone();
         let cursor_auto_approve = self.auto_approve_flag.clone();
         let permission_prompt = self.cursor_permission_prompt();
+        let hooks = self.cursor_interaction_hooks();
         // Consume the startup prewarm so we reuse its open, not a second one.
         let prewarm = self.cursor_prewarm.take();
 
@@ -1047,24 +1185,26 @@ impl CodeTuiApp {
             let (client, session_id, model_id, capabilities) = match existing {
                 Some(handles) => handles,
                 None => {
-                    // Reuse the prewarm (awaiting it costs only the remaining
-                    // connect time); a panicked one falls through to cold-open.
+                    // Reuse a *successful* prewarm (awaiting it costs only the
+                    // remaining connect time). A panicked or failed-to-connect
+                    // one falls through to a fresh open with bounded connect
+                    // retry, so a flaky link at prewarm time doesn't surface as a
+                    // dead turn on the first miss.
                     let prewarmed = match prewarm {
-                        Some(handle) => match handle.await {
-                            Ok(res) => Some(res.map_err(|e| anyhow::anyhow!(e))),
-                            Err(_) => None,
-                        },
+                        Some(handle) => handle.await.ok().and_then(Result::ok),
                         None => None,
                     };
                     let opened = match prewarmed {
-                        Some(r) => r,
+                        Some(session) => Ok(session),
                         None => {
-                            open_cursor_session(
+                            open_cursor_session_with_retry(
                                 key,
                                 requested_model.clone(),
                                 cwd,
                                 cursor_auto_approve,
                                 permission_prompt,
+                                hooks,
+                                Some(tx.clone()),
                             )
                             .await
                         }
@@ -2701,6 +2841,7 @@ async fn open_cursor_session(
     cwd: String,
     auto_approve: std::sync::Arc<std::sync::atomic::AtomicBool>,
     permission_prompt: cursor_acp::CursorPermissionPrompt,
+    hooks: cursor_acp::CursorInteractionHooks,
 ) -> Result<CursorAcpSession> {
     CursorAcpSession::open_with_options(
         &key,
@@ -2710,8 +2851,150 @@ async fn open_cursor_session(
         cursor_acp::ModelPickPreference::PreferNoThinking,
         Some(auto_approve),
         Some(permission_prompt),
+        hooks,
     )
     .await
+}
+
+/// Bounded retry-with-backoff around [`open_cursor_session`]. cursor-agent
+/// already retries its own live HTTP/2 link (the "keepalive ping timed out …
+/// retry" you see in its TUI), so aivo only sees a hard failure when that's
+/// exhausted or the child dies during connect — a single miss on a flaky link
+/// (e.g. a VPN/proxy tunnel) would otherwise kill the turn outright. Retry the
+/// *connect* (idempotent, no conversation to lose yet) a few times with backoff,
+/// emitting a `retrying` notice through `tx` when present so the reconnect is
+/// visible (matching the native engine's retry UX). Permanent failures — missing
+/// binary, legacy key — return immediately; retrying them can't help.
+async fn open_cursor_session_with_retry(
+    key: ApiKey,
+    requested_model: Option<String>,
+    cwd: String,
+    auto_approve: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    permission_prompt: cursor_acp::CursorPermissionPrompt,
+    hooks: cursor_acp::CursorInteractionHooks,
+    tx: Option<UnboundedSender<RuntimeEvent>>,
+) -> Result<CursorAcpSession> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        let result = open_cursor_session(
+            key.clone(),
+            requested_model.clone(),
+            cwd.clone(),
+            auto_approve.clone(),
+            permission_prompt.clone(),
+            hooks.clone(),
+        )
+        .await;
+        match result {
+            Ok(session) => return Ok(session),
+            Err(e) if attempt >= MAX_ATTEMPTS || is_permanent_cursor_open_error(&e) => {
+                return Err(e);
+            }
+            Err(_) => {
+                // "retrying" is the marker the event loop keys on to show the
+                // reconnect state (and to auto-clear the notice on recovery).
+                if let Some(tx) = &tx {
+                    tx.send(RuntimeEvent::AgentNotice(format!(
+                        "Cursor connection failed — retrying ({}/{MAX_ATTEMPTS})…",
+                        attempt + 1
+                    )))
+                    .ok();
+                }
+                // 400ms, 800ms: long enough to ride out a brief tunnel hiccup,
+                // short enough to stay responsive.
+                let backoff = std::time::Duration::from_millis(400u64 << (attempt - 1));
+                tokio::time::sleep(backoff).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Whether a cursor open error is permanent — retrying it is pointless because
+/// the cause won't clear on its own. Everything else (spawn, `initialize`,
+/// `session/new`) can be a transient network/handshake failure worth another
+/// attempt. Matches the full error chain so wrapping context doesn't hide the
+/// root marker.
+fn is_permanent_cursor_open_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    msg.contains("was not found on PATH") || msg.contains("predates per-account isolation")
+}
+
+/// Compose cursor's structured plan (title/overview/body + todo & phase
+/// checklists) into a markdown body for the approval card.
+fn render_cursor_plan_markdown(req: &cursor_acp::CursorPlanRequest) -> String {
+    let mut out = String::new();
+    if let Some(name) = &req.name {
+        out.push_str(&format!("# {name}\n\n"));
+    }
+    if let Some(overview) = &req.overview {
+        out.push_str(&format!("{overview}\n\n"));
+    }
+    if !req.plan.trim().is_empty() {
+        out.push_str(req.plan.trim());
+        out.push_str("\n\n");
+    }
+    let checklist = |todos: &[cursor_acp::CursorTodo]| -> String {
+        todos
+            .iter()
+            .map(|t| format!("- {} {}\n", todo_checkbox(&t.status), t.content))
+            .collect()
+    };
+    if !req.todos.is_empty() {
+        out.push_str(&checklist(&req.todos));
+        out.push('\n');
+    }
+    for phase in &req.phases {
+        out.push_str(&format!("## {}\n\n", phase.name));
+        out.push_str(&checklist(&phase.todos));
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        out.push_str("(cursor proposed a plan with no details)");
+    }
+    out.trim_end().to_string()
+}
+
+fn todo_checkbox(status: &str) -> &'static str {
+    match map_cursor_todo_status(status) {
+        "in_progress" => "[~]",
+        "completed" => "[x]",
+        _ => "[ ]",
+    }
+}
+
+/// Map a cursor todo status to aivo's 3-state plan status; `cancelled`→`completed`.
+fn map_cursor_todo_status(status: &str) -> &'static str {
+    match status {
+        "in_progress" => "in_progress",
+        "completed" | "cancelled" => "completed",
+        _ => "pending",
+    }
+}
+
+/// Map an ask-card answer (one label, or labels joined by ", " when multi) back
+/// to cursor option ids by exact label match.
+fn select_ids_for_answer(
+    answer: &str,
+    options: &[(String, String)],
+    multi_select: bool,
+) -> Vec<String> {
+    let parts: Vec<&str> = if multi_select {
+        answer.split(", ").collect()
+    } else {
+        vec![answer]
+    };
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            options
+                .iter()
+                .find(|(_, label)| label == part)
+                .map(|(id, _)| id.clone())
+        })
+        .collect()
 }
 
 async fn drive_cursor_turn(
@@ -2791,4 +3074,136 @@ async fn drive_cursor_turn(
         model: model_id,
         raw_body: None,
     })
+}
+
+#[cfg(test)]
+mod ask_id_tests {
+    use super::{map_cursor_todo_status, render_cursor_plan_markdown, select_ids_for_answer};
+    use crate::services::cursor_acp::{CursorPlanPhase, CursorPlanRequest, CursorTodo};
+
+    #[test]
+    fn cursor_plan_markdown_includes_title_todos_and_phases() {
+        let req = CursorPlanRequest {
+            name: Some("Do the thing".into()),
+            overview: Some("A short overview".into()),
+            plan: "The plan body.".into(),
+            todos: vec![CursorTodo {
+                id: "t1".into(),
+                content: "first step".into(),
+                status: "in_progress".into(),
+            }],
+            phases: vec![CursorPlanPhase {
+                name: "Phase 1".into(),
+                todos: vec![CursorTodo {
+                    id: "p1".into(),
+                    content: "phase step".into(),
+                    status: "completed".into(),
+                }],
+            }],
+        };
+        let md = render_cursor_plan_markdown(&req);
+        assert!(md.contains("# Do the thing"));
+        assert!(md.contains("A short overview"));
+        assert!(md.contains("The plan body."));
+        assert!(md.contains("- [~] first step")); // in_progress glyph
+        assert!(md.contains("## Phase 1"));
+        assert!(md.contains("- [x] phase step")); // completed glyph
+    }
+
+    #[test]
+    fn cursor_plan_markdown_handles_empty_plan() {
+        let req = CursorPlanRequest {
+            name: None,
+            overview: None,
+            plan: String::new(),
+            todos: vec![],
+            phases: vec![],
+        };
+        assert!(render_cursor_plan_markdown(&req).contains("no details"));
+    }
+
+    #[test]
+    fn cursor_todo_status_maps_to_three_state_plan() {
+        assert_eq!(map_cursor_todo_status("pending"), "pending");
+        assert_eq!(map_cursor_todo_status("in_progress"), "in_progress");
+        assert_eq!(map_cursor_todo_status("completed"), "completed");
+        // cancelled folds into completed; unknown → pending.
+        assert_eq!(map_cursor_todo_status("cancelled"), "completed");
+        assert_eq!(map_cursor_todo_status("weird"), "pending");
+    }
+
+    fn opts() -> Vec<(String, String)> {
+        vec![
+            ("o1".into(), "Just this file".into()),
+            ("o2".into(), "Whole crate".into()),
+            ("o3".into(), "Everything".into()),
+        ]
+    }
+
+    #[test]
+    fn single_select_maps_label_to_one_id() {
+        assert_eq!(
+            select_ids_for_answer("Whole crate", &opts(), false),
+            vec!["o2"]
+        );
+    }
+
+    #[test]
+    fn multi_select_splits_and_maps_each_label() {
+        assert_eq!(
+            select_ids_for_answer("Just this file, Everything", &opts(), true),
+            vec!["o1", "o3"]
+        );
+    }
+
+    #[test]
+    fn unmatched_labels_are_dropped() {
+        // "none" (empty multi-select sentinel) and typos map to no id.
+        assert!(select_ids_for_answer("none", &opts(), true).is_empty());
+        assert!(select_ids_for_answer("nonexistent", &opts(), false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cursor_open_retry_tests {
+    use super::is_permanent_cursor_open_error;
+
+    #[test]
+    fn missing_binary_is_permanent() {
+        let err = anyhow::anyhow!(
+            "`cursor-agent` was not found on PATH. Install Cursor CLI support first."
+        );
+        assert!(is_permanent_cursor_open_error(&err));
+    }
+
+    #[test]
+    fn legacy_key_is_permanent() {
+        let err = anyhow::anyhow!("This cursor key predates per-account isolation. Run …");
+        assert!(is_permanent_cursor_open_error(&err));
+    }
+
+    #[test]
+    fn permanent_marker_survives_context_wrapping() {
+        // The marker must be found even when nested under added `.context(...)`.
+        let err = anyhow::anyhow!("`cursor-agent` was not found on PATH.")
+            .context("opening cursor session");
+        assert!(is_permanent_cursor_open_error(&err));
+    }
+
+    #[test]
+    fn handshake_and_network_failures_are_transient() {
+        // These are the ones worth retrying — a flaky link at connect.
+        for msg in [
+            "cursor-agent ACP initialize failed",
+            "cursor-agent ACP session/new failed — check the cursor key with `aivo keys reauth abc`",
+            "ACP child stdout closed",
+            "connection reset by peer",
+        ] {
+            let err = anyhow::anyhow!(msg.to_string());
+            assert!(
+                !is_permanent_cursor_open_error(&err),
+                "should retry transient: {msg}"
+            );
+        }
+    }
 }

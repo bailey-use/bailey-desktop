@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::commands::models::fetch_models;
@@ -25,7 +25,7 @@ use crate::services::provider_protocol::{
 use crate::services::request_log::RequestLogger;
 use crate::services::responses_chat_conversion::ResponsesStreamConverter;
 use crate::services::responses_to_chat_router::{
-    ResponsesToChatRouterConfig, convert_chat_response_to_responses_sse,
+    ResponsesToChatRouterConfig, collect_custom_tool_names, convert_chat_response_to_responses_sse,
     convert_responses_to_chat_request,
 };
 use crate::services::route_cache::{RouteCache, RouteSlot};
@@ -915,10 +915,16 @@ async fn handle_responses(request: &str, state: &ServeState) -> Result<RouterRes
     // for the protocol that is actually selected.
     let mut config = responses_router_config(state, resolve_slot(&body, state).current().0);
     config.actual_model = Some(original_model.clone());
+    let custom_tools = collect_custom_tool_names(&body);
     let mut chat_body = convert_responses_to_chat_request(&body, &config);
     chat_body["stream"] = json!(client_wants_stream);
     let chat_response = handle_chat_body(chat_body, state).await?;
-    convert_chat_response_for_responses_route(chat_response, client_wants_stream, &original_model)
+    convert_chat_response_for_responses_route(
+        chat_response,
+        client_wants_stream,
+        &original_model,
+        custom_tools,
+    )
 }
 
 /// Returns true if the status code should trigger failover.
@@ -1395,6 +1401,7 @@ fn convert_chat_response_for_responses_route(
     chat_response: RouterResponse,
     client_wants_stream: bool,
     original_model: &str,
+    custom_tools: HashSet<String>,
 ) -> Result<RouterResponse> {
     match chat_response {
         RouterResponse::Buffered {
@@ -1408,10 +1415,19 @@ fn convert_chat_response_for_responses_route(
 
             if client_wants_stream {
                 let sse = if content_type.contains("text/event-stream") {
-                    convert_chat_sse_to_responses_sse(std::str::from_utf8(&body)?, original_model)
+                    convert_chat_sse_to_responses_sse(
+                        std::str::from_utf8(&body)?,
+                        original_model,
+                        &custom_tools,
+                    )
                 } else {
                     let chat_json: Value = serde_json::from_slice(&body)?;
-                    convert_chat_response_to_responses_sse(&chat_json, false, original_model)
+                    convert_chat_response_to_responses_sse(
+                        &chat_json,
+                        false,
+                        original_model,
+                        &custom_tools,
+                    )
                 };
                 Ok(RouterResponse::buffered(
                     200,
@@ -1420,8 +1436,11 @@ fn convert_chat_response_for_responses_route(
                 ))
             } else {
                 let chat_json: Value = serde_json::from_slice(&body)?;
-                let response_json =
-                    convert_chat_response_to_responses_json(&chat_json, original_model)?;
+                let response_json = convert_chat_response_to_responses_json(
+                    &chat_json,
+                    original_model,
+                    &custom_tools,
+                )?;
                 Ok(RouterResponse::buffered(
                     200,
                     CONTENT_TYPE_JSON,
@@ -1445,7 +1464,8 @@ fn convert_chat_response_for_responses_route(
                 content_type: "text/event-stream".to_string(),
                 body: Box::new(StreamingBody::Responses {
                     source: body,
-                    converter: ResponsesStreamConverter::new(original_model, false),
+                    converter: ResponsesStreamConverter::new(original_model, false)
+                        .with_custom_tools(custom_tools),
                 }),
             })
         }
@@ -1541,6 +1561,7 @@ mod tests {
             RouterResponse::buffered(200, CONTENT_TYPE_JSON, serde_json::to_vec(&chat).unwrap()),
             false,
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 
@@ -1573,6 +1594,7 @@ mod tests {
             RouterResponse::buffered(200, "text/event-stream", chat_sse.as_bytes().to_vec()),
             true,
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 
@@ -1607,6 +1629,7 @@ mod tests {
             },
             false,
             "gpt-4o",
+            HashSet::new(),
         );
 
         assert!(response.is_err());
@@ -1675,6 +1698,7 @@ mod tests {
             RouterResponse::buffered(429, CONTENT_TYPE_JSON, error_body.to_vec()),
             false,
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 
@@ -1694,6 +1718,7 @@ mod tests {
             RouterResponse::buffered(500, CONTENT_TYPE_JSON, error_body.to_vec()),
             true,
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 
@@ -1740,6 +1765,7 @@ mod tests {
             RouterResponse::buffered(200, CONTENT_TYPE_JSON, serde_json::to_vec(&chat).unwrap()),
             true, // client wants stream
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 
@@ -1935,6 +1961,7 @@ mod tests {
             RouterResponse::buffered(200, CONTENT_TYPE_JSON, b"not valid json".to_vec()),
             false,
             "gpt-4o",
+            HashSet::new(),
         );
         assert!(response.is_err());
     }
@@ -1946,6 +1973,7 @@ mod tests {
             RouterResponse::buffered(200, CONTENT_TYPE_JSON, Vec::new()),
             false,
             "gpt-4o",
+            HashSet::new(),
         );
         assert!(response.is_err());
     }
@@ -1958,6 +1986,7 @@ mod tests {
             RouterResponse::buffered(400, CONTENT_TYPE_JSON, error_body.to_vec()),
             true,
             "gpt-4o",
+            HashSet::new(),
         )
         .unwrap();
 

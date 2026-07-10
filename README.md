@@ -11,16 +11,21 @@ processes:
 Tauri + React UI
         ↕ newline-delimited JSON-RPC 2.0
 aivo app-server --stdio
-        ↕
-AgentEngine / tools / approvals
+        ├─ AgentEngine / approvals (local)
+        ├─ Bailey Local Tools (product-managed local stdio)
+        ├─ user-installed MCP extensions
+        └─ selected model provider (remote or local)
 ```
 
 The first development slice includes real multi-turn in-process AgentEngine
 execution, streamed events, reverse approval and user-input requests,
 cancellation, durable thread resume, a bundled sidecar, provider/model
-discovery and thread selection, user-configured MCP tools, and a native Bailey
-task interface. Provider and MCP secrets remain inside Aivo. The wire contract
-is documented in [docs/app-server-protocol.md](docs/app-server-protocol.md).
+discovery and thread selection, product-managed Bailey Local Tools,
+user-configured MCP extensions, and a native Bailey task interface. Product
+tools and user MCP are separate sources attached to the same AgentEngine;
+provider and MCP secrets remain inside Aivo. The wire and Local Tools launcher
+contract are documented in
+[docs/app-server-protocol.md](docs/app-server-protocol.md).
 
 Development:
 
@@ -39,10 +44,11 @@ Prerelease (`desktop-build-<run number>`). These development packages are
 not production-signed: macOS is ad-hoc signed but not notarized, and Windows is
 unsigned until the repository signing secrets are configured.
 
-Automatic Bailey Cloud MCP provisioning, project-scoped MCP consent,
-turn-scoped model overrides, attachments, and signed Windows distribution are
-the next slices; they are not silently stubbed as working capabilities in
-protocol v1. Bailey Cloud is a tool/service layer, not a second planner.
+Installer-specific Bailey Local Tools discovery, Bailey Cloud account/record
+sync, project-scoped MCP consent, turn-scoped model overrides, attachments, and
+signed Windows distribution are the next slices; they are not silently stubbed
+as working capabilities in protocol v1. Bailey Cloud may serve as the selected
+model gateway and knowledge/record backend, but it is not a second planner.
 
 ---
 

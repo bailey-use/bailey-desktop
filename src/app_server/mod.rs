@@ -292,17 +292,27 @@ impl AppServer {
                                     },
                                     "approval": true,
                                     "userInput": true,
-                                    "mcp": {
-                                        "tools": true,
-                                        "configScopes": ["user"],
-                                        "projectConfiguration": false,
-                                        "transports": ["stdio", "streamableHttp"],
-                                        "oauth": {
-                                            "storedCredentials": true,
-                                            "interactive": false
+                                    "toolSources": {
+                                        "productTools": {
+                                            "managed": true,
+                                            "configuration": "launcher",
+                                            "transport": "stdio",
+                                            "approvalRequired": true,
+                                            "load": "thread",
+                                            "bestEffort": true
                                         },
-                                        "load": "thread",
-                                        "bestEffort": true
+                                        "userMcp": {
+                                            "tools": true,
+                                            "configScopes": ["user"],
+                                            "projectConfiguration": false,
+                                            "transports": ["stdio", "streamableHttp"],
+                                            "oauth": {
+                                                "storedCredentials": true,
+                                                "interactive": false
+                                            },
+                                            "load": "thread",
+                                            "bestEffort": true
+                                        }
                                     },
                                     "cloud": false,
                                 },
@@ -482,7 +492,7 @@ impl AppServer {
                                         "cwd": thread.cwd.clone(),
                                         "provider": thread.provider(),
                                         "model": thread.raw_model.clone(),
-                                        "mcp": thread.mcp(),
+                                        "toolSources": thread.tool_sources(),
                                         "title": thread.title().await,
                                         "state": "idle",
                                     });
@@ -579,7 +589,7 @@ impl AppServer {
                                             "cwd": thread.cwd.clone(),
                                             "provider": thread.provider(),
                                             "model": thread.raw_model.clone(),
-                                            "mcp": thread.mcp(),
+                                            "toolSources": thread.tool_sources(),
                                             "title": title,
                                             "messages": messages,
                                             "state": "idle",
@@ -828,11 +838,13 @@ impl AppServer {
                 .await
                 .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?;
             let agent_compatible = !key.is_any_oauth() && !key.is_cursor_acp();
-            let kind = session::public_provider_for_base_url(&key.base_url).kind;
+            let public_provider = session::public_provider_for_base_url(&key.base_url);
             data.push(json!({
                 "id": provider_id,
                 "displayName": display_name,
-                "kind": kind,
+                "kind": public_provider.kind,
+                "configurationLocation": public_provider.configuration_location,
+                "inferenceLocation": public_provider.inference_location,
                 "active": active_model_provider.as_deref() == Some(key.id.as_str()),
                 "agentCompatible": agent_compatible,
                 "selectedModel": selected_model,

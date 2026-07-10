@@ -6,10 +6,17 @@
   and built-in Code functionality; attach Bailey behavior at App Server,
   provider, MCP, and Desktop UI boundaries whenever possible.
 - Aivo `AgentEngine` is the only planner and executor for a Desktop turn.
-  Built-in code tools and Bailey MCP tools belong to the same engine/tool loop.
+  Built-in code tools and Bailey Local Tools belong to the same engine/tool
+  loop.
 - Treat the Bailey model gateway as an Aivo model provider. It may route,
-  authenticate, meter, and fail over model requests, but it is not an agent.
-- Bailey Cloud is an MCP tool/service layer. Do not add a second model client,
+  authenticate, inject Bailey knowledge, meter, and fail over model requests,
+  but it is not an agent.
+- Bailey Local Tools are product-managed local capabilities, not entries users
+  must copy into their MCP configuration. Keep user MCP as a separate extension
+  surface and never load project MCP in App Server without an explicit consent
+  flow.
+- Bailey Cloud is ordinary model-gateway, account, sync, knowledge, evidence,
+  and record infrastructure. Do not add a Cloud MCP agent, second model client,
   planner, recipe loop, autonomous retry loop, or completion decision there.
 - Provider secrets, base URLs, and protocol-routing details stay inside Aivo's
   local provider store and must not cross the Desktop protocol.

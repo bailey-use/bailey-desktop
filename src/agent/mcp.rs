@@ -63,6 +63,17 @@ const MCP_HTTP_ERROR_SNIPPET_BYTES: usize = 64 * 1024;
 /// older `2024-11-05` it has always sent.
 const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 
+/// Product-managed Bailey Local Tools are injected by the Desktop launcher,
+/// not copied into the user's MCP configuration. The command is deliberately
+/// separate from `~/.config/aivo/mcp.json` so product tools cannot be disabled,
+/// replaced, or made trusted by a user/project MCP entry with the same name.
+pub const BAILEY_LOCAL_MCP_COMMAND_ENV: &str = "BAILEY_LOCAL_MCP_COMMAND";
+/// Optional JSON string array passed to [`BAILEY_LOCAL_MCP_COMMAND_ENV`]. A JSON
+/// contract avoids shell parsing and therefore preserves argument boundaries.
+pub const BAILEY_LOCAL_MCP_ARGS_JSON_ENV: &str = "BAILEY_LOCAL_MCP_ARGS_JSON";
+const BAILEY_LOCAL_MCP_SERVER_NAME: &str = "bailey_local";
+pub const BAILEY_LOCAL_MCP_TOOL_PREFIX: &str = "mcp__bailey_local__";
+
 /// How aivo reaches an MCP server: a spawned child over stdio, or a remote
 /// endpoint over Streamable HTTP. Both speak JSON-RPC 2.0; only the way a
 /// request/response round-trip is carried differs.
@@ -196,6 +207,15 @@ pub struct McpClient {
     /// OAuth. A typed signal (rather than matching the error text) so the UI can
     /// render "needs authorization" and the auto-authorize path fires reliably.
     needs_auth: HashSet<String>,
+}
+
+/// Result of loading the product-managed Bailey Local MCP entry from the
+/// launcher environment. `configured` distinguishes "this build/launcher did
+/// not provide Local Tools" from a configured command that failed to parse,
+/// spawn, or handshake.
+pub struct ProductToolsLoad {
+    pub configured: bool,
+    pub client: McpClient,
 }
 
 /// One server's outcome, reported incrementally during a connect (see
@@ -673,6 +693,27 @@ impl McpClient {
         .await
     }
 
+    /// Connect the Bailey-owned Local Tools process supplied by the Desktop
+    /// launcher. This source is always a single stdio server and always
+    /// `trust:false`; neither user nor project MCP configuration participates.
+    ///
+    /// Absence is a supported packaging state and produces an empty client with
+    /// `configured == false`. A malformed launcher contract is reported through
+    /// the client's ordinary aggregate errors so App Server can stay available
+    /// while marking the product-tool source degraded.
+    pub async fn connect_product_tools_from_env() -> ProductToolsLoad {
+        let (configured, loaded) = load_product_tools_from_env();
+        let client = Self::connect_loaded(
+            loaded,
+            &HashSet::new(),
+            MCP_HANDSHAKE_TIMEOUT,
+            None,
+            None,
+        )
+        .await;
+        ProductToolsLoad { configured, client }
+    }
+
     /// Like `connect`, but skips servers disabled in `/mcp` and invokes `progress`
     /// with each server's outcome the moment its handshake resolves (servers connect
     /// concurrently), so a UI can flip each row to its real status instead of
@@ -1115,6 +1156,98 @@ fn load_user_config(
         })
         .unwrap_or_default();
     load_config_files(files)
+}
+
+/// Build the one product-owned Local MCP config from an explicit launcher
+/// contract. Arguments are JSON rather than a shell string: the App Server
+/// never invokes a shell and never has to guess quoting rules. The returned
+/// config cannot be overridden by `.mcp.json` and forces `trust:false` in code.
+fn load_product_tools_from_env() -> (
+    bool,
+    (HashMap<String, ServerConfig>, Vec<(String, String)>),
+) {
+    let source = "Bailey Local Tools".to_string();
+    let command = match std::env::var(BAILEY_LOCAL_MCP_COMMAND_ENV) {
+        Ok(command) if !command.trim().is_empty() => command,
+        Ok(_) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_COMMAND_ENV} must not be empty"),
+                    )],
+                ),
+            );
+        }
+        Err(std::env::VarError::NotPresent) => {
+            return (false, (HashMap::new(), Vec::new()));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_COMMAND_ENV} is not valid UTF-8"),
+                    )],
+                ),
+            );
+        }
+    };
+
+    let args = match std::env::var(BAILEY_LOCAL_MCP_ARGS_JSON_ENV) {
+        Ok(raw) => match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(args) => args,
+            Err(error) => {
+                return (
+                    true,
+                    (
+                        HashMap::new(),
+                        vec![(
+                            source,
+                            format!(
+                                "{BAILEY_LOCAL_MCP_ARGS_JSON_ENV} must be a JSON string array ({error})"
+                            ),
+                        )],
+                    ),
+                );
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_ARGS_JSON_ENV} is not valid UTF-8"),
+                    )],
+                ),
+            );
+        }
+    };
+
+    let config = ServerConfig {
+        transport: Transport::Stdio {
+            command,
+            args,
+            env: HashMap::new(),
+        },
+        // Product tools operate the user's machine. This is a code-level
+        // invariant, not a launcher/user setting.
+        trust: false,
+    };
+    (
+        true,
+        (
+            HashMap::from([(BAILEY_LOCAL_MCP_SERVER_NAME.to_string(), config)]),
+            Vec::new(),
+        ),
+    )
 }
 
 fn load_config_files(

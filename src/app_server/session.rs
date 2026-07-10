@@ -1,14 +1,16 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::agent::engine::{AgentEngine, TurnCtx, TurnStop};
+use crate::agent::engine::{AgentEngine, ExternalTools, TurnCtx, TurnStop};
 use crate::agent::jobs::{JobTable, SharedJobs};
-use crate::agent::mcp::{FilteredTools, McpClient};
+use crate::agent::mcp::{BAILEY_LOCAL_MCP_TOOL_PREFIX, FilteredTools, McpClient};
 use crate::services::code_session_store::CodeSessionLease;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, StoredChatMessage};
@@ -21,16 +23,87 @@ use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_p
 pub struct PublicProvider {
     pub kind: String,
     pub label: String,
+    pub configuration_location: &'static str,
+    pub inference_location: &'static str,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PublicMcpStatus {
+pub struct PublicProductToolsStatus {
+    pub configured: bool,
+    pub connected: bool,
+    pub tools: usize,
+    pub issues: usize,
+    pub degraded: bool,
+    pub approval_required: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicUserMcpStatus {
     pub scope: &'static str,
     pub connected_servers: usize,
     pub tools: usize,
     pub issues: usize,
     pub degraded: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicToolSourcesStatus {
+    pub product_tools: PublicProductToolsStatus,
+    pub user_mcp: PublicUserMcpStatus,
+}
+
+/// App Server attaches product tools and user-installed MCP servers to the same
+/// AgentEngine. Source order is also collision precedence: Bailey-owned tools
+/// win over a user MCP server that advertises the same final function name.
+struct AppServerExternalTools {
+    sources: Vec<Arc<dyn ExternalTools>>,
+}
+
+impl AppServerExternalTools {
+    fn new(sources: Vec<Arc<dyn ExternalTools>>) -> Self {
+        Self { sources }
+    }
+}
+
+impl ExternalTools for AppServerExternalTools {
+    fn specs(&self) -> Vec<Value> {
+        let mut seen = HashSet::new();
+        let mut specs = Vec::new();
+        for source in &self.sources {
+            for spec in source.specs() {
+                let Some(name) = spec["function"]["name"].as_str() else {
+                    specs.push(spec);
+                    continue;
+                };
+                if seen.insert(name.to_string()) {
+                    specs.push(spec);
+                }
+            }
+        }
+        specs
+    }
+
+    fn handles(&self, name: &str) -> bool {
+        self.sources.iter().any(|source| source.handles(name))
+    }
+
+    fn requires_approval(&self, name: &str) -> bool {
+        self.sources
+            .iter()
+            .find(|source| source.handles(name))
+            .is_some_and(|source| source.requires_approval(name))
+    }
+
+    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
+        if let Some(source) = self.sources.iter().find(|source| source.handles(name)) {
+            return source.call(name, args);
+        }
+        let message = format!("unknown external tool: {name}");
+        Box::pin(async move { Err(message) })
+    }
 }
 
 pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
@@ -40,6 +113,8 @@ pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
         return PublicProvider {
             kind: "aivo_starter".to_string(),
             label: "Aivo Starter".to_string(),
+            configuration_location: "local",
+            inference_location: "remote",
         };
     }
     let (kind, label) = match crate::services::provider_profile::provider_profile_for_base_url(
@@ -59,6 +134,23 @@ pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
     PublicProvider {
         kind: kind.to_string(),
         label: label.to_string(),
+        configuration_location: "local",
+        inference_location: inference_location_for_base_url(base_url),
+    }
+}
+
+fn inference_location_for_base_url(base_url: &str) -> &'static str {
+    if crate::services::provider_profile::is_ollama_base(base_url) {
+        return "local";
+    }
+    let Ok(url) = url::Url::parse(base_url) else {
+        return "remote";
+    };
+    match url.host() {
+        Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => "local",
+        Some(url::Host::Ipv4(address)) if address.is_loopback() => "local",
+        Some(url::Host::Ipv6(address)) if address.is_loopback() => "local",
+        _ => "remote",
     }
 }
 
@@ -152,7 +244,7 @@ pub struct ThreadRuntime {
     pub cwd: PathBuf,
     pub raw_model: String,
     provider: PublicProvider,
-    mcp: PublicMcpStatus,
+    tool_sources: PublicToolSourcesStatus,
     credential_base_url: String,
     key: ApiKey,
     _lease: CodeSessionLease,
@@ -169,8 +261,8 @@ impl ThreadRuntime {
         &self.provider
     }
 
-    pub fn mcp(&self) -> &PublicMcpStatus {
-        &self.mcp
+    pub fn tool_sources(&self) -> &PublicToolSourcesStatus {
+        &self.tool_sources
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,27 +424,51 @@ impl ThreadRuntime {
         engine.set_confirm_before_build();
         engine.enable_user_input();
 
-        // App Server v1 has no project-MCP consent flow. Load only the user's
-        // explicit global config so opening a repo can never execute its
-        // `.mcp.json` stdio commands without approval. Connection/config errors
-        // are best-effort: the thread remains usable with the tools that did
-        // connect, and the public status exposes counts without leaking details.
-        let disabled_mcp_servers = store.get_disabled_mcp_servers().await;
-        let disabled_mcp_tools = store.get_disabled_mcp_tools().await;
-        let (mcp, mcp_client, disabled_mcp_tools) =
+        // Bailey Local Tools are a product-owned source supplied by the Desktop
+        // launcher. User MCP remains an independent extension source. App Server
+        // still ignores packs and project `.mcp.json`, so merely opening a repo
+        // cannot spawn repo-provided code without a consent flow.
+        let (product_load, disabled_mcp_servers, disabled_mcp_tools) = tokio::join!(
+            McpClient::connect_product_tools_from_env(),
+            store.get_disabled_mcp_servers(),
+            store.get_disabled_mcp_tools(),
+        );
+        let product_configured = product_load.configured;
+        let product_client = Arc::new(product_load.client);
+        let product_issues = product_client.errors().len();
+        let product_tools = PublicProductToolsStatus {
+            configured: product_configured,
+            connected: product_client.connected_server_count() > 0,
+            tools: product_client.available_tool_count(&HashSet::new()),
+            issues: product_issues,
+            // Product tools are a required Bailey capability. An absent launcher
+            // contract is different from a clean optional user-MCP state and
+            // must remain visible to Desktop as degraded.
+            degraded: !product_configured || product_issues > 0,
+            // Enforced in `connect_product_tools_from_env`; this is status, not
+            // a setting exposed to the protocol client.
+            approval_required: true,
+        };
+
+        let (user_mcp, user_mcp_client, disabled_mcp_tools) =
             match (disabled_mcp_servers, disabled_mcp_tools) {
                 (Ok(disabled_servers), Ok(disabled_tools)) => {
-                    let disabled_servers = disabled_servers
-                        .into_iter()
-                        .collect::<std::collections::HashSet<_>>();
-                    let disabled_tools = disabled_tools
-                        .into_iter()
-                        .collect::<std::collections::HashSet<_>>();
+                    let disabled_servers = disabled_servers.into_iter().collect::<HashSet<_>>();
+                    let mut disabled_tools = disabled_tools.into_iter().collect::<HashSet<_>>();
                     let client = Arc::new(
                         McpClient::connect_user_config_enabled(&disabled_servers).await,
                     );
+                    // Reserve the product namespace even when the packaged
+                    // Local Tools process is absent or degraded. A user MCP
+                    // entry cannot masquerade as Bailey-owned capabilities.
+                    disabled_tools.extend(client.specs().into_iter().filter_map(|spec| {
+                        spec["function"]["name"]
+                            .as_str()
+                            .filter(|name| name.starts_with(BAILEY_LOCAL_MCP_TOOL_PREFIX))
+                            .map(ToString::to_string)
+                    }));
                     let issues = client.errors().len();
-                    let status = PublicMcpStatus {
+                    let status = PublicUserMcpStatus {
                         scope: "user",
                         connected_servers: client.connected_server_count(),
                         tools: client.available_tool_count(&disabled_tools),
@@ -364,7 +480,7 @@ impl ThreadRuntime {
                 (servers, tools) => {
                     let issues = servers.is_err() as usize + tools.is_err() as usize;
                     (
-                        PublicMcpStatus {
+                        PublicUserMcpStatus {
                             scope: "user",
                             connected_servers: 0,
                             tools: 0,
@@ -372,22 +488,34 @@ impl ThreadRuntime {
                             degraded: true,
                         },
                         None,
-                        std::collections::HashSet::new(),
+                        HashSet::new(),
                     )
                 }
             };
-        if let Some(mcp_client) = mcp_client
-            && mcp_client.has_tools()
+
+        let mut external_sources: Vec<Arc<dyn ExternalTools>> = Vec::new();
+        if product_client.has_tools() {
+            external_sources.push(product_client);
+        }
+        if let Some(user_mcp_client) = user_mcp_client
+            && user_mcp_client.has_tools()
         {
             if disabled_mcp_tools.is_empty() {
-                engine.set_external_tools(mcp_client);
+                external_sources.push(user_mcp_client);
             } else {
-                engine.set_external_tools(Arc::new(FilteredTools::new(
-                    mcp_client,
+                external_sources.push(Arc::new(FilteredTools::new(
+                    user_mcp_client,
                     disabled_mcp_tools,
                 )));
             }
         }
+        if !external_sources.is_empty() {
+            engine.set_external_tools(Arc::new(AppServerExternalTools::new(external_sources)));
+        }
+        let tool_sources = PublicToolSourcesStatus {
+            product_tools,
+            user_mcp,
+        };
         if let Some(messages) = engine_messages {
             engine.restore_conversation(messages);
         } else {
@@ -414,7 +542,7 @@ impl ThreadRuntime {
             cwd,
             raw_model,
             provider,
-            mcp,
+            tool_sources,
             credential_base_url: context_base,
             key,
             _lease: lease,

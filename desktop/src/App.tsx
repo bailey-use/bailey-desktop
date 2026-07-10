@@ -60,12 +60,16 @@ type StoredThreadMessage = {
 type PublicProvider = {
   kind: string;
   label: string;
+  configurationLocation: "local";
+  inferenceLocation: "local" | "remote";
 };
 
 type ModelProvider = {
   id: string;
   displayName: string;
   kind: string;
+  configurationLocation: "local";
+  inferenceLocation: "local" | "remote";
   active: boolean;
   agentCompatible: boolean;
   selectedModel?: string | null;
@@ -86,10 +90,29 @@ type ModelListResult = {
   warning?: string | null;
 };
 
+type ToolSourcesStatus = {
+  productTools: {
+    configured: boolean;
+    connected: boolean;
+    tools: number;
+    issues: number;
+    degraded: boolean;
+    approvalRequired: boolean;
+  };
+  userMcp: {
+    scope: "user";
+    connectedServers: number;
+    tools: number;
+    issues: number;
+    degraded: boolean;
+  };
+};
+
 type ThreadSummary = {
   sessionId: string;
   cwd: string;
   provider?: PublicProvider;
+  toolSources?: ToolSourcesStatus;
   model: string;
   title: string;
   preview: string;
@@ -102,6 +125,7 @@ type ThreadOpenResult = {
   sessionId: string;
   cwd: string;
   provider?: PublicProvider;
+  toolSources?: ToolSourcesStatus;
   model: string;
   title: string;
   preview?: string;
@@ -161,7 +185,29 @@ const previewConversation: ConversationState = {
   sessionId: "preview-session-initial",
   threadId: "preview-thread-initial",
   cwd: previewProject,
-  provider: { kind: "aivo_starter", label: "Aivo Starter" },
+  provider: {
+    kind: "aivo_starter",
+    label: "Aivo Starter",
+    configurationLocation: "local",
+    inferenceLocation: "remote",
+  },
+  toolSources: {
+    productTools: {
+      configured: true,
+      connected: true,
+      tools: 24,
+      issues: 0,
+      degraded: false,
+      approvalRequired: true,
+    },
+    userMcp: {
+      scope: "user",
+      connectedServers: 0,
+      tools: 0,
+      issues: 0,
+      degraded: false,
+    },
+  },
   model: "Aivo Starter",
   title: "简化 Bailey 任务界面",
   preview: "布局已经收敛到项目侧栏、当前任务和输入框三层。",
@@ -197,6 +243,8 @@ function App() {
           id: "aivo-starter",
           displayName: "Aivo Starter",
           kind: "aivo_starter",
+          configurationLocation: "local",
+          inferenceLocation: "remote",
           active: true,
           agentCompatible: true,
           selectedModel: "Aivo Starter",
@@ -864,7 +912,7 @@ function App() {
     } catch (error) {
       setProviders([]);
       setProvidersLoaded(true);
-      setProviderLoadError("无法读取 Aivo Provider 列表，请重试。");
+      setProviderLoadError("无法读取模型连接列表，请重试。");
       setDiagnostic(
         `Could not load model providers: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -910,10 +958,10 @@ function App() {
           : provider,
       ));
       if (result.catalogAvailable && result.selectedModelAvailable === false) {
-        setModelWarning("之前保存的默认模型已不在 Provider 列表中，请选择或填写一个模型。");
+        setModelWarning("之前保存的默认模型已不在该模型服务中，请选择或填写一个模型。");
       } else {
         setModelWarning(
-          result.warning ? "Provider 未提供模型列表，仍可手动填写模型 ID。" : "",
+          result.warning ? "模型服务未提供模型列表，仍可手动填写模型 ID。" : "",
         );
       }
     } catch (error) {
@@ -1126,13 +1174,13 @@ function App() {
       ?? providers.find((provider) => provider.id === modelProvider);
     const model = newTaskModel.trim();
     if (providerLoadError) {
-      throw new Error("无法读取 Aivo Provider 列表，请先在模型菜单中重试。");
+      throw new Error("无法读取模型连接列表，请先在模型菜单中重试。");
     }
     if (providerCatalogLoaded && !selectedProvider) {
-      throw new Error("没有可用于 AgentEngine 的模型 Provider，请先在 Aivo 中配置 Provider。");
+      throw new Error("没有可用于 AgentEngine 的模型连接，请先在 Aivo 中配置模型服务。");
     }
     if (selectedProvider && !model && !selectedProvider.selectedModel?.trim()) {
-      throw new Error("这个 Provider 没有默认模型，请先选择或填写模型 ID。");
+      throw new Error("这个模型连接没有默认模型，请先选择或填写模型 ID。");
     }
     if (isLayoutPreview) {
       const suffix = `${Date.now()}-${Math.random()}`;
@@ -1141,7 +1189,12 @@ function App() {
         threadId: `preview-thread-${suffix}`,
         cwd: projectPath,
         provider: selectedProvider
-          ? { kind: selectedProvider.kind, label: selectedProvider.displayName }
+          ? {
+              kind: selectedProvider.kind,
+              label: selectedProvider.displayName,
+              configurationLocation: selectedProvider.configurationLocation,
+              inferenceLocation: selectedProvider.inferenceLocation,
+            }
           : undefined,
         model: model || selectedProvider?.selectedModel || "Aivo Starter",
         title: "新任务",
@@ -1361,10 +1414,10 @@ function App() {
   const newTaskProviderInfo = providers.find((provider) => provider.id === newTaskProvider);
   const newTaskProviderLabel = newTaskProviderInfo?.displayName
     ?? (providerLoadError
-      ? "Provider 加载失败"
+      ? "模型连接加载失败"
       : providersLoaded
-        ? "未配置 Provider"
-        : "正在读取 Provider");
+        ? "未配置模型连接"
+        : "正在读取模型连接");
   const newTaskModelLabel = newTaskModel
     || newTaskProviderInfo?.selectedModel
     || "需要选择模型";
@@ -1379,6 +1432,27 @@ function App() {
     providerDraftInfo?.agentCompatible
       && (modelDraft.trim() || providerDefaultModelAvailable),
   );
+  const modelLocation = !newTaskProviderInfo
+    ? "模型位置待配置"
+    : newTaskProviderInfo.inferenceLocation === "local"
+      ? "模型本地推理"
+      : "模型远端推理";
+  const activeProductTools = activeConversation?.toolSources?.productTools;
+  const activeUserMcp = activeConversation?.toolSources?.userMcp;
+  const activeInferenceLocation = !activeConversation?.provider
+    ? "待配置"
+    : activeConversation.provider.inferenceLocation === "local"
+      ? "本地"
+      : "远端";
+  const productToolsStatus = !threadId
+    ? "等待任务"
+    : !activeProductTools
+      ? "状态未知"
+      : !activeProductTools.configured
+        ? "未安装或未配置"
+        : activeProductTools.connected && !activeProductTools.degraded
+          ? `已连接 · ${activeProductTools.tools} 个工具`
+          : `连接异常 · ${activeProductTools.issues} 个问题`;
 
   return (
     <div className="app-shell">
@@ -1503,6 +1577,32 @@ function App() {
             >
               <strong>{statusLabel}</strong>
               <p>{operationError || (connection === "ready" ? "代码和命令在本机运行" : statusText)}</p>
+              {connection === "ready" && (
+                <dl className="runtime-boundaries">
+                  <div>
+                    <dt>Agent / 工具执行</dt>
+                    <dd>本地</dd>
+                  </div>
+                  <div>
+                    <dt>模型推理</dt>
+                    <dd>{activeInferenceLocation}</dd>
+                  </div>
+                  <div>
+                    <dt>Bailey Local Tools</dt>
+                    <dd className={activeProductTools?.degraded ? "degraded" : undefined}>
+                      {productToolsStatus}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>用户 MCP</dt>
+                    <dd className={activeUserMcp?.degraded ? "degraded" : undefined}>
+                      {activeUserMcp
+                        ? `${activeUserMcp.connectedServers} 个服务 · ${activeUserMcp.tools} 个工具`
+                        : "状态未知"}
+                    </dd>
+                  </div>
+                </dl>
+              )}
               {durabilityDirty && (
                 <button
                   className="status-action"
@@ -1784,7 +1884,7 @@ function App() {
             <div className="composer-toolbar">
               <span className="local-runtime" aria-live="polite">
                 <span className={`status-dot ${connection}`} />
-                本地执行
+                工具本地执行 · {modelLocation}
               </span>
               <div className="composer-actions">
                 <div className="model-picker-wrap" ref={modelPickerRef}>
@@ -1831,7 +1931,7 @@ function App() {
                         </div>
                       )}
                       <label htmlFor="model-provider">
-                        新任务 Provider
+                        模型连接（本地配置）
                         <select
                           id="model-provider"
                           value={providerDraft}
@@ -1845,7 +1945,7 @@ function App() {
                         >
                           {!providerDraft && (
                             <option value="">
-                              {providersLoaded ? "选择可用 Provider" : "Runtime 当前 Provider"}
+                              {providersLoaded ? "选择模型服务" : "Runtime 当前模型连接"}
                             </option>
                           )}
                           {providers.map((provider) => (
@@ -1860,7 +1960,7 @@ function App() {
                         </select>
                       </label>
                       <label htmlFor="model-id">
-                        新任务 Model
+                        模型（{providerDraftInfo?.inferenceLocation === "local" ? "本地" : "远端"}）
                         <input
                           ref={modelInputRef}
                           id="model-id"
@@ -2040,6 +2140,7 @@ function conversationFromSummary(
 ): ConversationState {
   return {
     ...summary,
+    toolSources: summary.toolSources ?? previous?.toolSources,
     threadId: undefined,
     items: previous?.items ?? [],
     draft: previous?.draft ?? "",
@@ -2079,6 +2180,7 @@ function conversationFromOpenResult(result: ThreadOpenResult): ConversationState
     threadId: result.threadId,
     cwd: result.cwd,
     provider: result.provider,
+    toolSources: result.toolSources,
     model: result.model,
     title: result.title || "新任务",
     preview: result.preview ?? messages.at(-1)?.content ?? "",

@@ -26,19 +26,46 @@ capabilities. `health/check` is the only method allowed before initialization.
 The `models` capability reports support for provider discovery, model listing,
 and provider/model selection when a thread is created.
 
-The `mcp` capability reports real external-tool support. Protocol v1 loads only
-enabled servers from Aivo's user-level `~/.config/aivo/mcp.json`, at thread
-initialization. Both stdio and Streamable HTTP transports are supported;
-previously stored OAuth credentials may be used, but App Server does not start
-an interactive OAuth flow. Pack and project `.mcp.json` files are not read, so
-opening a repository cannot implicitly start a project-provided command. MCP
-connection and configuration failures are best-effort and do not prevent the
-thread from opening. If Aivo cannot read the user's MCP enable/disable
-preferences, loading fails closed with zero MCP tools and a degraded summary.
+The `toolSources` capability distinguishes Bailey-owned product tools from MCP
+servers installed by the user:
+
+- `productTools` is Bailey Local Tools, a product-managed stdio process. The
+  Desktop launcher supplies its executable contract; it is not copied into
+  `~/.config/aivo/mcp.json`, is never loaded from a project, and is forced to
+  require Aivo approval.
+- `userMcp` loads only enabled servers from Aivo's user-level
+  `~/.config/aivo/mcp.json`, at thread initialization. Both stdio and
+  Streamable HTTP transports are supported. Previously stored OAuth credentials
+  may be used, but App Server does not start an interactive OAuth flow.
+
+Pack and project `.mcp.json` files are not read, so opening a repository cannot
+implicitly start a project-provided command. Both sources are best-effort and
+do not prevent a thread from opening when one fails. If Aivo cannot read the
+user MCP enable/disable preferences, that source fails closed with zero tools
+and a degraded summary.
 
 ```json
-{"mcp":{"tools":true,"configScopes":["user"],"projectConfiguration":false,"transports":["stdio","streamableHttp"],"oauth":{"storedCredentials":true,"interactive":false},"load":"thread","bestEffort":true}}
+{"toolSources":{"productTools":{"managed":true,"configuration":"launcher","transport":"stdio","approvalRequired":true,"load":"thread","bestEffort":true},"userMcp":{"tools":true,"configScopes":["user"],"projectConfiguration":false,"transports":["stdio","streamableHttp"],"oauth":{"storedCredentials":true,"interactive":false},"load":"thread","bestEffort":true}}}
 ```
+
+Until installer-specific resource discovery is implemented, the launcher
+contract is explicit and shell-free:
+
+- `BAILEY_LOCAL_MCP_COMMAND`: executable path or command name for Bailey Local
+  Tools. If absent, product tools are reported as not configured.
+- `BAILEY_LOCAL_MCP_ARGS_JSON`: optional JSON array of string arguments.
+
+For repository development only, a launcher can point at the source entry:
+
+```text
+BAILEY_LOCAL_MCP_COMMAND=node
+BAILEY_LOCAL_MCP_ARGS_JSON=["/absolute/path/to/bailey-use/src/mcp/server.js"]
+```
+
+Production packaging must replace that example with its installed launcher or
+binary path. App Server does not contain a developer-machine path and does not
+parse a shell command line. The product source's `trust:false` behavior is
+enforced in code rather than accepted from either environment variable.
 
 ## Client methods
 
@@ -57,11 +84,14 @@ Returns the model providers already configured in Aivo. It never returns a
 secret or base URL:
 
 ```json
-{"activeModelProvider":"provider_...","data":[{"id":"provider_...","displayName":"My Gateway","kind":"openai_compatible","active":true,"agentCompatible":true,"selectedModel":"gpt-5"}]}
+{"activeModelProvider":"provider_...","data":[{"id":"provider_...","displayName":"My Gateway","kind":"openai_compatible","configurationLocation":"local","inferenceLocation":"remote","active":true,"agentCompatible":true,"selectedModel":"gpt-5"}]}
 ```
 
 `agentCompatible: false` means the credential belongs to an external CLI or
 ACP runtime and cannot drive Aivo's in-process `AgentEngine`.
+`configurationLocation` is always `local`; `inferenceLocation` reports only
+whether the endpoint is loopback/local or remote. Neither field reveals the
+endpoint itself.
 
 ### `model/list`
 
@@ -93,12 +123,17 @@ starts a new thread.
 Starting a thread creates its durable session before returning. The response
 contains `threadId`, `sessionId`, canonical `cwd`, `model`, `title`, and a
 sanitized `provider` object such as
-`{"kind":"openai_compatible","label":"OpenAI-compatible"}`. Credential ids,
-names, secrets, and base URLs are not returned with the thread. A runtime thread
-also reports a sanitized MCP summary such as
-`{"scope":"user","connectedServers":1,"tools":6,"issues":0,"degraded":false}`.
-It exposes only aggregate counts; server names, commands, URLs, credentials, and
-raw connection errors remain local. A runtime thread allows one active turn.
+`{"kind":"openai_compatible","label":"OpenAI-compatible","configurationLocation":"local","inferenceLocation":"remote"}`.
+The two location fields explain the boundary without exposing the endpoint.
+Credential ids, names, secrets, and base URLs are not returned with the thread. A runtime thread
+also reports sanitized source summaries:
+
+```json
+{"toolSources":{"productTools":{"configured":true,"connected":true,"tools":8,"issues":0,"degraded":false,"approvalRequired":true},"userMcp":{"scope":"user","connectedServers":1,"tools":6,"issues":0,"degraded":false}}}
+```
+
+They expose only aggregate counts; server names, commands, URLs, credentials,
+and raw connection errors remain local. A runtime thread allows one active turn.
 The durable session survives `thread/close`, server shutdown, and desktop
 restart. Its title is the first non-empty line of the first accepted user
 message, truncated to 34 Unicode characters with an ellipsis when needed.
@@ -125,14 +160,14 @@ Key ids, key names, and base URLs are never returned.
 ```
 
 Resume creates a new in-memory runtime backed by the existing durable session.
-It restores the session's stored provider and model, reloads the current
-user-level MCP configuration, and returns `threadId`, `sessionId`, canonical
-`cwd`, sanitized `provider`, the aggregate `mcp` summary, `model`, `title`, and
-display messages. Exact AgentEngine messages (including tool call/result ids)
-are restored when available; older sessions fall back to their user/assistant
-text history. A kernel-backed lease allows only one app-server process to load
-a session at a time. Process exit and crashes release the lease automatically;
-stale lock-file paths are safe to reuse.
+It restores the session's stored provider and model, reloads Bailey Local Tools
+and the current user-level MCP configuration, and returns `threadId`,
+`sessionId`, canonical `cwd`, sanitized `provider`, aggregate `toolSources`,
+`model`, `title`, and display messages. Exact AgentEngine messages (including
+tool call/result ids) are restored when available; older sessions fall back to
+their user/assistant text history. A kernel-backed lease allows only one
+app-server process to load a session at a time. Process exit and crashes release
+the lease automatically; stale lock-file paths are safe to reuse.
 
 ### `thread/delete`
 
@@ -226,12 +261,13 @@ unknown decisions fail closed.
 ## Ownership boundary
 
 The Aivo `AgentEngine` is the only planner/executor for this protocol. Bailey
-Cloud may expose app knowledge, task/evidence records, verification helpers,
-and bounded Browser/CUA/API operations through MCP. It must not call a model or
-run a second planner, recipe loop, retry loop, or completion decision for the
-same turn.
+Local Tools provides bounded Browser/CUA/device capabilities to that engine.
+The selected model provider remains the only model connection. Bailey Cloud is
+ordinary model-gateway, knowledge, account, sync, and record infrastructure; it
+is not an MCP planner or a second AgentEngine.
 
-Project-scoped MCP consent/configuration, MCP management and interactive OAuth,
-attachments, Cloud transport, and edit-review interactions are not advertised
-by protocol v1 yet. Turn-scoped model overrides are also not advertised yet;
-Desktop applies provider/model changes when it creates the next thread.
+Project-scoped MCP consent/configuration, user MCP management and interactive
+OAuth, packaged Local Tools path discovery, attachments, Cloud record sync, and
+edit-review interactions are not advertised by protocol v1 yet. Turn-scoped
+model overrides are also not advertised yet; Desktop applies provider/model
+changes when it creates the next thread.

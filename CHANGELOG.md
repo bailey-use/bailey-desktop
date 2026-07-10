@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.39.0
+
+The biggest `aivo code` release yet. The agent gains a lifecycle-hooks system, verbatim project guides, headless JSON output with resume, and LSP-backed self-verification on by default. Subagents now run in isolated git worktrees with per-repo profiles, report USD cost against a `--max-cost` budget, and stream live per-delegate progress when running in parallel. Extension packs bundle skills, agents, hooks, and MCP servers as a single installable unit. Under the hood the config directory splits into chartered state/secrets/cache/logs/run paths, and a raft of TUI correctness fixes land for `/rewind`, post-resume context estimates, and mid-turn steering.
+
+- feat(code): lifecycle hooks, verbatim project guides, headless json+resume, LSP/self-verify defaults, and job finish notices (d64da1a)
+- feat(code): subagent worktree isolation, per-repo agent profiles, USD cost with `--max-cost`, and `--add-dir` (1442131)
+- feat(code): extension packs — skills, agents, hooks, and MCP as one installable unit (0a370c8)
+- feat(code): live per-delegate progress for parallel sub-agents (1fe91cc)
+- feat(code): mid-turn steering, bash output spill, truncation hints, and fake-model capture (6233e98)
+- fix(router): bridge codex 0.143+ sol-model tools through the chat transform (67aa11e)
+- fix(code): interrupt-safe `/rewind` scoping, picker mapping, and read-only targets (23ad611)
+- fix(code): base the post-resume footer/context estimate on the durable transcript (4aeec85)
+- fix(agent): own the run_bash process group and tree-kill to stop TUI freezes (f06a201)
+- fix(agent): resolve subagent data-loss and isolation issues (f6e8337)
+- fix(codex-app): track the renamed GUI binary in Codex.app v26.707 (5c7985e)
+- fix(tests): three Windows-only CI failures (9c494de)
+- refactor(config): chartered config-dir layout — state/secrets/cache/logs/run split (d2fa873)
+- refactor(code): sweep user-facing "chat" wording to session/code terms (9ccec4a)
+- refactor(code): drop the percent from the footer context meter (70e9971)
+- test(agent): unit tests for compaction edge branches (f84364d)
+
 ## v0.38.2
 
 This release deepens the `aivo code` cursor backend.

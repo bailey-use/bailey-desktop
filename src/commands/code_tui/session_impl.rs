@@ -2461,6 +2461,8 @@ is preserved."
             .and_then(|p| p.cost_usd(&self.session_tokens))
             .unwrap_or(0.0);
         self.history = session.messages;
+        // Resumed rows never map to live checkpoints (the store is session-scoped).
+        self.agent_turn_indices.clear();
         self.expanded_thinking.clear();
         self.expanded_output.clear();
         self.local_outputs.clear();

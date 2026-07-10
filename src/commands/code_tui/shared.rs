@@ -2358,6 +2358,11 @@ pub(super) struct CodeTuiApp {
     /// In-memory only; cleared when history is replaced (new chat, resume, rewind).
     /// A toggle bumps `transcript_revision`, the body-cache key, so a flip repaints.
     pub(super) expanded_thinking: std::collections::HashSet<usize>,
+    /// History indices of user turns dispatched to the agent engine. The `/rewind`
+    /// picker matches checkpoints by prompt text; requiring this flag stops a
+    /// plain-chat/ACP turn with identical text from stealing an engine turn's
+    /// checkpoint. In-memory; cleared on new chat/resume, retained-below on rewind.
+    pub(super) agent_turn_indices: std::collections::HashSet<usize>,
     /// Thinking duration (ms) per committed assistant turn, by history index.
     /// Recorded but no longer surfaced (thoughts show content, not timing).
     /// In-memory only, cleared alongside `expanded_thinking`.

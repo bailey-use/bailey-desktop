@@ -282,13 +282,16 @@ impl TurnCtx<'_> {
 /// `tree` = working-tree snapshot at turn start (`None` = conversation-only).
 /// `prompt` = opening user text stored verbatim (the picker matches on it, since
 /// `messages[msg_index]` gets mutated in place). `changed` = paths the turn modified
-/// (a rewind reverts only their union); `None` until recorded / for interrupted turns.
+/// (a rewind reverts only their union); `None` until recorded. `seg_tree` = diff
+/// base for a segment resumed after an interrupt recorded `changed`, so the
+/// user's hand-edits made while the turn sat interrupted stay out of the diff.
 #[derive(Clone)]
 pub(crate) struct Checkpoint {
     pub(crate) msg_index: usize,
     pub(crate) prompt: String,
     pub(crate) tree: Option<String>,
     pub(crate) changed: Option<Vec<std::path::PathBuf>>,
+    pub(crate) seg_tree: Option<String>,
 }
 
 /// Result of a [`AgentEngine::rewind_to`] — counts for the notice.
@@ -1285,6 +1288,7 @@ questions.",
                 prompt: checkpoint_prompt,
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
         }
         // Merge into a preceding user turn (e.g. a turn cancelled before its first
@@ -1616,17 +1620,50 @@ questions.",
         );
 
         // Record paths this turn changed so `/rewind` reverts only the agent's edits.
-        // Interrupted turns skip this — finalized lazily by `rewind_to`.
-        let changed = match self.checkpoints.last().and_then(|c| c.tree.clone()) {
-            Some(tree) => match self.checkpoint_store.as_mut() {
-                Some(store) => Some(store.changed_since(&tree).await),
+        self.record_turn_changes().await;
+    }
+
+    /// Record the paths the turn's yet-unrecorded segment changed into its
+    /// checkpoint: the first segment diffs from the turn tree, a resumed segment
+    /// from its own `seg_tree` (keeping idle-gap hand-edits out of the revert set).
+    /// Idempotent, so the TUI's cancel path can call it without racing turn end.
+    pub(crate) async fn record_turn_changes(&mut self) {
+        let Some(cp) = self.checkpoints.last() else {
+            return;
+        };
+        let prior = cp.changed.clone();
+        let base = match (&prior, cp.seg_tree.clone()) {
+            (None, _) => cp.tree.clone(),
+            (Some(_), seg @ Some(_)) => seg,
+            (Some(_), None) => return, // fully recorded — no open segment
+        };
+        let diff = match &base {
+            Some(b) => match self.checkpoint_store.as_mut() {
+                Some(store) => store.changed_since(b).await,
                 None => Some(Vec::new()),
             },
+            // No tree → nothing revertible; Some([]) still marks the turn
+            // recorded so `rewind_to` won't lazy-diff it.
             None => Some(Vec::new()),
         };
-        if let Some(cp) = self.checkpoints.last_mut() {
-            cp.changed = changed;
+        let Some(cp) = self.checkpoints.last_mut() else {
+            return;
+        };
+        match diff {
+            Some(paths) => {
+                let mut set: std::collections::BTreeSet<std::path::PathBuf> =
+                    prior.unwrap_or_default().into_iter().collect();
+                set.extend(paths);
+                cp.changed = Some(set.into_iter().collect());
+            }
+            None => {
+                // Diff unavailable (git error / size cap) → the segment's changes
+                // are unknown; drop the tree so the turn reads non-revertible.
+                cp.tree = None;
+                cp.changed = Some(prior.unwrap_or_default());
+            }
         }
+        cp.seg_tree = None;
     }
 
     /// Fold interjections into the last tool result — a fresh user turn after
@@ -1683,16 +1720,38 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
         tool_calls: &[ToolCall],
     ) -> (u64, Vec<(String, String)>) {
         // Lazy `/rewind` checkpoint: snapshot the pre-edit (turn-start) tree the first
-        // time a batch isn't entirely read-only. Conservative — anything off the `is_read_only` allowlist triggers it.
-        if self.checkpoints.last().is_some_and(|c| c.tree.is_none())
-            && !tool_calls.iter().all(|c| tools::is_read_only(&c.name))
-        {
-            let tree = match self.checkpoint_store.as_mut() {
-                Some(store) => store.snapshot().await,
-                None => None,
-            };
-            if let Some(cp) = self.checkpoints.last_mut() {
-                cp.tree = tree;
+        // time a batch isn't entirely read-only. Conservative — anything off the
+        // `is_read_only` allowlist triggers it. A turn resumed after an interrupt
+        // (`changed` already recorded) also snapshots a `seg_tree` diff base, so the
+        // resumed segment's diff excludes the user's edits made in between.
+        if !tool_calls.iter().all(|c| tools::is_read_only(&c.name)) {
+            let need_tree = self.checkpoints.last().is_some_and(|c| c.tree.is_none());
+            let need_seg = !need_tree
+                && self
+                    .checkpoints
+                    .last()
+                    .is_some_and(|c| c.changed.is_some() && c.seg_tree.is_none());
+            if need_tree || need_seg {
+                let tree = match self.checkpoint_store.as_mut() {
+                    Some(store) => store.snapshot().await,
+                    None => None,
+                };
+                if let Some(cp) = self.checkpoints.last_mut() {
+                    if need_tree {
+                        cp.tree = tree.clone();
+                        // A prior record means an interrupt closed the first
+                        // segment pre-mutation — this snapshot is also the seg base.
+                        if cp.changed.is_some() {
+                            cp.seg_tree = tree;
+                        }
+                    } else {
+                        match tree {
+                            Some(t) => cp.seg_tree = Some(t),
+                            // Can't isolate the segment's diff → non-revertible.
+                            None => cp.tree = None,
+                        }
+                    }
+                }
             }
         }
 
@@ -2272,21 +2331,36 @@ Re-run the full command without write confinement?",
 
     /// Per-checkpoint `/rewind` targets in order for the picker: `(prompt, file_revertible)`.
     /// The TUI matches by prompt text newest-backward. Cheap and in-memory (no git).
+    /// Revertible = any checkpoint from the turn onward has a tree (a read-only
+    /// turn restores from the first later one — see [`Self::rewind_to`]).
     pub fn rewind_targets(&self) -> Vec<(String, bool)> {
-        self.checkpoints
-            .iter()
-            .map(|c| (c.prompt.clone(), c.tree.is_some()))
-            .collect()
+        let mut out = Vec::with_capacity(self.checkpoints.len());
+        let mut tree_from_here = false;
+        for c in self.checkpoints.iter().rev() {
+            tree_from_here |= c.tree.is_some();
+            out.push((c.prompt.clone(), tree_from_here));
+        }
+        out.reverse();
+        out
     }
 
     /// Rewind to checkpoint `ordinal`: revert the union of files the rewound turns
     /// changed (leaving the user's independent edits), truncate to the turn's user
-    /// message, drop the rewound checkpoints, re-derive the working set. A `None`-tree
-    /// checkpoint rewinds the conversation only.
+    /// message, drop the rewound checkpoints, re-derive the working set. When no
+    /// checkpoint from `ordinal` onward has a tree, the conversation alone rewinds.
     pub async fn rewind_to(&mut self, ordinal: usize) -> RewindOutcome {
         let mut outcome = RewindOutcome::default();
-        let tree = self.checkpoints.get(ordinal).and_then(|c| c.tree.clone());
-        // Union of paths every rewound turn changed; finalize interrupted turns (`changed == None`) lazily.
+        // Close the last turn's open segment (an abort whose cancel record raced us).
+        self.record_turn_changes().await;
+        // Restore target: the turn's own pre-edit tree, or — for a read-only turn
+        // that never snapshotted — the first later checkpoint's tree (turns in
+        // between have no tree because they changed nothing, so it equals this
+        // turn's end state).
+        let tree = self.checkpoints[ordinal.min(self.checkpoints.len())..]
+            .iter()
+            .find_map(|c| c.tree.clone());
+        // Union of paths every rewound turn changed; finalize never-recorded
+        // (crash-orphaned) checkpoints lazily.
         let mut paths: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
         for i in ordinal..self.checkpoints.len() {
@@ -2295,7 +2369,7 @@ Re-run the full command without write confinement?",
                 Some(c) => c,
                 None => match self.checkpoints[i].tree.clone() {
                     Some(t) => match self.checkpoint_store.as_mut() {
-                        Some(store) => store.changed_since(&t).await,
+                        Some(store) => store.changed_since(&t).await.unwrap_or_default(),
                         None => Vec::new(),
                     },
                     None => Vec::new(),
@@ -7823,6 +7897,7 @@ mod tests {
             prompt: "a".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7835,6 +7910,7 @@ mod tests {
             prompt: "c".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7869,6 +7945,7 @@ mod tests {
             prompt: "c".into(),
             tree: Some("abc".into()),
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7881,6 +7958,7 @@ mod tests {
             prompt: "e".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7906,6 +7984,7 @@ mod tests {
                 prompt: u.into(),
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
             engine.messages.push(json!({"role": "user", "content": u}));
             engine
@@ -7956,6 +8035,7 @@ mod tests {
             prompt: "first".into(),
             tree: Some("abc".into()),
             changed: None,
+            seg_tree: None,
         });
         engine.push_text_turn("user", "first".into());
         engine.push_text_turn("user", "second".into());
@@ -7987,6 +8067,7 @@ mod tests {
             prompt: "go".into(),
             tree,
             changed: None,
+            seg_tree: None,
         });
         // Simulate the turn: rename + edit (the case byte-snapshots couldn't revert).
         std::fs::rename(p.join("a.txt"), p.join("b.txt")).unwrap();
@@ -7996,6 +8077,140 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v0");
         assert!(!p.join("b.txt").exists(), "renamed file removed");
         assert!(outcome.restored >= 1);
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_record_shields_user_edits_from_rewind() {
+        // Hand-edits made after the cancel-time record must survive a later rewind.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("agent.txt"), "a0").unwrap();
+        std::fs::write(p.join("mine.txt"), "m0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        let tree = {
+            let store = engine.checkpoint_store.as_mut().unwrap();
+            if !store.git_available().await {
+                return; // git missing → skip
+            }
+            store.snapshot().await
+        };
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "go".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        // Agent edit + cancel-time record, then a post-interrupt hand-edit.
+        std::fs::write(p.join("agent.txt"), "a1").unwrap();
+        engine.record_turn_changes().await;
+        std::fs::write(p.join("mine.txt"), "m-edited").unwrap();
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(std::fs::read_to_string(p.join("agent.txt")).unwrap(), "a0");
+        assert_eq!(
+            std::fs::read_to_string(p.join("mine.txt")).unwrap(),
+            "m-edited",
+            "the user's post-interrupt edit must survive the rewind"
+        );
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn resumed_segment_diffs_from_its_own_base() {
+        // Segments union across an interrupt+resend, minus the user's idle-gap edit.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("agent.txt"), "a0").unwrap();
+        std::fs::write(p.join("mine.txt"), "m0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        let tree = {
+            let store = engine.checkpoint_store.as_mut().unwrap();
+            if !store.git_available().await {
+                return; // git missing → skip
+            }
+            store.snapshot().await
+        };
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "go".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        // Segment 1 (agent edit + interrupt record), idle-gap user edit, then
+        // segment 2 from a fresh seg base (agent create + turn-end record).
+        std::fs::write(p.join("agent.txt"), "a1").unwrap();
+        engine.record_turn_changes().await;
+        std::fs::write(p.join("mine.txt"), "m-edited").unwrap();
+        let seg = engine.checkpoint_store.as_mut().unwrap().snapshot().await;
+        engine.checkpoints.last_mut().unwrap().seg_tree = seg;
+        std::fs::write(p.join("new.txt"), "n").unwrap();
+        engine.record_turn_changes().await;
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(std::fs::read_to_string(p.join("agent.txt")).unwrap(), "a0");
+        assert!(!p.join("new.txt").exists(), "segment-2 create removed");
+        assert_eq!(
+            std::fs::read_to_string(p.join("mine.txt")).unwrap(),
+            "m-edited",
+            "the idle-gap hand-edit is not part of either segment"
+        );
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn rewind_to_read_only_turn_restores_from_the_next_tree() {
+        // Rewinding to a tree-less (read-only) turn must still revert later edits.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "v0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        if !engine
+            .checkpoint_store
+            .as_mut()
+            .unwrap()
+            .git_available()
+            .await
+        {
+            return; // git missing → skip
+        }
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "look".into(),
+            tree: None,
+            changed: Some(Vec::new()),
+            seg_tree: None,
+        });
+        let tree = engine.checkpoint_store.as_mut().unwrap().snapshot().await;
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "edit".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        std::fs::write(p.join("a.txt"), "v1").unwrap();
+        engine.record_turn_changes().await;
+
+        // Both turns read as file-revertible: the read-only one borrows the later tree.
+        let targets = engine.rewind_targets();
+        assert_eq!(
+            targets.iter().map(|t| t.1).collect::<Vec<_>>(),
+            [true, true]
+        );
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(
+            std::fs::read_to_string(p.join("a.txt")).unwrap(),
+            "v0",
+            "the later turn's edit reverts even from a read-only target"
+        );
+        assert_eq!(outcome.restored, 1);
         assert!(outcome.error.is_none());
     }
 
@@ -8024,6 +8239,7 @@ mod tests {
             prompt: "go".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
 
         // A read-only batch must NOT snapshot.

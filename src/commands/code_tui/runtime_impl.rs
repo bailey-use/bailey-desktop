@@ -839,6 +839,11 @@ impl CodeTuiApp {
                 }
             }
         };
+        // Flag the user row as engine-dispatched for the `/rewind` picker match —
+        // after every early return, so a turn that never ran stays unflagged.
+        if self.history.last().is_some_and(|m| m.role == "user") {
+            self.agent_turn_indices.insert(self.history.len() - 1);
+        }
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -875,6 +880,20 @@ impl CodeTuiApp {
                 None => engine.run_turn(&ctx, &mut ui, input).await,
             }
         }));
+    }
+
+    /// After aborting an agent turn, close its checkpoint's open segment in the
+    /// background: the abort skips the turn-end record, and diffing only at
+    /// `/rewind` would sweep the user's post-interrupt hand-edits into the revert
+    /// set. Idempotent, so racing a completed turn is benign.
+    fn finalize_interrupted_checkpoint(&self) {
+        let Some(session) = &self.agent_engine else {
+            return;
+        };
+        let engine = session.engine.clone();
+        tokio::spawn(async move {
+            engine.lock().await.record_turn_changes().await;
+        });
     }
 
     /// Tear down the per-turn agent serve (shutdown notify + abort accept loop).
@@ -1599,17 +1618,22 @@ impl CodeTuiApp {
             Vec::new()
         };
         // Map display turns onto checkpoints by prompt text from the newest
-        // backward. A turn that doesn't match the next checkpoint (a non-agent turn,
-        // or one trimmed/compacted away, or one predating the engine) is
-        // conversation-only and consumes no checkpoint. Robust to trimming,
-        // compaction, and rebuilds — unlike positional arithmetic, which restored
-        // the wrong tree when the lists drifted.
+        // backward, over engine-dispatched rows only (a plain-chat/ACP row with
+        // identical text must not steal an engine turn's checkpoint). A flagged
+        // turn that doesn't match the next checkpoint (trimmed/compacted away, or
+        // predating the engine) is conversation-only and consumes no checkpoint.
+        // Robust to trimming, compaction, and rebuilds — unlike positional
+        // arithmetic, which restored the wrong tree when the lists drifted.
         let mut row_ordinal: Vec<Option<usize>> = vec![None; turn_count];
         let mut row_revertible: Vec<bool> = vec![false; turn_count];
         let mut remaining = targets.len();
         for turn_idx in (0..turn_count).rev() {
-            let content = &self.history[user_indices[turn_idx]].content;
-            if remaining > 0 && targets[remaining - 1].0 == *content {
+            let history_index = user_indices[turn_idx];
+            let content = &self.history[history_index].content;
+            if remaining > 0
+                && self.agent_turn_indices.contains(&history_index)
+                && targets[remaining - 1].0 == *content
+            {
                 remaining -= 1;
                 row_ordinal[turn_idx] = Some(remaining);
                 row_revertible[turn_idx] = targets[remaining].1;
@@ -1665,6 +1689,8 @@ impl CodeTuiApp {
         }
         let removed = self.history[history_index].clone();
         self.history.truncate(history_index);
+        // Surviving indices are unchanged by the truncation — keep them.
+        self.agent_turn_indices.retain(|&i| i < history_index);
         // Indices shift on truncation — drop inline-expand state and durations so
         // they can't point at the wrong block.
         self.expanded_thinking.clear();
@@ -2300,6 +2326,7 @@ pieces and keep going"
         self.cancel_inflight_request(CancelKind::Discard);
         self.overlay = Overlay::None;
         self.history.clear();
+        self.agent_turn_indices.clear();
         self.expanded_thinking.clear();
         self.expanded_output.clear();
         self.local_outputs.clear();
@@ -2381,6 +2408,9 @@ pieces and keep going"
         if let Some(task) = self.response_task.take() {
             task.abort();
         }
+        if was_agent_turn {
+            self.finalize_interrupted_checkpoint();
+        }
         // Tear down the agent turn's serve and drop any pending permission card
         // (the dropped reply makes the engine's awaiting tool fail closed).
         self.stop_agent_serve();
@@ -2425,6 +2455,8 @@ pieces and keep going"
                 self.history.pop();
             }
         }
+        // Either pop above may have removed a flagged user row.
+        self.agent_turn_indices.retain(|&i| i < self.history.len());
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
         self.sending = false;
@@ -2468,8 +2500,12 @@ pieces and keep going"
             return Ok(());
         }
 
+        let was_agent_turn = self.agent_serve.is_some();
         if let Some(task) = self.response_task.take() {
             task.abort();
+        }
+        if was_agent_turn {
+            self.finalize_interrupted_checkpoint();
         }
         // Tear down an agent turn's serve / permission card if this was one.
         self.stop_agent_serve();
@@ -2658,8 +2694,9 @@ fn rewind_excerpt(text: &str) -> String {
 }
 
 /// Trailing annotation on a `/rewind` picker row: a "conversation only" marker
-/// when the turn has no tree snapshot (file revert unavailable); otherwise empty
-/// (the exact file impact is reported in the notice after applying).
+/// when no checkpoint from the turn onward has a tree snapshot (file revert
+/// unavailable); otherwise empty (the exact file impact is reported in the
+/// notice after applying).
 fn rewind_label_suffix(conversation_only: bool) -> String {
     if conversation_only {
         "  · conversation only".to_string()

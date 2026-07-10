@@ -302,6 +302,7 @@ impl CodeTuiApp {
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),
+            agent_turn_indices: std::collections::HashSet::new(),
             reasoning_durations: std::collections::HashMap::new(),
             turn_durations: std::collections::HashMap::new(),
             reasoning_started_at: None,

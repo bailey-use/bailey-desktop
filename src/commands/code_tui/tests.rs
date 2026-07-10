@@ -1508,6 +1508,7 @@ fn make_test_app(
         local_outputs: std::collections::HashMap::new(),
         expanded_output: std::collections::HashSet::new(),
         expanded_thinking: std::collections::HashSet::new(),
+        agent_turn_indices: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
         turn_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
@@ -1621,6 +1622,75 @@ async fn test_open_rewind_picker_lists_user_turns_newest_first() {
     // No live engine in the test app → no checkpoints → conversation-only.
     assert!(ordinal.is_none());
     assert!(picker.items[0].label.contains("conversation only"));
+}
+
+#[tokio::test]
+async fn test_rewind_picker_ignores_non_agent_row_with_identical_text() {
+    // A plain-chat/ACP row with text equal to an earlier engine turn's prompt
+    // must not steal that turn's checkpoint (that rewound one turn too far).
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (role, content) in [
+        ("user", "continue"),
+        ("assistant", "done"),
+        ("user", "continue"),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    // Only the FIRST "continue" went through the engine.
+    app.agent_turn_indices.insert(0);
+    let mut engine =
+        crate::agent::engine::AgentEngine::new("/tmp", "claude", "2026-06-14", &[], &[], 0, 0);
+    engine.checkpoints.push(crate::agent::engine::Checkpoint {
+        msg_index: 1,
+        prompt: "continue".to_string(),
+        tree: Some("abc".to_string()),
+        changed: Some(Vec::new()),
+        seg_tree: None,
+    });
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "claude".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+
+    app.open_rewind_picker().await.unwrap();
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected a rewind picker overlay");
+    };
+    assert_eq!(picker.items.len(), 2);
+    // Newest row = the plain-chat duplicate: no checkpoint, conversation-only.
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+    } = &picker.items[0].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!(*history_index, 2);
+    assert!(
+        ordinal.is_none(),
+        "a non-engine row must not steal the checkpoint"
+    );
+    assert!(picker.items[0].label.contains("conversation only"));
+    // Older row = the real engine turn: keeps its checkpoint and file revert.
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+    } = &picker.items[1].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!(*history_index, 0);
+    assert_eq!(*ordinal, Some(0));
+    assert!(!picker.items[1].label.contains("conversation only"));
 }
 
 #[tokio::test]

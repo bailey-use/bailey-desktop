@@ -676,6 +676,7 @@ mod tests {
                 prompt: format!("cp{i}"),
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
         }
         e.apply_compaction(3, "early work");
@@ -818,6 +819,7 @@ mod tests {
                 prompt: format!("cp{i}"),
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
         }
         e.enforce_budget(100);

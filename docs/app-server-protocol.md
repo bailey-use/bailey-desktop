@@ -36,23 +36,78 @@ and in-memory thread count.
 ```
 
 `keyId` and `model` fall back to Aivo's active key and selected coding model.
-The first version keeps threads in memory and allows one active turn per
-thread.
+Starting a thread creates its durable session before returning. The response
+contains `threadId`, `sessionId`, canonical `cwd`, `model`, and `title`; API-key
+metadata never crosses the protocol. A runtime thread allows one active turn.
+The durable session survives `thread/close`, server shutdown, and desktop
+restart. Its title is the first non-empty line of the first accepted user
+message, truncated to 34 Unicode characters with an ellipsis when needed.
+
+### `thread/list`
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"thread/list","params":{"cwd":"/work/project"}}
+```
+
+The cwd is canonicalized and the response contains every durable session in
+that project, regardless of which local key created it. Rows are newest first:
+
+```json
+{"data":[{"sessionId":"session_...","cwd":"/work/project","model":"aivo/starter","title":"Fix the failing test","preview":"...","updatedAt":"...","createdAt":"..."}]}
+```
+
+Key ids, key names, and base URLs are never returned.
+
+### `thread/resume`
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{"sessionId":"session_..."}}
+```
+
+Resume creates a new in-memory runtime backed by the existing durable session.
+It restores the session's stored key and model and returns `threadId`,
+`sessionId`, canonical `cwd`, `model`, `title`, and display messages. Exact
+AgentEngine messages (including tool call/result ids) are restored when
+available; older sessions fall back to their user/assistant text history. A
+kernel-backed lease allows only one app-server process to load a session at a
+time. Process exit and crashes release the lease automatically; stale lock-file
+paths are safe to reuse.
+
+### `thread/delete`
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"sessionId":"session_..."}}
+```
+
+Deletes an unloaded durable session and its artifacts. A loaded session returns
+`THREAD_BUSY`; callers must successfully `thread/close` its runtime first. The
+operation is idempotent and returns `state: "deleted"` or `state: "not_found"`.
+It never returns key or provider metadata.
+
+### `thread/flush`
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"thread/flush","params":{"threadId":"thread_..."}}
+```
+
+Retries durable persistence from the currently loaded in-memory conversation
+and AgentEngine transcript without running another agent turn. It returns
+`persisted: true` on success and `THREAD_BUSY` while a turn is active.
 
 ### `thread/close`
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"thread/close","params":{"threadId":"thread_..."}}
+{"jsonrpc":"2.0","id":7,"method":"thread/close","params":{"threadId":"thread_..."}}
 ```
 
-Stops any active turn, releases background jobs and removes the in-memory
-thread. Desktop clients close the previous thread after a replacement has been
-created successfully.
+Stops any active turn, releases background jobs and removes only the in-memory
+runtime. It does not delete the durable session. Desktop clients close the
+previous runtime after a replacement or resume has been created successfully.
 
 ### `turn/start`
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"turn/start","params":{"threadId":"thread_...","text":"Fix the failing test"}}
+{"jsonrpc":"2.0","id":8,"method":"turn/start","params":{"threadId":"thread_...","text":"Fix the failing test"}}
 ```
 
 The server acknowledges immediately with a `turnId`; the agent continues on a
@@ -81,9 +136,10 @@ event.
 
 ### `turn/cancel`
 
-Cancellation is idempotent. It stops model/tool work and denies pending
-interactions, but does not claim to roll back side effects that already
-happened.
+Cancellation is idempotent. It stops model/tool work, denies pending
+interactions, and persists the interrupted AgentEngine transcript before the
+terminal event so completed tool results are not replayed after resume. It does
+not claim to roll back side effects that already happened.
 
 ### `shutdown`
 
@@ -113,5 +169,5 @@ Cloud integration may authenticate devices, assign remote tasks, map Cloud task
 ids to local thread/turn ids, and record events. It must not run a second
 planner or recipe loop for the same turn.
 
-Persistence, resume/replay, MCP consent, attachments, Cloud transport, and
-edit-review interactions are intentionally not advertised by protocol v1 yet.
+MCP consent, attachments, Cloud transport, and edit-review interactions are
+not advertised by protocol v1 yet.

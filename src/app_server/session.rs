@@ -7,8 +7,9 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::agent::engine::{AgentEngine, TurnCtx, TurnStop};
 use crate::agent::jobs::{JobTable, SharedJobs};
+use crate::services::code_session_store::CodeSessionLease;
 use crate::services::models_cache::ModelsCache;
-use crate::services::session_store::{ApiKey, SessionStore};
+use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, StoredChatMessage};
 
 use super::protocol::{INTERNAL_ERROR, NOT_FOUND, RpcFailure, THREAD_BUSY, UNAVAILABLE};
 use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_pending_for_turn};
@@ -17,6 +18,14 @@ struct ActiveTurn {
     turn_id: String,
     task: tokio::task::JoinHandle<()>,
     terminal: Arc<AtomicBool>,
+}
+
+pub const NEW_THREAD_TITLE: &str = "新任务";
+
+#[derive(Clone)]
+struct DurableConversation {
+    title: String,
+    messages: Vec<StoredChatMessage>,
 }
 
 pub struct PreparedTurn {
@@ -31,8 +40,14 @@ pub struct PreparedCancel {
     seq: Arc<AtomicU64>,
 }
 
+struct CancelledTurn {
+    thread_id: String,
+    turn_id: String,
+    seq: Arc<AtomicU64>,
+}
+
 impl PreparedCancel {
-    pub async fn execute(self, outbound: &Outbound, pending: &PendingInteractions) {
+    async fn abort(self, pending: &PendingInteractions) -> CancelledTurn {
         let Self {
             thread_id,
             turn_id,
@@ -42,8 +57,38 @@ impl PreparedCancel {
         task.abort();
         let _ = task.await;
         fail_pending_for_turn(pending, &thread_id, &turn_id);
-        let emitter = EventEmitter::new(outbound.clone(), thread_id, turn_id, seq);
-        emitter.emit("turn.cancelled", json!({ "sideEffectsRolledBack": false }));
+        CancelledTurn {
+            thread_id,
+            turn_id,
+            seq,
+        }
+    }
+
+    pub async fn execute(
+        self,
+        runtime: &ThreadRuntime,
+        outbound: &Outbound,
+        pending: &PendingInteractions,
+    ) {
+        let cancelled = self.abort(pending).await;
+        let persisted = runtime.persist_interrupted_engine().await.is_ok();
+        cancelled.emit(outbound, persisted);
+    }
+}
+
+impl CancelledTurn {
+    fn emit(self, outbound: &Outbound, persisted: bool) {
+        let emitter = EventEmitter::new(outbound.clone(), self.thread_id, self.turn_id, self.seq);
+        if !persisted {
+            emitter.emit(
+                "error",
+                json!({ "text": "Cancelled turn context could not be saved." }),
+            );
+        }
+        emitter.emit(
+            "turn.cancelled",
+            json!({ "sideEffectsRolledBack": false, "persisted": persisted }),
+        );
     }
 }
 
@@ -55,25 +100,93 @@ impl PreparedTurn {
 
 pub struct ThreadRuntime {
     pub id: String,
+    pub session_id: String,
     pub cwd: PathBuf,
     pub raw_model: String,
-    pub key_name: String,
     key: ApiKey,
+    _lease: CodeSessionLease,
     store: SessionStore,
     engine: Arc<Mutex<AgentEngine>>,
+    conversation: Arc<Mutex<DurableConversation>>,
     jobs: SharedJobs,
     active: Arc<Mutex<Option<ActiveTurn>>>,
     seq: Arc<AtomicU64>,
 }
 
 impl ThreadRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         id: String,
+        session_id: String,
+        lease: CodeSessionLease,
         cwd: String,
         key_id: Option<String>,
         requested_model: Option<String>,
         store: SessionStore,
         cache: &ModelsCache,
+    ) -> Result<Arc<Self>, RpcFailure> {
+        Self::create_with_conversation(
+            id,
+            session_id,
+            lease,
+            cwd,
+            key_id,
+            requested_model,
+            store,
+            cache,
+            DurableConversation {
+                title: NEW_THREAD_TITLE.to_string(),
+                messages: Vec::new(),
+            },
+            None,
+        )
+        .await
+    }
+
+    pub async fn resume(
+        id: String,
+        state: CodeSessionState,
+        title: String,
+        lease: CodeSessionLease,
+        store: SessionStore,
+        cache: &ModelsCache,
+    ) -> Result<Arc<Self>, RpcFailure> {
+        let CodeSessionState {
+            session_id,
+            key_id,
+            cwd,
+            model,
+            messages,
+            engine_messages,
+            ..
+        } = state;
+        Self::create_with_conversation(
+            id,
+            session_id,
+            lease,
+            cwd,
+            Some(key_id),
+            Some(model),
+            store,
+            cache,
+            DurableConversation { title, messages },
+            engine_messages,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_with_conversation(
+        id: String,
+        session_id: String,
+        lease: CodeSessionLease,
+        cwd: String,
+        key_id: Option<String>,
+        requested_model: Option<String>,
+        store: SessionStore,
+        cache: &ModelsCache,
+        conversation: DurableConversation,
+        engine_messages: Option<Vec<Value>>,
     ) -> Result<Arc<Self>, RpcFailure> {
         let cwd = validate_cwd(&cwd)?;
         let mut key = match key_id.as_deref() {
@@ -158,9 +271,20 @@ impl ThreadRuntime {
         engine.enable_rewind_checkpoints(cwd.to_string_lossy().as_ref());
         engine.set_confirm_before_build();
         engine.enable_user_input();
-        let jobs = JobTable::new(Some(store.session_artifacts_dir(&id).join("jobs")));
+        if let Some(messages) = engine_messages {
+            engine.restore_conversation(messages);
+        } else {
+            engine.seed_history(
+                conversation
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+                    .map(|message| (message.role.clone(), message.content.clone())),
+            );
+        }
+        let jobs = JobTable::new(Some(store.session_artifacts_dir(&session_id).join("jobs")));
         engine.set_jobs(jobs.clone());
-        engine.set_artifacts_dir(store.session_artifacts_dir(&id));
+        engine.set_artifacts_dir(store.session_artifacts_dir(&session_id));
         engine.maybe_enable_lsp(&cwd);
         store
             .record_selection(&key.id, "app-server", Some(&raw_model))
@@ -169,16 +293,167 @@ impl ThreadRuntime {
 
         Ok(Arc::new(Self {
             id,
+            session_id,
             cwd,
             raw_model,
-            key_name: key.display_name().to_string(),
             key,
+            _lease: lease,
             store,
             engine: Arc::new(Mutex::new(engine)),
+            conversation: Arc::new(Mutex::new(conversation)),
             jobs,
             active: Arc::new(Mutex::new(None)),
             seq: Arc::new(AtomicU64::new(0)),
         }))
+    }
+
+    pub async fn title(&self) -> String {
+        self.conversation.lock().await.title.clone()
+    }
+
+    pub async fn persist_empty(&self) -> Result<(), RpcFailure> {
+        self.persist_snapshot(None).await
+    }
+
+    async fn persist_user_turn(&self, turn_id: &str, user_text: &str) -> Result<(), RpcFailure> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let previous = {
+            let mut conversation = self.conversation.lock().await;
+            let previous = conversation.clone();
+            let has_user = conversation
+                .messages
+                .iter()
+                .any(|message| message.role == "user" && !message.content.trim().is_empty());
+            if !has_user {
+                conversation.title =
+                    title_from_text(user_text).unwrap_or_else(|| NEW_THREAD_TITLE.to_string());
+            }
+            conversation.messages.push(StoredChatMessage {
+                role: "user".to_string(),
+                content: user_text.to_string(),
+                reasoning_content: None,
+                id: Some(format!("{turn_id}:user")),
+                timestamp: Some(now),
+                attachments: None,
+                model: None,
+            });
+            previous
+        };
+        if let Err(error) = self.persist_snapshot(None).await {
+            *self.conversation.lock().await = previous;
+            return Err(error);
+        }
+        // The accepted user turn is now newer than the previously exact engine
+        // transcript. Clear that blob until completion refreshes it so a crash or
+        // cancellation resumes from the full display history rather than silently
+        // dropping the acknowledged prompt.
+        if let Err(error) = self
+            .store
+            .save_agent_messages(&self.session_id, &[])
+            .await
+            .map_err(internal)
+        {
+            *self.conversation.lock().await = previous;
+            let _ = self.persist_snapshot(None).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn persist_turn_completion(
+        &self,
+        turn_id: &str,
+        assistant_text: String,
+        engine_messages: &[Value],
+    ) -> Result<(), RpcFailure> {
+        if !assistant_text.trim().is_empty() {
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut conversation = self.conversation.lock().await;
+            conversation.messages.push(StoredChatMessage {
+                role: "assistant".to_string(),
+                content: assistant_text,
+                reasoning_content: None,
+                id: Some(format!("{turn_id}:assistant")),
+                timestamp: Some(now),
+                attachments: None,
+                model: Some(self.raw_model.clone()),
+            });
+        }
+        self.persist_snapshot(Some(engine_messages)).await
+    }
+
+    async fn persist_interrupted_engine(&self) -> Result<(), RpcFailure> {
+        let messages = self.recoverable_engine_messages().await;
+        self.store
+            .save_agent_messages(&self.session_id, &messages)
+            .await
+            .map_err(internal)
+    }
+
+    async fn recoverable_engine_messages(&self) -> Vec<Value> {
+        let latest_user = self
+            .conversation
+            .lock()
+            .await
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(|message| message.content.clone());
+        let conversation = self.engine.lock().await.export_conversation();
+        let covers_latest_user = latest_user.as_deref().is_some_and(|latest| {
+            conversation
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "user")
+                .and_then(|message| message["content"].as_str())
+                == Some(latest)
+        });
+        // Cancellation can arrive while the route is still starting, before the
+        // engine has appended this turn's user message. Keep the exact blob clear
+        // in that case so resume seeds the already-durable display history.
+        if covers_latest_user {
+            conversation
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub async fn flush(&self) -> Result<(), RpcFailure> {
+        if let Some(active) = self.active.lock().await.as_ref() {
+            return Err(RpcFailure::new(THREAD_BUSY, "thread has an active turn")
+                .with_data(json!({ "threadId": self.id, "turnId": active.turn_id })));
+        }
+        let messages = self.recoverable_engine_messages().await;
+        self.persist_snapshot(Some(&messages)).await
+    }
+
+    async fn persist_snapshot(&self, engine_messages: Option<&[Value]>) -> Result<(), RpcFailure> {
+        let conversation = self.conversation.lock().await.clone();
+        let preview = conversation_preview(&conversation.messages);
+        let tokens = self.store.chat_session_tokens(&self.session_id).await;
+        self.store
+            .save_code_session_with_id(
+                &self.key.id,
+                &self.key.base_url,
+                &self.cwd.to_string_lossy(),
+                &self.session_id,
+                &self.raw_model,
+                None,
+                &conversation.messages,
+                &conversation.title,
+                &preview,
+                tokens,
+            )
+            .await
+            .map_err(internal)?;
+        if let Some(messages) = engine_messages {
+            self.store
+                .save_agent_messages(&self.session_id, messages)
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
     }
 
     pub async fn prepare_turn(
@@ -202,6 +477,8 @@ impl ThreadRuntime {
                     .with_data(json!({ "threadId": self.id, "turnId": active.turn_id })),
             );
         }
+
+        self.persist_user_turn(&turn_id, &text).await?;
 
         let terminal = Arc::new(AtomicBool::new(false));
         let emitter = EventEmitter::new(
@@ -286,10 +563,25 @@ impl ThreadRuntime {
         let mut engine = self.engine.lock().await;
         engine.run_turn(&ctx, &mut ui, text).await;
         ui.finish_streams();
-        let _conversation = engine.export_conversation();
+        let conversation = engine.export_conversation();
         drop(engine);
 
-        let (event_type, payload) = if let Some(error) = ui.last_error.as_deref() {
+        let assistant_text = ui.answer().to_string();
+        let persist_error = self
+            .persist_turn_completion(&turn_id, assistant_text.clone(), &conversation)
+            .await
+            .err();
+
+        if persist_error.is_some() {
+            emitter.emit(
+                "error",
+                json!({
+                    "text": "Conversation could not be saved; this turn remains available only while the runtime is open."
+                }),
+            );
+        }
+        let persisted = persist_error.is_none();
+        let (event_type, mut payload) = if let Some(error) = ui.last_error.as_deref() {
             (
                 "turn.failed",
                 json!({ "error": redact(error), "text": redact(ui.answer()) }),
@@ -302,6 +594,7 @@ impl ThreadRuntime {
         } else {
             ("turn.completed", json!({ "text": redact(ui.answer()) }))
         };
+        payload["persisted"] = Value::Bool(persisted);
         emit_terminal_once(&terminal, &emitter, event_type, payload);
         fail_pending_for_turn(&pending_for_cleanup, &self.id, &turn_id);
     }
@@ -344,7 +637,7 @@ impl ThreadRuntime {
         if let Some(turn_id) = turn_id
             && let Ok(Some(cancel)) = self.prepare_cancel(&turn_id).await
         {
-            cancel.execute(outbound, pending).await;
+            cancel.execute(self, outbound, pending).await;
         }
         let _ = self.jobs.kill_all().await;
     }
@@ -408,6 +701,56 @@ impl Drop for RouterCleanup {
     }
 }
 
+pub(super) fn canonicalize_cwd(cwd: &str) -> Result<PathBuf, RpcFailure> {
+    validate_cwd(cwd)
+}
+
+pub(super) fn title_from_messages(messages: &[StoredChatMessage], model: &str) -> String {
+    messages
+        .iter()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty())
+        .and_then(|message| title_from_text(&message.content))
+        .unwrap_or_else(|| {
+            if messages.is_empty() {
+                NEW_THREAD_TITLE.to_string()
+            } else {
+                model.to_string()
+            }
+        })
+}
+
+fn conversation_preview(messages: &[StoredChatMessage]) -> String {
+    let snippets = messages
+        .iter()
+        .rev()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter(|message| !message.content.trim().is_empty())
+        .take(2)
+        .map(|message| {
+            message
+                .content
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
+    snippets.into_iter().rev().collect::<Vec<_>>().join(" · ")
+}
+
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn title_from_text(text: &str) -> Option<String> {
+    let line = first_non_empty_line(text)?;
+    let mut chars = line.chars();
+    let mut title = chars.by_ref().take(34).collect::<String>();
+    if chars.next().is_some() {
+        title.push('…');
+    }
+    Some(title)
+}
+
 fn validate_cwd(cwd: &str) -> Result<PathBuf, RpcFailure> {
     let cwd = Path::new(cwd);
     if !cwd.is_dir() {
@@ -461,6 +804,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn title_uses_first_line_and_truncates_by_unicode_scalar() {
+        assert_eq!(
+            title_from_text("\n  第一行标题  \n第二行"),
+            Some("第一行标题".to_string())
+        );
+        let long = "界".repeat(35);
+        assert_eq!(
+            title_from_text(&long),
+            Some(format!("{}…", "界".repeat(34)))
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_waits_for_in_flight_events_before_the_terminal_event() {
         let (outbound, mut messages) = mpsc::unbounded_channel();
@@ -483,7 +839,8 @@ mod tests {
             seq,
         };
         let pending = PendingInteractions::default();
-        cancel.execute(&outbound, &pending).await;
+        let cancelled = cancel.abort(&pending).await;
+        cancelled.emit(&outbound, true);
 
         let in_flight = messages.recv().await.unwrap();
         let terminal = messages.recv().await.unwrap();

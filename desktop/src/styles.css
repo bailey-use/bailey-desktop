@@ -224,6 +224,20 @@ button {
 }
 .status-popover strong { font-size: 12px; }
 .status-popover p { margin: 5px 0 0; color: #92998d; font-size: 11px; line-height: 1.45; }
+.status-action {
+  min-height: 30px;
+  margin-top: 10px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #17200f;
+  background: #caf16c;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.status-action:hover:not(:disabled) { background: #d7f78d; }
 .status-popover pre { max-height: 100px; overflow: auto; margin: 9px 0 0; color: #858c80; font: 9px/1.45 ui-monospace, monospace; white-space: pre-wrap; }
 
 .main-panel {
@@ -276,6 +290,7 @@ button {
   padding: 30px max(36px, calc((100% - 736px) / 2)) 42px;
   scroll-padding-bottom: 32px;
 }
+.transcript-content { min-height: 100%; }
 
 .empty-state,
 .thread-ready {
@@ -332,6 +347,12 @@ button {
   gap: 9px;
   list-style: none;
   cursor: pointer;
+}
+.activity-row.static {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
 }
 .activity-row summary::-webkit-details-marker { display: none; }
 .activity-row summary:hover { color: #b9beb4; }

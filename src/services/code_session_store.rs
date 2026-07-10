@@ -11,6 +11,46 @@ use crate::services::session_store::{
 #[derive(Debug, Clone)]
 pub(crate) struct CodeSessionStore {
     pub(crate) ctx: ConfigContext,
+    #[cfg(test)]
+    pub(crate) fail_next_index_save: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Kernel-backed exclusive lease for one durable session runtime. The lock file
+/// is intentionally kept on disk: process exit (including SIGKILL) releases the
+/// OS lock, and the next owner can reuse the stale path safely without an
+/// unlink/open race creating two independently locked inodes.
+pub(crate) struct CodeSessionLease {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for CodeSessionLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the descriptor stays valid for the guard lifetime.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CodeSessionLease {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+
+        // SAFETY: this handle was successfully locked and remains valid here.
+        unsafe {
+            UnlockFile(self.file.as_raw_handle(), 0, 0, u32::MAX, u32::MAX);
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Drop for CodeSessionLease {
+    fn drop(&mut self) {}
 }
 
 /// Only user/assistant prose makes a readable title/preview. Agent turns also
@@ -80,15 +120,101 @@ impl CodeSessionStore {
         self.sessions_dir().join("artifacts").join(session_id)
     }
 
+    pub(crate) fn try_acquire_session_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CodeSessionLease>> {
+        let leases_dir = self.sessions_dir().join("leases");
+        std::fs::create_dir_all(&leases_dir)
+            .with_context(|| format!("Failed to create session leases dir: {leases_dir:?}"))?;
+        let path = leases_dir.join(format!("{session_id}.lock"));
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("Failed to open session lease: {path:?}"))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            loop {
+                // SAFETY: the file descriptor remains open in the returned guard.
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if error
+                    .raw_os_error()
+                    .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+                {
+                    return Ok(None);
+                }
+                return Err(error)
+                    .with_context(|| format!("Failed to lock session lease: {path:?}"));
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, GetLastError};
+            use windows_sys::Win32::Storage::FileSystem::{
+                LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+            };
+            use windows_sys::Win32::System::IO::OVERLAPPED;
+
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            // SAFETY: the handle is valid and kept alive by the returned guard.
+            let rc = unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            };
+            if rc == 0 {
+                let code = unsafe { GetLastError() };
+                if code == ERROR_LOCK_VIOLATION {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("Failed to lock session lease: {path:?}"));
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = &file;
+            anyhow::bail!("session leases are unsupported on this platform");
+        }
+
+        use std::io::{Seek, Write};
+        file.set_len(0)?;
+        file.rewind()?;
+        writeln!(file, "pid={}", std::process::id())?;
+        file.flush()?;
+        Ok(Some(CodeSessionLease { file }))
+    }
+
     /// The one place session deletion happens, so artifacts can't orphan. Artifacts
     /// are best-effort; the file result is returned (already-gone counts as success).
     async fn delete_session_files(&self, session_id: &str) -> std::io::Result<()> {
-        let file = match tokio::fs::remove_file(self.session_file_path(session_id)).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        };
+        match tokio::fs::remove_file(self.session_file_path(session_id)).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
         let _ = tokio::fs::remove_dir_all(self.session_artifacts_dir(session_id)).await;
-        file
+        Ok(())
     }
 
     fn index_path(&self) -> PathBuf {
@@ -116,6 +242,14 @@ impl CodeSessionStore {
     }
 
     async fn save_index(&self, index: &SessionIndex) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_index_save
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected session index write failure");
+        }
+
         let sessions_dir = self.sessions_dir();
         tokio::fs::create_dir_all(&sessions_dir)
             .await
@@ -230,7 +364,10 @@ impl CodeSessionStore {
 
     // ── Eviction ──────────────────────────────────────────────────────────
 
-    async fn evict_old_sessions(&self, index: &mut SessionIndex) -> Result<()> {
+    fn stage_old_session_evictions(
+        &self,
+        index: &mut SessionIndex,
+    ) -> Result<Vec<(String, CodeSessionLease)>> {
         const MAX_SESSIONS_PER_SCOPE: usize = 20;
         const MAX_TOTAL_SESSIONS: usize = 100;
 
@@ -279,17 +416,34 @@ impl CodeSessionStore {
             }
         }
 
-        // Delete session files (and any durable artifacts alongside them).
-        for session_id in &to_delete {
-            let _ = self.delete_session_files(session_id).await;
+        // A runtime holds this same lease for its entire lifetime. Stage only
+        // candidates whose lease can be taken non-blockingly; protected sessions
+        // may temporarily push the index over its cap and are reconsidered later.
+        // Keep every acquired lease alive until the caller has atomically saved
+        // the pruned index and removed the corresponding files.
+        let mut staged = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for session_id in to_delete {
+            if !seen.insert(session_id.clone()) {
+                continue;
+            }
+            let Some(lease) = self.try_acquire_session_lease(&session_id)? else {
+                continue;
+            };
+            staged.push((session_id, lease));
         }
 
-        // Prune index
-        if !to_delete.is_empty() {
-            index.entries.retain(|e| !to_delete.contains(&e.session_id));
+        if !staged.is_empty() {
+            let staged_ids = staged
+                .iter()
+                .map(|(session_id, _)| session_id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            index
+                .entries
+                .retain(|entry| !staged_ids.contains(entry.session_id.as_str()));
         }
 
-        Ok(())
+        Ok(staged)
     }
 
     // ── Rebuild index safety net ──────────────────────────────────────────
@@ -552,8 +706,16 @@ impl CodeSessionStore {
             None => index.entries.push(new_entry),
         }
 
-        self.evict_old_sessions(&mut index).await?;
-        self.save_index(&index).await
+        let staged_evictions = self.stage_old_session_evictions(&mut index)?;
+        self.save_index(&index).await?;
+        // The durable index is authoritative. Delete only after its atomic write
+        // succeeds, while the candidate leases are still held. A file-delete
+        // failure can leave an unindexed orphan, but never a stale index row that
+        // points at a missing session.
+        for (session_id, _lease) in staged_evictions {
+            let _ = self.delete_session_files(&session_id).await;
+        }
+        Ok(())
     }
 
     /// Refresh only the durable agent-engine transcript of an existing chat
@@ -648,37 +810,70 @@ impl CodeSessionStore {
 
         let path = self.session_file_path(session_id);
         let existed = path.exists();
-        // Hard-fail on the file (user-facing delete must not silently no-op).
-        self.delete_session_files(session_id)
-            .await
-            .with_context(|| format!("Failed to delete session file: {:?}", path))?;
-
-        let mut index = self.load_index().await.unwrap_or_default();
+        // Deletion must fail closed when the durable index is unreadable. Treating
+        // corruption as an empty index could remove the only recoverable copy while
+        // leaving a stale row that cannot be repaired transactionally.
+        let mut index = self.load_index().await?;
+        let original_index = index.clone();
         let before = index.entries.len();
         index.entries.retain(|e| e.session_id != session_id);
-        if index.entries.len() < before {
+        let index_changed = index.entries.len() < before;
+        // Remove the durable reference first. If this write fails, no session
+        // content or artifacts have been touched and the caller can safely retry.
+        if index_changed {
             self.save_index(&index).await?;
         }
 
-        Ok(existed || before > index.entries.len())
+        if let Err(error) = self.delete_session_files(session_id).await {
+            // The file still exists when remove_file fails. Restore its index row;
+            // best-effort rollback failure remains surfaced by the delete error.
+            if index_changed {
+                let _ = self.save_index(&original_index).await;
+            }
+            return Err(error).with_context(|| format!("Failed to delete session file: {path:?}"));
+        }
+
+        Ok(existed || index_changed)
     }
 
     /// Removes session files for all sessions belonging to a key.
     pub(crate) async fn remove_sessions_for_key(&self, key_id: &str) -> Result<()> {
         let _lock = self.acquire_session_lock()?;
-        let mut index = self.load_index().await.unwrap_or_default();
-        let to_delete: Vec<String> = index
+        // Destructive cleanup must fail closed. A corrupt/unreadable index is
+        // not equivalent to an empty one and must never authorize file removal.
+        let mut index = self.load_index().await?;
+        let candidates: Vec<String> = index
             .entries
             .iter()
             .filter(|e| e.key_id == key_id)
             .map(|e| e.session_id.clone())
             .collect();
-        for session_id in &to_delete {
-            let _ = self.delete_session_files(session_id).await;
+        let mut staged = Vec::new();
+        for session_id in candidates {
+            let Some(lease) = self.try_acquire_session_lease(&session_id)? else {
+                // Another runtime still owns this session. Keep both its index row
+                // and file intact; a later cleanup may safely retry.
+                continue;
+            };
+            staged.push((session_id, lease));
         }
-        index.entries.retain(|e| e.key_id != key_id);
-        if !to_delete.is_empty() {
-            self.save_index(&index).await?;
+
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let staged_ids = staged
+            .iter()
+            .map(|(session_id, _)| session_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        index
+            .entries
+            .retain(|entry| !staged_ids.contains(entry.session_id.as_str()));
+        self.save_index(&index).await?;
+        // As with cap eviction, the committed index is authoritative. A failed
+        // best-effort unlink may leave an unindexed orphan for later cleanup, but
+        // cannot leave a row pointing at a file that was already removed.
+        for (session_id, _lease) in staged {
+            let _ = self.delete_session_files(&session_id).await;
         }
         Ok(())
     }
@@ -698,6 +893,7 @@ mod tests {
                 config_path,
                 config_dir,
             },
+            fail_next_index_save: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -736,6 +932,179 @@ mod tests {
             timestamp: None,
             attachments: None,
         }]
+    }
+
+    #[test]
+    fn session_lease_reuses_stale_path_and_releases_on_drop() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = make_store(&temp_dir);
+        let leases = store.sessions_dir().join("leases");
+        std::fs::create_dir_all(&leases).unwrap();
+        std::fs::write(leases.join("sess.lock"), b"pid=999999\n").unwrap();
+
+        let first = store.try_acquire_session_lease("sess").unwrap().unwrap();
+        assert!(store.try_acquire_session_lease("sess").unwrap().is_none());
+        drop(first);
+        assert!(store.try_acquire_session_lease("sess").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn eviction_skips_leased_session_until_runtime_releases_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        for index in 0..20 {
+            store
+                .save_code_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/test",
+                    &format!("sess{index}"),
+                    "model",
+                    None,
+                    &sample_messages(),
+                    "title",
+                    "preview",
+                    SessionTokens::default(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let artifacts = store.session_artifacts_dir("sess0");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("evidence.txt"), b"keep").unwrap();
+        let lease = store.try_acquire_session_lease("sess0").unwrap().unwrap();
+
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess20",
+                "model",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        assert!(store.get_code_session("sess0").await.unwrap().is_some());
+        assert!(artifacts.join("evidence.txt").exists());
+        assert_eq!(store.all_chat_sessions().await.unwrap().len(), 21);
+
+        drop(lease);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess21",
+                "model",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        assert!(store.get_code_session("sess0").await.unwrap().is_none());
+        assert!(!artifacts.exists());
+        assert_eq!(store.all_chat_sessions().await.unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn eviction_index_failure_keeps_old_file_and_index_row() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        for index in 0..20 {
+            store
+                .save_code_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/test",
+                    &format!("sess{index:02}"),
+                    "model",
+                    None,
+                    &sample_messages(),
+                    "title",
+                    "preview",
+                    SessionTokens::default(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let oldest = "sess00";
+        let artifacts = store.session_artifacts_dir(oldest);
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("evidence.txt"), b"keep").unwrap();
+
+        store
+            .fail_next_index_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess20",
+                "model",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected session index"));
+
+        let index = store.load_index().await.unwrap();
+        assert!(index.entries.iter().any(|entry| entry.session_id == oldest));
+        assert!(
+            !index
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == "sess20")
+        );
+        assert!(store.session_file_path(oldest).exists());
+        assert!(artifacts.join("evidence.txt").exists());
+        assert!(
+            store.try_acquire_session_lease(oldest).unwrap().is_some(),
+            "failed index write must release the staged eviction lease"
+        );
+
+        // Retrying the same save can now publish the new index first and only
+        // then remove the former oldest session and its artifacts.
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess20",
+                "model",
+                None,
+                &sample_messages(),
+                "title",
+                "preview",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!store.session_file_path(oldest).exists());
+        assert!(!artifacts.exists());
+        let index = store.load_index().await.unwrap();
+        assert!(!index.entries.iter().any(|entry| entry.session_id == oldest));
+        assert!(
+            index
+                .entries
+                .iter()
+                .any(|entry| entry.session_id == "sess20")
+        );
     }
 
     #[tokio::test]
@@ -916,6 +1285,35 @@ mod tests {
         assert!(!art.exists(), "artifacts dir should be pruned on delete");
     }
 
+    #[tokio::test]
+    async fn delete_session_fails_closed_when_index_is_corrupt() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        store
+            .save_code_session_with_id(
+                &key_id,
+                "http://localhost",
+                "/tmp/test",
+                "sess1",
+                "gpt-4o",
+                None,
+                &sample_messages(),
+                "hello",
+                "hello",
+                SessionTokens::default(),
+            )
+            .await
+            .unwrap();
+        let artifacts = store.session_artifacts_dir("sess1");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        std::fs::write(artifacts.join("evidence.txt"), "keep").unwrap();
+        std::fs::write(store.index_path(), "{broken").unwrap();
+
+        assert!(store.delete_chat_session("sess1").await.is_err());
+        assert!(store.session_file_path("sess1").exists());
+        assert!(artifacts.exists());
+    }
+
     /// Cap eviction is the one deletion path with no user in the loop.
     #[tokio::test]
     async fn eviction_removes_artifacts_dir() {
@@ -1011,6 +1409,54 @@ mod tests {
         // Both should be gone
         assert!(store.get_code_session("sess1").await.unwrap().is_none());
         assert!(store.get_code_session("sess2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn key_removal_publishes_index_before_deleting_and_skips_busy_sessions() {
+        let temp_dir = TempDir::new().unwrap();
+        let (store, key_id) = setup_store_with_key(&temp_dir).await;
+        for session_id in ["busy", "idle"] {
+            store
+                .save_code_session_with_id(
+                    &key_id,
+                    "http://localhost",
+                    "/tmp/test",
+                    session_id,
+                    "model",
+                    None,
+                    &sample_messages(),
+                    "title",
+                    "preview",
+                    SessionTokens::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let busy_lease = store.try_acquire_session_lease("busy").unwrap().unwrap();
+
+        store
+            .fail_next_index_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = store.remove_sessions_for_key(&key_id).await.unwrap_err();
+        assert!(error.to_string().contains("injected session index"));
+        let index = store.load_index().await.unwrap();
+        assert!(index.entries.iter().any(|entry| entry.session_id == "busy"));
+        assert!(index.entries.iter().any(|entry| entry.session_id == "idle"));
+        assert!(store.session_file_path("busy").exists());
+        assert!(store.session_file_path("idle").exists());
+
+        store.remove_sessions_for_key(&key_id).await.unwrap();
+        let index = store.load_index().await.unwrap();
+        assert!(index.entries.iter().any(|entry| entry.session_id == "busy"));
+        assert!(!index.entries.iter().any(|entry| entry.session_id == "idle"));
+        assert!(store.session_file_path("busy").exists());
+        assert!(!store.session_file_path("idle").exists());
+
+        drop(busy_lease);
+        store.remove_sessions_for_key(&key_id).await.unwrap();
+        let index = store.load_index().await.unwrap();
+        assert!(!index.entries.iter().any(|entry| entry.session_id == "busy"));
+        assert!(!store.session_file_path("busy").exists());
     }
 
     #[tokio::test]

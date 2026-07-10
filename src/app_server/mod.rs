@@ -11,11 +11,13 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::errors::ExitCode;
+use crate::services::session_store::StoredChatMessage;
 use crate::services::{ModelsCache, SessionStore};
 
 use protocol::{
     IncomingMessage, InitializeParams, NOT_INITIALIZED, RpcFailure, ThreadCloseParams,
-    ThreadStartParams, TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
+    ThreadDeleteParams, ThreadFlushParams, ThreadListParams, ThreadResumeParams, ThreadStartParams,
+    TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
 };
 use session::ThreadRuntime;
 use ui::{Outbound, PendingInteractions};
@@ -269,7 +271,15 @@ impl AppServer {
                                 },
                                 "clientInfo": client,
                                 "capabilities": {
-                                    "threads": { "persistent": false, "close": true, "maxActiveTurnsPerThread": 1 },
+                                    "threads": {
+                                        "persistent": true,
+                                        "list": true,
+                                        "resume": true,
+                                        "delete": true,
+                                        "flush": true,
+                                        "close": true,
+                                        "maxActiveTurnsPerThread": 1
+                                    },
                                     "turns": { "cancel": true, "textOnly": true },
                                     "approval": true,
                                     "userInput": true,
@@ -290,6 +300,56 @@ impl AppServer {
                     Err(error) => self.send_error(id, error),
                 }
             }
+            "thread/list" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match protocol::parse_params::<ThreadListParams>(params) {
+                    Ok(params) => match session::canonicalize_cwd(&params.cwd) {
+                        Ok(cwd) => match self.store.all_chat_sessions().await {
+                            Ok(mut entries) => {
+                                entries.retain(|entry| {
+                                    std::fs::canonicalize(&entry.cwd)
+                                        .is_ok_and(|entry_cwd| entry_cwd == cwd)
+                                });
+                                entries
+                                    .sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+                                let cwd = cwd.to_string_lossy().to_string();
+                                let mut data = Vec::with_capacity(entries.len());
+                                for entry in entries {
+                                    let title = match self
+                                        .store
+                                        .get_code_session(&entry.session_id)
+                                        .await
+                                    {
+                                        Ok(Some(state)) => session::title_from_messages(
+                                            &state.messages,
+                                            &state.model,
+                                        ),
+                                        _ => entry.title.clone(),
+                                    };
+                                    data.push(json!({
+                                        "sessionId": entry.session_id,
+                                        "cwd": cwd,
+                                        "model": entry.model,
+                                        "title": title,
+                                        "preview": entry.preview,
+                                        "updatedAt": entry.updated_at,
+                                        "createdAt": entry.created_at,
+                                    }));
+                                }
+                                self.send_result(id, json!({ "data": data }));
+                            }
+                            Err(error) => self.send_error(
+                                id,
+                                RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                            ),
+                        },
+                        Err(error) => self.send_error(id, error),
+                    },
+                    Err(error) => self.send_error(id, error),
+                }
+            }
             "thread/start" => {
                 if !self.require_initialized(id.clone()) {
                     return true;
@@ -297,8 +357,31 @@ impl AppServer {
                 match protocol::parse_params::<ThreadStartParams>(params) {
                     Ok(params) => {
                         let thread_id = self.next_id("thread");
+                        let session_id = new_durable_session_id();
+                        let lease = match self.store.try_acquire_code_session_lease(&session_id) {
+                            Ok(Some(lease)) => lease,
+                            Ok(None) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(
+                                        protocol::THREAD_BUSY,
+                                        "new session id is unexpectedly leased",
+                                    ),
+                                );
+                                return true;
+                            }
+                            Err(error) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                                );
+                                return true;
+                            }
+                        };
                         match ThreadRuntime::create(
                             thread_id.clone(),
+                            session_id,
+                            lease,
                             params.cwd,
                             params.key_id,
                             params.model,
@@ -307,20 +390,224 @@ impl AppServer {
                         )
                         .await
                         {
-                            Ok(thread) => {
-                                let result = json!({
-                                    "threadId": thread.id.clone(),
-                                    "cwd": thread.cwd.clone(),
-                                    "model": thread.raw_model.clone(),
-                                    "keyName": thread.key_name.clone(),
-                                    "state": "idle",
-                                });
-                                self.threads.insert(thread_id, thread);
-                                self.send_result(id, result);
-                            }
+                            Ok(thread) => match thread.persist_empty().await {
+                                Ok(()) => {
+                                    let result = json!({
+                                        "threadId": thread.id.clone(),
+                                        "sessionId": thread.session_id.clone(),
+                                        "cwd": thread.cwd.clone(),
+                                        "model": thread.raw_model.clone(),
+                                        "title": thread.title().await,
+                                        "state": "idle",
+                                    });
+                                    self.threads.insert(thread_id, thread);
+                                    self.send_result(id, result);
+                                }
+                                Err(error) => {
+                                    let _ =
+                                        self.store.delete_chat_session(&thread.session_id).await;
+                                    self.send_error(id, error);
+                                }
+                            },
                             Err(error) => self.send_error(id, error),
                         }
                     }
+                    Err(error) => self.send_error(id, error),
+                }
+            }
+            "thread/resume" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match protocol::parse_params::<ThreadResumeParams>(params) {
+                    Ok(params) if !valid_session_id(&params.session_id) => self.send_error(
+                        id,
+                        RpcFailure::new(protocol::INVALID_PARAMS, "invalid session id"),
+                    ),
+                    Ok(params)
+                        if self
+                            .threads
+                            .values()
+                            .any(|thread| thread.session_id == params.session_id) =>
+                    {
+                        self.send_error(
+                            id,
+                            RpcFailure::new(protocol::THREAD_BUSY, "session is already loaded")
+                                .with_data(json!({ "sessionId": params.session_id })),
+                        );
+                    }
+                    Ok(params) => {
+                        let lease = match self
+                            .store
+                            .try_acquire_code_session_lease(&params.session_id)
+                        {
+                            Ok(Some(lease)) => lease,
+                            Ok(None) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(
+                                        protocol::THREAD_BUSY,
+                                        "session is already loaded by another process",
+                                    )
+                                    .with_data(json!({ "sessionId": params.session_id })),
+                                );
+                                return true;
+                            }
+                            Err(error) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                                );
+                                return true;
+                            }
+                        };
+                        match self.store.get_code_session(&params.session_id).await {
+                            Ok(Some(state)) if state.session_id != params.session_id => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(
+                                        protocol::INTERNAL_ERROR,
+                                        "stored session id does not match its file name",
+                                    ),
+                                );
+                            }
+                            Ok(Some(state)) => {
+                                let title =
+                                    session::title_from_messages(&state.messages, &state.model);
+                                let messages = public_messages(&state.messages);
+                                let thread_id = self.next_id("thread");
+                                match ThreadRuntime::resume(
+                                    thread_id.clone(),
+                                    state,
+                                    title.clone(),
+                                    lease,
+                                    self.store.clone(),
+                                    &self.cache,
+                                )
+                                .await
+                                {
+                                    Ok(thread) => {
+                                        let result = json!({
+                                            "threadId": thread.id.clone(),
+                                            "sessionId": thread.session_id.clone(),
+                                            "cwd": thread.cwd.clone(),
+                                            "model": thread.raw_model.clone(),
+                                            "title": title,
+                                            "messages": messages,
+                                            "state": "idle",
+                                        });
+                                        self.threads.insert(thread_id, thread);
+                                        self.send_result(id, result);
+                                    }
+                                    Err(error) if error.code == protocol::NOT_FOUND => self
+                                        .send_error(
+                                            id,
+                                            RpcFailure::new(
+                                                protocol::UNAVAILABLE,
+                                                "session credentials are unavailable",
+                                            ),
+                                        ),
+                                    Err(error) => self.send_error(id, error),
+                                }
+                            }
+                            Ok(None) => self.send_error(
+                                id,
+                                RpcFailure::new(protocol::NOT_FOUND, "session not found"),
+                            ),
+                            Err(error) => self.send_error(
+                                id,
+                                RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                            ),
+                        }
+                    }
+                    Err(error) => self.send_error(id, error),
+                }
+            }
+            "thread/delete" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match protocol::parse_params::<ThreadDeleteParams>(params) {
+                    Ok(params) if !valid_session_id(&params.session_id) => self.send_error(
+                        id,
+                        RpcFailure::new(protocol::INVALID_PARAMS, "invalid session id"),
+                    ),
+                    Ok(params)
+                        if self
+                            .threads
+                            .values()
+                            .any(|thread| thread.session_id == params.session_id) =>
+                    {
+                        self.send_error(
+                            id,
+                            RpcFailure::new(protocol::THREAD_BUSY, "session is currently loaded")
+                                .with_data(json!({ "sessionId": params.session_id })),
+                        );
+                    }
+                    Ok(params) => {
+                        let _lease = match self
+                            .store
+                            .try_acquire_code_session_lease(&params.session_id)
+                        {
+                            Ok(Some(lease)) => lease,
+                            Ok(None) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(
+                                        protocol::THREAD_BUSY,
+                                        "session is currently loaded by another process",
+                                    )
+                                    .with_data(json!({ "sessionId": params.session_id })),
+                                );
+                                return true;
+                            }
+                            Err(error) => {
+                                self.send_error(
+                                    id,
+                                    RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                                );
+                                return true;
+                            }
+                        };
+                        match self.store.delete_chat_session(&params.session_id).await {
+                            Ok(deleted) => self.send_result(
+                                id,
+                                json!({
+                                    "sessionId": params.session_id,
+                                    "state": if deleted { "deleted" } else { "not_found" },
+                                }),
+                            ),
+                            Err(error) => self.send_error(
+                                id,
+                                RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()),
+                            ),
+                        }
+                    }
+                    Err(error) => self.send_error(id, error),
+                }
+            }
+            "thread/flush" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match protocol::parse_params::<ThreadFlushParams>(params) {
+                    Ok(params) => match self.threads.get(&params.thread_id).cloned() {
+                        Some(thread) => match thread.flush().await {
+                            Ok(()) => self.send_result(
+                                id,
+                                json!({
+                                    "threadId": thread.id.clone(),
+                                    "sessionId": thread.session_id.clone(),
+                                    "persisted": true,
+                                }),
+                            ),
+                            Err(error) => self.send_error(id, error),
+                        },
+                        None => self.send_error(
+                            id,
+                            RpcFailure::new(protocol::NOT_FOUND, "thread not found"),
+                        ),
+                    },
                     Err(error) => self.send_error(id, error),
                 }
             }
@@ -393,7 +680,7 @@ impl AppServer {
                                     id,
                                     json!({ "turnId": params.turn_id, "state": "cancelled" }),
                                 );
-                                cancel.execute(&self.outbound, &self.pending).await;
+                                cancel.execute(&thread, &self.outbound, &self.pending).await;
                             }
                             Ok(None) => self.send_result(
                                 id,
@@ -466,6 +753,47 @@ impl AppServer {
         ui::fail_all_pending(&self.pending);
         self.threads.clear();
     }
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn new_durable_session_id() -> String {
+    use rand::Rng;
+
+    let bytes: [u8; 16] = rand::thread_rng().r#gen();
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+        ]),
+    )
+}
+
+fn public_messages(messages: &[StoredChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .map(|message| {
+            let mut value = json!({
+                "role": message.role,
+                "content": message.content,
+            });
+            if let Some(reasoning) = message.reasoning_content.as_deref() {
+                value["reasoningContent"] = Value::String(reasoning.to_string());
+            }
+            value
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use crate::services::system_env;
 
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::atomic_write::atomic_write_secure;
-use crate::services::code_session_store::CodeSessionStore;
+use crate::services::code_session_store::{CodeSessionLease, CodeSessionStore};
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::route_cache::PersistedRoute;
@@ -1383,7 +1383,13 @@ impl SessionStore {
     fn from_ctx(ctx: ConfigContext) -> Self {
         Self {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
-            sessions: CodeSessionStore { ctx: ctx.clone() },
+            sessions: CodeSessionStore {
+                ctx: ctx.clone(),
+                #[cfg(test)]
+                fail_next_index_save: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+            },
             stats: UsageStatsStore::new(ctx.clone()),
             last_sel: LastSelectionStore { ctx: ctx.clone() },
             logs: LogStore::new(ctx.config_dir.clone()),
@@ -2116,6 +2122,13 @@ impl SessionStore {
     /// Per-session directory for durable agent artifacts (sub-agent reports, job logs).
     pub fn session_artifacts_dir(&self, session_id: &str) -> PathBuf {
         self.sessions.session_artifacts_dir(session_id)
+    }
+
+    pub(crate) fn try_acquire_code_session_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CodeSessionLease>> {
+        self.sessions.try_acquire_session_lease(session_id)
     }
 
     pub async fn get_code_session(&self, session_id: &str) -> Result<Option<CodeSessionState>> {

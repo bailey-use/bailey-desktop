@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Bailey main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "dialog:allow-confirm",
+    "dialog:allow-open"
+  ]
 }

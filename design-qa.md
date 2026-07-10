@@ -9,7 +9,7 @@
 - Focused sidebar comparison: `design-qa/codex-bailey-sidebar-comparison.png`
 - Focused composer comparison: `design-qa/codex-bailey-composer-comparison.png`
 - Minimum supported window capture: `design-qa/bailey-layout-min-window.png`
-- Primary viewport: `1440 × 817`, dark theme, active project and active task, transcript with user/tool/assistant items, idle composer.
+- Primary viewport: `1440 × 817`, dark theme, active project and active task, transcript with user/tool/assistant items, idle composer. The implementation capture retains a visible focus ring on the runtime-status trigger; the source capture does not expose its focus state, and this does not change layout geometry.
 - Responsive viewport: `900 × 600`, matching the Tauri window minimum width.
 
 ## Findings
@@ -21,7 +21,7 @@ No actionable P0, P1, or P2 differences remain for the requested scope: learn th
 - Colors and tokens: the source's dark neutral structure is retained while Bailey's olive/lime palette remains product-specific. This is an intentional brand substitution, not layout drift. Contrast and visible focus rings remain present.
 - Image and asset fidelity: the target has no required photographic or illustrative assets. Visible interface icons use the Phosphor icon library; no emoji, handcrafted SVG, CSS drawing, or placeholder imagery substitutes were introduced.
 - Copy and content: Codex product labels and unsupported Scheduled/Plugins/Sites/Chat entries were deliberately not copied. Bailey copy describes real local execution, projects, tasks, model selection, approvals, and runtime state.
-- States and interactions: project search, project opening in preview, model popover, message submission, tool disclosure rows, approval/user-input controls, and stop behavior were exercised. Browser console error check returned zero errors.
+- States and interactions: multi-conversation creation/switching, project search, model popover, message submission, focus return, and disclosure controls were exercised. Approval/user-input focus semantics were code-reviewed and their app-server routing is integration-tested; a live native approval dialog was not recaptured in the browser. Browser console error check returned zero errors.
 - Native packaging: the final Tauri macOS app bundle built and launched with its sidecar. The browser comparison excludes native macOS window chrome; no extra fake titlebar was added to the web layout.
 
 ## Comparison history
@@ -44,12 +44,18 @@ Fixes applied:
 
 Post-fix evidence is recorded in `design-qa/codex-bailey-comparison.png`, with readable focused checks in `design-qa/codex-bailey-sidebar-comparison.png` and `design-qa/codex-bailey-composer-comparison.png`. The sidebar split, centered transcript axis, composer width/height, nested Project → Task hierarchy, and bottom anchoring now match the reference layout. Remaining visible differences are expected Bailey branding, dynamic transcript content, omitted unavailable Codex destinations, and native window chrome.
 
+### Pass 3 — passed after conversation-flow repair
+
+The project-scoped multi-conversation and focus changes were captured again at `1440 × 817` and compared against the same normalized Codex source. They add only nested task rows and interaction state; the measured sidebar split, transcript axis, composer geometry, typography hierarchy, palette, icon family, and responsive behavior remain unchanged. The visible lime focus outline is an intentional Bailey accessibility token.
+
 ## Primary interactions tested
 
 - Toggle project search.
-- Open/reset a project in layout-preview mode without invoking unavailable browser-side Tauri APIs.
-- Open and cancel the model picker.
-- Submit a follow-up message and render the resulting user/activity/assistant sequence.
+- Create multiple conversations inside one project while preserving existing task rows.
+- Submit a prompt by mouse and confirm focus returns to the composer.
+- Switch tasks, restore the prior transcript, and confirm focus returns to the composer.
+- Open the model picker, confirm its input receives focus, and dismiss it with Escape back to the trigger.
+- Open project search and the task disclosure, then confirm Escape dismissal and trigger-focus return.
 - Render compact and minimum-window states at `1440 × 817` and `900 × 600`.
 - Check browser error logs after navigation and interaction: no errors.
 

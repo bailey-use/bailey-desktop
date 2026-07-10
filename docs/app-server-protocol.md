@@ -26,6 +26,20 @@ capabilities. `health/check` is the only method allowed before initialization.
 The `models` capability reports support for provider discovery, model listing,
 and provider/model selection when a thread is created.
 
+The `mcp` capability reports real external-tool support. Protocol v1 loads only
+enabled servers from Aivo's user-level `~/.config/aivo/mcp.json`, at thread
+initialization. Both stdio and Streamable HTTP transports are supported;
+previously stored OAuth credentials may be used, but App Server does not start
+an interactive OAuth flow. Pack and project `.mcp.json` files are not read, so
+opening a repository cannot implicitly start a project-provided command. MCP
+connection and configuration failures are best-effort and do not prevent the
+thread from opening. If Aivo cannot read the user's MCP enable/disable
+preferences, loading fails closed with zero MCP tools and a degraded summary.
+
+```json
+{"mcp":{"tools":true,"configScopes":["user"],"projectConfiguration":false,"transports":["stdio","streamableHttp"],"oauth":{"storedCredentials":true,"interactive":false},"load":"thread","bestEffort":true}}
+```
+
 ## Client methods
 
 ### `health/check`
@@ -81,7 +95,10 @@ contains `threadId`, `sessionId`, canonical `cwd`, `model`, `title`, and a
 sanitized `provider` object such as
 `{"kind":"openai_compatible","label":"OpenAI-compatible"}`. Credential ids,
 names, secrets, and base URLs are not returned with the thread. A runtime thread
-allows one active turn.
+also reports a sanitized MCP summary such as
+`{"scope":"user","connectedServers":1,"tools":6,"issues":0,"degraded":false}`.
+It exposes only aggregate counts; server names, commands, URLs, credentials, and
+raw connection errors remain local. A runtime thread allows one active turn.
 The durable session survives `thread/close`, server shutdown, and desktop
 restart. Its title is the first non-empty line of the first accepted user
 message, truncated to 34 Unicode characters with an ellipsis when needed.
@@ -108,13 +125,14 @@ Key ids, key names, and base URLs are never returned.
 ```
 
 Resume creates a new in-memory runtime backed by the existing durable session.
-It restores the session's stored provider and model and returns `threadId`,
-`sessionId`, canonical `cwd`, sanitized `provider`, `model`, `title`, and display messages. Exact
-AgentEngine messages (including tool call/result ids) are restored when
-available; older sessions fall back to their user/assistant text history. A
-kernel-backed lease allows only one app-server process to load a session at a
-time. Process exit and crashes release the lease automatically; stale lock-file
-paths are safe to reuse.
+It restores the session's stored provider and model, reloads the current
+user-level MCP configuration, and returns `threadId`, `sessionId`, canonical
+`cwd`, sanitized `provider`, the aggregate `mcp` summary, `model`, `title`, and
+display messages. Exact AgentEngine messages (including tool call/result ids)
+are restored when available; older sessions fall back to their user/assistant
+text history. A kernel-backed lease allows only one app-server process to load
+a session at a time. Process exit and crashes release the lease automatically;
+stale lock-file paths are safe to reuse.
 
 ### `thread/delete`
 
@@ -213,7 +231,7 @@ and bounded Browser/CUA/API operations through MCP. It must not call a model or
 run a second planner, recipe loop, retry loop, or completion decision for the
 same turn.
 
-MCP consent, attachments, Cloud transport, and edit-review interactions are
-not advertised by protocol v1 yet. Turn-scoped model overrides are also not
-advertised yet; Desktop applies provider/model changes when it creates the next
-thread.
+Project-scoped MCP consent/configuration, MCP management and interactive OAuth,
+attachments, Cloud transport, and edit-review interactions are not advertised
+by protocol v1 yet. Turn-scoped model overrides are also not advertised yet;
+Desktop applies provider/model changes when it creates the next thread.

@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, oneshot};
 
 use crate::agent::engine::{AgentEngine, TurnCtx, TurnStop};
 use crate::agent::jobs::{JobTable, SharedJobs};
+use crate::agent::mcp::{FilteredTools, McpClient};
 use crate::services::code_session_store::CodeSessionLease;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, StoredChatMessage};
@@ -20,6 +21,16 @@ use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_p
 pub struct PublicProvider {
     pub kind: String,
     pub label: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicMcpStatus {
+    pub scope: &'static str,
+    pub connected_servers: usize,
+    pub tools: usize,
+    pub issues: usize,
+    pub degraded: bool,
 }
 
 pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
@@ -141,6 +152,7 @@ pub struct ThreadRuntime {
     pub cwd: PathBuf,
     pub raw_model: String,
     provider: PublicProvider,
+    mcp: PublicMcpStatus,
     credential_base_url: String,
     key: ApiKey,
     _lease: CodeSessionLease,
@@ -155,6 +167,10 @@ pub struct ThreadRuntime {
 impl ThreadRuntime {
     pub fn provider(&self) -> &PublicProvider {
         &self.provider
+    }
+
+    pub fn mcp(&self) -> &PublicMcpStatus {
+        &self.mcp
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -315,6 +331,63 @@ impl ThreadRuntime {
         engine.enable_rewind_checkpoints(cwd.to_string_lossy().as_ref());
         engine.set_confirm_before_build();
         engine.enable_user_input();
+
+        // App Server v1 has no project-MCP consent flow. Load only the user's
+        // explicit global config so opening a repo can never execute its
+        // `.mcp.json` stdio commands without approval. Connection/config errors
+        // are best-effort: the thread remains usable with the tools that did
+        // connect, and the public status exposes counts without leaking details.
+        let disabled_mcp_servers = store.get_disabled_mcp_servers().await;
+        let disabled_mcp_tools = store.get_disabled_mcp_tools().await;
+        let (mcp, mcp_client, disabled_mcp_tools) =
+            match (disabled_mcp_servers, disabled_mcp_tools) {
+                (Ok(disabled_servers), Ok(disabled_tools)) => {
+                    let disabled_servers = disabled_servers
+                        .into_iter()
+                        .collect::<std::collections::HashSet<_>>();
+                    let disabled_tools = disabled_tools
+                        .into_iter()
+                        .collect::<std::collections::HashSet<_>>();
+                    let client = Arc::new(
+                        McpClient::connect_user_config_enabled(&disabled_servers).await,
+                    );
+                    let issues = client.errors().len();
+                    let status = PublicMcpStatus {
+                        scope: "user",
+                        connected_servers: client.connected_server_count(),
+                        tools: client.available_tool_count(&disabled_tools),
+                        issues,
+                        degraded: issues > 0,
+                    };
+                    (status, Some(client), disabled_tools)
+                }
+                (servers, tools) => {
+                    let issues = servers.is_err() as usize + tools.is_err() as usize;
+                    (
+                        PublicMcpStatus {
+                            scope: "user",
+                            connected_servers: 0,
+                            tools: 0,
+                            issues,
+                            degraded: true,
+                        },
+                        None,
+                        std::collections::HashSet::new(),
+                    )
+                }
+            };
+        if let Some(mcp_client) = mcp_client
+            && mcp_client.has_tools()
+        {
+            if disabled_mcp_tools.is_empty() {
+                engine.set_external_tools(mcp_client);
+            } else {
+                engine.set_external_tools(Arc::new(FilteredTools::new(
+                    mcp_client,
+                    disabled_mcp_tools,
+                )));
+            }
+        }
         if let Some(messages) = engine_messages {
             engine.restore_conversation(messages);
         } else {
@@ -341,6 +414,7 @@ impl ThreadRuntime {
             cwd,
             raw_model,
             provider,
+            mcp,
             credential_base_url: context_base,
             key,
             _lease: lease,

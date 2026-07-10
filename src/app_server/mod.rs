@@ -292,7 +292,18 @@ impl AppServer {
                                     },
                                     "approval": true,
                                     "userInput": true,
-                                    "mcp": false,
+                                    "mcp": {
+                                        "tools": true,
+                                        "configScopes": ["user"],
+                                        "projectConfiguration": false,
+                                        "transports": ["stdio", "streamableHttp"],
+                                        "oauth": {
+                                            "storedCredentials": true,
+                                            "interactive": false
+                                        },
+                                        "load": "thread",
+                                        "bestEffort": true
+                                    },
                                     "cloud": false,
                                 },
                             }),
@@ -471,6 +482,7 @@ impl AppServer {
                                         "cwd": thread.cwd.clone(),
                                         "provider": thread.provider(),
                                         "model": thread.raw_model.clone(),
+                                        "mcp": thread.mcp(),
                                         "title": thread.title().await,
                                         "state": "idle",
                                     });
@@ -567,6 +579,7 @@ impl AppServer {
                                             "cwd": thread.cwd.clone(),
                                             "provider": thread.provider(),
                                             "model": thread.raw_model.clone(),
+                                            "mcp": thread.mcp(),
                                             "title": title,
                                             "messages": messages,
                                             "state": "idle",

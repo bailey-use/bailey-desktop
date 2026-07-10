@@ -656,6 +656,23 @@ impl McpClient {
         .await
     }
 
+    /// Connect only servers explicitly configured in the aivo-global
+    /// `~/.config/aivo/mcp.json`, honoring the user's disabled-server set.
+    ///
+    /// This deliberately ignores pack and project `.mcp.json` files. It is the
+    /// safe entry point for non-interactive UI transports that do not yet expose
+    /// the project-stdio consent flow used by the Code TUI.
+    pub async fn connect_user_config_enabled(disabled: &HashSet<String>) -> McpClient {
+        Self::connect_loaded(
+            load_user_config(user_config_path().as_deref()),
+            disabled,
+            MCP_HANDSHAKE_TIMEOUT,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Like `connect`, but skips servers disabled in `/mcp` and invokes `progress`
     /// with each server's outcome the moment its handshake resolves (servers connect
     /// concurrently), so a UI can flip each row to its real status instead of
@@ -721,7 +738,24 @@ impl McpClient {
         progress: Option<&(dyn Fn(String, ServerConnectStatus) + Sync)>,
         reuse: Option<&McpClient>,
     ) -> McpClient {
-        let (configs, mut errors) = load_configs(user_path, cwd);
+        Self::connect_loaded(
+            load_configs(user_path, cwd),
+            disabled,
+            handshake_timeout,
+            progress,
+            reuse,
+        )
+        .await
+    }
+
+    async fn connect_loaded(
+        loaded: (HashMap<String, ServerConfig>, Vec<(String, String)>),
+        disabled: &HashSet<String>,
+        handshake_timeout: Duration,
+        progress: Option<&(dyn Fn(String, ServerConnectStatus) + Sync)>,
+        reuse: Option<&McpClient>,
+    ) -> McpClient {
+        let (configs, mut errors) = loaded;
         let mut servers: HashMap<String, Arc<McpServer>> = HashMap::new();
         let mut needs_auth = HashSet::new();
 
@@ -794,6 +828,26 @@ impl McpClient {
 
     pub fn has_tools(&self) -> bool {
         self.servers.values().any(|s| !s.tools.is_empty())
+    }
+
+    /// Aggregate connection state for protocol clients without exposing server
+    /// names, commands, endpoint URLs, or failure details.
+    pub fn connected_server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    pub fn available_tool_count(&self, disabled: &HashSet<String>) -> usize {
+        let mut seen = HashSet::new();
+        self.servers
+            .iter()
+            .flat_map(|(name, server)| {
+                server
+                    .tools
+                    .iter()
+                    .map(move |tool| qualified_name(name, &tool.name))
+            })
+            .filter(|name| !disabled.contains(name) && seen.insert(name.clone()))
+            .count()
     }
 
     /// Connect/parse failures as `(source, reason)`, for surfacing to the user.
@@ -1034,8 +1088,6 @@ fn load_configs(
     user_path: Option<&Path>,
     cwd: &Path,
 ) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
-    let mut configs = HashMap::new();
-    let mut errors = Vec::new();
     let mut files: Vec<(PathBuf, String)> = Vec::new();
     // Packs first = lowest precedence; gated on user_path so `None` (tests) stays isolated.
     if user_path.is_some() {
@@ -1048,6 +1100,28 @@ fn load_configs(
         files.push((path.to_path_buf(), "~/.config/aivo/mcp.json".to_string()));
     }
     files.push((cwd.join(".mcp.json"), ".mcp.json".to_string()));
+    load_config_files(files)
+}
+
+fn load_user_config(
+    user_path: Option<&Path>,
+) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
+    let files = user_path
+        .map(|path| {
+            vec![(
+                path.to_path_buf(),
+                "~/.config/aivo/mcp.json".to_string(),
+            )]
+        })
+        .unwrap_or_default();
+    load_config_files(files)
+}
+
+fn load_config_files(
+    files: Vec<(PathBuf, String)>,
+) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
+    let mut configs = HashMap::new();
+    let mut errors = Vec::new();
     for (path, label) in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue; // absent → fine

@@ -73,6 +73,22 @@ impl CodeTuiApp {
                 args,
                 step,
             } => self.apply_subagent_activity(agent, tool, args, step),
+            RuntimeEvent::AgentSubBegin { labels } => self.apply_subagent_begin(labels),
+            RuntimeEvent::AgentSubSlot {
+                slot,
+                agent,
+                tool,
+                args,
+                step,
+            } => self.apply_subagent_slot(slot, agent, tool, args, step),
+            RuntimeEvent::AgentSubDenied { slot, tool } => self.apply_subagent_denied(slot, tool),
+            RuntimeEvent::AgentSubDone {
+                slot,
+                ok,
+                steps,
+                tokens,
+            } => self.apply_subagent_done(slot, ok, steps, tokens),
+            RuntimeEvent::AgentSubFinish => self.subagent_rows.clear(),
             RuntimeEvent::AgentToolUpdate {
                 id,
                 args,
@@ -522,6 +538,78 @@ impl CodeTuiApp {
         self.last_tool_action = Some((label, Instant::now()));
     }
 
+    /// Unnamed delegates get numbered so every row stays distinguishable.
+    pub(super) fn apply_subagent_begin(&mut self, labels: Vec<String>) {
+        let now = Instant::now();
+        self.subagent_rows = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| super::shared::SubagentRow {
+                name: if name.is_empty() {
+                    format!("sub-agent {}", i + 1)
+                } else {
+                    name
+                },
+                action: "starting".to_string(),
+                step: 0,
+                started: now,
+                denied: None,
+                done: None,
+            })
+            .collect();
+    }
+
+    /// The action label is precomputed here so rendering stays pure.
+    pub(super) fn apply_subagent_slot(
+        &mut self,
+        slot: usize,
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    ) {
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        if !agent.is_empty() {
+            row.name = agent;
+        }
+        row.action = if tool.is_empty() {
+            "working".to_string()
+        } else {
+            super::render::tool_action_label(&tool, &args, &cwd)
+        };
+        row.step = step;
+    }
+
+    /// Mark the row and explain in a notice, so the deny doesn't read as
+    /// delegate sloppiness.
+    pub(super) fn apply_subagent_denied(&mut self, slot: usize, tool: String) {
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        let name = row.name.clone();
+        row.denied = Some(tool.clone());
+        self.notice = Some((
+            WARNING,
+            format!(
+                "{name}: `{tool}` auto-denied — parallel delegates can't prompt; run it solo to approve"
+            ),
+        ));
+    }
+
+    pub(super) fn apply_subagent_done(&mut self, slot: usize, ok: bool, steps: usize, tokens: u64) {
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        row.done = Some((ok, steps, tokens, row.started.elapsed()));
+    }
+
     /// Enrich the matching tool-call entry in place (cursor reports the resolved
     /// path/pattern and the result in a later `tool_call_update`, keyed by id):
     /// swap in the real args and attach a compact result / failed flag. Bumps the
@@ -720,6 +808,7 @@ impl CodeTuiApp {
         // A retry that recovered on the final step has no later chunk to clear it.
         self.clear_retry_notice();
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
@@ -956,6 +1045,7 @@ impl CodeTuiApp {
         self.commit_assistant_segment(partial);
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.pending_submit = None;
         // A dead compact turn must not mark the NEXT turn as a compact.
@@ -987,6 +1077,7 @@ impl CodeTuiApp {
         format: ChatFormat,
     ) -> Result<()> {
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.response_task = None;
         // The turn's format belongs to the model that ran it — don't clobber a

@@ -1403,6 +1403,7 @@ fn make_test_app(
         request_started_at: None,
         compact_before: None,
         last_tool_action: None,
+        subagent_rows: Vec::new(),
         status_display: None,
         turn_output_tokens: 0,
         retrying: false,
@@ -2695,6 +2696,56 @@ fn test_subagent_activity_drives_status_line() {
         status.contains('↳'),
         "marked as nested delegation: {status:?}"
     );
+}
+
+#[test]
+fn test_parallel_subagent_rows_render_under_status_line() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    // The batch's `subagent` calls are in flight (no results yet).
+    app.apply_agent_tool_call(
+        None,
+        "subagent".to_string(),
+        serde_json::json!({"label": "audit auth flow", "task": "…"}),
+        vec![],
+    );
+    app.apply_subagent_begin(vec!["audit auth flow".to_string(), String::new()]);
+    // The unnamed delegate is numbered so its row stays distinguishable.
+    assert_eq!(app.subagent_rows[1].name, "sub-agent 2");
+    app.apply_subagent_slot(
+        0,
+        "audit auth flow".to_string(),
+        "grep".to_string(),
+        serde_json::json!({"pattern": "session"}),
+        3,
+    );
+    app.apply_subagent_denied(1, "run_bash".to_string());
+    app.apply_subagent_done(1, true, 8, 1200);
+    // Headline counts completions; per-delegate rows sit under it.
+    assert_eq!(app.desired_status(), "running 2 sub-agents (1 done)");
+    let lines = app.build_transcript().plain_lines;
+    let running = lines
+        .iter()
+        .find(|l| l.contains("audit auth flow — searching session"))
+        .expect("live row shows the delegate's current action");
+    assert!(running.contains("step 3"), "carries steps: {running:?}");
+    let done = lines
+        .iter()
+        .find(|l| l.contains("✓ sub-agent 2 — done"))
+        .expect("finished row flips to ✓ with stats");
+    assert!(done.contains("1.2k tokens"), "carries tokens: {done:?}");
+    // A denied gated call surfaces as a warning notice, not a silent deny.
+    let (_, notice) = app.notice.clone().expect("denial sets a notice");
+    assert!(
+        notice.contains("run_bash") && notice.contains("auto-denied"),
+        "explains the deny: {notice:?}"
+    );
+    // Slot events past the row list are ignored (defensive).
+    app.apply_subagent_slot(9, String::new(), String::new(), serde_json::Value::Null, 1);
+    // Batch end retires the rows and hands the headline back.
+    app.subagent_rows.clear();
+    assert_ne!(app.desired_status(), "running 2 sub-agents (1 done)");
 }
 
 #[test]

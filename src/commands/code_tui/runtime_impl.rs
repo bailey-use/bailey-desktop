@@ -326,6 +326,7 @@ impl CodeTuiApp {
         self.pending_reasoning.clear();
         // Reset per-turn status state (label can't flash before the first tool).
         self.last_tool_action = None;
+        self.subagent_rows.clear();
         self.turn_output_tokens = 0;
         self.retrying = false;
         self.pending_submit = Some(PendingSubmission {
@@ -2781,6 +2782,64 @@ struct ChatAgentUi {
     steering: SteeringQueue,
 }
 
+/// Bridges parallel sub-agent progress to the event loop's per-delegate rows.
+struct ChatSubagentSink {
+    tx: UnboundedSender<RuntimeEvent>,
+}
+
+impl crate::agent::engine::SubagentSink for ChatSubagentSink {
+    fn begin(&self, labels: &[String]) {
+        self.tx
+            .send(RuntimeEvent::AgentSubBegin {
+                labels: labels.to_vec(),
+            })
+            .ok();
+    }
+
+    fn activity(
+        &self,
+        slot: usize,
+        agent: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        step: usize,
+    ) {
+        self.tx
+            .send(RuntimeEvent::AgentSubSlot {
+                slot,
+                agent: agent.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                step,
+            })
+            .ok();
+    }
+
+    fn denied(&self, slot: usize, tool: &str) {
+        self.tx
+            .send(RuntimeEvent::AgentSubDenied {
+                slot,
+                tool: tool.to_string(),
+            })
+            .ok();
+    }
+
+    fn done(&self, slot: usize, ok: bool, steps: usize, tokens: u64) {
+        self.tx
+            .send(RuntimeEvent::AgentSubDone {
+                slot,
+                ok,
+                steps,
+                tokens,
+            })
+            .ok();
+    }
+
+    fn finish(&self) {
+        self.tx.send(RuntimeEvent::AgentSubFinish).ok();
+    }
+}
+
 impl crate::agent::engine::AgentUi for ChatAgentUi {
     fn assistant_text(&mut self, delta: &str) {
         self.tx
@@ -2841,6 +2900,12 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 step,
             })
             .ok();
+    }
+
+    fn subagent_sink(&mut self) -> Option<std::sync::Arc<dyn crate::agent::engine::SubagentSink>> {
+        Some(std::sync::Arc::new(ChatSubagentSink {
+            tx: self.tx.clone(),
+        }))
     }
 
     fn plan_updated(&mut self, items: &[crate::agent::plan::PlanItem]) {

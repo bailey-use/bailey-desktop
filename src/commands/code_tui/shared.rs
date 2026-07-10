@@ -1714,6 +1714,19 @@ pub(super) enum DeferredFinish {
 /// Composer→engine steering handoff; `std::sync` mutex — never held across an await.
 pub(super) type SteeringQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
+/// One delegate's live row in a parallel sub-agent batch.
+pub(super) struct SubagentRow {
+    pub(super) name: String,
+    /// Present-tense current action, precomputed at event time so rendering stays pure.
+    pub(super) action: String,
+    pub(super) step: usize,
+    pub(super) started: Instant,
+    /// Last gated tool auto-denied for this delegate.
+    pub(super) denied: Option<String>,
+    /// (produced an answer, steps, tokens, runtime) once finished.
+    pub(super) done: Option<(bool, usize, u64, std::time::Duration)>,
+}
+
 pub(super) enum RuntimeEvent {
     Delta(ChatResponseChunk),
     Finished {
@@ -1861,6 +1874,32 @@ pub(super) enum RuntimeEvent {
         args: serde_json::Value,
         step: usize,
     },
+    /// A parallel sub-agent batch started — one live row per delegate, slot order.
+    AgentSubBegin {
+        labels: Vec<String>,
+    },
+    /// Slot-tagged counterpart of [`AgentSubActivity`](Self::AgentSubActivity).
+    AgentSubSlot {
+        slot: usize,
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    },
+    /// A parallel delegate's gated tool call was auto-denied.
+    AgentSubDenied {
+        slot: usize,
+        tool: String,
+    },
+    /// A parallel delegate finished (`ok` = it produced an answer).
+    AgentSubDone {
+        slot: usize,
+        ok: bool,
+        steps: usize,
+        tokens: u64,
+    },
+    /// The batch is over — retire the rows (results land as cards).
+    AgentSubFinish,
     /// An agent error (e.g. an LLM/API failure) — shown as an error-hued notice.
     AgentError(String),
     /// The agent turn finished (engine called `footer`) — commit the turn.
@@ -2065,6 +2104,9 @@ pub(super) struct CodeTuiApp {
     /// Current tool step, present-tense (`running grep`), + when it started.
     /// Feeds the inline status label.
     pub(super) last_tool_action: Option<(String, Instant)>,
+    /// Live rows under the spinner for a parallel sub-agent batch (slot-indexed);
+    /// cleared on batch finish / turn end.
+    pub(super) subagent_rows: Vec<SubagentRow>,
     /// The status label on screen + when first shown; throttled by
     /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
     pub(super) status_display: Option<(String, Instant)>,

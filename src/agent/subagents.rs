@@ -170,6 +170,8 @@ pub fn normalize_tool_name(name: &str) -> Option<&'static str> {
         "ls" | "list" | "listdir" | "listfiles" | "dir" => "list_dir",
         "webfetch" | "fetch" | "fetchurl" | "urlfetch" | "http" | "httpget" => "web_fetch",
         "skill" | "skills" | "loadskill" => "skill",
+        // Claude Code's Task/Agent vocabulary (and `sub_agent` casings) → delegation.
+        "subagent" | "task" | "agent" | "spawnagent" | "dispatchagent" | "delegate" => "subagent",
         _ => return None,
     })
 }
@@ -749,5 +751,12 @@ mod tests {
         assert_eq!(normalize_tool_name("apply"), Some("apply_patch"));
         assert_eq!(normalize_tool_name("str_replace_editor"), Some("edit_file"));
         assert_eq!(normalize_tool_name("edit_file"), Some("edit_file"));
+        // Claude Code's delegation vocabulary lands on `subagent` (incl. odd
+        // casings), so a Task-prior call delegates instead of erroring.
+        assert_eq!(normalize_tool_name("Task"), Some("subagent"));
+        assert_eq!(normalize_tool_name("Agent"), Some("subagent"));
+        assert_eq!(normalize_tool_name("sub_agent"), Some("subagent"));
+        assert_eq!(normalize_tool_name("dispatch_agent"), Some("subagent"));
+        assert_eq!(normalize_tool_name("subagent"), Some("subagent"));
     }
 }

@@ -552,6 +552,18 @@ impl CodeTuiApp {
         if !self.sending {
             return "running command".to_string();
         }
+        // A parallel sub-agent batch owns the headline while its rows are live.
+        if !self.subagent_rows.is_empty() {
+            let done = self
+                .subagent_rows
+                .iter()
+                .filter(|r| r.done.is_some())
+                .count();
+            return format!(
+                "running {} sub-agents ({done} done)",
+                self.subagent_rows.len()
+            );
+        }
         if let Some(action) = self.current_action_label() {
             return action;
         }
@@ -594,6 +606,23 @@ impl CodeTuiApp {
         lines.push(spinner);
         // No accent bar — the status line is chrome, not a message.
         bars.push(None);
+        for row in self.subagent_status_rows() {
+            lines.push(row);
+            bars.push(None);
+        }
+    }
+
+    /// Live parallel-batch rows, styled like the spinner they sit under. Empty
+    /// when idle so an interrupted batch can't leave ghost rows.
+    fn subagent_status_rows(&self) -> Vec<StyledLine> {
+        if !self.sending {
+            return Vec::new();
+        }
+        let style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        self.subagent_rows
+            .iter()
+            .map(|row| line_plain(super::render::subagent_row_text(row), style))
+            .collect()
     }
 
     /// A cheap O(1) fingerprint of everything the cached *history body* depends
@@ -818,6 +847,10 @@ impl CodeTuiApp {
             }
             tail.push(spinner.clone());
             tail_bars.push(None);
+            for row in self.subagent_status_rows() {
+                tail.push(row);
+                tail_bars.push(None);
+            }
             let wrapped_tail = wrap_transcript(&tail, &tail_bars, text_width);
             text_lines.extend(wrapped_tail.text.lines);
             rows.extend(wrapped_tail.rows);
@@ -1754,11 +1787,15 @@ impl CodeTuiApp {
         // The volatile tail's char-wrap height, sized like the body's estimate so
         // the pane grows to fit the streamed reply (which left the cached body).
         let volatile_prepass = self.volatile_tail_prepass(plain_width);
-        // The spinner's leading blank + its (short) status line, sized the same
+        // Spinner blank + status line + any live sub-agent rows, sized the same
         // way the body's char-wrap height estimate is, so the pane height matches.
         let spinner_prepass = spinner
             .as_ref()
-            .map(|line| wrap_plain_lines(&[String::new(), line.plain.clone()], plain_width).len())
+            .map(|line| {
+                let mut plain = vec![String::new(), line.plain.clone()];
+                plain.extend(self.subagent_status_rows().into_iter().map(|r| r.plain));
+                wrap_plain_lines(&plain, plain_width).len()
+            })
             .unwrap_or(0);
         let prepass_rows = self
             .transcript_cache

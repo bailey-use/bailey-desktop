@@ -797,6 +797,37 @@ pub(super) fn render_pending_status(
     );
 }
 
+/// Row-name cap — short enough that the delegate's action stays visible.
+const SUBAGENT_ROW_NAME_MAX_COLS: usize = 28;
+
+/// One live row for a parallel delegate: `↳ name — action · step N (12s)`,
+/// flipping to `✓ name — done (32s · 8 step(s) · 1.2k tokens)`.
+pub(super) fn subagent_row_text(row: &super::shared::SubagentRow) -> String {
+    let name = truncate_label(&row.name, SUBAGENT_ROW_NAME_MAX_COLS);
+    if let Some((ok, steps, tokens, took)) = &row.done {
+        let mark = if *ok { "✓" } else { "✗" };
+        let what = if *ok { "done" } else { "no answer" };
+        let mut stats = format!("{} · {steps} step(s)", format_request_elapsed(*took));
+        if *tokens > 0 {
+            stats.push_str(&format!(" · {} tokens", format_token_count_value(*tokens)));
+        }
+        return format!("  {mark} {name} — {what} ({stats})");
+    }
+    let action = truncate_label(&row.action, ACTION_TARGET_MAX_COLS);
+    let mut line = format!("  ↳ {name} — {action}");
+    if row.step > 0 {
+        line.push_str(&format!(" · step {}", row.step));
+    }
+    line.push_str(&format!(
+        " ({})",
+        format_request_elapsed(row.started.elapsed())
+    ));
+    if let Some(tool) = &row.denied {
+        line.push_str(&format!(" · {tool} denied"));
+    }
+    line
+}
+
 /// Footer context-stat color by fullness: a quiet signal that warms toward the
 /// model's window limit (compaction territory) before it's hit.
 pub(super) fn context_fill_color(pct: u64) -> Color {
@@ -882,6 +913,7 @@ pub(super) fn render_tool_call(
     cwd: &str,
     line_starts: &[Option<usize>],
 ) {
+    let name = canonical_tool_name(name);
     let summary = tool_arg_summary(name, args, cwd);
     let verb_style = if crate::agent::tools::is_mutating(name) {
         Style::default().fg(WARNING)
@@ -1044,7 +1076,7 @@ fn tool_display_name(name: &str) -> String {
 /// model-facing seed notes; the transcript uses [`tool_call_target_display`].
 pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
     let pick = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    match name {
+    match canonical_tool_name(name) {
         "read_file" | "edit_file" | "multi_edit" | "delete_file" | "write_file" | "list_dir" => {
             basename(pick("path"))
         }
@@ -1058,7 +1090,7 @@ pub(super) fn tool_call_target(name: &str, args: &serde_json::Value) -> String {
 /// Transcript form of [`tool_call_target`]: a `run_bash` command is condensed for
 /// display; everything else is identical.
 pub(super) fn tool_call_target_display(name: &str, args: &serde_json::Value, cwd: &str) -> String {
-    if name == "run_bash" {
+    if canonical_tool_name(name) == "run_bash" {
         let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
         condense_command(command, cwd)
     } else {
@@ -1069,14 +1101,27 @@ pub(super) fn tool_call_target_display(name: &str, args: &serde_json::Value, cwd
 /// Present-tense label for the inline status line — `running grep "foo"`,
 /// `reading main.rs`, `delegating to reviewer`. Target capped so it can't wrap.
 pub(super) fn tool_action_label(name: &str, args: &serde_json::Value, cwd: &str) -> String {
+    let name = canonical_tool_name(name);
     if name == "subagent" {
-        let agent = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        return match agent {
-            Some(a) => format!("delegating to {a}"),
-            None => "delegating".to_string(),
+        // Fallback keys are Claude Code's names for the same fields.
+        let pick = |keys: [&str; 2]| {
+            keys.into_iter().find_map(|k| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+        };
+        return match (
+            pick(["label", "description"]),
+            pick(["agent", "subagent_type"]),
+        ) {
+            (Some(label), _) => format!(
+                "delegating: {}",
+                truncate_label(label, ACTION_TARGET_MAX_COLS)
+            ),
+            (None, Some(agent)) => format!("delegating to {agent}"),
+            (None, None) => "delegating".to_string(),
         };
     }
     if name == "update_plan" {
@@ -2350,10 +2395,16 @@ fn condense_subagent_task(task: &str) -> String {
     t.to_string()
 }
 
+/// Display canonicalization: models sometimes emit Claude Code vocabulary
+/// (`Task`, `Read`, …) which would fall through to the raw-name jargon path.
+pub(super) fn canonical_tool_name(name: &str) -> &str {
+    crate::agent::subagents::normalize_tool_name(name).unwrap_or(name)
+}
+
 /// One-line argument summary for a tool's `→ verb(...)` line (the salient field).
 fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
     let pick = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    match name {
+    match canonical_tool_name(name) {
         // File paths: relative to cwd, left-truncated so the basename survives.
         "read_file" | "list_dir" | "write_file" | "edit_file" | "multi_edit" | "delete_file" => {
             display_path(pick("path"), cwd)
@@ -2364,10 +2415,25 @@ fn tool_arg_summary(name: &str, args: &serde_json::Value, cwd: &str) -> String {
         "skill" => truncate_chars(pick("name"), 60),
         // The question is the salient detail; the answer lands on the `⎿` result line.
         "ask_user" => truncate_chars(pick("question"), 72),
-        // "subagent" is jargon — the delegated task is the salient detail and
-        // renders as the label itself (see `render_tool_call`), so surface the
-        // task directly (preamble stripped) with no `subagent(...)` wrapper.
-        "subagent" => truncate_chars(&condense_subagent_task(pick("task")), 72),
+        // "subagent" is jargon — the short `label`, else the task (preamble
+        // stripped), renders as the label itself (see `render_tool_call`).
+        // `description`/`prompt` are Claude Code's names for the same args.
+        "subagent" => {
+            let label = [pick("label"), pick("description")]
+                .into_iter()
+                .find(|s| !s.trim().is_empty());
+            match label {
+                Some(l) => truncate_chars(l.trim(), 72),
+                None => {
+                    let task = if pick("task").is_empty() {
+                        pick("prompt")
+                    } else {
+                        pick("task")
+                    };
+                    truncate_chars(&condense_subagent_task(task), 72)
+                }
+            }
+        }
         _ => String::new(),
     }
 }
@@ -2583,6 +2649,7 @@ pub(super) fn render_output_line(raw: &str) -> String {
 }
 
 fn tool_result_summary(s: &str, cwd: &str, tool: Option<&str>) -> String {
+    let tool = tool.map(canonical_tool_name);
     // Multi-line output (read_file's numbered lines, dir listings, command
     // output) collapses to a clean count — the `→ verb(args)` line above already
     // says what ran, so a peek at the noisy first line (line numbers, etc.) adds
@@ -3204,7 +3271,8 @@ pub(super) fn compact_lines_and_bars(lines: &mut Vec<StyledLine>, bars: &mut Vec
 #[cfg(test)]
 mod render_tests {
     use super::{
-        condense_subagent_task, render_edit_diff, strip_ansi_and_controls, tool_result_summary,
+        condense_subagent_task, render_edit_diff, strip_ansi_and_controls, subagent_row_text,
+        tool_arg_summary, tool_result_summary,
     };
 
     #[test]
@@ -3258,6 +3326,94 @@ mod render_tests {
         );
         // Never strip down to nothing — a bare preamble stays as-is.
         assert_eq!(condense_subagent_task("You are"), "You are");
+    }
+
+    #[test]
+    fn tool_action_label_subagent_prefers_label_and_accepts_cc_vocabulary() {
+        use super::tool_action_label;
+        // A short `label` beats the specialist name in the status line.
+        assert_eq!(
+            tool_action_label(
+                "subagent",
+                &serde_json::json!({"label": "audit auth flow", "agent": "reviewer"}),
+                ""
+            ),
+            "delegating: audit auth flow"
+        );
+        assert_eq!(
+            tool_action_label("subagent", &serde_json::json!({"agent": "reviewer"}), ""),
+            "delegating to reviewer"
+        );
+        // Claude Code's `Task` call (description/prompt/subagent_type args)
+        // renders as a delegation, not `running Task`.
+        assert_eq!(
+            tool_action_label(
+                "Task",
+                &serde_json::json!({"description": "deep-dive engine", "prompt": "…", "subagent_type": "explore"}),
+                ""
+            ),
+            "delegating: deep-dive engine"
+        );
+        // Other hallucinated Claude Code names canonicalize for display too.
+        assert_eq!(
+            tool_action_label("Bash", &serde_json::json!({"command": "ls"}), ""),
+            "running ls"
+        );
+    }
+
+    #[test]
+    fn tool_arg_summary_subagent_prefers_label_over_task() {
+        assert_eq!(
+            tool_arg_summary(
+                "subagent",
+                &serde_json::json!({"label": "audit auth flow", "task": "You are auditing the auth flow in depth"}),
+                ""
+            ),
+            "audit auth flow"
+        );
+        // Claude Code arg names work as fallbacks.
+        assert_eq!(
+            tool_arg_summary(
+                "Task",
+                &serde_json::json!({"prompt": "Please investigate the crash"}),
+                ""
+            ),
+            "investigate the crash"
+        );
+    }
+
+    #[test]
+    fn subagent_row_text_running_and_done_forms() {
+        use std::time::{Duration, Instant};
+        let mut row = super::super::shared::SubagentRow {
+            name: "audit auth flow".to_string(),
+            action: "reading engine.rs".to_string(),
+            step: 4,
+            started: Instant::now(),
+            denied: None,
+            done: None,
+        };
+        let text = subagent_row_text(&row);
+        assert!(
+            text.starts_with("  ↳ audit auth flow — reading engine.rs · step 4 ("),
+            "unexpected running row: {text}"
+        );
+        row.denied = Some("run_bash".to_string());
+        assert!(
+            subagent_row_text(&row).ends_with(") · run_bash denied"),
+            "denied marker missing: {}",
+            subagent_row_text(&row)
+        );
+        row.done = Some((true, 8, 1200, Duration::from_secs(32)));
+        assert_eq!(
+            subagent_row_text(&row),
+            "  ✓ audit auth flow — done (32s · 8 step(s) · 1.2k tokens)"
+        );
+        row.done = Some((false, 12, 0, Duration::from_secs(61)));
+        assert_eq!(
+            subagent_row_text(&row),
+            "  ✗ audit auth flow — no answer (1m 1s · 12 step(s))"
+        );
     }
 
     #[test]

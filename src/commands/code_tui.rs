@@ -189,6 +189,7 @@ impl CodeTuiApp {
             request_started_at: None,
             compact_before: None,
             last_tool_action: None,
+            subagent_rows: Vec::new(),
             status_display: None,
             turn_output_tokens: 0,
             retrying: false,

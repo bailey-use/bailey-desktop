@@ -102,6 +102,19 @@ const MAX_TOUCHED_FILES: usize = 200;
 /// Cap on the agent's durable scratchpad (most-recent kept).
 const MAX_NOTES: usize = 50;
 
+/// Live progress for a parallel sub-agent batch, slot-tagged in call order.
+/// `Arc`-shared (`&self` + `Send + Sync`) so concurrent delegates report into one UI.
+pub trait SubagentSink: Send + Sync {
+    fn begin(&self, labels: &[String]);
+    /// Empty `tool` = thinking between calls.
+    fn activity(&self, slot: usize, agent: &str, tool: &str, args: &Value, step: usize);
+    /// A gated call was auto-denied (no interactive approval mid-batch).
+    fn denied(&self, slot: usize, tool: &str);
+    /// `ok` = the delegate produced an answer.
+    fn done(&self, slot: usize, ok: bool, steps: usize, tokens: u64);
+    fn finish(&self);
+}
+
 /// Side-effects the engine delegates: rendering and the permission prompt.
 /// `ask_permission` fires only for mutating tools that aren't pre-approved; a
 /// non-TTY impl must fail closed (Deny). `Send` so the chat TUI can drive it on a task.
@@ -118,6 +131,10 @@ pub trait AgentUi: Send {
     /// (label-only) so a long delegation isn't a frozen label. `tool` empty =
     /// thinking between calls; `step` = child's 1-based turn. Default no-op.
     fn subagent_activity(&mut self, _agent: &str, _tool: &str, _args: &Value, _step: usize) {}
+    /// Live feed for a parallel sub-agent batch; `None` (default) keeps it quiet.
+    fn subagent_sink(&mut self) -> Option<std::sync::Arc<dyn SubagentSink>> {
+        None
+    }
     /// Prompt for the next REPL turn. `None` ends the session (EOF / `/exit`);
     /// default `None` → one-shot only.
     fn read_user_input(&mut self) -> Option<String> {
@@ -1925,6 +1942,14 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 "running {} sub-agents in parallel",
                 subagent_idx.len()
             ));
+            let sink = ui.subagent_sink();
+            if let Some(s) = &sink {
+                let labels: Vec<String> = subagent_idx
+                    .iter()
+                    .map(|&i| subagent_display_name(&tool_calls[i].arguments))
+                    .collect();
+                s.begin(&labels);
+            }
             let base = self.turn_usage.completion_tokens;
             let this: &Self = self;
             let mut sub_tokens_total = 0u64;
@@ -1932,10 +1957,12 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
             // chunk runs concurrently (join_all — same primitive as the read batch, and
             // unlike buffer_unordered it doesn't impose a higher-ranked Send bound on
             // the heavy sub-engine future), chunks run one after another.
-            for chunk in subagent_idx.chunks(SUBAGENT_PARALLEL_CAP) {
-                let runs = chunk.iter().map(|&i| {
+            for (chunk_no, chunk) in subagent_idx.chunks(SUBAGENT_PARALLEL_CAP).enumerate() {
+                let runs = chunk.iter().enumerate().map(|(j, &i)| {
                     let args = &tool_calls[i].arguments;
-                    async move { (i, this.run_subagent(ctx, None, base, args).await) }
+                    let slot = chunk_no * SUBAGENT_PARALLEL_CAP + j;
+                    let sink = sink.clone().map(|s| (s, slot));
+                    async move { (i, this.run_subagent(ctx, None, sink, base, args).await) }
                 });
                 for (i, res) in futures::future::join_all(runs).await {
                     outcomes[i] = Some(match res {
@@ -1946,6 +1973,9 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                         Err(e) => Err(e),
                     });
                 }
+            }
+            if let Some(s) = &sink {
+                s.finish();
             }
             extra_tokens = extra_tokens.saturating_add(sub_tokens_total);
             self.turn_usage.completion_tokens = self
@@ -2015,7 +2045,7 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 // Fresh sub-engine on the same serve/cwd; fold its total in. Pass the UI + base so it forwards live token growth.
                 let base = self.turn_usage.completion_tokens;
                 match self
-                    .run_subagent(ctx, Some(&mut *ui), base, &call.arguments)
+                    .run_subagent(ctx, Some(&mut *ui), None, base, &call.arguments)
                     .await
                 {
                     Ok((msg, sub_tokens)) => {
@@ -2404,21 +2434,23 @@ Re-run the full command without write confinement?",
         &self,
         ctx: &TurnCtx<'_>,
         parent_ui: Option<&mut dyn AgentUi>,
+        sink: Option<(std::sync::Arc<dyn SubagentSink>, usize)>,
         base: u64,
         args: &Value,
     ) -> Result<(String, u64), String> {
-        let task = args
-            .get("task")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| "subagent: missing `task`".to_string())?;
+        // Fallback keys are Claude Code's names, so a Task-vocabulary call still delegates.
+        let str_arg = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+            })
+        };
+        let task =
+            str_arg(&["task", "prompt"]).ok_or_else(|| "subagent: missing `task`".to_string())?;
         // Named specialist if `agent` matches; unknown names fall back to generic (lenient, don't fail the turn).
-        let profile = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
+        let profile = str_arg(&["agent", "subagent_type"])
             .and_then(|n| self.subagents.iter().find(|s| s.name == n));
         // Model precedence: explicit `model` arg > profile's pinned model > parent's model.
         let model = args
@@ -2492,19 +2524,10 @@ Re-run the full command without write confinement?",
             sub.apply_profile(p);
         }
 
-        // Matched specialist, else the requested name, else generic.
-        let agent_name = profile
-            .map(|p| p.name.clone())
-            .or_else(|| {
-                args.get("agent")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        let agent_name = subagent_display_name(args);
         let mut ui = SubagentUi {
             parent: parent_ui,
+            sink,
             base,
             agent_name,
             ..Default::default()
@@ -2522,6 +2545,9 @@ Re-run the full command without write confinement?",
         };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
         Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
+        if let Some((s, slot)) = &ui.sink {
+            s.done(*slot, !ui.answer().is_empty(), ui.steps, ui.tokens);
+        }
         let mut msg = ui.result_message();
         if let Some(g) = guard {
             msg.push_str(&g.finalize());
@@ -2605,11 +2631,25 @@ fn slug_for_artifact(task: &str) -> String {
     }
 }
 
+/// Delegate display name from call args; empty → the UI numbers it.
+fn subagent_display_name(args: &Value) -> String {
+    for key in ["label", "description", "agent", "subagent_type"] {
+        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// The `subagent` tool — engine-handled (needs the serve + a fresh engine), top-level
 /// engine only. When named specialists exist, an `agent` field enumerates them.
 fn subagent_tool_spec(subagents: &[Subagent]) -> ToolSpec {
     let mut properties = json!({
         "task": {"type": "string", "description": "A complete, standalone instruction for the sub-agent."},
+        "label": {"type": "string", "description": "Short name for this delegate (3–6 words), shown in the live progress UI — e.g. \"audit auth flow\"."},
         "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."},
         "isolation": {"type": "string", "enum": ["worktree"], "description": "Optional: run the sub-agent in a disposable git worktree — an isolated snapshot of the last commit (uncommitted changes not included). Its edits stay there and the result tells you how to review/apply them. Use when a delegate will edit files, especially several delegates in parallel."}
     });
@@ -2619,7 +2659,8 @@ focused (offload a big investigation), or pass `model` to delegate hard work to 
 sub-agent does not see this conversation, so make `task` complete and standalone; it cannot spawn \
 further sub-agents. Call `subagent` several times in one turn to run independent investigations in \
 parallel — they execute concurrently and each result comes back separately; give parallel delegates \
-that edit files `isolation: \"worktree\"` so they can't clobber each other."
+that edit files `isolation: \"worktree\"` so they can't clobber each other. Always pass a short \
+`label` so the user can follow each delegate's progress."
         .to_string();
     if !subagents.is_empty() {
         let names: Vec<&str> = subagents.iter().map(|s| s.name.as_str()).collect();
@@ -2703,6 +2744,8 @@ struct SubagentUi<'a> {
     tokens: u64,
     /// Forward live token growth (base + sub so-far) to the parent UI.
     parent: Option<&'a mut dyn AgentUi>,
+    /// Slot-tagged live feed for the detached (parallel) path, where `parent` is `None`.
+    sink: Option<(std::sync::Arc<dyn SubagentSink>, usize)>,
     base: u64,
     /// Specialist name + turn counter, forwarded to the parent's status feed.
     agent_name: String,
@@ -2741,12 +2784,15 @@ impl SubagentUi<'_> {
     fn forward_activity(&mut self, tool: &str, args: &Value) {
         let Self {
             parent,
+            sink,
             agent_name,
             turn_no,
             ..
         } = self;
         if let Some(p) = parent.as_deref_mut() {
             p.subagent_activity(agent_name, tool, args, *turn_no);
+        } else if let Some((s, slot)) = sink {
+            s.activity(*slot, agent_name, tool, args, *turn_no);
         }
     }
 }
@@ -2790,9 +2836,16 @@ impl AgentUi for SubagentUi<'_> {
     ) -> BoxFuture<'a, Decision> {
         // Forward to the parent (card in the TUI, fail-closed when headless) rather than
         // auto-allowing, so the catastrophic-command floor holds for sub-agents too.
+        // Detached (parallel batch): deny, but visibly — a silent deny reads as
+        // the delegate just doing a bad job.
         match self.parent.as_deref_mut() {
             Some(p) => p.ask_permission(tool, preview),
-            None => Box::pin(async { Decision::Deny }),
+            None => {
+                if let Some((s, slot)) = &self.sink {
+                    s.denied(*slot, tool);
+                }
+                Box::pin(async { Decision::Deny })
+            }
         }
     }
 }
@@ -7738,7 +7791,77 @@ mod tests {
         let spec = subagent_tool_spec(&[]);
         assert_eq!(spec.name, "subagent");
         assert!(spec.parameters["properties"].get("agent").is_none());
+        assert!(spec.parameters["properties"].get("label").is_some());
         assert_eq!(spec.parameters["required"], json!(["task"]));
+    }
+
+    #[test]
+    fn subagent_display_name_prefers_label_and_cc_names() {
+        assert_eq!(
+            subagent_display_name(&json!({"label": "audit auth", "agent": "reviewer"})),
+            "audit auth"
+        );
+        // Claude Code arg names are accepted as fallbacks.
+        assert_eq!(
+            subagent_display_name(&json!({"description": "deep dive", "subagent_type": "explore"})),
+            "deep dive"
+        );
+        assert_eq!(
+            subagent_display_name(&json!({"subagent_type": "explore"})),
+            "explore"
+        );
+        assert_eq!(subagent_display_name(&json!({"task": "long text"})), "");
+    }
+
+    #[tokio::test]
+    async fn subagent_ui_sink_forwards_activity_and_denies_visibly() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<String>>);
+        impl SubagentSink for Recording {
+            fn begin(&self, labels: &[String]) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("begin:{}", labels.len()));
+            }
+            fn activity(&self, slot: usize, agent: &str, tool: &str, _args: &Value, step: usize) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("activity:{slot}:{agent}:{tool}:{step}"));
+            }
+            fn denied(&self, slot: usize, tool: &str) {
+                self.0.lock().unwrap().push(format!("denied:{slot}:{tool}"));
+            }
+            fn done(&self, slot: usize, ok: bool, steps: usize, _tokens: u64) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("done:{slot}:{ok}:{steps}"));
+            }
+            fn finish(&self) {
+                self.0.lock().unwrap().push("finish".to_string());
+            }
+        }
+        let sink = std::sync::Arc::new(Recording::default());
+        let mut ui = SubagentUi {
+            sink: Some((sink.clone(), 3)),
+            agent_name: "audit auth".to_string(),
+            ..Default::default()
+        };
+        ui.turn_start();
+        ui.tool_start("read_file", &json!({"path": "a.rs"}));
+        let decision = ui.ask_permission("run_bash", None).await;
+        assert!(matches!(decision, Decision::Deny));
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "activity:3:audit auth::1",
+                "activity:3:audit auth:read_file:1",
+                "denied:3:run_bash",
+            ]
+        );
     }
 
     /// With profiles, the tool advertises them via an `agent` enum.

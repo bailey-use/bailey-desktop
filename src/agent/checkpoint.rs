@@ -141,16 +141,23 @@ impl CheckpointStore {
     /// Work-tree paths that differ from snapshot `tree` right now. Called at a
     /// turn's end to record what that turn changed, so a later `/rewind` reverts
     /// only those paths — not files the user edited independently between turns.
-    /// Empty on any git error.
-    pub async fn changed_since(&mut self, tree: &str) -> Vec<PathBuf> {
+    /// `None` when the diff couldn't be computed (git error / size cap), so the
+    /// caller can mark the turn non-revertible instead of "changed nothing".
+    pub async fn changed_since(&mut self, tree: &str) -> Option<Vec<PathBuf>> {
         if !self.git_available().await {
-            return Vec::new();
+            return None;
         }
-        let Some(git_dir) = self.ensure_init().await else {
-            return Vec::new();
-        };
+        let git_dir = self.ensure_init().await?;
+        // Same guard as `snapshot`: a turn can balloon the tree it started under,
+        // and `add -A` below would hash it all, unbounded, at turn end.
+        if self.exceeds_cap(&git_dir).await {
+            return None;
+        }
         // Stage first so newly-created files are seen, then diff `tree` vs index.
-        let _ = self.git(&git_dir).args(["add", "-A"]).output().await;
+        let add = self.git(&git_dir).args(["add", "-A"]).output().await.ok()?;
+        if !add.status.success() {
+            return None;
+        }
         match self
             .git(&git_dir)
             .args(["diff", "--name-only", "--cached", "-z"])
@@ -158,13 +165,14 @@ impl CheckpointStore {
             .output()
             .await
         {
-            Ok(o) if o.status.success() => o
-                .stdout
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                .map(path_from_git_bytes)
-                .collect(),
-            _ => Vec::new(),
+            Ok(o) if o.status.success() => Some(
+                o.stdout
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(path_from_git_bytes)
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 
@@ -496,7 +504,7 @@ mod tests {
     /// The real rewind flow a turn drives: record what changed since `tree`, then
     /// revert only those paths.
     async fn rewind(store: &mut CheckpointStore, tree: &str) -> RestoreReport {
-        let changed = store.changed_since(tree).await;
+        let changed = store.changed_since(tree).await.expect("changed_since");
         store.restore_paths(tree, &changed).await
     }
 
@@ -577,7 +585,7 @@ mod tests {
         let t0 = store.snapshot().await.expect("snapshot");
         // Agent turn edits only agent.rs; record what it touched (turn end).
         write(cwd, "agent.rs", "a1");
-        let changed = store.changed_since(&t0).await;
+        let changed = store.changed_since(&t0).await.expect("changed_since");
         // The user then hand-edits an unrelated file, after the turn.
         write(cwd, "mine.rs", "m-edited");
         // Rewind reverts agent.rs but preserves mine.rs (whole-tree used to clobber it).
@@ -635,6 +643,24 @@ mod tests {
         assert!(
             store.snapshot().await.is_none(),
             "guard trips → no snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_since_none_when_tree_balloons_past_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(cwd, "a.rs", "x");
+        // Byte cap of 8: the initial tree fits, the turn's output doesn't.
+        let mut store = CheckpointStore::new(cwd).with_caps(usize::MAX, 8);
+        if !store.git_available().await {
+            return;
+        }
+        let t0 = store.snapshot().await.expect("snapshot");
+        write(cwd, "big.bin", "0123456789abcdef");
+        assert!(
+            store.changed_since(&t0).await.is_none(),
+            "cap overrun → no diff"
         );
     }
 

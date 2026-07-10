@@ -14,6 +14,7 @@ use crate::services::openai_models::{
 use crate::services::provider_protocol::ProviderProtocol;
 use crate::services::responses_to_chat_router::ResponsesToChatRouterConfig;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -145,12 +146,12 @@ pub fn convert_responses_to_chat_request(
                     }
                 }
                 Some("message") => {
-                    // Validate role - only allow valid OpenAI chat completion roles
-                    let role = item
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .filter(|r| matches!(*r, "system" | "user" | "assistant" | "tool"))
-                        .unwrap_or("user");
+                    // Only valid chat roles; Responses "developer" → "system".
+                    let role = match item.get("role").and_then(|v| v.as_str()) {
+                        Some("developer") => "system",
+                        Some(r @ ("system" | "user" | "assistant" | "tool")) => r,
+                        _ => "user",
+                    };
                     // Vision/file inputs (input_image, input_file) must be
                     // preserved when bridging to Chat Completions; falling back
                     // to text-only here silently dropped them. The helper
@@ -173,9 +174,9 @@ pub fn convert_responses_to_chat_request(
                         messages.push(json!({"role": role, "content": content}));
                     }
                 }
-                Some("function_call") => {
+                Some(item_type @ ("function_call" | "custom_tool_call")) => {
                     // Use call_id as the Chat Completions tool_calls[].id so it matches
-                    // the corresponding function_call_output.call_id → tool_call_id.
+                    // the corresponding *_call_output.call_id → tool_call_id.
                     // Fall back to id only if call_id is absent.
                     let call_id = item
                         .get("call_id")
@@ -183,10 +184,16 @@ pub fn convert_responses_to_chat_request(
                         .or_else(|| item.get("id").and_then(|v| v.as_str()))
                         .unwrap_or("call_0");
                     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("{}");
+                    // custom_tool_call input is freeform; mirror the {"input": …} wrapping.
+                    let arguments = if item_type == "custom_tool_call" {
+                        json!({"input": item.get("input").and_then(|v| v.as_str()).unwrap_or("")})
+                            .to_string()
+                    } else {
+                        item.get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string()
+                    };
                     let tool_call = json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}});
                     // Append to the open turn so parallel calls and post-narration calls share one message.
                     let idx = open_assistant_turn(&mut messages, &mut current_assistant);
@@ -202,7 +209,7 @@ pub fn convert_responses_to_chat_request(
                         config.requires_reasoning_content,
                     );
                 }
-                Some("function_call_output") => {
+                Some("function_call_output" | "custom_tool_call_output") => {
                     current_assistant = None;
                     let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                     // `output` may be a plain string or an array of content
@@ -244,18 +251,10 @@ pub fn convert_responses_to_chat_request(
         }
     }
 
-    // Convert tools: filter non-function, convert format
-    let tools: Vec<Value> = body
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|tools| {
-            tools
-                .iter()
-                .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"))
-                .map(convert_tool_to_chat_format)
-                .collect()
-        })
-        .unwrap_or_default();
+    let tools: Vec<Value> = responses_request_tools(body)
+        .into_iter()
+        .filter_map(convert_responses_tool_to_chat)
+        .collect();
 
     // Apply model name transform (e.g. openai/ prefix for OpenRouter)
     // Skip transform when using Copilot — model names pass through unchanged
@@ -586,6 +585,65 @@ pub fn extract_content_text(content: Option<&Value>) -> String {
     }
 }
 
+/// Top-level `tools` plus tools from `additional_tools` input items — where
+/// codex ≥0.143 (sol models) declares them.
+fn responses_request_tools(body: &Value) -> Vec<&Value> {
+    let mut out: Vec<&Value> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if let Some(input) = body.get("input").and_then(|v| v.as_array()) {
+        for item in input {
+            if item.get("type").and_then(|v| v.as_str()) == Some("additional_tools")
+                && let Some(tools) = item.get("tools").and_then(|t| t.as_array())
+            {
+                out.extend(tools.iter());
+            }
+        }
+    }
+    out
+}
+
+/// Names of `custom` (freeform-input) tools, e.g. codex's sol `exec`. The
+/// emitter must answer these with `custom_tool_call` items — codex rejects a
+/// `function_call` for a custom tool.
+pub fn collect_custom_tool_names(body: &Value) -> HashSet<String> {
+    responses_request_tools(body)
+        .into_iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("custom"))
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `function` maps directly; `custom` wraps as a one-string-arg (`input`)
+/// function; hosted tools and `namespace` groups drop (no chat equivalent).
+fn convert_responses_tool_to_chat(tool: &Value) -> Option<Value> {
+    match tool.get("type").and_then(|v| v.as_str()) {
+        Some("function") => Some(convert_tool_to_chat_format(tool)),
+        Some("custom") => {
+            let name = tool.get("name").and_then(|v| v.as_str())?;
+            let mut description = tool
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            description.push_str("\n\nPass the raw input text as the single `input` argument.");
+            Some(json!({"type": "function", "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string", "description": "The raw tool input text."}},
+                    "required": ["input"]
+                }
+            }}))
+        }
+        _ => None,
+    }
+}
+
 /// Converts a tool from Responses API format to Chat Completions format.
 ///
 /// Responses API: `{type, name, description, parameters}`
@@ -727,6 +785,7 @@ pub fn convert_chat_response_to_responses_sse(
     chat: &Value,
     requires_reasoning_content: bool,
     original_model: &str,
+    custom_tools: &HashSet<String>,
 ) -> String {
     let (content, tool_calls, reasoning_content) = extract_chat_response_payload(chat);
 
@@ -768,12 +827,26 @@ pub fn convert_chat_response_to_responses_sse(
         chunk["usage"] = usage.clone();
     }
 
-    let mut converter = ResponsesStreamConverter::new(original_model, requires_reasoning_content);
+    let mut converter = ResponsesStreamConverter::new(original_model, requires_reasoning_content)
+        .with_custom_tools(custom_tools.clone());
     let mut sse = String::new();
     converter.ensure_created(&mut sse);
     converter.process_chunk(&chunk, &mut sse);
     sse.push_str(&converter.finish());
     sse
+}
+
+/// Unwraps `{"input": …}` back to raw text; raw (non-JSON) args pass through.
+fn custom_input_from_args(args: &str) -> String {
+    match serde_json::from_str::<Value>(args) {
+        Ok(Value::Object(map)) => match map.get("input") {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => args.to_string(),
+        },
+        Ok(Value::String(s)) => s,
+        _ => args.to_string(),
+    }
 }
 
 /// Incrementally converts a streaming Chat Completions response (SSE chunks with
@@ -799,6 +872,8 @@ pub struct ResponsesStreamConverter {
     usage: Option<Value>,
     /// Upstream sent finish_reason "length" — surface status "incomplete".
     truncated: bool,
+    /// `custom`-tool names — calls go out as `custom_tool_call` items.
+    custom_tools: HashSet<String>,
 }
 
 struct StreamItem {
@@ -814,6 +889,10 @@ struct StreamToolCall {
     call_id: String,
     name: String,
     args: String,
+    /// Buffered; emitted as one `custom_tool_call` item at finish.
+    is_custom: bool,
+    /// `response.output_item.added` already emitted.
+    announced: bool,
 }
 
 impl ResponsesStreamConverter {
@@ -832,7 +911,14 @@ impl ResponsesStreamConverter {
             tools: Vec::new(),
             usage: None,
             truncated: false,
+            custom_tools: HashSet::new(),
         }
+    }
+
+    /// See `collect_custom_tool_names`.
+    pub fn with_custom_tools(mut self, names: HashSet<String>) -> Self {
+        self.custom_tools = names;
+        self
     }
 
     /// Feeds a network chunk of the upstream SSE body, returning any Responses API
@@ -965,6 +1051,39 @@ impl ResponsesStreamConverter {
         }
 
         for tool in &self.tools {
+            if tool.is_custom {
+                // item.done + response.completed suffice — codex needs no input.delta events.
+                let item = json!({
+                    "id": tool.item_id, "call_id": tool.call_id,
+                    "type": "custom_tool_call", "status": "completed",
+                    "name": tool.name, "input": custom_input_from_args(&tool.args)
+                });
+                out.push_str(&sse_event(
+                    "response.output_item.done",
+                    &json!({
+                        "type": "response.output_item.done",
+                        "response_id": self.resp_id, "output_index": tool.output_index,
+                        "item": item.clone()
+                    }),
+                ));
+                output_items.push((tool.output_index, item));
+                continue;
+            }
+            if !tool.announced {
+                // Deferred announcement whose name never arrived.
+                out.push_str(&sse_event(
+                    "response.output_item.added",
+                    &json!({
+                        "type": "response.output_item.added",
+                        "response_id": self.resp_id, "output_index": tool.output_index,
+                        "item": {
+                            "id": tool.item_id, "call_id": tool.call_id,
+                            "type": "function_call", "status": "in_progress",
+                            "name": tool.name, "arguments": ""
+                        }
+                    }),
+                ));
+            }
             out.push_str(&sse_event(
                 "response.function_call_arguments.done",
                 &json!({
@@ -1193,6 +1312,10 @@ impl ResponsesStreamConverter {
                 }
                 if let Some(name) = name_fragment.filter(|s| !s.is_empty()) {
                     self.tools[p].name = name.to_string();
+                    // Announced slots already went out as function_call.
+                    if !self.tools[p].announced {
+                        self.tools[p].is_custom = self.custom_tools.contains(name);
+                    }
                 }
                 p
             }
@@ -1202,18 +1325,7 @@ impl ResponsesStreamConverter {
                 let item_id = gen_id("fc");
                 let call_id = id_fragment.filter(|s| !s.is_empty()).unwrap_or("call_0");
                 let name = name_fragment.unwrap_or("");
-                out.push_str(&sse_event(
-                    "response.output_item.added",
-                    &json!({
-                        "type": "response.output_item.added",
-                        "response_id": self.resp_id, "output_index": output_index,
-                        "item": {
-                            "id": item_id, "call_id": call_id,
-                            "type": "function_call", "status": "in_progress",
-                            "name": name, "arguments": ""
-                        }
-                    }),
-                ));
+                let is_custom = !name.is_empty() && self.custom_tools.contains(name);
                 self.tools.push(StreamToolCall {
                     chat_index,
                     output_index,
@@ -1221,14 +1333,55 @@ impl ResponsesStreamConverter {
                     call_id: call_id.to_string(),
                     name: name.to_string(),
                     args: String::new(),
+                    is_custom,
+                    announced: false,
                 });
                 self.tools.len() - 1
             }
         };
 
         if let Some(args) = args_fragment.filter(|s| !s.is_empty()) {
-            let tool = &mut self.tools[pos];
-            tool.args.push_str(args);
+            self.tools[pos].args.push_str(args);
+        }
+
+        // Custom calls buffer until finish; with custom tools declared,
+        // announcing waits for the name so the item type can't flip post-.added.
+        let tool = &self.tools[pos];
+        if tool.is_custom || (!self.custom_tools.is_empty() && tool.name.is_empty()) {
+            return;
+        }
+        if !self.tools[pos].announced {
+            self.tools[pos].announced = true;
+            let tool = &self.tools[pos];
+            out.push_str(&sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "response_id": self.resp_id, "output_index": tool.output_index,
+                    "item": {
+                        "id": tool.item_id, "call_id": tool.call_id,
+                        "type": "function_call", "status": "in_progress",
+                        "name": tool.name, "arguments": ""
+                    }
+                }),
+            ));
+            // Flush arguments buffered while the announcement was deferred.
+            let tool = &self.tools[pos];
+            if !tool.args.is_empty() {
+                out.push_str(&sse_event(
+                    "response.function_call_arguments.delta",
+                    &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "response_id": self.resp_id, "output_index": tool.output_index,
+                        "item_id": tool.item_id, "delta": tool.args
+                    }),
+                ));
+            }
+            return;
+        }
+
+        if let Some(args) = args_fragment.filter(|s| !s.is_empty()) {
+            let tool = &self.tools[pos];
             let item_id = tool.item_id.clone();
             let output_index = tool.output_index;
             out.push_str(&sse_event(
@@ -2234,7 +2387,12 @@ mod tests {
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
         });
 
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "deepseek-reasoner");
+        let sse = convert_chat_response_to_responses_sse(
+            &chat,
+            false,
+            "deepseek-reasoner",
+            &HashSet::new(),
+        );
 
         // The first `output_item.added` is a reasoning item with summary text,
         // at output_index 0. function_call comes after at output_index 1.
@@ -2260,7 +2418,7 @@ mod tests {
             "choices": [{"message": {"content": "hi"}}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4", &HashSet::new());
         assert!(
             !sse.contains("response.reasoning_summary_text"),
             "no reasoning events expected when message has no reasoning_content"
@@ -2280,7 +2438,12 @@ mod tests {
             }}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "deepseek-reasoner");
+        let sse = convert_chat_response_to_responses_sse(
+            &chat,
+            false,
+            "deepseek-reasoner",
+            &HashSet::new(),
+        );
         assert!(sse.contains("response.reasoning_summary_text.delta"));
 
         let completed = sse
@@ -2358,6 +2521,188 @@ mod tests {
         let tools = chat["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "shell");
+    }
+
+    #[test]
+    fn test_convert_request_hoists_additional_tools_and_wraps_custom() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run JavaScript code",
+                     "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"}},
+                    {"type": "function", "name": "wait", "description": "Wait",
+                     "parameters": {"type": "object", "properties": {"cell_id": {"type": "string"}}}},
+                    {"type": "namespace", "name": "collaboration", "tools": [
+                        {"type": "function", "name": "spawn_agent", "parameters": {}}
+                    ]}
+                ]},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+
+        let tools = chat["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "custom + function survive, namespace drops");
+        assert_eq!(tools[0]["function"]["name"], "exec");
+        let params = &tools[0]["function"]["parameters"];
+        assert_eq!(params["properties"]["input"]["type"], "string");
+        assert_eq!(params["required"][0], "input");
+        assert!(
+            tools[0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Run JavaScript code")
+        );
+        assert_eq!(tools[1]["function"]["name"], "wait");
+
+        // additional_tools must not leak into messages.
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+
+        let custom = collect_custom_tool_names(&body);
+        assert_eq!(custom.len(), 1);
+        assert!(custom.contains("exec"));
+    }
+
+    #[test]
+    fn test_convert_request_custom_tool_call_history_round_trips() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "user", "content": "create the file"},
+                {"type": "custom_tool_call", "status": "completed", "call_id": "call_1",
+                 "name": "exec", "input": "await tools.exec_command({cmd: \"touch x\"})"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": [
+                    {"type": "input_text", "text": "Script completed"},
+                    {"type": "input_text", "text": "Output:"}
+                ]}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        let messages = chat["messages"].as_array().unwrap();
+
+        assert_eq!(messages[1]["role"], "assistant");
+        let tc = &messages[1]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "exec");
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            args["input"],
+            "await tools.exec_command({cmd: \"touch x\"})"
+        );
+
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["content"], "Script completed\nOutput:");
+    }
+
+    #[test]
+    fn test_convert_request_developer_role_maps_to_system() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"type": "message", "role": "developer", "content": "harness instructions"},
+                {"type": "message", "role": "user", "content": "hi"}
+            ]
+        });
+        let chat = convert_responses_to_chat_request(&body, &openai_router_config());
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "harness instructions");
+    }
+
+    #[test]
+    fn test_convert_response_sse_emits_custom_tool_call_item() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_9",
+                        "type": "function",
+                        "function": {"name": "exec",
+                            "arguments": "{\"input\":\"await tools.exec_command({cmd: \\\"ls\\\"})\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let custom: HashSet<String> = ["exec".to_string()].into();
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-5.6-sol", &custom);
+
+        assert!(sse.contains("\"type\":\"custom_tool_call\""), "{sse}");
+        assert!(sse.contains("\"call_id\":\"call_9\""));
+        assert!(
+            sse.contains("\"input\":\"await tools.exec_command({cmd: \\\"ls\\\"})\""),
+            "{sse}"
+        );
+        assert!(!sse.contains("\"type\":\"function_call\""), "{sse}");
+        assert!(!sse.contains("function_call_arguments"), "{sse}");
+        let completed = sse
+            .lines()
+            .filter_map(crate::services::http_utils::sse_data_payload)
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .find(|v| v["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed["response"]["output"][0]["type"],
+            "custom_tool_call"
+        );
+        assert_eq!(completed["response"]["output"][0]["name"], "exec");
+    }
+
+    #[test]
+    fn test_convert_response_sse_custom_call_raw_args_pass_through() {
+        let chat = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_raw", "type": "function",
+                    "function": {"name": "exec", "arguments": "await tools.wait()"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let custom: HashSet<String> = ["exec".to_string()].into();
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-5.6-sol", &custom);
+        assert!(sse.contains("\"input\":\"await tools.wait()\""), "{sse}");
+    }
+
+    #[test]
+    fn test_streaming_converter_buffers_custom_calls_until_finish() {
+        let custom: HashSet<String> = ["exec".to_string()].into();
+        let mut converter =
+            ResponsesStreamConverter::new("gpt-5.6-sol", false).with_custom_tools(custom);
+
+        let chunk1 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_s\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"inp\"}}]},\"finish_reason\":null}]}\n";
+        let chunk2 = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ut\\\":\\\"1+1\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n";
+        let mut out = converter.push_bytes(chunk1.as_bytes());
+        out.push_str(&converter.push_bytes(chunk2.as_bytes()));
+        assert!(!out.contains("output_item.added"), "{out}");
+        assert!(!out.contains("function_call_arguments"), "{out}");
+
+        let tail = converter.finish();
+        assert!(tail.contains("\"type\":\"custom_tool_call\""), "{tail}");
+        assert!(tail.contains("\"input\":\"1+1\""), "{tail}");
+    }
+
+    #[test]
+    fn test_streaming_converter_function_calls_unaffected_by_custom_set() {
+        let custom: HashSet<String> = ["exec".to_string()].into();
+        let mut converter =
+            ResponsesStreamConverter::new("gpt-5.6-sol", false).with_custom_tools(custom);
+
+        let chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_w\",\"function\":{\"name\":\"wait\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n";
+        let out = converter.push_bytes(chunk.as_bytes());
+        assert!(out.contains("output_item.added"), "{out}");
+        assert!(out.contains("\"type\":\"function_call\""), "{out}");
+
+        let tail = converter.finish();
+        assert!(tail.contains("function_call_arguments.done"), "{tail}");
+        assert!(!tail.contains("custom_tool_call"), "{tail}");
     }
 
     #[test]
@@ -2471,7 +2816,7 @@ mod tests {
             },
             "choices": [{"message": {"role": "assistant", "content": "Here are your files."}}]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("event: response.created\n"));
         assert!(sse.contains("event: response.output_text.delta\n"));
         assert!(sse.contains("event: response.output_text.done\n"));
@@ -2496,7 +2841,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("event: response.output_item.added\n"));
         assert!(sse.contains("event: response.function_call_arguments.delta\n"));
         assert!(sse.contains("event: response.function_call_arguments.done\n"));
@@ -2511,7 +2856,7 @@ mod tests {
         let chat = json!({
             "choices": [{"message": {"role": "assistant", "content": ""}}]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(!sse.contains("response.output_text.delta"));
         assert!(sse.contains("response.output_text.done"));
     }
@@ -2524,7 +2869,7 @@ mod tests {
                 {"message": {"role": "assistant", "content": "world"}}
             ]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("Hello\\nworld"));
     }
 
@@ -2538,7 +2883,7 @@ mod tests {
                 }
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("Hello\\nworld"));
     }
 
@@ -2547,7 +2892,7 @@ mod tests {
         let chat = json!({
             "result": {"response": "Hello from envelope"}
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("Hello from envelope"));
     }
 
@@ -2561,7 +2906,7 @@ mod tests {
                 "content": [{"type": "output_text", "text": "Hello from output"}]
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("Hello from output"));
     }
 
@@ -2578,7 +2923,7 @@ mod tests {
                 }]
             }
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("\"call_id\":\"call_123\""));
         assert!(sse.contains("\"name\":\"shell\""));
     }
@@ -2586,7 +2931,7 @@ mod tests {
     #[test]
     fn test_convert_response_uses_correct_object_type() {
         let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("\"object\":\"response\""));
         assert!(!sse.contains("realtime.response"));
     }
@@ -2594,7 +2939,7 @@ mod tests {
     #[test]
     fn test_convert_response_includes_response_id() {
         let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("\"response_id\""));
     }
 
@@ -2611,7 +2956,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("\"call_id\":\"call_abc123\""));
     }
 
@@ -2623,7 +2968,7 @@ mod tests {
                 "finish_reason": "length"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("\"status\":\"incomplete\""), "{sse}");
         assert!(sse.contains("\"reason\":\"max_output_tokens\""), "{sse}");
     }
@@ -2669,7 +3014,7 @@ mod tests {
     #[test]
     fn test_convert_response_text_only_emits_single_message_item() {
         let chat = json!({"choices": [{"message": {"role": "assistant", "content": "hi"}}]});
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         let completed = sse
             .lines()
             .find(|l| l.contains("\"type\":\"response.completed\""))
@@ -2694,7 +3039,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         // Preamble text must survive as a message item, before the call.
         assert!(
             sse.contains("\"text\":\"Let me check that file.\""),
@@ -2727,7 +3072,7 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         let completed = sse
             .lines()
             .find(|l| l.contains("\"type\":\"response.completed\""))
@@ -2824,7 +3169,7 @@ mod tests {
     #[test]
     fn test_convert_response_sse_empty_choices_no_panic() {
         let chat = json!({"choices": []});
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("event: response.created"));
         assert!(sse.contains("event: response.completed"));
     }
@@ -2832,7 +3177,7 @@ mod tests {
     #[test]
     fn test_convert_response_sse_missing_choices_no_panic() {
         let chat = json!({});
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("event: response.created"));
         assert!(sse.contains("event: response.completed"));
     }
@@ -2982,7 +3327,7 @@ mod tests {
                 "total_tokens": null
             }
         });
-        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o");
+        let sse = convert_chat_response_to_responses_sse(&chat, false, "gpt-4o", &HashSet::new());
         assert!(sse.contains("event: response.created\n"));
         assert!(sse.contains("event: response.completed\n"));
         assert!(sse.contains("\"input_tokens\""));

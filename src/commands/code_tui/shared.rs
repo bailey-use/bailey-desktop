@@ -1711,6 +1711,22 @@ pub(super) enum DeferredFinish {
     },
 }
 
+/// Composer→engine steering handoff; `std::sync` mutex — never held across an await.
+pub(super) type SteeringQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// One delegate's live row in a parallel sub-agent batch.
+pub(super) struct SubagentRow {
+    pub(super) name: String,
+    /// Present-tense current action, precomputed at event time so rendering stays pure.
+    pub(super) action: String,
+    pub(super) step: usize,
+    pub(super) started: Instant,
+    /// Last gated tool auto-denied for this delegate.
+    pub(super) denied: Option<String>,
+    /// (produced an answer, steps, tokens, runtime) once finished.
+    pub(super) done: Option<(bool, usize, u64, std::time::Duration)>,
+}
+
 pub(super) enum RuntimeEvent {
     Delta(ChatResponseChunk),
     Finished {
@@ -1762,6 +1778,8 @@ pub(super) enum RuntimeEvent {
     /// The agent's just-streamed output was a tool call written as text: drop the
     /// uncommitted segment so the markup never reaches the scrollback.
     AgentDiscardSegment,
+    /// The engine consumed a mid-turn interjection — commit it at the injection point.
+    AgentSteered(String),
     /// A background MCP connect finished. Carries the client (possibly empty) and
     /// the generation it started under; the event loop caches it and rebuilds the
     /// engine if it brought tools, but drops a result from a stale generation.
@@ -1856,6 +1874,32 @@ pub(super) enum RuntimeEvent {
         args: serde_json::Value,
         step: usize,
     },
+    /// A parallel sub-agent batch started — one live row per delegate, slot order.
+    AgentSubBegin {
+        labels: Vec<String>,
+    },
+    /// Slot-tagged counterpart of [`AgentSubActivity`](Self::AgentSubActivity).
+    AgentSubSlot {
+        slot: usize,
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    },
+    /// A parallel delegate's gated tool call was auto-denied.
+    AgentSubDenied {
+        slot: usize,
+        tool: String,
+    },
+    /// A parallel delegate finished (`ok` = it produced an answer).
+    AgentSubDone {
+        slot: usize,
+        ok: bool,
+        steps: usize,
+        tokens: u64,
+    },
+    /// The batch is over — retire the rows (results land as cards).
+    AgentSubFinish,
     /// An agent error (e.g. an LLM/API failure) — shown as an error-hued notice.
     AgentError(String),
     /// The agent turn finished (engine called `footer`) — commit the turn.
@@ -2060,6 +2104,9 @@ pub(super) struct CodeTuiApp {
     /// Current tool step, present-tense (`running grep`), + when it started.
     /// Feeds the inline status label.
     pub(super) last_tool_action: Option<(String, Instant)>,
+    /// Live rows under the spinner for a parallel sub-agent batch (slot-indexed);
+    /// cleared on batch finish / turn end.
+    pub(super) subagent_rows: Vec<SubagentRow>,
     /// The status label on screen + when first shown; throttled by
     /// `tick_status_throttle` so it switches at most once per `STATUS_MIN_DURATION`.
     pub(super) status_display: Option<(String, Instant)>,
@@ -2081,6 +2128,9 @@ pub(super) struct CodeTuiApp {
     /// `aivo stats --since` can attribute windowed chat usage. Reset on `/new`,
     /// re-seeded from the stored entry on resume.
     pub(super) session_tokens: crate::services::session_store::SessionTokens,
+    /// Estimated session spend in USD (snapshot pricing × each turn's measured
+    /// usage); 0 when the model has no known pricing. Reset on `/new`.
+    pub(super) session_cost_usd: f64,
     /// Active model's context window (tokens), 0 = unknown. Cached on model/key
     /// change for the footer utilization stat; see `refresh_context_window`.
     pub(super) context_window: u64,
@@ -2318,6 +2368,9 @@ pub(super) struct CodeTuiApp {
     /// auto-sent (one per turn) as the preceding turn finishes — a real FIFO so
     /// a second queued message doesn't silently clobber the first.
     pub(super) queued_messages: Vec<String>,
+    /// Mid-turn steering handoff to the engine task; leftovers reclaim into
+    /// `queued_messages` at turn end, cleared with it on interrupt/cancel.
+    pub(super) steering_queue: SteeringQueue,
     /// Slash commands typed while a turn was in flight that need the engine idle
     /// (`/compact`, `/rewind`, `/goal`, `/plan`), in submit order; executed as the
     /// turn finishes, before any queued message. Cleared with `queued_messages` on
@@ -2347,6 +2400,11 @@ pub(super) struct CodeTuiApp {
     /// In-memory only; cleared when history is replaced (new chat, resume, rewind).
     /// A toggle bumps `transcript_revision`, the body-cache key, so a flip repaints.
     pub(super) expanded_thinking: std::collections::HashSet<usize>,
+    /// History indices of user turns dispatched to the agent engine. The `/rewind`
+    /// picker matches checkpoints by prompt text; requiring this flag stops a
+    /// plain-chat/ACP turn with identical text from stealing an engine turn's
+    /// checkpoint. In-memory; cleared on new chat/resume, retained-below on rewind.
+    pub(super) agent_turn_indices: std::collections::HashSet<usize>,
     /// Thinking duration (ms) per committed assistant turn, by history index.
     /// Recorded but no longer surfaced (thoughts show content, not timing).
     /// In-memory only, cleared alongside `expanded_thinking`.

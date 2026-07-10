@@ -315,7 +315,7 @@ is preserved."
             self.notice = Some((
                 MUTED,
                 format!(
-                    "Switched key to {} — chat preserved",
+                    "Switched key to {} — session preserved",
                     self.key.display_name()
                 ),
             ));
@@ -524,7 +524,7 @@ is preserved."
         let mut engine =
             AgentEngine::new(&real_cwd, &self.model, &date, &guides, &skills, window, 0);
         let subagents =
-            crate::agent::subagents::discover_subagents(self.session_store.config_dir());
+            crate::agent::subagents::discover_subagents(cwd, self.session_store.config_dir());
         engine.set_subagents(&subagents);
         if let Some(ctx) = self.injected_context.as_deref() {
             engine.append_system_context(ctx);
@@ -548,7 +548,12 @@ is preserved."
                 ));
             }
         }
-        engine.seed_history(super::runtime_impl::agent_seed_turns(&self.history));
+        // A resumed transcript (pending until the first send) beats the lossy display seed.
+        if let Some(conversation) = self.pending_agent_messages.clone() {
+            engine.restore_conversation(conversation);
+        } else {
+            engine.seed_history(super::runtime_impl::agent_seed_turns(&self.history));
+        }
         engine.context_report()
     }
 
@@ -1733,6 +1738,15 @@ is preserved."
             ));
             return Ok(());
         }
+        if scope == crate::agent::mcp::ServerScope::Pack {
+            self.notice = Some((
+                WARNING,
+                format!(
+                    "`{name}` is provided by an installed pack — remove it with `aivo code packs rm`"
+                ),
+            ));
+            return Ok(());
+        }
         match crate::agent::mcp::remove_user_server(name).await {
             Ok(true) => {
                 // Clear any leftover disabled flag so a re-add isn't stuck off.
@@ -2447,7 +2461,13 @@ is preserved."
             .session_store
             .chat_session_tokens(&self.session_id)
             .await;
+        // Re-estimated from the resumed totals (the `~` label tolerates price drift).
+        self.session_cost_usd = crate::services::model_metadata::model_pricing(&self.model)
+            .and_then(|p| p.cost_usd(&self.session_tokens))
+            .unwrap_or(0.0);
         self.history = session.messages;
+        // Resumed rows never map to live checkpoints (the store is session-scoped).
+        self.agent_turn_indices.clear();
         self.expanded_thinking.clear();
         self.expanded_output.clear();
         self.local_outputs.clear();

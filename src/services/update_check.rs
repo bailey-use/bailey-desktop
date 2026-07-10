@@ -10,11 +10,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::services::system_env;
-
 const LATEST_URL: &str = "https://getaivo.dev/dl/latest";
 const CHECK_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
-const CACHE_FILE: &str = "update_check.json";
 
 /// Last network check result, persisted between runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,12 +25,9 @@ pub struct UpdateCheck {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    Some(
-        system_env::home_dir()?
-            .join(".config")
-            .join("aivo")
-            .join(CACHE_FILE),
-    )
+    Some(crate::services::paths::update_check(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 pub fn load() -> Option<UpdateCheck> {

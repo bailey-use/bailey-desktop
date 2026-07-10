@@ -46,7 +46,8 @@ fn signals_goal_complete(text: &str) -> bool {
     })
 }
 
-/// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns (parity with one-shot).
+/// `AIVO_AGENT_SELF_CORRECT=1` — post-edit verification in interactive turns. Opt-in
+/// here (headless defaults on): a full-suite run stalls a watched turn.
 fn env_self_correct() -> bool {
     crate::services::system_env::env_flag("AIVO_AGENT_SELF_CORRECT").unwrap_or(false)
 }
@@ -325,6 +326,7 @@ impl CodeTuiApp {
         self.pending_reasoning.clear();
         // Reset per-turn status state (label can't flash before the first tool).
         self.last_tool_action = None;
+        self.subagent_rows.clear();
         self.turn_output_tokens = 0;
         self.retrying = false;
         self.pending_submit = Some(PendingSubmission {
@@ -392,20 +394,32 @@ impl CodeTuiApp {
         Ok(())
     }
 
-    /// Stash a message typed during an in-flight turn; sent when the turn ends.
-    /// Appends to a FIFO so several can queue without clobbering each other.
+    /// Stash a message typed mid-turn: an engine run steers it, anything else
+    /// queues for turn end.
     fn queue_message(&mut self, input: String) {
         if input.trim().is_empty() {
             return;
         }
         self.record_draft_history(&input);
-        self.queued_messages.push(input);
+        // Serve up + not `/compact` (which runs no batches) = a steerable run.
+        if self.agent_serve.is_some() && self.compact_before.is_none() {
+            self.steering_queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(input);
+            self.notice = Some((
+                MUTED,
+                "Queued — the agent picks it up after the current tool step".to_string(),
+            ));
+        } else {
+            self.queued_messages.push(input);
+            self.notice = Some((MUTED, self.queued_notice()));
+        }
         self.draft.clear();
         self.cursor = 0;
         self.command_menu.reset();
         self.draft_history_index = None;
         self.draft_history_stash = None;
-        self.notice = Some((MUTED, self.queued_notice()));
     }
 
     /// Notice text for the queue, reflecting how many are waiting.
@@ -413,6 +427,26 @@ impl CodeTuiApp {
         match self.queued_messages.len() {
             0 | 1 => "Queued — sends when the current turn finishes".to_string(),
             n => format!("Queued ({n} waiting) — sent one per turn, in order"),
+        }
+    }
+
+    pub(super) fn clear_steering_queue(&mut self) {
+        self.steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Move unconsumed interjections to the front of the follow-up queue.
+    pub(super) fn reclaim_unsent_steering(&mut self) {
+        let drained: Vec<String> = self
+            .steering_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for (i, message) in drained.into_iter().enumerate() {
+            self.queued_messages.insert(i, message);
         }
     }
 
@@ -666,19 +700,24 @@ impl CodeTuiApp {
             });
             // Share the live thinking toggle so the engine requests reasoning (on
             // reasoning-capable models) only while thinking is on.
-            // Offer any named specialist sub-agents authored under
-            // `~/.config/aivo/agents`. The model delegates to them via the
-            // `subagent` tool's `agent` field.
-            let subagents =
-                crate::agent::subagents::discover_subagents(self.session_store.config_dir());
+            // Named specialist sub-agents (project `.aivo/agents`/`.claude/agents`,
+            // then `~/.config/aivo/agents`); the model delegates via `agent`.
+            let subagents = crate::agent::subagents::discover_subagents(
+                std::path::Path::new(&real_cwd),
+                self.session_store.config_dir(),
+            );
             engine.set_subagents(&subagents);
             // Persistent grant store so "always allow"s survive across sessions.
             engine.set_grants_path(self.session_store.config_dir());
             // Durable sub-agent reports under this session's artifacts dir (survive compaction).
             engine.set_artifacts_dir(self.session_store.session_artifacts_dir(&self.session_id));
             engine.set_jobs(self.jobs.clone());
-            // Opt-in LSP diagnostics-after-edit (AIVO_AGENT_LSP=1).
+            // LSP diagnostics-after-edit (default on; AIVO_AGENT_LSP=0 opts out).
             engine.maybe_enable_lsp(std::path::Path::new(&real_cwd));
+            // User lifecycle hooks (~/.config/aivo/hooks.json).
+            engine.set_hooks(std::sync::Arc::new(
+                crate::agent::hooks::HookSet::load_default(),
+            ));
             // Carry prior conversation in, best fidelity first: a resumed session's
             // durable transcript, else the outgoing engine's messages on a model
             // switch (both verbatim), else the lossy text seed of display history.
@@ -759,6 +798,7 @@ impl CodeTuiApp {
         // toggle takes effect on this running turn's permission gate.
         let auto_approve = self.auto_approve_flag.clone();
         let review_edits = self.review_edits_flag.clone();
+        let steering = self.steering_queue.clone();
         // The context window may have resolved AFTER the engine was built (a model
         // only known via the background catalog warm). Carry the latest value in
         // so the engine can fill a still-missing window and start compacting,
@@ -800,6 +840,11 @@ impl CodeTuiApp {
                 }
             }
         };
+        // Flag the user row as engine-dispatched for the `/rewind` picker match —
+        // after every early return, so a turn that never ran stays unflagged.
+        if self.history.last().is_some_and(|m| m.role == "user") {
+            self.agent_turn_indices.insert(self.history.len() - 1);
+        }
         self.response_task = Some(tokio::spawn(async move {
             let client = crate::services::http_utils::router_http_client();
             let ctx = TurnCtx {
@@ -815,6 +860,7 @@ impl CodeTuiApp {
             let mut ui = ChatAgentUi {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
+                steering,
             };
             let mut engine = engine.lock().await;
             engine.set_context_window(context_window);
@@ -835,6 +881,20 @@ impl CodeTuiApp {
                 None => engine.run_turn(&ctx, &mut ui, input).await,
             }
         }));
+    }
+
+    /// After aborting an agent turn, close its checkpoint's open segment in the
+    /// background: the abort skips the turn-end record, and diffing only at
+    /// `/rewind` would sweep the user's post-interrupt hand-edits into the revert
+    /// set. Idempotent, so racing a completed turn is benign.
+    fn finalize_interrupted_checkpoint(&self) {
+        let Some(session) = &self.agent_engine else {
+            return;
+        };
+        let engine = session.engine.clone();
+        tokio::spawn(async move {
+            engine.lock().await.record_turn_changes().await;
+        });
     }
 
     /// Tear down the per-turn agent serve (shutdown notify + abort accept loop).
@@ -953,6 +1013,7 @@ impl CodeTuiApp {
             let mut ui = ChatAgentUi {
                 tx,
                 cwd: std::path::PathBuf::from(&cwd),
+                steering: SteeringQueue::default(),
             };
             let started = Instant::now();
             let mut engine = engine.lock().await;
@@ -1558,17 +1619,22 @@ impl CodeTuiApp {
             Vec::new()
         };
         // Map display turns onto checkpoints by prompt text from the newest
-        // backward. A turn that doesn't match the next checkpoint (a non-agent turn,
-        // or one trimmed/compacted away, or one predating the engine) is
-        // conversation-only and consumes no checkpoint. Robust to trimming,
-        // compaction, and rebuilds — unlike positional arithmetic, which restored
-        // the wrong tree when the lists drifted.
+        // backward, over engine-dispatched rows only (a plain-chat/ACP row with
+        // identical text must not steal an engine turn's checkpoint). A flagged
+        // turn that doesn't match the next checkpoint (trimmed/compacted away, or
+        // predating the engine) is conversation-only and consumes no checkpoint.
+        // Robust to trimming, compaction, and rebuilds — unlike positional
+        // arithmetic, which restored the wrong tree when the lists drifted.
         let mut row_ordinal: Vec<Option<usize>> = vec![None; turn_count];
         let mut row_revertible: Vec<bool> = vec![false; turn_count];
         let mut remaining = targets.len();
         for turn_idx in (0..turn_count).rev() {
-            let content = &self.history[user_indices[turn_idx]].content;
-            if remaining > 0 && targets[remaining - 1].0 == *content {
+            let history_index = user_indices[turn_idx];
+            let content = &self.history[history_index].content;
+            if remaining > 0
+                && self.agent_turn_indices.contains(&history_index)
+                && targets[remaining - 1].0 == *content
+            {
                 remaining -= 1;
                 row_ordinal[turn_idx] = Some(remaining);
                 row_revertible[turn_idx] = targets[remaining].1;
@@ -1624,6 +1690,8 @@ impl CodeTuiApp {
         }
         let removed = self.history[history_index].clone();
         self.history.truncate(history_index);
+        // Surviving indices are unchanged by the truncation — keep them.
+        self.agent_turn_indices.retain(|&i| i < history_index);
         // Indices shift on truncation — drop inline-expand state and durations so
         // they can't point at the wrong block.
         self.expanded_thinking.clear();
@@ -2259,6 +2327,7 @@ pieces and keep going"
         self.cancel_inflight_request(CancelKind::Discard);
         self.overlay = Overlay::None;
         self.history.clear();
+        self.agent_turn_indices.clear();
         self.expanded_thinking.clear();
         self.expanded_output.clear();
         self.local_outputs.clear();
@@ -2285,6 +2354,7 @@ pieces and keep going"
         self.context_tokens = 0;
         // Fresh session → fresh token tally (the index entry starts at zero).
         self.session_tokens = crate::services::session_store::SessionTokens::default();
+        self.session_cost_usd = 0.0;
         self.context_is_estimate = true;
         self.follow_output = true;
         self.plan_mode = false;
@@ -2339,6 +2409,9 @@ pieces and keep going"
         if let Some(task) = self.response_task.take() {
             task.abort();
         }
+        if was_agent_turn {
+            self.finalize_interrupted_checkpoint();
+        }
         // Tear down the agent turn's serve and drop any pending permission card
         // (the dropped reply makes the engine's awaiting tool fail closed).
         self.stop_agent_serve();
@@ -2347,6 +2420,7 @@ pieces and keep going"
         self.agent_review = None;
         self.agent_plan_approval = None;
         self.queued_messages.clear();
+        self.clear_steering_queue();
         self.queued_commands.clear();
         if was_sending && let Some(session) = self.cursor_acp_session.as_ref() {
             // Fire-and-forget session/cancel so the agent stops generating
@@ -2382,6 +2456,8 @@ pieces and keep going"
                 self.history.pop();
             }
         }
+        // Either pop above may have removed a flagged user row.
+        self.agent_turn_indices.retain(|&i| i < self.history.len());
         self.cursor = self.draft.len();
         self.sync_command_menu_state();
         self.sending = false;
@@ -2425,8 +2501,12 @@ pieces and keep going"
             return Ok(());
         }
 
+        let was_agent_turn = self.agent_serve.is_some();
         if let Some(task) = self.response_task.take() {
             task.abort();
+        }
+        if was_agent_turn {
+            self.finalize_interrupted_checkpoint();
         }
         // Tear down an agent turn's serve / permission card if this was one.
         self.stop_agent_serve();
@@ -2435,6 +2515,7 @@ pieces and keep going"
         self.agent_review = None;
         self.agent_plan_approval = None;
         self.queued_messages.clear();
+        self.clear_steering_queue();
         self.queued_commands.clear();
 
         let partial = std::mem::take(&mut self.pending_response);
@@ -2614,8 +2695,9 @@ fn rewind_excerpt(text: &str) -> String {
 }
 
 /// Trailing annotation on a `/rewind` picker row: a "conversation only" marker
-/// when the turn has no tree snapshot (file revert unavailable); otherwise empty
-/// (the exact file impact is reported in the notice after applying).
+/// when no checkpoint from the turn onward has a tree snapshot (file revert
+/// unavailable); otherwise empty (the exact file impact is reported in the
+/// notice after applying).
 fn rewind_label_suffix(conversation_only: bool) -> String {
     if conversation_only {
         "  · conversation only".to_string()
@@ -2697,6 +2779,65 @@ struct ChatAgentUi {
     tx: UnboundedSender<RuntimeEvent>,
     /// Workspace root, for resolving an edit's `path` in the pre-edit probe.
     cwd: std::path::PathBuf,
+    steering: SteeringQueue,
+}
+
+/// Bridges parallel sub-agent progress to the event loop's per-delegate rows.
+struct ChatSubagentSink {
+    tx: UnboundedSender<RuntimeEvent>,
+}
+
+impl crate::agent::engine::SubagentSink for ChatSubagentSink {
+    fn begin(&self, labels: &[String]) {
+        self.tx
+            .send(RuntimeEvent::AgentSubBegin {
+                labels: labels.to_vec(),
+            })
+            .ok();
+    }
+
+    fn activity(
+        &self,
+        slot: usize,
+        agent: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        step: usize,
+    ) {
+        self.tx
+            .send(RuntimeEvent::AgentSubSlot {
+                slot,
+                agent: agent.to_string(),
+                tool: tool.to_string(),
+                args: args.clone(),
+                step,
+            })
+            .ok();
+    }
+
+    fn denied(&self, slot: usize, tool: &str) {
+        self.tx
+            .send(RuntimeEvent::AgentSubDenied {
+                slot,
+                tool: tool.to_string(),
+            })
+            .ok();
+    }
+
+    fn done(&self, slot: usize, ok: bool, steps: usize, tokens: u64) {
+        self.tx
+            .send(RuntimeEvent::AgentSubDone {
+                slot,
+                ok,
+                steps,
+                tokens,
+            })
+            .ok();
+    }
+
+    fn finish(&self) {
+        self.tx.send(RuntimeEvent::AgentSubFinish).ok();
+    }
 }
 
 impl crate::agent::engine::AgentUi for ChatAgentUi {
@@ -2718,6 +2859,20 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
 
     fn discard_streamed_segment(&mut self) {
         self.tx.send(RuntimeEvent::AgentDiscardSegment).ok();
+    }
+
+    fn drain_steering(&mut self) -> Vec<String> {
+        let drained: Vec<String> = self
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        // Same channel as tool results, so the transcript commit lands in order.
+        for text in &drained {
+            self.tx.send(RuntimeEvent::AgentSteered(text.clone())).ok();
+        }
+        drained
     }
 
     fn context_usage(&mut self, tokens: u64, measured: bool) {
@@ -2745,6 +2900,12 @@ impl crate::agent::engine::AgentUi for ChatAgentUi {
                 step,
             })
             .ok();
+    }
+
+    fn subagent_sink(&mut self) -> Option<std::sync::Arc<dyn crate::agent::engine::SubagentSink>> {
+        Some(std::sync::Arc::new(ChatSubagentSink {
+            tx: self.tx.clone(),
+        }))
     }
 
     fn plan_updated(&mut self, items: &[crate::agent::plan::PlanItem]) {

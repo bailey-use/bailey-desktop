@@ -3,7 +3,7 @@
 //! Written by `aivo login` after the device is linked; read by `aivo info`.
 //! This is display metadata only — there is no secret here (the Ed25519 device
 //! key remains the credential), so it lives as a plain JSON file at
-//! `~/.config/aivo/account.json` (mode 0600), separate from the encrypted
+//! `<config>/secrets/account.json` (mode 0600), separate from the encrypted
 //! `config.json` and untouched by other aivo commands.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::services::atomic_write::{atomic_write_secure, ensure_private_dir};
-use crate::services::system_env;
 
 /// The account this device is linked to. `email`/`name` are best-effort —
 /// the server may omit them.
@@ -44,12 +43,9 @@ impl Account {
 }
 
 fn account_path() -> Option<PathBuf> {
-    Some(
-        system_env::home_dir()?
-            .join(".config")
-            .join("aivo")
-            .join("account.json"),
-    )
+    Some(crate::services::paths::account_json(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 /// Loads the stored account, or `None` if not logged in / unreadable.

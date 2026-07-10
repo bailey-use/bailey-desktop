@@ -55,6 +55,10 @@ const MAX_COMPLETION_NUDGES: usize = 2;
 const MAX_SELFCORRECT_ATTEMPTS: usize = 3;
 const VERIFY_FAILED_PREFIX: &str = "The project's checks are failing, so the task isn't done. \
 Fix the cause and continue — don't stop until they pass:";
+/// Cap on Stop-hook refusals per turn, so a hook that always exits 2 can't loop the run.
+const MAX_STOP_HOOK_CONTINUES: usize = 3;
+const STOP_HOOK_PREFIX: &str = "A user-configured Stop hook reviewed your answer and asked you \
+to continue. Address the following, then finish:";
 /// Prefix of the artifact-pointer line; compaction preserves it so the parent can
 /// `read_file` a cleared sub-agent report back.
 pub(crate) const ARTIFACT_POINTER_PREFIX: &str = "[full report saved: ";
@@ -98,6 +102,19 @@ const MAX_TOUCHED_FILES: usize = 200;
 /// Cap on the agent's durable scratchpad (most-recent kept).
 const MAX_NOTES: usize = 50;
 
+/// Live progress for a parallel sub-agent batch, slot-tagged in call order.
+/// `Arc`-shared (`&self` + `Send + Sync`) so concurrent delegates report into one UI.
+pub trait SubagentSink: Send + Sync {
+    fn begin(&self, labels: &[String]);
+    /// Empty `tool` = thinking between calls.
+    fn activity(&self, slot: usize, agent: &str, tool: &str, args: &Value, step: usize);
+    /// A gated call was auto-denied (no interactive approval mid-batch).
+    fn denied(&self, slot: usize, tool: &str);
+    /// `ok` = the delegate produced an answer.
+    fn done(&self, slot: usize, ok: bool, steps: usize, tokens: u64);
+    fn finish(&self);
+}
+
 /// Side-effects the engine delegates: rendering and the permission prompt.
 /// `ask_permission` fires only for mutating tools that aren't pre-approved; a
 /// non-TTY impl must fail closed (Deny). `Send` so the chat TUI can drive it on a task.
@@ -114,10 +131,19 @@ pub trait AgentUi: Send {
     /// (label-only) so a long delegation isn't a frozen label. `tool` empty =
     /// thinking between calls; `step` = child's 1-based turn. Default no-op.
     fn subagent_activity(&mut self, _agent: &str, _tool: &str, _args: &Value, _step: usize) {}
+    /// Live feed for a parallel sub-agent batch; `None` (default) keeps it quiet.
+    fn subagent_sink(&mut self) -> Option<std::sync::Arc<dyn SubagentSink>> {
+        None
+    }
     /// Prompt for the next REPL turn. `None` ends the session (EOF / `/exit`);
     /// default `None` → one-shot only.
     fn read_user_input(&mut self) -> Option<String> {
         None
+    }
+    /// Mid-turn messages, drained after each tool batch. Default none so a
+    /// sub-agent can't consume the parent's queue.
+    fn drain_steering(&mut self) -> Vec<String> {
+        Vec::new()
     }
     fn assistant_text(&mut self, delta: &str);
     /// A streamed reasoning/thinking delta (separate from the visible reply). Default no-op.
@@ -273,13 +299,16 @@ impl TurnCtx<'_> {
 /// `tree` = working-tree snapshot at turn start (`None` = conversation-only).
 /// `prompt` = opening user text stored verbatim (the picker matches on it, since
 /// `messages[msg_index]` gets mutated in place). `changed` = paths the turn modified
-/// (a rewind reverts only their union); `None` until recorded / for interrupted turns.
+/// (a rewind reverts only their union); `None` until recorded. `seg_tree` = diff
+/// base for a segment resumed after an interrupt recorded `changed`, so the
+/// user's hand-edits made while the turn sat interrupted stay out of the diff.
 #[derive(Clone)]
 pub(crate) struct Checkpoint {
     pub(crate) msg_index: usize,
-    prompt: String,
-    tree: Option<String>,
-    changed: Option<Vec<std::path::PathBuf>>,
+    pub(crate) prompt: String,
+    pub(crate) tree: Option<String>,
+    pub(crate) changed: Option<Vec<std::path::PathBuf>>,
+    pub(crate) seg_tree: Option<String>,
 }
 
 /// Result of a [`AgentEngine::rewind_to`] — counts for the notice.
@@ -369,11 +398,11 @@ pub struct AgentEngine {
     /// Unattended `-e` only: reject a text turn that admits it isn't done (or trails
     /// off mid-step) and nudge to continue, rather than accept it as the final answer.
     require_completion: bool,
-    /// Opt-in (`AIVO_AGENT_SELF_CORRECT`): when the agent declares done, run the
-    /// project's validator and, on failure, feed it back so it fixes the cause.
+    /// Run the project's validator at declared-done and feed failures back. Default
+    /// on for headless `-e` (`AIVO_AGENT_SELF_CORRECT=0` opts out), opt-in (`=1`) interactive.
     self_correct: bool,
     /// Gates self-correct so investigate-only turns don't re-run the whole suite.
-    /// Starts true: the tree state is unknown until a first green run baselines it.
+    /// Starts true (tree state unknown); [`Self::set_verified_baseline`] clears it.
     dirty_since_verify: bool,
     /// Interactive chat only (off for headless/sub-agents): see [`CONFIRM_BEFORE_BUILD`].
     confirm_before_build: bool,
@@ -390,10 +419,15 @@ pub struct AgentEngine {
     /// File-staleness guard: baselines of files read this session, so a mutating tool
     /// can be refused when its target changed on disk since the model last read it.
     file_tracker: crate::agent::file_tracker::FileTracker,
-    /// Opt-in LSP diagnostics-after-edit (`AIVO_AGENT_LSP=1`); `None` = disabled.
+    /// LSP diagnostics-after-edit (default on, `AIVO_AGENT_LSP=0` opts out); `None` = disabled.
     lsp: Option<crate::agent::lsp::LspManager>,
     /// App-owned background-job table; `None` → `check_job` unadvertised.
     jobs: Option<crate::agent::jobs::SharedJobs>,
+    /// User lifecycle hooks; `None` = none configured. Shared with sub-engines.
+    hooks: Option<std::sync::Arc<crate::agent::hooks::HookSet>>,
+    /// `--max-cost`: stop the turn at this estimated spend (USD; 0 = off).
+    max_cost_usd: f64,
+    cost_pricing: Option<crate::services::model_metadata::Pricing>,
     /// chars/4 tokens of the `-c` block folded into the system prompt, so
     /// `context_report` can split it back out.
     injected_context_tokens: usize,
@@ -550,7 +584,23 @@ impl AgentEngine {
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
             jobs: None,
+            hooks: None,
+            max_cost_usd: 0.0,
+            cost_pricing: None,
             injected_context_tokens: 0,
+        }
+    }
+
+    /// Cap the turn's estimated spend (USD; 0 = no cap). Headless `--max-cost`.
+    pub fn set_cost_budget(&mut self, usd: f64, pricing: crate::services::model_metadata::Pricing) {
+        self.max_cost_usd = usd;
+        self.cost_pricing = Some(pricing);
+    }
+
+    /// Wire the user's lifecycle hooks (see [`crate::agent::hooks`]).
+    pub fn set_hooks(&mut self, hooks: std::sync::Arc<crate::agent::hooks::HookSet>) {
+        if !hooks.is_empty() {
+            self.hooks = Some(hooks);
         }
     }
 
@@ -559,10 +609,12 @@ impl AgentEngine {
         self.max_output_tokens = tokens;
     }
 
-    /// Back the "always allow" grants with a persistent store at `<config>/grants.json`,
+    /// Back the "always allow" grants with a persistent store at `<config>/state/grants.json`,
     /// loading any grants already saved there. Without this the store is session-only.
     pub fn set_grants_path(&mut self, config_dir: &Path) {
-        self.grants = crate::agent::grant_store::GrantStore::load(config_dir.join("grants.json"));
+        self.grants = crate::agent::grant_store::GrantStore::load(
+            crate::services::paths::grants_json(config_dir),
+        );
     }
 
     /// Persist sub-agent reports under `dir` so a long delegation survives compaction.
@@ -589,10 +641,10 @@ impl AgentEngine {
         }
     }
 
-    /// Enable LSP diagnostics-after-edit rooted at `cwd` when `AIVO_AGENT_LSP` is set —
-    /// after a successful edit, the language server's native errors are fed back.
+    /// Enable LSP diagnostics-after-edit rooted at `cwd` (default on; `AIVO_AGENT_LSP=0`
+    /// opts out) — after a successful edit, the language server's native errors are fed back.
     pub fn maybe_enable_lsp(&mut self, cwd: &Path) {
-        if crate::services::system_env::env_flag("AIVO_AGENT_LSP").unwrap_or(false) {
+        if crate::services::system_env::env_flag("AIVO_AGENT_LSP").unwrap_or(true) {
             let mgr = crate::agent::lsp::LspManager::new(cwd);
             mgr.warm(); // start indexing now so the first edit's check isn't cold
             self.lsp = Some(mgr);
@@ -745,6 +797,12 @@ questions.",
     /// Takes a bool so goal mode can toggle it per turn on a reused engine.
     pub fn set_self_correct(&mut self, on: bool) {
         self.self_correct = on;
+    }
+
+    /// Treat the current tree as verified — only a mutation re-arms self-verify, so
+    /// the default-on headless path doesn't pay a suite run for investigate-only work.
+    pub fn set_verified_baseline(&mut self) {
+        self.dirty_since_verify = false;
     }
 
     /// Set the `reasoning_effort` level (`/effort`). Only meaningful for reasoning models.
@@ -1269,6 +1327,7 @@ questions.",
                 prompt: checkpoint_prompt,
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
         }
         // Merge into a preceding user turn (e.g. a turn cancelled before its first
@@ -1297,6 +1356,7 @@ questions.",
         let mut page_repeats = 0usize;
         // Same-signature tool-failure streaks: hint the schema, then hard-stop a loop.
         let mut failure_guard = guards::FailureGuard::default();
+        let mut stop_hook_continues = 0usize;
         let mut converged = false;
 
         for _ in 0..self.max_steps {
@@ -1419,6 +1479,21 @@ questions.",
                 converged = true;
                 break;
             }
+            // Same for the USD budget (`--max-cost`): estimated spend from measured usage.
+            if self.max_cost_usd > 0.0
+                && let Some(cost) = self
+                    .cost_pricing
+                    .as_ref()
+                    .and_then(|p| p.cost_usd(&self.turn_usage))
+                && cost >= self.max_cost_usd
+            {
+                ui.notify(&format!(
+                    "stopping: reached the cost budget (~${cost:.2} of ${:.2})",
+                    self.max_cost_usd
+                ));
+                converged = true;
+                break;
+            }
 
             // Empty completion converges the turn; don't record it — an empty assistant 400s the Anthropic bridge (non-retryable → bricks the next turn).
             let no_output = message.tool_calls.is_empty()
@@ -1494,6 +1569,18 @@ questions.",
                         }
                     }
                 }
+                // A Stop hook may refuse the stop; the turn continues with its guidance.
+                if stop_hook_continues < MAX_STOP_HOOK_CONTINUES
+                    && let Some(hooks) = self.hooks.clone()
+                    && let Some(guidance) = hooks
+                        .stop_guidance(message.content.as_deref().unwrap_or(""), ctx.cwd)
+                        .await
+                {
+                    stop_hook_continues += 1;
+                    ui.notify("a Stop hook asked the agent to continue");
+                    self.push_text_turn("user", format!("{STOP_HOOK_PREFIX}\n{guidance}"));
+                    continue;
+                }
                 converged = true; // answered without calling tools
                 // Finalize a started plan on real convergence so it can't linger as
                 // "0/N done". Gated on `started` — an all-pending plan (planned then converged) is left alone.
@@ -1554,6 +1641,9 @@ questions.",
                 }
                 guards::FailureAction::None => {}
             }
+
+            self.inject_job_notices();
+            self.inject_steering(ui);
         }
 
         if !converged {
@@ -1569,16 +1659,92 @@ questions.",
         );
 
         // Record paths this turn changed so `/rewind` reverts only the agent's edits.
-        // Interrupted turns skip this — finalized lazily by `rewind_to`.
-        let changed = match self.checkpoints.last().and_then(|c| c.tree.clone()) {
-            Some(tree) => match self.checkpoint_store.as_mut() {
-                Some(store) => Some(store.changed_since(&tree).await),
+        self.record_turn_changes().await;
+    }
+
+    /// Record the paths the turn's yet-unrecorded segment changed into its
+    /// checkpoint: the first segment diffs from the turn tree, a resumed segment
+    /// from its own `seg_tree` (keeping idle-gap hand-edits out of the revert set).
+    /// Idempotent, so the TUI's cancel path can call it without racing turn end.
+    pub(crate) async fn record_turn_changes(&mut self) {
+        let Some(cp) = self.checkpoints.last() else {
+            return;
+        };
+        let prior = cp.changed.clone();
+        let base = match (&prior, cp.seg_tree.clone()) {
+            (None, _) => cp.tree.clone(),
+            (Some(_), seg @ Some(_)) => seg,
+            (Some(_), None) => return, // fully recorded — no open segment
+        };
+        let diff = match &base {
+            Some(b) => match self.checkpoint_store.as_mut() {
+                Some(store) => store.changed_since(b).await,
                 None => Some(Vec::new()),
             },
+            // No tree → nothing revertible; Some([]) still marks the turn
+            // recorded so `rewind_to` won't lazy-diff it.
             None => Some(Vec::new()),
         };
-        if let Some(cp) = self.checkpoints.last_mut() {
-            cp.changed = changed;
+        let Some(cp) = self.checkpoints.last_mut() else {
+            return;
+        };
+        match diff {
+            Some(paths) => {
+                let mut set: std::collections::BTreeSet<std::path::PathBuf> =
+                    prior.unwrap_or_default().into_iter().collect();
+                set.extend(paths);
+                cp.changed = Some(set.into_iter().collect());
+            }
+            None => {
+                // Diff unavailable (git error / size cap) → the segment's changes
+                // are unknown; drop the tree so the turn reads non-revertible.
+                cp.tree = None;
+                cp.changed = Some(prior.unwrap_or_default());
+            }
+        }
+        cp.seg_tree = None;
+    }
+
+    /// Fold interjections into the last tool result — a fresh user turn after
+    /// tool results 400s the Anthropic bridge.
+    fn inject_steering(&mut self, ui: &mut dyn AgentUi) {
+        let steering = ui.drain_steering();
+        if steering.is_empty() {
+            return;
+        }
+        let block = format!(
+            "<user_interjection>\n{}\n</user_interjection>\nThe user sent this while you were \
+working. Factor it in before continuing — it may change what to do next.",
+            steering.join("\n\n")
+        );
+        self.fold_into_last_tool_result(block);
+    }
+
+    /// Surface jobs that finished since the last step, so the model needn't busy-poll.
+    fn inject_job_notices(&mut self) {
+        let Some(jobs) = &self.jobs else { return };
+        let notices = jobs.drain_finished_notices();
+        if notices.is_empty() {
+            return;
+        }
+        let block = format!(
+            "<background_jobs>\n{}\n</background_jobs>\nThese background job(s) finished while \
+you were working. If the outcome matters to the task, inspect the log; otherwise continue.",
+            notices.join("\n")
+        );
+        self.fold_into_last_tool_result(block);
+    }
+
+    /// Append `block` to the last tool result, or push a user turn when there is
+    /// none — a fresh user turn straight after tool results 400s the Anthropic bridge.
+    fn fold_into_last_tool_result(&mut self, block: String) {
+        if let Some(last) = self.messages.last_mut()
+            && last.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(c) = last.get("content").and_then(Value::as_str)
+        {
+            last["content"] = json!(format!("{c}\n\n{block}"));
+        } else {
+            self.push_text_turn("user", block);
         }
     }
 
@@ -1593,16 +1759,38 @@ questions.",
         tool_calls: &[ToolCall],
     ) -> (u64, Vec<(String, String)>) {
         // Lazy `/rewind` checkpoint: snapshot the pre-edit (turn-start) tree the first
-        // time a batch isn't entirely read-only. Conservative — anything off the `is_read_only` allowlist triggers it.
-        if self.checkpoints.last().is_some_and(|c| c.tree.is_none())
-            && !tool_calls.iter().all(|c| tools::is_read_only(&c.name))
-        {
-            let tree = match self.checkpoint_store.as_mut() {
-                Some(store) => store.snapshot().await,
-                None => None,
-            };
-            if let Some(cp) = self.checkpoints.last_mut() {
-                cp.tree = tree;
+        // time a batch isn't entirely read-only. Conservative — anything off the
+        // `is_read_only` allowlist triggers it. A turn resumed after an interrupt
+        // (`changed` already recorded) also snapshots a `seg_tree` diff base, so the
+        // resumed segment's diff excludes the user's edits made in between.
+        if !tool_calls.iter().all(|c| tools::is_read_only(&c.name)) {
+            let need_tree = self.checkpoints.last().is_some_and(|c| c.tree.is_none());
+            let need_seg = !need_tree
+                && self
+                    .checkpoints
+                    .last()
+                    .is_some_and(|c| c.changed.is_some() && c.seg_tree.is_none());
+            if need_tree || need_seg {
+                let tree = match self.checkpoint_store.as_mut() {
+                    Some(store) => store.snapshot().await,
+                    None => None,
+                };
+                if let Some(cp) = self.checkpoints.last_mut() {
+                    if need_tree {
+                        cp.tree = tree.clone();
+                        // A prior record means an interrupt closed the first
+                        // segment pre-mutation — this snapshot is also the seg base.
+                        if cp.changed.is_some() {
+                            cp.seg_tree = tree;
+                        }
+                    } else {
+                        match tree {
+                            Some(t) => cp.seg_tree = Some(t),
+                            // Can't isolate the segment's diff → non-revertible.
+                            None => cp.tree = None,
+                        }
+                    }
+                }
             }
         }
 
@@ -1639,6 +1827,14 @@ questions.",
 `exit_plan_mode` with your plan."
                         .to_string(),
                 ));
+                continue;
+            }
+            // PreToolUse veto runs before the permission tiers — a veto never
+            // prompts; an allow still goes through them.
+            if let Some(hooks) = self.hooks.clone()
+                && let Some(reason) = hooks.pre_tool_use_deny(n, &call.arguments, ctx.cwd).await
+            {
+                outcomes[i] = Some(Err(format!("blocked by PreToolUse hook: {reason}")));
                 continue;
             }
             // Confirm only genuinely risky actions: destructive command, out-of-cwd
@@ -1768,6 +1964,14 @@ questions.",
                 "running {} sub-agents in parallel",
                 subagent_idx.len()
             ));
+            let sink = ui.subagent_sink();
+            if let Some(s) = &sink {
+                let labels: Vec<String> = subagent_idx
+                    .iter()
+                    .map(|&i| subagent_display_name(&tool_calls[i].arguments))
+                    .collect();
+                s.begin(&labels);
+            }
             let base = self.turn_usage.completion_tokens;
             let this: &Self = self;
             let mut sub_tokens_total = 0u64;
@@ -1775,10 +1979,12 @@ questions.",
             // chunk runs concurrently (join_all — same primitive as the read batch, and
             // unlike buffer_unordered it doesn't impose a higher-ranked Send bound on
             // the heavy sub-engine future), chunks run one after another.
-            for chunk in subagent_idx.chunks(SUBAGENT_PARALLEL_CAP) {
-                let runs = chunk.iter().map(|&i| {
+            for (chunk_no, chunk) in subagent_idx.chunks(SUBAGENT_PARALLEL_CAP).enumerate() {
+                let runs = chunk.iter().enumerate().map(|(j, &i)| {
                     let args = &tool_calls[i].arguments;
-                    async move { (i, this.run_subagent(ctx, None, base, args).await) }
+                    let slot = chunk_no * SUBAGENT_PARALLEL_CAP + j;
+                    let sink = sink.clone().map(|s| (s, slot));
+                    async move { (i, this.run_subagent(ctx, None, sink, base, args).await) }
                 });
                 for (i, res) in futures::future::join_all(runs).await {
                     outcomes[i] = Some(match res {
@@ -1789,6 +1995,9 @@ questions.",
                         Err(e) => Err(e),
                     });
                 }
+            }
+            if let Some(s) = &sink {
+                s.finish();
             }
             extra_tokens = extra_tokens.saturating_add(sub_tokens_total);
             self.turn_usage.completion_tokens = self
@@ -1858,7 +2067,7 @@ questions.",
                 // Fresh sub-engine on the same serve/cwd; fold its total in. Pass the UI + base so it forwards live token growth.
                 let base = self.turn_usage.completion_tokens;
                 match self
-                    .run_subagent(ctx, Some(&mut *ui), base, &call.arguments)
+                    .run_subagent(ctx, Some(&mut *ui), None, base, &call.arguments)
                     .await
                 {
                     Ok((msg, sub_tokens)) => {
@@ -2003,6 +2212,28 @@ command in the foreground (drop `background`)."
                     && let Some(Ok(msg)) = &mut outcomes[i]
                 {
                     msg.push_str(&block);
+                }
+            }
+        }
+
+        // PostToolUse feedback folds into each call's result (like the LSP fold above).
+        if let Some(hooks) = self.hooks.clone().filter(|h| h.has_post()) {
+            for (i, call) in tool_calls.iter().enumerate() {
+                let Some(result) = outcomes[i].as_ref() else {
+                    continue;
+                };
+                let n = subagents::normalize_tool_name(&call.name).unwrap_or(&call.name);
+                let Some(extra) = hooks
+                    .post_tool_use(n, &call.arguments, result, ctx.cwd)
+                    .await
+                else {
+                    continue;
+                };
+                let block = format!("\n\n[PostToolUse hook]\n{extra}");
+                match outcomes[i].as_mut() {
+                    Some(Ok(msg)) => msg.push_str(&block),
+                    Some(Err(msg)) => msg.push_str(&block),
+                    None => {}
                 }
             }
         }
@@ -2152,21 +2383,36 @@ Re-run the full command without write confinement?",
 
     /// Per-checkpoint `/rewind` targets in order for the picker: `(prompt, file_revertible)`.
     /// The TUI matches by prompt text newest-backward. Cheap and in-memory (no git).
+    /// Revertible = any checkpoint from the turn onward has a tree (a read-only
+    /// turn restores from the first later one — see [`Self::rewind_to`]).
     pub fn rewind_targets(&self) -> Vec<(String, bool)> {
-        self.checkpoints
-            .iter()
-            .map(|c| (c.prompt.clone(), c.tree.is_some()))
-            .collect()
+        let mut out = Vec::with_capacity(self.checkpoints.len());
+        let mut tree_from_here = false;
+        for c in self.checkpoints.iter().rev() {
+            tree_from_here |= c.tree.is_some();
+            out.push((c.prompt.clone(), tree_from_here));
+        }
+        out.reverse();
+        out
     }
 
     /// Rewind to checkpoint `ordinal`: revert the union of files the rewound turns
     /// changed (leaving the user's independent edits), truncate to the turn's user
-    /// message, drop the rewound checkpoints, re-derive the working set. A `None`-tree
-    /// checkpoint rewinds the conversation only.
+    /// message, drop the rewound checkpoints, re-derive the working set. When no
+    /// checkpoint from `ordinal` onward has a tree, the conversation alone rewinds.
     pub async fn rewind_to(&mut self, ordinal: usize) -> RewindOutcome {
         let mut outcome = RewindOutcome::default();
-        let tree = self.checkpoints.get(ordinal).and_then(|c| c.tree.clone());
-        // Union of paths every rewound turn changed; finalize interrupted turns (`changed == None`) lazily.
+        // Close the last turn's open segment (an abort whose cancel record raced us).
+        self.record_turn_changes().await;
+        // Restore target: the turn's own pre-edit tree, or — for a read-only turn
+        // that never snapshotted — the first later checkpoint's tree (turns in
+        // between have no tree because they changed nothing, so it equals this
+        // turn's end state).
+        let tree = self.checkpoints[ordinal.min(self.checkpoints.len())..]
+            .iter()
+            .find_map(|c| c.tree.clone());
+        // Union of paths every rewound turn changed; finalize never-recorded
+        // (crash-orphaned) checkpoints lazily.
         let mut paths: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
         for i in ordinal..self.checkpoints.len() {
@@ -2175,7 +2421,7 @@ Re-run the full command without write confinement?",
                 Some(c) => c,
                 None => match self.checkpoints[i].tree.clone() {
                     Some(t) => match self.checkpoint_store.as_mut() {
-                        Some(store) => store.changed_since(&t).await,
+                        Some(store) => store.changed_since(&t).await.unwrap_or_default(),
                         None => Vec::new(),
                     },
                     None => Vec::new(),
@@ -2210,21 +2456,23 @@ Re-run the full command without write confinement?",
         &self,
         ctx: &TurnCtx<'_>,
         parent_ui: Option<&mut dyn AgentUi>,
+        sink: Option<(std::sync::Arc<dyn SubagentSink>, usize)>,
         base: u64,
         args: &Value,
     ) -> Result<(String, u64), String> {
-        let task = args
-            .get("task")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or_else(|| "subagent: missing `task`".to_string())?;
+        // Fallback keys are Claude Code's names, so a Task-vocabulary call still delegates.
+        let str_arg = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+            })
+        };
+        let task =
+            str_arg(&["task", "prompt"]).ok_or_else(|| "subagent: missing `task`".to_string())?;
         // Named specialist if `agent` matches; unknown names fall back to generic (lenient, don't fail the turn).
-        let profile = args
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
+        let profile = str_arg(&["agent", "subagent_type"])
             .and_then(|n| self.subagents.iter().find(|s| s.name == n));
         // Model precedence: explicit `model` arg > profile's pinned model > parent's model.
         let model = args
@@ -2234,8 +2482,31 @@ Re-run the full command without write confinement?",
             .or_else(|| profile.and_then(|p| p.model.as_deref()))
             .unwrap_or(&self.model);
 
+        // Isolation: explicit arg wins, else the profile's flag; unavailable falls
+        // back to the shared workspace with a note.
+        let isolate = args.get("isolation").and_then(|v| v.as_str()) == Some("worktree")
+            || profile.is_some_and(|p| p.isolation_worktree);
+        let mut guard: Option<subagents::WorktreeGuard> = None;
+        let mut sub_cwd: PathBuf = ctx.cwd.to_path_buf();
+        let mut isolation_note: Option<String> = None;
+        if isolate {
+            match subagents::create_worktree(ctx.cwd) {
+                Ok(wt) => {
+                    // Keep the delegate at the parent's subdir vantage point; guard
+                    // prunes the worktree if this future is dropped before finalize.
+                    sub_cwd = subagents::worktree_cwd(ctx.cwd, &wt);
+                    guard = Some(subagents::WorktreeGuard::new(ctx.cwd, &wt));
+                }
+                Err(why) => {
+                    isolation_note = Some(format!(
+                        "\n\n[worktree isolation] unavailable ({why}); ran in the shared workspace."
+                    ));
+                }
+            }
+        }
+
         let mut sub = AgentEngine::new(
-            &ctx.cwd.display().to_string(),
+            &sub_cwd.display().to_string(),
             model,
             &self.date,
             &self.guides,
@@ -2250,6 +2521,11 @@ Re-run the full command without write confinement?",
         }
         // Honor the parent's hosted-web-search opt-in/out in delegated work.
         sub.set_web_search_enabled(self.use_web_search_enabled);
+        // Pre/PostToolUse guards cover delegated work; Stop hooks don't (they gate
+        // the user-facing answer, not each delegate).
+        if let Some(hooks) = &self.hooks {
+            sub.set_hooks(std::sync::Arc::new(hooks.without_stop()));
+        }
         // Carry the parent's reasoning effort — but only if it's valid for the sub's model (may differ), else keep the sub's default.
         if let Some(effort) = &self.reasoning_effort
             && crate::services::model_metadata::snapshot_limits(model)
@@ -2270,26 +2546,36 @@ Re-run the full command without write confinement?",
             sub.apply_profile(p);
         }
 
-        // Matched specialist, else the requested name, else generic.
-        let agent_name = profile
-            .map(|p| p.name.clone())
-            .or_else(|| {
-                args.get("agent")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        let agent_name = subagent_display_name(args);
         let mut ui = SubagentUi {
             parent: parent_ui,
+            sink,
             base,
             agent_name,
             ..Default::default()
         };
+        // The sub's ctx roots tool execution + sandbox confinement at its own cwd.
+        let sub_ctx = TurnCtx {
+            client: ctx.client,
+            serve_base: ctx.serve_base,
+            auth: ctx.auth,
+            cwd: &sub_cwd,
+            yes: ctx.yes,
+            auto_approve_all: ctx.auto_approve_all,
+            auto_approve: ctx.auto_approve,
+            review_edits: ctx.review_edits,
+        };
         // Box the recursive future (run_turn → subagent → run_turn) so it isn't infinitely-sized.
-        Box::pin(sub.run_turn(ctx, &mut ui, task.to_string())).await;
+        Box::pin(sub.run_turn(&sub_ctx, &mut ui, task.to_string())).await;
+        if let Some((s, slot)) = &ui.sink {
+            s.done(*slot, !ui.answer().is_empty(), ui.steps, ui.tokens);
+        }
         let mut msg = ui.result_message();
+        if let Some(g) = guard {
+            msg.push_str(&g.finalize());
+        } else if let Some(note) = isolation_note {
+            msg.push_str(&note);
+        }
         // Gate on the STORED length (not the bare answer) so the tail can't push it over
         // the clear threshold and get cleared without a pointer.
         if let Some(dir) = &self.artifacts_dir
@@ -2367,19 +2653,36 @@ fn slug_for_artifact(task: &str) -> String {
     }
 }
 
+/// Delegate display name from call args; empty → the UI numbers it.
+fn subagent_display_name(args: &Value) -> String {
+    for key in ["label", "description", "agent", "subagent_type"] {
+        if let Some(v) = args.get(key).and_then(|v| v.as_str()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// The `subagent` tool — engine-handled (needs the serve + a fresh engine), top-level
 /// engine only. When named specialists exist, an `agent` field enumerates them.
 fn subagent_tool_spec(subagents: &[Subagent]) -> ToolSpec {
     let mut properties = json!({
         "task": {"type": "string", "description": "A complete, standalone instruction for the sub-agent."},
-        "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."}
+        "label": {"type": "string", "description": "Short name for this delegate (3–6 words), shown in the live progress UI — e.g. \"audit auth flow\"."},
+        "model": {"type": "string", "description": "Optional model id to run the sub-agent on (default: the agent's configured model, else same as you)."},
+        "isolation": {"type": "string", "enum": ["worktree"], "description": "Optional: run the sub-agent in a disposable git worktree — an isolated snapshot of the last commit (uncommitted changes not included). Its edits stay there and the result tells you how to review/apply them. Use when a delegate will edit files, especially several delegates in parallel."}
     });
     let mut description = "Delegate a self-contained subtask to a fresh sub-agent that has the same \
 file/shell tools and runs its own loop, then hands back its result. Use it to keep your own context \
 focused (offload a big investigation), or pass `model` to delegate hard work to a stronger model. The \
 sub-agent does not see this conversation, so make `task` complete and standalone; it cannot spawn \
 further sub-agents. Call `subagent` several times in one turn to run independent investigations in \
-parallel — they execute concurrently and each result comes back separately."
+parallel — they execute concurrently and each result comes back separately; give parallel delegates \
+that edit files `isolation: \"worktree\"` so they can't clobber each other. Always pass a short \
+`label` so the user can follow each delegate's progress."
         .to_string();
     if !subagents.is_empty() {
         let names: Vec<&str> = subagents.iter().map(|s| s.name.as_str()).collect();
@@ -2463,6 +2766,8 @@ struct SubagentUi<'a> {
     tokens: u64,
     /// Forward live token growth (base + sub so-far) to the parent UI.
     parent: Option<&'a mut dyn AgentUi>,
+    /// Slot-tagged live feed for the detached (parallel) path, where `parent` is `None`.
+    sink: Option<(std::sync::Arc<dyn SubagentSink>, usize)>,
     base: u64,
     /// Specialist name + turn counter, forwarded to the parent's status feed.
     agent_name: String,
@@ -2501,12 +2806,15 @@ impl SubagentUi<'_> {
     fn forward_activity(&mut self, tool: &str, args: &Value) {
         let Self {
             parent,
+            sink,
             agent_name,
             turn_no,
             ..
         } = self;
         if let Some(p) = parent.as_deref_mut() {
             p.subagent_activity(agent_name, tool, args, *turn_no);
+        } else if let Some((s, slot)) = sink {
+            s.activity(*slot, agent_name, tool, args, *turn_no);
         }
     }
 }
@@ -2550,9 +2858,16 @@ impl AgentUi for SubagentUi<'_> {
     ) -> BoxFuture<'a, Decision> {
         // Forward to the parent (card in the TUI, fail-closed when headless) rather than
         // auto-allowing, so the catastrophic-command floor holds for sub-agents too.
+        // Detached (parallel batch): deny, but visibly — a silent deny reads as
+        // the delegate just doing a bad job.
         match self.parent.as_deref_mut() {
             Some(p) => p.ask_permission(tool, preview),
-            None => Box::pin(async { Decision::Deny }),
+            None => {
+                if let Some((s, slot)) = &self.sink {
+                    s.denied(*slot, tool);
+                }
+                Box::pin(async { Decision::Deny })
+            }
         }
     }
 }
@@ -2788,8 +3103,12 @@ mod tests {
         plan_decision: Option<crate::agent::protocol::PlanDecision>,
         /// The plan text of each `approve_plan` call, in order.
         approved_plans: Vec<String>,
+        steering: Vec<String>,
     }
     impl AgentUi for CapturingUi {
+        fn drain_steering(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.steering)
+        }
         fn assistant_text(&mut self, t: &str) {
             self.text.push_str(t);
         }
@@ -2959,6 +3278,34 @@ mod tests {
         format!("data: {delta}\n\ndata: [DONE]\n\n")
     }
 
+    /// Drain the full request before replying: closing with unread bytes RSTs the
+    /// response (Windows), and the engine's retry then eats the next scripted body.
+    fn drain_request(sock: &mut std::net::TcpStream) {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            data.extend_from_slice(&buf[..n]);
+            let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_len: usize = String::from_utf8_lossy(&data[..pos])
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            if data.len() >= pos + 4 + body_len {
+                return;
+            }
+        }
+    }
+
     fn spawn_sse_sequence(bodies: Vec<String>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2967,8 +3314,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept() else {
                     break;
                 };
-                let mut buf = [0u8; 16384];
-                let _ = sock.read(&mut buf); // drain the request
+                drain_request(&mut sock);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -4011,6 +4357,48 @@ mod tests {
         assert!(parts.iter().any(|p| p["type"] == "image_url"));
     }
 
+    #[tokio::test]
+    async fn steering_folds_into_the_last_tool_result_at_the_batch_boundary() {
+        let dir = tmp();
+        let ls = tool_call_sse("list_dir", json!({ "path": "." }));
+        let port = spawn_sse_sequence(vec![ls, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi {
+            steering: vec!["actually, focus on the README".to_string()],
+            ..Default::default()
+        };
+        engine
+            .run_turn(
+                &turn_ctx(&client, &base, &dir),
+                &mut ui,
+                "look around".into(),
+            )
+            .await;
+        assert!(ui.steering.is_empty(), "the queue must be drained");
+        let tool_msg = engine
+            .messages
+            .iter()
+            .rfind(|m| m["role"] == "tool")
+            .expect("a tool result");
+        let content = tool_msg["content"].as_str().unwrap();
+        assert!(
+            content.contains("<user_interjection>")
+                && content.contains("actually, focus on the README"),
+            "interjection must ride the tool result: {content}"
+        );
+        let roles: Vec<&str> = engine
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !roles.windows(2).any(|w| w == ["tool", "user"]),
+            "no bare user turn after tool results: {roles:?}"
+        );
+    }
+
     #[test]
     fn push_user_content_never_makes_consecutive_user_turns() {
         let dir = tmp();
@@ -4832,6 +5220,112 @@ mod tests {
         assert_eq!(ui2.answer(), "plain answer");
     }
 
+    /// `isolation: "worktree"`: the sub-agent's writes land in a disposable worktree,
+    /// the parent tree stays untouched, and the result says where the changes are.
+    #[tokio::test]
+    async fn subagent_worktree_isolation_keeps_parent_tree_clean() {
+        let dir = tmp();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+
+        let parent_call = tool_call_sse(
+            "subagent",
+            json!({"task": "add b.txt", "isolation": "worktree"}),
+        );
+        let sub_write = tool_call_sse("write_file", json!({"path": "b.txt", "content": "two"}));
+        let port = spawn_sse_sequence(vec![
+            parent_call,
+            sub_write,
+            FINAL_TEXT_SSE.to_string(), // sub declares done
+            FINAL_TEXT_SSE.to_string(), // parent declares done
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate the edit".into()),
+            &mut ui,
+        )
+        .await;
+
+        assert!(
+            !dir.join("b.txt").exists(),
+            "parent tree must stay untouched"
+        );
+        let report = engine
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .find(|s| s.contains("[worktree isolation]"))
+            .expect("result must carry the worktree note")
+            .to_string();
+        assert!(report.contains("1 path(s) changed"), "{report}");
+        // The reported worktree really holds the edit; clean it up.
+        let wt = report
+            .split("worktree at ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .map(PathBuf::from)
+            .expect("note names the worktree path");
+        assert!(wt.join("b.txt").is_file(), "edit landed in the worktree");
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
+            .output();
+    }
+
+    /// Isolation requested outside a git repo falls back to the shared workspace
+    /// with a note, rather than failing the delegation.
+    #[tokio::test]
+    async fn subagent_worktree_isolation_falls_back_outside_git() {
+        let dir = tmp();
+        let parent_call = tool_call_sse(
+            "subagent",
+            json!({"task": "look around", "isolation": "worktree"}),
+        );
+        let port = spawn_sse_sequence(vec![
+            parent_call,
+            FINAL_TEXT_SSE.to_string(),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("delegate".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("[worktree isolation] unavailable"))
+            }),
+            "fallback must be reported"
+        );
+    }
+
     /// A sub-agent's token usage folds into the parent turn's total (the sub's LLM calls aren't parent steps).
     #[tokio::test]
     async fn subagent_tokens_fold_into_parent_total() {
@@ -5221,6 +5715,40 @@ mod tests {
         assert_eq!(runs.lines().count(), 1, "suite ran once, not per turn");
     }
 
+    /// Under a verified baseline (the default-on headless arrangement), an
+    /// investigate-only run converges without paying for a suite run; a mutating run
+    /// still verifies at declared-done.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selfcorrect_verified_baseline_skips_investigate_only_runs() {
+        let dir = tmp();
+        std::fs::write(dir.join("run_tests.sh"), "echo run >> runs.log; exit 0\n").unwrap();
+
+        let port = spawn_sse_sequence(vec![
+            // Turn 1: read + done → clean baseline → no suite run.
+            tool_call_sse("read_file", json!({"path": "run_tests.sh"})),
+            FINAL_TEXT_SSE.to_string(),
+            // Turn 2: write + done → dirty → suite runs.
+            tool_call_sse("write_file", json!({"path": "f", "content": "x"})),
+            FINAL_TEXT_SSE.to_string(),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_self_correct(true);
+        engine.set_verified_baseline();
+        let mut ui = CapturingUi::default();
+        let ctx = turn_ctx(&client, &base, &dir);
+        run_session(&mut engine, &ctx, Some("just look around".into()), &mut ui).await;
+        assert!(
+            !dir.join("runs.log").exists(),
+            "investigate-only run must not trigger the suite"
+        );
+        run_session(&mut engine, &ctx, Some("now edit".into()), &mut ui).await;
+        let runs = std::fs::read_to_string(dir.join("runs.log")).unwrap_or_default();
+        assert_eq!(runs.lines().count(), 1, "mutation re-arms verification");
+    }
+
     // --- background jobs (Phase 4) ---
 
     #[test]
@@ -5273,6 +5801,169 @@ mod tests {
                     .is_some_and(|s| s.contains("started background job j1"))
             }),
             "expected a job-started tool result"
+        );
+    }
+
+    /// A background job that finished is surfaced at the next step boundary, folded
+    /// into the last tool result (bridge-safe), so the model needn't busy-poll.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finished_background_job_notice_is_injected_at_step_boundary() {
+        let dir = tmp();
+        let jobs = jobs::JobTable::new(Some(dir.join("jobs")));
+        jobs.spawn("echo bye", &dir).unwrap();
+        // Already reaped-finished before the turn: the first boundary drains it.
+        for _ in 0..100 {
+            if jobs.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let call = tool_call_sse("list_dir", json!({"path": "."}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_jobs(jobs);
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("look around".into()),
+            &mut ui,
+        )
+        .await;
+        let folded = engine.messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("<background_jobs>") && s.contains("job j1"))
+        });
+        assert!(
+            folded,
+            "expected the finish notice folded into a tool result: {:?}",
+            engine.messages
+        );
+    }
+
+    // --- user lifecycle hooks ---
+
+    fn hookset(
+        dir: &std::path::Path,
+        json_str: &str,
+    ) -> std::sync::Arc<crate::agent::hooks::HookSet> {
+        let path = dir.join("hooks.json");
+        std::fs::write(&path, json_str).unwrap();
+        std::sync::Arc::new(crate::agent::hooks::HookSet::load_from(&path))
+    }
+
+    /// A PreToolUse veto (exit 2) blocks the call before it runs; the stderr reason
+    /// reaches the model as the tool error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_tool_use_hook_veto_blocks_the_call() {
+        let dir = tmp();
+        let call = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"write_file","hooks":[
+                {"command":"echo writes are frozen >&2; exit 2"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("write it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(!dir.join("f").exists(), "vetoed call must not run");
+        assert!(
+            engine.messages.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("blocked by PreToolUse hook: writes are frozen"))
+            }),
+            "the veto reason must reach the model"
+        );
+    }
+
+    /// PostToolUse stdout is folded into the tool result (same pattern as LSP diagnostics).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_tool_use_hook_feedback_lands_in_the_tool_result() {
+        let dir = tmp();
+        let call = tool_call_sse("write_file", json!({"path": "f", "content": "x"}));
+        let port = spawn_sse_sequence(vec![call, FINAL_TEXT_SSE.to_string()]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"write_file","hooks":[
+                {"command":"echo formatting applied"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("write it".into()),
+            &mut ui,
+        )
+        .await;
+        assert!(dir.join("f").exists(), "allowed call runs");
+        let folded = engine.messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content").and_then(Value::as_str).is_some_and(|s| {
+                    s.contains("[PostToolUse hook]") && s.contains("formatting applied")
+                })
+        });
+        assert!(folded, "hook stdout must land in the tool result");
+    }
+
+    /// A Stop-hook refusal (exit 2) feeds guidance back and the turn continues;
+    /// once the hook allows, the turn converges normally.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_hook_refusal_continues_the_turn_with_guidance() {
+        let dir = tmp();
+        let port = spawn_sse_sequence(vec![
+            FINAL_TEXT_SSE.to_string(), // 1st done attempt → hook refuses
+            FINAL_TEXT_SSE.to_string(), // 2nd done attempt → hook allows
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut engine = AgentEngine::new(&dir.display().to_string(), "m", "", &[], &[], 0, 0);
+        // Refuse once (flag file marks the first refusal), then allow.
+        engine.set_hooks(hookset(
+            &dir,
+            r#"{"hooks":{"Stop":[{"hooks":[
+                {"command":"[ -f stop-flag ] || { touch stop-flag; echo also run the linter >&2; exit 2; }"}]}]}}"#,
+        ));
+        let mut ui = CapturingUi::default();
+        run_session(
+            &mut engine,
+            &turn_ctx(&client, &base, &dir),
+            Some("do the thing".into()),
+            &mut ui,
+        )
+        .await;
+        let guided = engine.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("also run the linter"))
+        });
+        assert!(guided, "the refusal guidance must be fed back");
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("Stop hook asked the agent to continue")),
+            "expected a stop-hook notice: {:?}",
+            ui.notices
         );
     }
 
@@ -6751,6 +7442,8 @@ mod tests {
             model: model.map(str::to_string),
             tools: tools.map(|t| t.into_iter().map(str::to_string).collect()),
             body: format!("You are {name}. Follow the {name} playbook."),
+            isolation_worktree: false,
+            repo_local: false,
             source: PathBuf::new(),
         }
     }
@@ -7120,7 +7813,77 @@ mod tests {
         let spec = subagent_tool_spec(&[]);
         assert_eq!(spec.name, "subagent");
         assert!(spec.parameters["properties"].get("agent").is_none());
+        assert!(spec.parameters["properties"].get("label").is_some());
         assert_eq!(spec.parameters["required"], json!(["task"]));
+    }
+
+    #[test]
+    fn subagent_display_name_prefers_label_and_cc_names() {
+        assert_eq!(
+            subagent_display_name(&json!({"label": "audit auth", "agent": "reviewer"})),
+            "audit auth"
+        );
+        // Claude Code arg names are accepted as fallbacks.
+        assert_eq!(
+            subagent_display_name(&json!({"description": "deep dive", "subagent_type": "explore"})),
+            "deep dive"
+        );
+        assert_eq!(
+            subagent_display_name(&json!({"subagent_type": "explore"})),
+            "explore"
+        );
+        assert_eq!(subagent_display_name(&json!({"task": "long text"})), "");
+    }
+
+    #[tokio::test]
+    async fn subagent_ui_sink_forwards_activity_and_denies_visibly() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<String>>);
+        impl SubagentSink for Recording {
+            fn begin(&self, labels: &[String]) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("begin:{}", labels.len()));
+            }
+            fn activity(&self, slot: usize, agent: &str, tool: &str, _args: &Value, step: usize) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("activity:{slot}:{agent}:{tool}:{step}"));
+            }
+            fn denied(&self, slot: usize, tool: &str) {
+                self.0.lock().unwrap().push(format!("denied:{slot}:{tool}"));
+            }
+            fn done(&self, slot: usize, ok: bool, steps: usize, _tokens: u64) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("done:{slot}:{ok}:{steps}"));
+            }
+            fn finish(&self) {
+                self.0.lock().unwrap().push("finish".to_string());
+            }
+        }
+        let sink = std::sync::Arc::new(Recording::default());
+        let mut ui = SubagentUi {
+            sink: Some((sink.clone(), 3)),
+            agent_name: "audit auth".to_string(),
+            ..Default::default()
+        };
+        ui.turn_start();
+        ui.tool_start("read_file", &json!({"path": "a.rs"}));
+        let decision = ui.ask_permission("run_bash", None).await;
+        assert!(matches!(decision, Decision::Deny));
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "activity:3:audit auth::1",
+                "activity:3:audit auth:read_file:1",
+                "denied:3:run_bash",
+            ]
+        );
     }
 
     /// With profiles, the tool advertises them via an `agent` enum.
@@ -7306,6 +8069,7 @@ mod tests {
             prompt: "a".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7318,6 +8082,7 @@ mod tests {
             prompt: "c".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7352,6 +8117,7 @@ mod tests {
             prompt: "c".into(),
             tree: Some("abc".into()),
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7364,6 +8130,7 @@ mod tests {
             prompt: "e".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
         engine
             .messages
@@ -7389,6 +8156,7 @@ mod tests {
                 prompt: u.into(),
                 tree: None,
                 changed: None,
+                seg_tree: None,
             });
             engine.messages.push(json!({"role": "user", "content": u}));
             engine
@@ -7439,6 +8207,7 @@ mod tests {
             prompt: "first".into(),
             tree: Some("abc".into()),
             changed: None,
+            seg_tree: None,
         });
         engine.push_text_turn("user", "first".into());
         engine.push_text_turn("user", "second".into());
@@ -7470,6 +8239,7 @@ mod tests {
             prompt: "go".into(),
             tree,
             changed: None,
+            seg_tree: None,
         });
         // Simulate the turn: rename + edit (the case byte-snapshots couldn't revert).
         std::fs::rename(p.join("a.txt"), p.join("b.txt")).unwrap();
@@ -7479,6 +8249,140 @@ mod tests {
         assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v0");
         assert!(!p.join("b.txt").exists(), "renamed file removed");
         assert!(outcome.restored >= 1);
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupt_record_shields_user_edits_from_rewind() {
+        // Hand-edits made after the cancel-time record must survive a later rewind.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("agent.txt"), "a0").unwrap();
+        std::fs::write(p.join("mine.txt"), "m0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        let tree = {
+            let store = engine.checkpoint_store.as_mut().unwrap();
+            if !store.git_available().await {
+                return; // git missing → skip
+            }
+            store.snapshot().await
+        };
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "go".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        // Agent edit + cancel-time record, then a post-interrupt hand-edit.
+        std::fs::write(p.join("agent.txt"), "a1").unwrap();
+        engine.record_turn_changes().await;
+        std::fs::write(p.join("mine.txt"), "m-edited").unwrap();
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(std::fs::read_to_string(p.join("agent.txt")).unwrap(), "a0");
+        assert_eq!(
+            std::fs::read_to_string(p.join("mine.txt")).unwrap(),
+            "m-edited",
+            "the user's post-interrupt edit must survive the rewind"
+        );
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn resumed_segment_diffs_from_its_own_base() {
+        // Segments union across an interrupt+resend, minus the user's idle-gap edit.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("agent.txt"), "a0").unwrap();
+        std::fs::write(p.join("mine.txt"), "m0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        let tree = {
+            let store = engine.checkpoint_store.as_mut().unwrap();
+            if !store.git_available().await {
+                return; // git missing → skip
+            }
+            store.snapshot().await
+        };
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "go".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        // Segment 1 (agent edit + interrupt record), idle-gap user edit, then
+        // segment 2 from a fresh seg base (agent create + turn-end record).
+        std::fs::write(p.join("agent.txt"), "a1").unwrap();
+        engine.record_turn_changes().await;
+        std::fs::write(p.join("mine.txt"), "m-edited").unwrap();
+        let seg = engine.checkpoint_store.as_mut().unwrap().snapshot().await;
+        engine.checkpoints.last_mut().unwrap().seg_tree = seg;
+        std::fs::write(p.join("new.txt"), "n").unwrap();
+        engine.record_turn_changes().await;
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(std::fs::read_to_string(p.join("agent.txt")).unwrap(), "a0");
+        assert!(!p.join("new.txt").exists(), "segment-2 create removed");
+        assert_eq!(
+            std::fs::read_to_string(p.join("mine.txt")).unwrap(),
+            "m-edited",
+            "the idle-gap hand-edit is not part of either segment"
+        );
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn rewind_to_read_only_turn_restores_from_the_next_tree() {
+        // Rewinding to a tree-less (read-only) turn must still revert later edits.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        std::fs::write(p.join("a.txt"), "v0").unwrap();
+        let mut engine = rewind_engine(p);
+        engine.enable_rewind_checkpoints(&p.display().to_string());
+        if !engine
+            .checkpoint_store
+            .as_mut()
+            .unwrap()
+            .git_available()
+            .await
+        {
+            return; // git missing → skip
+        }
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "look".into(),
+            tree: None,
+            changed: Some(Vec::new()),
+            seg_tree: None,
+        });
+        let tree = engine.checkpoint_store.as_mut().unwrap().snapshot().await;
+        engine.checkpoints.push(Checkpoint {
+            msg_index: engine.messages.len(),
+            prompt: "edit".into(),
+            tree,
+            changed: None,
+            seg_tree: None,
+        });
+        std::fs::write(p.join("a.txt"), "v1").unwrap();
+        engine.record_turn_changes().await;
+
+        // Both turns read as file-revertible: the read-only one borrows the later tree.
+        let targets = engine.rewind_targets();
+        assert_eq!(
+            targets.iter().map(|t| t.1).collect::<Vec<_>>(),
+            [true, true]
+        );
+
+        let outcome = engine.rewind_to(0).await;
+        assert_eq!(
+            std::fs::read_to_string(p.join("a.txt")).unwrap(),
+            "v0",
+            "the later turn's edit reverts even from a read-only target"
+        );
+        assert_eq!(outcome.restored, 1);
         assert!(outcome.error.is_none());
     }
 
@@ -7507,6 +8411,7 @@ mod tests {
             prompt: "go".into(),
             tree: None,
             changed: None,
+            seg_tree: None,
         });
 
         // A read-only batch must NOT snapshot.

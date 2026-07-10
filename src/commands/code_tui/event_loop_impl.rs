@@ -73,6 +73,22 @@ impl CodeTuiApp {
                 args,
                 step,
             } => self.apply_subagent_activity(agent, tool, args, step),
+            RuntimeEvent::AgentSubBegin { labels } => self.apply_subagent_begin(labels),
+            RuntimeEvent::AgentSubSlot {
+                slot,
+                agent,
+                tool,
+                args,
+                step,
+            } => self.apply_subagent_slot(slot, agent, tool, args, step),
+            RuntimeEvent::AgentSubDenied { slot, tool } => self.apply_subagent_denied(slot, tool),
+            RuntimeEvent::AgentSubDone {
+                slot,
+                ok,
+                steps,
+                tokens,
+            } => self.apply_subagent_done(slot, ok, steps, tokens),
+            RuntimeEvent::AgentSubFinish => self.subagent_rows.clear(),
             RuntimeEvent::AgentToolUpdate {
                 id,
                 args,
@@ -80,6 +96,7 @@ impl CodeTuiApp {
                 failed,
             } => self.apply_agent_tool_update(id, args, result, failed),
             RuntimeEvent::AgentToolResult { content } => self.apply_agent_tool_result(content),
+            RuntimeEvent::AgentSteered(text) => self.apply_agent_steered(text),
             RuntimeEvent::AgentDiscardSegment => self.discard_streamed_segment(),
             RuntimeEvent::McpConnected { client, generation } => {
                 // Drop a connect that started before a `/mcp` toggle changed the
@@ -521,6 +538,78 @@ impl CodeTuiApp {
         self.last_tool_action = Some((label, Instant::now()));
     }
 
+    /// Unnamed delegates get numbered so every row stays distinguishable.
+    pub(super) fn apply_subagent_begin(&mut self, labels: Vec<String>) {
+        let now = Instant::now();
+        self.subagent_rows = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| super::shared::SubagentRow {
+                name: if name.is_empty() {
+                    format!("sub-agent {}", i + 1)
+                } else {
+                    name
+                },
+                action: "starting".to_string(),
+                step: 0,
+                started: now,
+                denied: None,
+                done: None,
+            })
+            .collect();
+    }
+
+    /// The action label is precomputed here so rendering stays pure.
+    pub(super) fn apply_subagent_slot(
+        &mut self,
+        slot: usize,
+        agent: String,
+        tool: String,
+        args: serde_json::Value,
+        step: usize,
+    ) {
+        let cwd = if self.real_cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.real_cwd.clone()
+        };
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        if !agent.is_empty() {
+            row.name = agent;
+        }
+        row.action = if tool.is_empty() {
+            "working".to_string()
+        } else {
+            super::render::tool_action_label(&tool, &args, &cwd)
+        };
+        row.step = step;
+    }
+
+    /// Mark the row and explain in a notice, so the deny doesn't read as
+    /// delegate sloppiness.
+    pub(super) fn apply_subagent_denied(&mut self, slot: usize, tool: String) {
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        let name = row.name.clone();
+        row.denied = Some(tool.clone());
+        self.notice = Some((
+            WARNING,
+            format!(
+                "{name}: `{tool}` auto-denied — parallel delegates can't prompt; run it solo to approve"
+            ),
+        ));
+    }
+
+    pub(super) fn apply_subagent_done(&mut self, slot: usize, ok: bool, steps: usize, tokens: u64) {
+        let Some(row) = self.subagent_rows.get_mut(slot) else {
+            return;
+        };
+        row.done = Some((ok, steps, tokens, row.started.elapsed()));
+    }
+
     /// Enrich the matching tool-call entry in place (cursor reports the resolved
     /// path/pattern and the result in a later `tool_call_update`, keyed by id):
     /// swap in the real args and attach a compact result / failed flag. Bumps the
@@ -649,6 +738,20 @@ impl CodeTuiApp {
         // reading scrolled-up output isn't snapped to the bottom each step.
     }
 
+    /// Commit a consumed interjection at its injection point (events arrive in
+    /// engine order).
+    pub(super) fn apply_agent_steered(&mut self, text: String) {
+        self.flush_pending_assistant();
+        self.history.push(ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: text,
+            reasoning_content: None,
+            attachments: vec![],
+        });
+        self.notice = Some((MUTED, "Interjection delivered".to_string()));
+    }
+
     /// Render an `update_plan` call as a SINGLE checklist card. The model resends
     /// the full plan on every call, so the transcript keeps just one card: each
     /// update drops the previous one and re-appends the latest at the current
@@ -705,6 +808,7 @@ impl CodeTuiApp {
         // A retry that recovered on the final step has no later chunk to clear it.
         self.clear_retry_notice();
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.response_task = None;
         self.pending_submit = None;
@@ -734,6 +838,11 @@ impl CodeTuiApp {
         // entry (and thus `aivo stats --since`) carries actual chat tokens.
         if let Some(session) = self.agent_engine.as_ref() {
             let turn = session.engine.lock().await.take_turn_usage();
+            if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
+                .and_then(|p| p.cost_usd(&turn))
+            {
+                self.session_cost_usd += cost;
+            }
             self.session_tokens = self.session_tokens.merge(turn);
         }
         // If the tool set changed mid-turn, drop the engine now so the next turn
@@ -758,6 +867,7 @@ impl CodeTuiApp {
         }
         // Before a queued message can flip `sending` and skip the capture.
         self.capture_plan_draft();
+        self.reclaim_unsent_steering();
         // Commands queued mid-turn run first (a queued `/plan go` needs the plan
         // captured above; a queued `/compact` should fold before the next message).
         self.drain_queued_commands().await;
@@ -935,6 +1045,7 @@ impl CodeTuiApp {
         self.commit_assistant_segment(partial);
         // Reset the turn, fail-closed like an interrupt.
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.pending_submit = None;
         // A dead compact turn must not mark the NEXT turn as a compact.
@@ -966,6 +1077,7 @@ impl CodeTuiApp {
         format: ChatFormat,
     ) -> Result<()> {
         self.sending = false;
+        self.subagent_rows.clear();
         self.request_started_at = None;
         self.response_task = None;
         // The turn's format belongs to the model that ran it — don't clobber a
@@ -1096,14 +1208,18 @@ impl CodeTuiApp {
             .await?;
         // Fold the same split into the session's running total so the chat index
         // entry feeds `aivo stats --since` (the non-agent / cursor path).
-        self.session_tokens =
-            self.session_tokens
-                .merge(crate::services::session_store::SessionTokens {
-                    prompt_tokens: usage.prompt_tokens,
-                    completion_tokens: usage.completion_tokens,
-                    cache_read_tokens: usage.cache_read_input_tokens,
-                    cache_write_tokens: usage.cache_creation_input_tokens,
-                });
+        let split = crate::services::session_store::SessionTokens {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cache_read_tokens: usage.cache_read_input_tokens,
+            cache_write_tokens: usage.cache_creation_input_tokens,
+        };
+        if let Some(cost) = crate::services::model_metadata::model_pricing(&self.model)
+            .and_then(|p| p.cost_usd(&split))
+        {
+            self.session_cost_usd += cost;
+        }
+        self.session_tokens = self.session_tokens.merge(split);
         self.context_tokens = if turn.usage.is_some() {
             usage.total_tokens()
         } else {

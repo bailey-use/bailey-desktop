@@ -1376,8 +1376,8 @@ fn version_token(t: &str) -> bool {
 
 /// Polls until the Codex.app GUI process has exited. Snapshots the pid(s) of
 /// the GUI's Mach-O main on first sighting (so an unrelated process whose
-/// argv mentions `Codex.app/Contents/MacOS/Codex` — debugger, editor opening
-/// the path, log tail — can't keep us pinned), then watches only those pids.
+/// argv mentions the `Codex.app/Contents/MacOS/` path — debugger, editor
+/// opening it, log tail — can't keep us pinned), then watches only those pids.
 ///
 /// Ctrl-C / SIGTERM offers two-tap confirmation: the first signal prints a
 /// hint, the second within 5s sends a graceful `osascript quit` (or SIGTERM
@@ -1572,7 +1572,9 @@ async fn quit_codex_app(tracked: &[i32]) {
     #[cfg(target_os = "macos")]
     {
         let _ = Command::new("osascript")
-            .args(["-e", "tell application \"Codex\" to quit"])
+            // Address by bundle id: the app's display name changed from
+            // "Codex" to "ChatGPT" in v26.707, but the id is stable.
+            .args(["-e", "tell application id \"com.openai.codex\" to quit"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1612,9 +1614,9 @@ async fn wait_for_codex_app_gui_exit() {
 }
 
 /// Returns the pids of running Codex.app GUI processes (Mach-O main on macOS,
-/// `Codex.exe` on Windows). Matches only the literal executable path, never
-/// argv: a `tail -f /Applications/Codex.app/Contents/MacOS/Codex.log` or
-/// `lldb /Applications/Codex.app/Contents/MacOS/Codex` would otherwise pin us.
+/// `Codex.exe` on Windows). Matches only the executable path (`comm`), never
+/// argv: a `tail -f` or `lldb` invocation naming a path inside
+/// `Codex.app/Contents/MacOS/` would otherwise pin us.
 async fn codex_app_gui_pids() -> Vec<i32> {
     #[cfg(unix)]
     {
@@ -1639,10 +1641,11 @@ async fn codex_app_gui_pids() -> Vec<i32> {
                 None => continue,
             };
             let exe = rest.trim();
-            // The Mach-O main lives at `/Applications/Codex.app/Contents/MacOS/Codex`
-            // (or `~/Applications/Codex.app/...`). Helper / framework /
-            // renderer processes have different `comm` values and stay out.
-            if exe.ends_with("/Codex.app/Contents/MacOS/Codex")
+            // The Mach-O main lives under `Codex.app/Contents/MacOS/` — named
+            // `Codex` through v26.6xx, renamed `ChatGPT` in v26.707 — so match
+            // the bundle dir, not the binary name. Helper / framework /
+            // renderer processes live under `Contents/Frameworks/` and stay out.
+            if exe.contains("/Codex.app/Contents/MacOS/")
                 && let Ok(pid) = pid_str.parse::<i32>()
             {
                 pids.push(pid);

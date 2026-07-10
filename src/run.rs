@@ -163,6 +163,21 @@ pub async fn run() -> ! {
     // launched — reqwest snapshots proxy env at construction, and env
     // mutation is only race-free while the current-thread runtime is idle.
     services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
+
+    // One-shot layout migration (flat config dir → state/secrets/cache/logs/run
+    // split). Cheap once migrated (a dozen stats); must precede every store,
+    // including the detached `__update-check` child below.
+    {
+        use std::io::IsTerminal;
+        let stragglers = services::paths::migrate_layout(&services::paths::config_dir());
+        if !stragglers.is_empty() && std::io::stderr().is_terminal() {
+            eprintln!(
+                "aivo: ignoring stale pre-migration file(s) in the config dir (created by an older aivo?): {}",
+                stragglers.join(", ")
+            );
+        }
+    }
+
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Detached background update checker; handle before clap/service init.
@@ -241,6 +256,7 @@ pub async fn run() -> ! {
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
+            Commands::Packs(_) => crate::commands::packs::PacksCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -310,6 +326,19 @@ pub async fn run() -> ! {
 
         Commands::Code(mut code_args) => {
             maybe_init_http_debug(&code_args.debug).await;
+            // Roots must exist (a typo'd root would silently allow nothing).
+            if !code_args.add_dir.is_empty() {
+                let mut roots = Vec::new();
+                for dir in &code_args.add_dir {
+                    let path = crate::services::system_env::expand_tilde(dir);
+                    if !path.is_dir() {
+                        eprintln!("{} --add-dir {dir}: not a directory", style::red("Error:"));
+                        process::exit(ExitCode::UserError.code());
+                    }
+                    roots.push(path);
+                }
+                crate::agent::sandbox::set_extra_write_roots(roots);
+            }
             let key_explicit = code_args.key.is_some();
             let initial_prompt = match take_code_initial_prompt(&mut code_args) {
                 Ok(prompt) => prompt,
@@ -321,7 +350,7 @@ pub async fn run() -> ! {
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
+                            "Expected a subcommand (mcp, skills, packs), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
                         ),
                     );
                     eprintln!(
@@ -398,6 +427,7 @@ pub async fn run() -> ! {
                     code_args.output_format,
                     code_args.max_steps,
                     code_args.max_output_tokens,
+                    code_args.max_cost,
                     code_args.auto_approve,
                 )
                 .await
@@ -893,6 +923,11 @@ pub async fn run() -> ! {
         Commands::Skills(skills_args) => {
             let command = crate::commands::skills::SkillsCommand::new();
             command.execute(skills_args).await
+        }
+
+        Commands::Packs(packs_args) => {
+            let command = crate::commands::packs::PacksCommand::new();
+            command.execute(packs_args).await
         }
 
         Commands::Share(share_args) => {

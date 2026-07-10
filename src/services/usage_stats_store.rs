@@ -91,8 +91,8 @@ pub(crate) struct UsageStatsStore {
 
 impl UsageStatsStore {
     pub(crate) fn new(config_ctx: ConfigContext) -> Self {
-        let stats_path = config_ctx.config_dir.join("stats.json");
-        let lock_path = config_ctx.config_dir.join("stats.lock");
+        let stats_path = crate::services::paths::stats_json(&config_ctx.config_dir);
+        let lock_path = crate::services::paths::stats_lock(&config_ctx.config_dir);
         Self {
             stats_ctx: StatsFileContext {
                 stats_path,
@@ -218,7 +218,7 @@ mod tests {
             .record_selection("key1", "claude", Some("opus"))
             .await
             .unwrap();
-        assert!(dir.path().join("stats.json").exists());
+        assert!(crate::services::paths::stats_json(dir.path()).exists());
         let stats = store.load().await.unwrap();
         assert_eq!(*stats.tool_counts.get("claude").unwrap(), 1);
     }
@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(*loaded.tool_counts.get("claude").unwrap(), 1);
 
         // stats.json should now exist
-        assert!(dir.path().join("stats.json").exists());
+        assert!(crate::services::paths::stats_json(dir.path()).exists());
 
         // config.json stats should be cleared
         let config_data = tokio::fs::read_to_string(&config_path).await.unwrap();
@@ -321,7 +321,7 @@ mod tests {
             .record_selection("key1", "claude", None)
             .await
             .unwrap();
-        let metadata = std::fs::metadata(dir.path().join("stats.json")).unwrap();
+        let metadata = std::fs::metadata(crate::services::paths::stats_json(dir.path())).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 }

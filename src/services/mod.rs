@@ -74,6 +74,7 @@ pub mod openai_gemini_bridge;
 pub mod openai_models;
 pub mod os_keyring;
 pub mod path_search;
+pub mod paths;
 pub mod percent_codec;
 pub mod project_id;
 pub mod protocol_fallback;

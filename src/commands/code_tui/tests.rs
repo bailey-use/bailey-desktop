@@ -254,7 +254,7 @@ async fn test_help_overlay_groups_lists_every_command_and_scrolls() {
     let (top, _) = render_full_screen(&mut app, 90, 70);
     assert!(top.contains("Slash commands"), "missing header:\n{top}");
     for group in [
-        "Chat",
+        "Session",
         "Model & key",
         "Context",
         "Skills & tools",
@@ -1403,6 +1403,7 @@ fn make_test_app(
         request_started_at: None,
         compact_before: None,
         last_tool_action: None,
+        subagent_rows: Vec::new(),
         status_display: None,
         turn_output_tokens: 0,
         retrying: false,
@@ -1410,6 +1411,7 @@ fn make_test_app(
         live_usage: None,
         context_tokens: 0,
         session_tokens: crate::services::session_store::SessionTokens::default(),
+        session_cost_usd: 0.0,
         context_window: 0,
         context_window_override: None,
         injected_context: None,
@@ -1496,6 +1498,7 @@ fn make_test_app(
         reasoning_effort: None,
         model_reasoning_efforts: Vec::new(),
         queued_messages: Vec::new(),
+        steering_queue: SteeringQueue::default(),
         queued_commands: Vec::new(),
         project_mcp_consent: ProjectMcpConsent::default(),
         pending_mcp_consent: None,
@@ -1506,6 +1509,7 @@ fn make_test_app(
         local_outputs: std::collections::HashMap::new(),
         expanded_output: std::collections::HashSet::new(),
         expanded_thinking: std::collections::HashSet::new(),
+        agent_turn_indices: std::collections::HashSet::new(),
         reasoning_durations: std::collections::HashMap::new(),
         turn_durations: std::collections::HashMap::new(),
         reasoning_started_at: None,
@@ -1619,6 +1623,75 @@ async fn test_open_rewind_picker_lists_user_turns_newest_first() {
     // No live engine in the test app → no checkpoints → conversation-only.
     assert!(ordinal.is_none());
     assert!(picker.items[0].label.contains("conversation only"));
+}
+
+#[tokio::test]
+async fn test_rewind_picker_ignores_non_agent_row_with_identical_text() {
+    // A plain-chat/ACP row with text equal to an earlier engine turn's prompt
+    // must not steal that turn's checkpoint (that rewound one turn too far).
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    for (role, content) in [
+        ("user", "continue"),
+        ("assistant", "done"),
+        ("user", "continue"),
+    ] {
+        app.history.push(ChatMessage {
+            model: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        });
+    }
+    // Only the FIRST "continue" went through the engine.
+    app.agent_turn_indices.insert(0);
+    let mut engine =
+        crate::agent::engine::AgentEngine::new("/tmp", "claude", "2026-06-14", &[], &[], 0, 0);
+    engine.checkpoints.push(crate::agent::engine::Checkpoint {
+        msg_index: 1,
+        prompt: "continue".to_string(),
+        tree: Some("abc".to_string()),
+        changed: Some(Vec::new()),
+        seg_tree: None,
+    });
+    app.agent_engine = Some(AgentSession {
+        key_id: "k".to_string(),
+        model: "claude".to_string(),
+        engine: std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
+    });
+
+    app.open_rewind_picker().await.unwrap();
+
+    let Overlay::Picker(picker) = &app.overlay else {
+        panic!("expected a rewind picker overlay");
+    };
+    assert_eq!(picker.items.len(), 2);
+    // Newest row = the plain-chat duplicate: no checkpoint, conversation-only.
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+    } = &picker.items[0].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!(*history_index, 2);
+    assert!(
+        ordinal.is_none(),
+        "a non-engine row must not steal the checkpoint"
+    );
+    assert!(picker.items[0].label.contains("conversation only"));
+    // Older row = the real engine turn: keeps its checkpoint and file revert.
+    let PickerValue::RewindTurn {
+        history_index,
+        ordinal,
+    } = &picker.items[1].value
+    else {
+        panic!("expected a RewindTurn value");
+    };
+    assert_eq!(*history_index, 0);
+    assert_eq!(*ordinal, Some(0));
+    assert!(!picker.items[1].label.contains("conversation only"));
 }
 
 #[tokio::test]
@@ -2365,7 +2438,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     app.context_window = 1_000_000;
     app.context_tokens = 0; // no turn yet → no fill to gauge
 
-    // The welcome screen shows the window size, not an empty `0 / 1M · 0%` meter.
+    // The welcome screen shows the window size, not an empty `0 / 1M` meter.
     let (label, color) = app.footer_status_label();
     assert_eq!(label, "1M context");
     assert_eq!(color, MUTED);
@@ -2373,7 +2446,7 @@ fn test_footer_status_label_shows_window_on_pristine_session() {
     // The first tokens flip it to the live gauge.
     app.context_tokens = 50_000;
     app.context_is_estimate = false;
-    assert_eq!(app.footer_status_label().0, "50k / 1M · 5%");
+    assert_eq!(app.footer_status_label().0, "50k / 1M");
 }
 
 #[test]
@@ -2384,9 +2457,9 @@ fn test_footer_status_label_shows_context_utilization() {
     app.context_tokens = 10_000;
     app.context_is_estimate = false; // a provider-measured fill
 
-    // used / window · pct%, quiet until it nears the limit.
+    // used / window, quiet until it nears the limit.
     let (label, color) = app.footer_status_label();
-    assert_eq!(label, "10k / 200k · 5%");
+    assert_eq!(label, "10k / 200k");
     assert_eq!(color, MUTED);
 
     // Warms toward the window limit (compaction territory).
@@ -2401,7 +2474,7 @@ fn test_footer_status_label_shows_context_utilization() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k · 20%");
+    assert_eq!(app.footer_status_label().0, "40k / 200k");
 }
 
 #[test]
@@ -2415,7 +2488,7 @@ fn test_footer_status_label_marks_estimates() {
     // understates the model's real context, so flag it with `~`.
     app.context_is_estimate = true;
     app.last_usage = None;
-    assert_eq!(app.footer_status_label().0, "~10k / 200k · ~5%");
+    assert_eq!(app.footer_status_label().0, "~10k / 200k");
 
     // A provider-measured last-turn total is exact even if the estimate flag
     // lingers from a prior turn — no tilde.
@@ -2424,7 +2497,7 @@ fn test_footer_status_label_marks_estimates() {
         completion_tokens: 0,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "40k / 200k · 20%");
+    assert_eq!(app.footer_status_label().0, "40k / 200k");
 }
 
 #[test]
@@ -2467,7 +2540,7 @@ fn test_footer_status_label_updates_live_during_turn() {
     // baseline (no drop at turn start) and grows it as text streams in, flagged `~`.
     app.sending = true;
     app.pending_response = "x".repeat(4_000); // ~1k tokens streamed so far
-    assert_eq!(app.footer_status_label().0, "~41k / 200k · ~20%");
+    assert_eq!(app.footer_status_label().0, "~41k / 200k");
 
     // Provider-measured usage arrives mid-stream (Anthropic message_start/_delta):
     // the live figure replaces the estimate immediately, no `~`.
@@ -2476,7 +2549,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_000,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52k / 200k · 26%");
+    assert_eq!(app.footer_status_label().0, "52k / 200k");
 
     // Turn ends: the fold into last_usage keeps the measured total on the footer.
     app.sending = false;
@@ -2486,7 +2559,7 @@ fn test_footer_status_label_updates_live_during_turn() {
         completion_tokens: 2_500,
         ..Default::default()
     });
-    assert_eq!(app.footer_status_label().0, "52.5k / 200k · 26%");
+    assert_eq!(app.footer_status_label().0, "52.5k / 200k");
 }
 
 #[test]
@@ -2500,13 +2573,13 @@ fn test_agent_context_drives_footer_live() {
     // counts the real request the engine sends, not just the visible transcript.
     // Flagged `~` since it is a chars/4 estimate.
     app.apply_agent_context(50_000, false);
-    assert_eq!(app.footer_status_label().0, "~50k / 200k · ~25%");
+    assert_eq!(app.footer_status_label().0, "~50k / 200k");
 
     // The step's measured total arrives → exact figure, no `~`, and streamed text
     // is not re-added on top (it is already in the measured completion).
     app.pending_response = "x".repeat(8_000); // would add ~2k if double-counted
     app.apply_agent_context(60_000, true);
-    assert_eq!(app.footer_status_label().0, "60k / 200k · 30%");
+    assert_eq!(app.footer_status_label().0, "60k / 200k");
 }
 
 #[test]
@@ -2623,6 +2696,56 @@ fn test_subagent_activity_drives_status_line() {
         status.contains('↳'),
         "marked as nested delegation: {status:?}"
     );
+}
+
+#[test]
+fn test_parallel_subagent_rows_render_under_status_line() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    // The batch's `subagent` calls are in flight (no results yet).
+    app.apply_agent_tool_call(
+        None,
+        "subagent".to_string(),
+        serde_json::json!({"label": "audit auth flow", "task": "…"}),
+        vec![],
+    );
+    app.apply_subagent_begin(vec!["audit auth flow".to_string(), String::new()]);
+    // The unnamed delegate is numbered so its row stays distinguishable.
+    assert_eq!(app.subagent_rows[1].name, "sub-agent 2");
+    app.apply_subagent_slot(
+        0,
+        "audit auth flow".to_string(),
+        "grep".to_string(),
+        serde_json::json!({"pattern": "session"}),
+        3,
+    );
+    app.apply_subagent_denied(1, "run_bash".to_string());
+    app.apply_subagent_done(1, true, 8, 1200);
+    // Headline counts completions; per-delegate rows sit under it.
+    assert_eq!(app.desired_status(), "running 2 sub-agents (1 done)");
+    let lines = app.build_transcript().plain_lines;
+    let running = lines
+        .iter()
+        .find(|l| l.contains("audit auth flow — searching session"))
+        .expect("live row shows the delegate's current action");
+    assert!(running.contains("step 3"), "carries steps: {running:?}");
+    let done = lines
+        .iter()
+        .find(|l| l.contains("✓ sub-agent 2 — done"))
+        .expect("finished row flips to ✓ with stats");
+    assert!(done.contains("1.2k tokens"), "carries tokens: {done:?}");
+    // A denied gated call surfaces as a warning notice, not a silent deny.
+    let (_, notice) = app.notice.clone().expect("denial sets a notice");
+    assert!(
+        notice.contains("run_bash") && notice.contains("auto-denied"),
+        "explains the deny: {notice:?}"
+    );
+    // Slot events past the row list are ignored (defensive).
+    app.apply_subagent_slot(9, String::new(), String::new(), serde_json::Value::Null, 1);
+    // Batch end retires the rows and hands the headline back.
+    app.subagent_rows.clear();
+    assert_ne!(app.desired_status(), "running 2 sub-agents (1 done)");
 }
 
 #[test]
@@ -8864,6 +8987,40 @@ async fn test_drained_queued_message_not_recorded_in_draft_history() {
     );
 }
 
+#[tokio::test]
+async fn test_mid_turn_message_steers_then_reclaims_or_commits() {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.sending = true;
+    app.agent_serve = Some((
+        tokio::spawn(async { Ok(()) }),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    app.draft = "actually use tabs".to_string();
+    app.cursor = app.draft.len();
+    app.submit_draft().await.unwrap();
+    assert!(
+        app.queued_messages.is_empty(),
+        "engine turns steer, not queue"
+    );
+    {
+        let steering = app.steering_queue.lock().unwrap();
+        assert_eq!(steering.as_slice(), ["actually use tabs".to_string()]);
+    }
+
+    app.reclaim_unsent_steering();
+    assert_eq!(app.queued_messages, vec!["actually use tabs".to_string()]);
+    assert!(app.steering_queue.lock().unwrap().is_empty());
+
+    app.apply_agent_steered("also add a test".to_string());
+    assert!(
+        app.history
+            .last()
+            .is_some_and(|m| m.role == "user" && m.content == "also add a test")
+    );
+}
+
 /// `/copy 0` is a usage error and out-of-range names the real count, instead of
 /// claiming no reply exists.
 #[tokio::test]
@@ -12860,6 +13017,54 @@ async fn test_resume_resets_agent_engine() {
         app.pending_agent_messages.as_ref().map(|m| m.len()),
         Some(2),
         "the durable transcript is stashed for exact restore on the next build"
+    );
+}
+
+/// The idle footer after `/resume` must estimate from the stashed durable
+/// transcript, not the lossy display seed (~10x too small on tool-heavy sessions).
+#[tokio::test]
+async fn test_resume_footer_estimate_uses_durable_transcript() {
+    let temp_dir = TempDir::new().unwrap();
+    let store = SessionStore::with_path(temp_dir.path().join("config.json"));
+    let key_id = store
+        .add_key_with_protocol("prod", "https://api.example.com", None, "sk-test")
+        .await
+        .unwrap();
+    let key = store.get_key_by_id(&key_id).await.unwrap().unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = make_test_app(tx, rx);
+    app.session_store = store;
+    app.key = key.clone();
+    app.model = "claude".to_string();
+
+    let fat = "x".repeat(200_000);
+    let session = LoadedSession {
+        key_id: key.id.clone(),
+        session_id: "resumed".to_string(),
+        raw_model: "claude".to_string(),
+        messages: vec![ChatMessage {
+            model: None,
+            role: "user".to_string(),
+            content: "earlier turn".to_string(),
+            reasoning_content: None,
+            attachments: vec![],
+        }],
+        engine_messages: Some(vec![
+            serde_json::json!({"role": "user", "content": "earlier turn"}),
+            serde_json::json!({"role": "tool", "tool_call_id": "t1", "content": fat}),
+        ]),
+    };
+    app.apply_loaded_session(session).await.unwrap();
+
+    assert!(
+        app.context_is_estimate,
+        "post-resume fill is an estimate until measured"
+    );
+    assert!(
+        app.context_tokens >= 50_000,
+        "estimate must reflect the ~50k-token transcript, got {}",
+        app.context_tokens
     );
 }
 

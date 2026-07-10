@@ -21,6 +21,9 @@ pub(crate) fn atomic_write_secure_blocking(final_path: &Path, data: &[u8]) -> Re
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        ensure_private_dir_blocking(parent)?;
+    }
 
     let mut tmp = tempfile::Builder::new()
         .prefix(".aivo-tmp-")

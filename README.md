@@ -1,3 +1,50 @@
+# Bailey Desktop
+
+Bailey Desktop is a Tauri GUI and long-lived App Server built on the
+[Aivo](https://github.com/yuanchuan/aivo) AgentEngine. This repository remains
+an upstream-tracking fork; the Aivo CLI continues to work unchanged.
+
+The desktop architecture keeps the GUI and agent runtime in separate
+processes:
+
+```text
+Tauri + React UI
+        ↕ newline-delimited JSON-RPC 2.0
+aivo app-server --stdio
+        ↕
+AgentEngine / tools / approvals
+```
+
+The first development slice includes real multi-turn in-process AgentEngine
+execution, streamed events, reverse approval and user-input requests,
+cancellation, a bundled sidecar, and a native Bailey task interface. The wire
+contract is documented in [docs/app-server-protocol.md](docs/app-server-protocol.md).
+
+Development:
+
+```bash
+cargo test --features __internal_test_fast_crypto --test app_server_stdio
+
+cd desktop
+pnpm install
+pnpm check
+pnpm tauri dev
+```
+
+Every commit pushed to `main` automatically builds a macOS DMG and Windows
+NSIS installer and publishes them as a commit-specific GitHub
+Prerelease (`desktop-build-<run number>`). These development packages are
+not production-signed: macOS is ad-hoc signed but not notarized, and Windows is
+unsigned until the repository signing secrets are configured.
+
+Cloud task routing, durable thread resume/replay, MCP consent, attachments,
+and signed Windows distribution are the next slices; they are not silently
+stubbed as working capabilities in protocol v1.
+
+---
+
+## Upstream Aivo
+
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
 > Aivo is a command-line tool that connects your existing coding agent to the model you want.

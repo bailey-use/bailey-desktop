@@ -29,6 +29,19 @@ Thumbs.db
 npm/native/
 npm/*.tgz
 
+# Bailey desktop
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/src-tauri/gen/
+desktop/src-tauri/icons/android/
+desktop/src-tauri/icons/ios/
+desktop/src-tauri/icons/Square*.png
+desktop/src-tauri/icons/StoreLogo.png
+desktop/src-tauri/icons/64x64.png
+desktop/src-tauri/icons/icon.png
+
 memory/
 
 # Python cache (canary fake provider)

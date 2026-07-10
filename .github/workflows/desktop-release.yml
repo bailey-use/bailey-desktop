@@ -1,0 +1,97 @@
+name: Desktop Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS
+            os: macos-latest
+            bundle: dmg
+            artifact: bailey-macos
+            asset_path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          - label: Windows x64
+            os: windows-latest
+            bundle: nsis
+            artifact: bailey-windows-x64
+            asset_path: desktop/src-tauri/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build installer
+        working-directory: desktop
+        run: pnpm tauri build --bundles ${{ matrix.bundle }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset_path }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create prerelease for this main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          tag="desktop-build-${RUN_NUMBER}"
+          short_sha="${COMMIT_SHA:0:7}"
+          mapfile -t assets < <(find release-assets -type f -print | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber --repo "$REPOSITORY"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --prerelease \
+              --title "Bailey Desktop build ${RUN_NUMBER} (${short_sha})" \
+              --notes "Automated development build from main commit ${COMMIT_SHA}. macOS is ad-hoc signed but not notarized; Windows is unsigned."
+          fi

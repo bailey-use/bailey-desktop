@@ -381,6 +381,10 @@ pub struct AgentEngine {
     first_party: bool,
     /// Interactive chat only: the `switch_model`/`set_effort` tools are advertised.
     session_controls: bool,
+    /// A connected UI can answer the structured `ask_user` tool. Kept separate
+    /// from terminal-only model/effort controls so app-server clients do not
+    /// advertise controls they cannot fulfil.
+    user_input_enabled: bool,
     /// `(system, tools)` prefix fingerprint from the last turn; checked under `AIVO_DEBUG`.
     prefix_fp: Option<(u64, u64)>,
     /// File-staleness guard: baselines of files read this session, so a mutating tool
@@ -541,6 +545,7 @@ impl AgentEngine {
             confirm_before_build: false,
             first_party: false,
             session_controls: false,
+            user_input_enabled: false,
             prefix_fp: None,
             file_tracker: crate::agent::file_tracker::FileTracker::default(),
             lsp: None,
@@ -624,6 +629,24 @@ impl AgentEngine {
         }
     }
 
+    /// Advertise structured user input for any interactive UI transport.
+    pub fn enable_user_input(&mut self) {
+        if self.user_input_enabled {
+            return;
+        }
+        self.user_input_enabled = true;
+        self.tools_openai
+            .push(tool_to_openai(crate::agent::ask::ask_user_tool_spec()));
+        let directive = "A live user interface is connected. When you need a bounded decision \
+with a short list of likely answers, call `ask_user` and wait for its result instead of ending \
+the turn with the question in prose. Ask in prose only for genuinely open-ended input.";
+        if let Some(content) = self.messages.first_mut().and_then(|m| m.get_mut("content"))
+            && let Some(system) = content.as_str()
+        {
+            *content = Value::String(format!("{system}\n\n{directive}"));
+        }
+    }
+
     /// Interactive chat only: append the live session facts + switch guidance to the system
     /// prompt (in place, like [`Self::set_first_party`]) and advertise `switch_model`/`set_effort`.
     pub fn set_chat_session_context(&mut self, ctx: ChatSessionContext) {
@@ -635,8 +658,7 @@ impl AgentEngine {
             .push(tool_to_openai(switch_model_tool_spec()));
         self.tools_openai
             .push(tool_to_openai(set_effort_tool_spec()));
-        self.tools_openai
-            .push(tool_to_openai(crate::agent::ask::ask_user_tool_spec()));
+        self.enable_user_input();
         let effort_clause = match &ctx.effort {
             Some(e) => format!(", reasoning effort: `{e}`"),
             None => String::new(),

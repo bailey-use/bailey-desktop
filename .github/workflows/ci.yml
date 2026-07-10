@@ -13,3 +13,43 @@ concurrency:
 jobs:
   test:
     uses: ./.github/workflows/test.yml
+
+  desktop:
+    if: github.event_name == 'pull_request'
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundle: dmg
+          - os: windows-latest
+            bundle: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> target
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify desktop installer
+        working-directory: desktop
+        run: pnpm tauri build --bundles ${{ matrix.bundle }}

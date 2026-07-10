@@ -41,6 +41,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
+    /// Run the desktop/IDE AgentEngine protocol over stdio
+    #[command(name = "app-server")]
+    AppServer(AppServerArgs),
+
     /// Run AI tools (claude, codex, codex-app, gemini, opencode, pi) - all args passed through
     Run(RunArgs),
 
@@ -106,6 +110,14 @@ pub enum Commands {
 
     /// Print a concise guide to using aivo (also read by the built-in code agent)
     Guide,
+}
+
+/// Arguments for `aivo app-server`.
+#[derive(Args, Debug, Clone)]
+pub struct AppServerArgs {
+    /// Use newline-delimited JSON-RPC 2.0 over stdin/stdout
+    #[arg(long)]
+    pub stdio: bool,
 }
 
 /// Arguments for `aivo login`.

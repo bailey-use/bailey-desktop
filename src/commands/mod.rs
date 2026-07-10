@@ -82,6 +82,7 @@ pub(crate) fn starter_provider_label(
 
 pub mod account;
 pub mod alias;
+pub mod app_server;
 pub mod code;
 pub(crate) mod code_agent_oneshot;
 pub(crate) mod code_request_builder;
@@ -107,6 +108,7 @@ pub mod update;
 
 pub use account::AccountCommand;
 pub use alias::AliasCommand;
+pub use app_server::AppServerCommand;
 pub use code::CodeCommand;
 pub use info::InfoCommand;
 pub use keys::KeysCommand;

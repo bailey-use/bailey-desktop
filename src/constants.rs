@@ -37,6 +37,7 @@ pub const KNOWN_TOOLS: &[&str] = &["claude", "codex", "codex-app", "gemini", "op
 /// shortcut keywords (`use`, `ping`), and the known tool names.
 pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     // Top-level subcommands
+    "app-server",
     "run",
     "keys",
     "account",

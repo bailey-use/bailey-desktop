@@ -14,9 +14,10 @@ use crate::cli_args::{
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
-    LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
-    ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AccountCommand, AliasCommand, AppServerCommand, CodeCommand, InfoCommand, KeysCommand,
+    LoginCommand, LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand,
+    ServeCommand, ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand,
+    UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -213,6 +214,7 @@ pub async fn run() -> ! {
         && let Some(cmd) = &args.command
     {
         match cmd {
+            Commands::AppServer(_) => AppServerCommand::print_help(),
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
             Commands::Account(a) => {
@@ -270,13 +272,17 @@ pub async fn run() -> ! {
     };
 
     // Skip the background check + notice when the user is already updating.
-    let is_update_cmd = matches!(command, Commands::Update(_));
-    if !is_update_cmd {
+    let skip_update_check = matches!(command, Commands::Update(_) | Commands::AppServer(_));
+    if !skip_update_check {
         services::update_check::maybe_spawn_background_check();
     }
 
     // Route to command handler
     let exit_code = match command {
+        Commands::AppServer(app_server_args) => {
+            AppServerCommand::execute(app_server_args, session_store, models_cache).await
+        }
+
         Commands::Alias(alias_args) => {
             let command = AliasCommand::new(session_store);
             command.execute(alias_args).await
@@ -930,7 +936,7 @@ pub async fn run() -> ! {
     services::huggingface::stop_if_we_started();
 
     // Nudge after the command (TUI screen restored) if a newer release is cached.
-    if !is_update_cmd {
+    if !skip_update_check {
         services::update_check::maybe_print_notice(crate::version::VERSION);
     }
 

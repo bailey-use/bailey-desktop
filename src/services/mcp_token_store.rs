@@ -3,7 +3,7 @@
 //! Each [`McpOAuthCredential`] is serialized to JSON, encrypted with the
 //! machine-local [`session_crypto`] key (AES-256-GCM, the same scheme the chat
 //! session store uses), and kept under its MCP server name in
-//! `~/.config/aivo/mcp_tokens.json` (mode 0600). This is deliberately separate
+//! `<config>/secrets/mcp_tokens.json` (mode 0600). This is deliberately separate
 //! from the `keys` store so server tokens never surface as user-managed API keys
 //! in `aivo keys`.
 
@@ -14,11 +14,13 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::services::mcp_oauth::McpOAuthCredential;
-use crate::services::{session_crypto, system_env};
+use crate::services::session_crypto;
 
-/// `~/.config/aivo/mcp_tokens.json`, or `None` without a home directory.
+/// `<config>/secrets/mcp_tokens.json`.
 pub fn store_path() -> Option<PathBuf> {
-    system_env::home_dir().map(|h| h.join(".config/aivo/mcp_tokens.json"))
+    Some(crate::services::paths::mcp_tokens(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 /// The stored credential for `server`, or `None` if absent/undecryptable. A

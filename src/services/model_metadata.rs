@@ -214,11 +214,12 @@ fn parse_row(row: &[serde_json::Value]) -> Option<ModelLimits> {
     })
 }
 
-/// Path of the user-refreshed snapshot, beside `config.json`. Written by
-/// `aivo update --sync-model-data`, overlaid by the loader above.
+/// Path of the user-refreshed snapshot (`<config>/cache/model_limits.json`).
+/// Written by `aivo update --sync-model-data`, overlaid by the loader above.
 pub fn override_model_limits_path() -> Option<std::path::PathBuf> {
-    crate::services::system_env::home_dir()
-        .map(|p| p.join(".config").join("aivo").join("model_limits.json"))
+    Some(crate::services::paths::model_limits(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 /// Folded keys sorted longest-first so the substring fallback picks the most
@@ -716,10 +717,13 @@ mod tests {
     }
 
     #[test]
-    fn override_path_sits_beside_config_json() {
+    fn override_path_sits_in_cache_dir() {
         if let Some(p) = override_model_limits_path() {
             assert_eq!(p.file_name().unwrap(), "model_limits.json");
-            assert_eq!(p.parent().unwrap().file_name().unwrap(), "aivo");
+            assert_eq!(
+                p.parent().unwrap().file_name().unwrap(),
+                crate::services::paths::CACHE_DIR
+            );
         }
     }
 

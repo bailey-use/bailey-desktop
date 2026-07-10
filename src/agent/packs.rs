@@ -40,7 +40,7 @@ impl PackContents {
 }
 
 pub fn packs_root() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/packs"))
+    Some(crate::services::paths::config_dir().join("packs"))
 }
 
 pub fn installed_packs() -> Vec<Pack> {

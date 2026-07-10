@@ -57,9 +57,8 @@ pub struct ModelsCache {
 
 impl ModelsCache {
     pub fn new() -> Self {
-        let cache_path = crate::services::system_env::home_dir()
-            .map(|p| p.join(".config").join("aivo").join("models-cache.json"))
-            .unwrap_or_else(|| PathBuf::from(".config/aivo/models-cache.json"));
+        let cache_path =
+            crate::services::paths::models_cache(&crate::services::paths::config_dir());
         Self {
             cache_path,
             entries: Arc::new(OnceCell::new()),

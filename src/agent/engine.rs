@@ -584,10 +584,12 @@ impl AgentEngine {
         self.max_output_tokens = tokens;
     }
 
-    /// Back the "always allow" grants with a persistent store at `<config>/grants.json`,
+    /// Back the "always allow" grants with a persistent store at `<config>/state/grants.json`,
     /// loading any grants already saved there. Without this the store is session-only.
     pub fn set_grants_path(&mut self, config_dir: &Path) {
-        self.grants = crate::agent::grant_store::GrantStore::load(config_dir.join("grants.json"));
+        self.grants = crate::agent::grant_store::GrantStore::load(
+            crate::services::paths::grants_json(config_dir),
+        );
     }
 
     /// Persist sub-agent reports under `dir` so a long delegation survives compaction.

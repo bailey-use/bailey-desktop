@@ -426,12 +426,9 @@ pub fn is_debug_active() -> bool {
 /// Build the default per-invocation log path:
 /// `~/.config/aivo/logs/debug-YYYYMMDD-HHMMSS-<pid>.jsonl`.
 pub fn default_log_path() -> PathBuf {
-    let home = crate::services::system_env::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let pid = std::process::id();
-    home.join(".config")
-        .join("aivo")
-        .join("logs")
+    crate::services::paths::logs_dir(&crate::services::paths::config_dir())
         .join(format!("debug-{now}-{pid}.jsonl"))
 }
 

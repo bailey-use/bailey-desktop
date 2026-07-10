@@ -162,6 +162,21 @@ pub async fn run() -> ! {
     // launched — reqwest snapshots proxy env at construction, and env
     // mutation is only race-free while the current-thread runtime is idle.
     services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
+
+    // One-shot layout migration (flat config dir → state/secrets/cache/logs/run
+    // split). Cheap once migrated (a dozen stats); must precede every store,
+    // including the detached `__update-check` child below.
+    {
+        use std::io::IsTerminal;
+        let stragglers = services::paths::migrate_layout(&services::paths::config_dir());
+        if !stragglers.is_empty() && std::io::stderr().is_terminal() {
+            eprintln!(
+                "aivo: ignoring stale pre-migration file(s) in the config dir (created by an older aivo?): {}",
+                stragglers.join(", ")
+            );
+        }
+    }
+
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Detached background update checker; handle before clap/service init.

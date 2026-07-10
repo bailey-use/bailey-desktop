@@ -31,8 +31,8 @@ const GUIDE_WALK_CAP: usize = 32;
 /// global `~/.config/aivo/AGENTS.md`, ancestors from the git root down, then `cwd`'s
 /// own (bare names; others absolute). Symlinked duplicates collapse to one entry.
 pub fn discover_project_guides(cwd: &Path) -> Vec<String> {
-    let global = crate::services::system_env::home_dir().map(|h| h.join(".config/aivo"));
-    discover_project_guides_at(cwd, global.as_deref())
+    let global = crate::services::paths::config_dir();
+    discover_project_guides_at(cwd, Some(&global))
 }
 
 /// [`discover_project_guides`] with the global config dir injectable for tests.

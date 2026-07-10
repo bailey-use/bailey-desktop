@@ -56,11 +56,9 @@ fn signature_cache() -> &'static Mutex<HashMap<String, SignatureEntry>> {
 }
 
 fn signature_store_path() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|p| {
-        p.join(".config")
-            .join("aivo")
-            .join("gemini_thought_signatures.json")
-    })
+    Some(crate::services::paths::gemini_thought_signatures(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 fn read_signature_store_from_disk() -> Option<HashMap<String, SignatureEntry>> {
@@ -113,6 +111,7 @@ fn write_string_atomic(path: &PathBuf, contents: &str) {
     let Some(parent) = path.parent() else {
         return;
     };
+    let _ = std::fs::create_dir_all(parent);
     let temp_path = parent.join(format!(
         ".gemini_thought_signatures.{}.tmp",
         current_unix_ts()

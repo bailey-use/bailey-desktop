@@ -65,10 +65,7 @@ impl HookSet {
     /// Missing/malformed → empty set. Project-scope hooks are deliberately not
     /// read: repo commands = RCE-on-open.
     pub fn load_default() -> Self {
-        let mut set = match crate::services::system_env::home_dir() {
-            Some(home) => Self::load_from(&home.join(".config/aivo/hooks.json")),
-            None => Self::default(),
-        };
+        let mut set = Self::load_from(&crate::services::paths::config_dir().join("hooks.json"));
         for file in crate::agent::packs::hooks_files() {
             set.merge(Self::load_from(&file));
         }

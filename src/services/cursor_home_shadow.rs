@@ -164,9 +164,7 @@ fn generate_account_id() -> String {
 }
 
 fn accounts_dir() -> Result<PathBuf> {
-    let home = crate::services::system_env::home_dir()
-        .context("cannot resolve $HOME for cursor shadow dir")?;
-    Ok(home.join(".config").join("aivo").join(ACCOUNTS_DIR_NAME))
+    Ok(crate::services::paths::config_dir().join(ACCOUNTS_DIR_NAME))
 }
 
 fn cursor_subdir_name() -> &'static str {

@@ -68,7 +68,7 @@ impl ResolverContext {
     /// already-initialized SessionStore from the dispatcher.
     pub fn from_system(project_root: PathBuf, session_store: SessionStore) -> Self {
         let home = system_env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let aivo_config_dir = home.join(".config").join("aivo");
+        let aivo_config_dir = crate::services::paths::config_dir();
         Self {
             project_root,
             session_store,

@@ -210,7 +210,7 @@ pub enum ServerConnectStatus {
 
 /// The aivo-global `mcp.json` the `/mcp` overlay reads and writes.
 pub fn user_config_path() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/mcp.json"))
+    Some(crate::services::paths::config_dir().join("mcp.json"))
 }
 
 /// Parse one config file's servers, or empty when it's absent/malformed.

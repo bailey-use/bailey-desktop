@@ -2271,6 +2271,29 @@ pub(crate) fn interactive_block_reason(command: &str) -> Option<InteractiveBlock
     None
 }
 
+/// SIGKILLs the child's whole process group on drop unless disarmed.
+#[cfg(unix)]
+struct GroupKillGuard(Option<i32>);
+
+#[cfg(unix)]
+impl GroupKillGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid.map(|p| p as i32))
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            crate::agent::jobs::signal_group(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome {
     let early = |result| BashOutcome {
         result,
@@ -2301,17 +2324,35 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     builder.args(&spawn.args).current_dir(cwd);
     crate::agent::sandbox::harden_headless(&mut builder);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own pgroup: a descendant probing /dev/tty (ssh passphrase, pinentry) stops
+    // on SIGTTIN/SIGTTOU instead of stealing the TUI's keystrokes or raw mode,
+    // and the tree is killable as `-pgid` (leader pgid == pid, as in jobs.rs).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
     let mut builder = tokio::process::Command::from(builder);
     builder.kill_on_drop(true);
     let child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),
     };
+    // `kill_on_drop` reaches only the direct child; the guard tree-kills on
+    // timeout, wait error, or cancellation (Esc interrupt drops this future).
+    #[cfg(unix)]
+    let mut tree_kill = GroupKillGuard::new(child.id());
+    #[cfg(windows)]
+    let pid = child.id();
     let output =
         match tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return early(Err(format!("run command: {e}"))),
             Err(_) => {
+                #[cfg(windows)]
+                if let Some(pid) = pid {
+                    let _ = crate::agent::jobs::taskkill_tree(pid);
+                }
                 return early(Err(format!(
                     "command timed out after {timeout}s and was killed. If it was waiting on \
                      interactive input (a password, prompt, or editor), a REPL, or a \
@@ -2323,6 +2364,9 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
                 )));
             }
         };
+    // Completed normally: leave deliberately-detached survivors alone.
+    #[cfg(unix)]
+    tree_kill.disarm();
     let mut out = String::new();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3403,6 +3447,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("timed out"));
+    }
+
+    /// Sharing the TUI's pgroup lets a descendant steal /dev/tty (interface freeze).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_runs_in_its_own_process_group() {
+        let dir = tmp();
+        // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
+        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir)
+            .await
+            .unwrap();
+        let child_pgid: i32 = out
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("unparseable pgid output: {out:?}"));
+        // SAFETY: getpgrp cannot fail.
+        let own_pgid = unsafe { libc::getpgrp() };
+        assert_ne!(
+            child_pgid, own_pgid,
+            "run_bash child shares the caller's process group"
+        );
+    }
+
+    /// Timeout must reach grandchildren, not just the direct shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_timeout_kills_grandchildren() {
+        let dir = tmp();
+        let pid_file = dir.join("orphan.pid");
+        let cmd = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let err = run_bash(&json!({"command": cmd, "timeout": 1}), &dir)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+        // SIGKILL is immediate but reaping isn't; poll until gone or zombie.
+        for _ in 0..40 {
+            // SAFETY: signal 0 only probes liveness.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            let stat = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if stat.is_empty() || stat.starts_with('Z') {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild {pid} survived the timeout tree-kill");
     }
 
     #[test]

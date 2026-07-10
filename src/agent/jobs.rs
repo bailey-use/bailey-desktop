@@ -469,7 +469,7 @@ fn hard_kill_signal(job: &mut Job) {
 
 /// Signal a whole process group (`-pgid`); best-effort (the target may have just exited).
 #[cfg(unix)]
-fn signal_group(pgid: i32, sig: i32) {
+pub(crate) fn signal_group(pgid: i32, sig: i32) {
     if pgid > 1 {
         // SAFETY: kill takes integers only; a negative pid targets the group.
         unsafe {
@@ -480,7 +480,7 @@ fn signal_group(pgid: i32, sig: i32) {
 
 /// `child.kill()` would orphan grandchildren (`npm run dev` → `node`); `/T` kills the tree.
 #[cfg(windows)]
-fn taskkill_tree(pid: u32) -> bool {
+pub(crate) fn taskkill_tree(pid: u32) -> bool {
     std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
         .stdout(std::process::Stdio::null())

@@ -15,9 +15,9 @@ use crate::services::session_store::StoredChatMessage;
 use crate::services::{ModelsCache, SessionStore};
 
 use protocol::{
-    IncomingMessage, InitializeParams, NOT_INITIALIZED, RpcFailure, ThreadCloseParams,
-    ThreadDeleteParams, ThreadFlushParams, ThreadListParams, ThreadResumeParams, ThreadStartParams,
-    TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
+    IncomingMessage, InitializeParams, ModelListParams, NOT_INITIALIZED, RpcFailure,
+    ThreadCloseParams, ThreadDeleteParams, ThreadFlushParams, ThreadListParams,
+    ThreadResumeParams, ThreadStartParams, TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
 };
 use session::ThreadRuntime;
 use ui::{Outbound, PendingInteractions};
@@ -145,6 +145,7 @@ async fn write_stdout(mut rx: mpsc::UnboundedReceiver<Value>) -> std::io::Result
 struct AppServer {
     store: SessionStore,
     cache: ModelsCache,
+    http: reqwest::Client,
     outbound: Outbound,
     pending: PendingInteractions,
     request_seq: Arc<AtomicU64>,
@@ -152,6 +153,7 @@ struct AppServer {
     initialized: bool,
     draining: bool,
     threads: HashMap<String, Arc<ThreadRuntime>>,
+    background_requests: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl AppServer {
@@ -159,6 +161,7 @@ impl AppServer {
         Self {
             store,
             cache,
+            http: reqwest::Client::new(),
             outbound,
             pending: PendingInteractions::default(),
             request_seq: Arc::new(AtomicU64::new(0)),
@@ -166,6 +169,7 @@ impl AppServer {
             initialized: false,
             draining: false,
             threads: HashMap::new(),
+            background_requests: Vec::new(),
         }
     }
 
@@ -281,6 +285,11 @@ impl AppServer {
                                         "maxActiveTurnsPerThread": 1
                                     },
                                     "turns": { "cancel": true, "textOnly": true },
+                                    "models": {
+                                        "providers": true,
+                                        "list": true,
+                                        "threadSelection": true
+                                    },
                                     "approval": true,
                                     "userInput": true,
                                     "mcp": false,
@@ -300,6 +309,46 @@ impl AppServer {
                     Err(error) => self.send_error(id, error),
                 }
             }
+            "provider/list" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match self.provider_list().await {
+                    Ok(result) => self.send_result(id, result),
+                    Err(error) => self.send_error(id, error),
+                }
+            }
+            "model/list" => {
+                if !self.require_initialized(id.clone()) {
+                    return true;
+                }
+                match protocol::parse_params::<ModelListParams>(params) {
+                    Ok(params) => {
+                        if let Some(response_id) = id {
+                            let store = self.store.clone();
+                            let cache = self.cache.clone();
+                            let http = self.http.clone();
+                            let outbound = self.outbound.clone();
+                            self.background_requests.retain(|task| !task.is_finished());
+                            self.background_requests.push(tokio::spawn(async move {
+                                let response = match Self::model_list(
+                                    &store,
+                                    &cache,
+                                    &http,
+                                    params,
+                                )
+                                .await
+                                {
+                                    Ok(result) => protocol::response(response_id, result),
+                                    Err(error) => protocol::error_response(response_id, &error),
+                                };
+                                let _ = outbound.send(response);
+                            }));
+                        }
+                    }
+                    Err(error) => self.send_error(id, error),
+                }
+            }
             "thread/list" => {
                 if !self.require_initialized(id.clone()) {
                     return true;
@@ -308,6 +357,22 @@ impl AppServer {
                     Ok(params) => match session::canonicalize_cwd(&params.cwd) {
                         Ok(cwd) => match self.store.all_chat_sessions().await {
                             Ok(mut entries) => {
+                                let providers_by_key: HashMap<_, _> = self
+                                    .store
+                                    .get_keys_and_active_id_info()
+                                    .await
+                                    .map(|(keys, _)| {
+                                        keys.into_iter()
+                                            .map(|key| {
+                                                let provider =
+                                                    session::public_provider_for_base_url(
+                                                        &key.base_url,
+                                                    );
+                                                (key.id, provider)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
                                 entries.retain(|entry| {
                                     std::fs::canonicalize(&entry.cwd)
                                         .is_ok_and(|entry_cwd| entry_cwd == cwd)
@@ -317,6 +382,12 @@ impl AppServer {
                                 let cwd = cwd.to_string_lossy().to_string();
                                 let mut data = Vec::with_capacity(entries.len());
                                 for entry in entries {
+                                    let provider = providers_by_key
+                                        .get(&entry.key_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            session::public_provider_for_base_url(&entry.base_url)
+                                        });
                                     let title = match self
                                         .store
                                         .get_code_session(&entry.session_id)
@@ -331,6 +402,7 @@ impl AppServer {
                                     data.push(json!({
                                         "sessionId": entry.session_id,
                                         "cwd": cwd,
+                                        "provider": provider,
                                         "model": entry.model,
                                         "title": title,
                                         "preview": entry.preview,
@@ -356,6 +428,7 @@ impl AppServer {
                 }
                 match protocol::parse_params::<ThreadStartParams>(params) {
                     Ok(params) => {
+                        let model_provider = params.model_provider.or(params.key_id);
                         let thread_id = self.next_id("thread");
                         let session_id = new_durable_session_id();
                         let lease = match self.store.try_acquire_code_session_lease(&session_id) {
@@ -383,7 +456,7 @@ impl AppServer {
                             session_id,
                             lease,
                             params.cwd,
-                            params.key_id,
+                            model_provider,
                             params.model,
                             self.store.clone(),
                             &self.cache,
@@ -396,6 +469,7 @@ impl AppServer {
                                         "threadId": thread.id.clone(),
                                         "sessionId": thread.session_id.clone(),
                                         "cwd": thread.cwd.clone(),
+                                        "provider": thread.provider(),
                                         "model": thread.raw_model.clone(),
                                         "title": thread.title().await,
                                         "state": "idle",
@@ -491,6 +565,7 @@ impl AppServer {
                                             "threadId": thread.id.clone(),
                                             "sessionId": thread.session_id.clone(),
                                             "cwd": thread.cwd.clone(),
+                                            "provider": thread.provider(),
                                             "model": thread.raw_model.clone(),
                                             "title": title,
                                             "messages": messages,
@@ -724,6 +799,104 @@ impl AppServer {
         }
     }
 
+    async fn provider_list(&self) -> Result<Value, RpcFailure> {
+        let (keys, active_model_provider) = self
+            .store
+            .get_keys_and_active_id_info()
+            .await
+            .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?;
+        let mut data = Vec::with_capacity(keys.len());
+        for key in keys {
+            let provider_id = key.id.clone();
+            let display_name = key.display_name().to_string();
+            let selected_model = self
+                .store
+                .get_code_model(&provider_id)
+                .await
+                .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?;
+            let agent_compatible = !key.is_any_oauth() && !key.is_cursor_acp();
+            let kind = session::public_provider_for_base_url(&key.base_url).kind;
+            data.push(json!({
+                "id": provider_id,
+                "displayName": display_name,
+                "kind": kind,
+                "active": active_model_provider.as_deref() == Some(key.id.as_str()),
+                "agentCompatible": agent_compatible,
+                "selectedModel": selected_model,
+            }));
+        }
+        Ok(json!({
+            "activeModelProvider": active_model_provider,
+            "data": data,
+        }))
+    }
+
+    async fn model_list(
+        store: &SessionStore,
+        cache: &ModelsCache,
+        http: &reqwest::Client,
+        params: ModelListParams,
+    ) -> Result<Value, RpcFailure> {
+        let key = match params.model_provider.as_deref() {
+            Some(provider) => store
+                .resolve_key_by_id_or_name(provider)
+                .await
+                .map_err(|_| RpcFailure::new(protocol::NOT_FOUND, "model provider not found"))?,
+            None => store
+                .get_active_key()
+                .await
+                .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?
+                .ok_or_else(|| RpcFailure::new(protocol::UNAVAILABLE, "no active model provider"))?,
+        };
+        if key.is_any_oauth() || key.is_cursor_acp() {
+            return Err(RpcFailure::new(
+                protocol::UNAVAILABLE,
+                "the selected provider cannot drive the in-process AgentEngine",
+            ));
+        }
+
+        let selected_model = store
+            .get_code_model(&key.id)
+            .await
+            .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?;
+        let (mut data, warning, catalog_available) =
+            match crate::commands::models::fetch_models_cached(
+                http,
+                &key,
+                cache,
+                params.refresh,
+            )
+            .await
+            {
+                Ok(models) => (models, None, true),
+                Err(_) => (
+                    Vec::new(),
+                    Some("the provider did not return a model catalog".to_string()),
+                    false,
+                ),
+            };
+        if !catalog_available
+            && let Some(model) = selected_model.as_ref()
+            && !data.contains(model)
+        {
+            data.insert(0, model.clone());
+        }
+        let selected_model_available = catalog_available
+            .then(|| selected_model.as_ref().map(|model| data.contains(model)))
+            .flatten();
+        let provider_id = key.id.clone();
+        let provider_name = key.display_name().to_string();
+        Ok(json!({
+            "modelProvider": provider_id,
+            "providerName": provider_name,
+            "selectedModel": selected_model,
+            "selectedModelAvailable": selected_model_available,
+            "catalogAvailable": catalog_available,
+            "data": data,
+            "warning": warning,
+        }))
+    }
+
     fn send_result(&self, id: Option<Value>, result: Value) {
         if let Some(id) = id {
             let _ = self.outbound.send(protocol::response(id, result));
@@ -747,6 +920,10 @@ impl AppServer {
 
     async fn shutdown(&mut self) {
         self.draining = true;
+        for request in self.background_requests.drain(..) {
+            request.abort();
+            let _ = request.await;
+        }
         for thread in self.threads.values() {
             thread.shutdown(&self.outbound, &self.pending).await;
         }

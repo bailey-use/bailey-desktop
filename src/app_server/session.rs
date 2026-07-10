@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
 
@@ -13,6 +14,42 @@ use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, Sto
 
 use super::protocol::{INTERNAL_ERROR, NOT_FOUND, RpcFailure, THREAD_BUSY, UNAVAILABLE};
 use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_pending_for_turn};
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicProvider {
+    pub kind: String,
+    pub label: String,
+}
+
+pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
+    use crate::services::provider_profile::ProviderKind;
+
+    if crate::services::provider_profile::is_aivo_starter_base(base_url) {
+        return PublicProvider {
+            kind: "aivo_starter".to_string(),
+            label: "Aivo Starter".to_string(),
+        };
+    }
+    let (kind, label) = match crate::services::provider_profile::provider_profile_for_base_url(
+        base_url,
+    )
+    .kind
+    {
+        ProviderKind::Copilot => ("copilot", "GitHub Copilot"),
+        ProviderKind::CursorAcp => ("cursor_acp", "Cursor"),
+        ProviderKind::Ollama => ("ollama", "Ollama"),
+        ProviderKind::OpenRouter => ("openrouter", "OpenRouter"),
+        ProviderKind::CloudflareAi => ("cloudflare_ai", "Cloudflare AI"),
+        ProviderKind::AnthropicCompatible => ("anthropic_compatible", "Anthropic-compatible"),
+        ProviderKind::GoogleNative => ("google_native", "Google"),
+        ProviderKind::OpenAiCompatible => ("openai_compatible", "OpenAI-compatible"),
+    };
+    PublicProvider {
+        kind: kind.to_string(),
+        label: label.to_string(),
+    }
+}
 
 struct ActiveTurn {
     turn_id: String,
@@ -103,6 +140,8 @@ pub struct ThreadRuntime {
     pub session_id: String,
     pub cwd: PathBuf,
     pub raw_model: String,
+    provider: PublicProvider,
+    credential_base_url: String,
     key: ApiKey,
     _lease: CodeSessionLease,
     store: SessionStore,
@@ -114,6 +153,10 @@ pub struct ThreadRuntime {
 }
 
 impl ThreadRuntime {
+    pub fn provider(&self) -> &PublicProvider {
+        &self.provider
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         id: String,
@@ -206,6 +249,7 @@ impl ThreadRuntime {
                 "the selected key cannot drive the in-process AgentEngine",
             ));
         }
+        let provider = public_provider_for_base_url(&key.base_url);
 
         let raw_model = match requested_model.filter(|model| !model.trim().is_empty()) {
             Some(model) => model,
@@ -296,6 +340,8 @@ impl ThreadRuntime {
             session_id,
             cwd,
             raw_model,
+            provider,
+            credential_base_url: context_base,
             key,
             _lease: lease,
             store,
@@ -435,7 +481,7 @@ impl ThreadRuntime {
         self.store
             .save_code_session_with_id(
                 &self.key.id,
-                &self.key.base_url,
+                &self.credential_base_url,
                 &self.cwd.to_string_lossy(),
                 &self.session_id,
                 &self.raw_model,

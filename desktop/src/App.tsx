@@ -57,9 +57,39 @@ type StoredThreadMessage = {
   reasoningContent?: string | null;
 };
 
+type PublicProvider = {
+  kind: string;
+  label: string;
+};
+
+type ModelProvider = {
+  id: string;
+  displayName: string;
+  kind: string;
+  active: boolean;
+  agentCompatible: boolean;
+  selectedModel?: string | null;
+};
+
+type ProviderListResult = {
+  activeModelProvider?: string | null;
+  data: ModelProvider[];
+};
+
+type ModelListResult = {
+  modelProvider: string;
+  providerName: string;
+  selectedModel?: string | null;
+  selectedModelAvailable?: boolean | null;
+  catalogAvailable: boolean;
+  data: string[];
+  warning?: string | null;
+};
+
 type ThreadSummary = {
   sessionId: string;
   cwd: string;
+  provider?: PublicProvider;
   model: string;
   title: string;
   preview: string;
@@ -71,6 +101,7 @@ type ThreadOpenResult = {
   threadId: string;
   sessionId: string;
   cwd: string;
+  provider?: PublicProvider;
   model: string;
   title: string;
   preview?: string;
@@ -130,6 +161,7 @@ const previewConversation: ConversationState = {
   sessionId: "preview-session-initial",
   threadId: "preview-thread-initial",
   cwd: previewProject,
+  provider: { kind: "aivo_starter", label: "Aivo Starter" },
   model: "Aivo Starter",
   title: "简化 Bailey 任务界面",
   preview: "布局已经收敛到项目侧栏、当前任务和输入框三层。",
@@ -159,7 +191,29 @@ function App() {
   const [newTaskModel, setNewTaskModel] = useState(
     isLayoutPreview ? "Aivo Starter" : "",
   );
+  const [providers, setProviders] = useState<ModelProvider[]>(
+    isLayoutPreview
+      ? [{
+          id: "aivo-starter",
+          displayName: "Aivo Starter",
+          kind: "aivo_starter",
+          active: true,
+          agentCompatible: true,
+          selectedModel: "Aivo Starter",
+        }]
+      : [],
+  );
+  const [providersLoaded, setProvidersLoaded] = useState(isLayoutPreview);
+  const [providerLoadError, setProviderLoadError] = useState("");
+  const [newTaskProvider, setNewTaskProvider] = useState(
+    isLayoutPreview ? "aivo-starter" : "",
+  );
+  const [providerDraft, setProviderDraft] = useState("");
   const [modelDraft, setModelDraft] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelWarning, setModelWarning] = useState("");
+  const [selectedModelAvailable, setSelectedModelAvailable] = useState<boolean | null>(null);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -186,7 +240,6 @@ function App() {
     (conversation) => conversation.sessionId === activeSessionId,
   );
   const threadId = activeConversation?.threadId;
-  const activeModel = activeConversation?.model ?? "";
   const items = activeConversation?.items ?? [];
   const prompt = activeConversation?.draft ?? "";
   const turnState: TurnState = runningThreadId ? "running" : "idle";
@@ -195,6 +248,7 @@ function App() {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const sendButtonRef = useRef<HTMLButtonElement>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
+  const modelRequestRef = useRef(0);
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const threadMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const interactionFocusRef = useRef<HTMLButtonElement>(null);
@@ -287,6 +341,7 @@ function App() {
 
   useEffect(() => {
     if (isLayoutPreview) return;
+    let cancelled = false;
 
     client.onEvent = handleEvent;
     client.onDiagnostic = (message) => setDiagnostic(message);
@@ -323,13 +378,18 @@ function App() {
       });
     void client
       .connect()
-      .then(() => {
+      .then(async () => {
+        const providerLoad = await loadProviders();
+        if (cancelled) return;
         setConnection("ready");
         setStatusText("Agent 已就绪");
         const rememberedProject = localStorage.getItem("bailey.cwd");
-        if (rememberedProject) void openProject(rememberedProject);
+        if (rememberedProject) {
+          void openProject(rememberedProject, providerLoad.preferred, providerLoad.loaded);
+        }
       })
       .catch((error: unknown) => {
+        if (cancelled) return;
         setConnection("error");
         setStatusText(error instanceof Error ? error.message : String(error));
         setConversations((current) => current.map((conversation) => ({
@@ -342,6 +402,7 @@ function App() {
         client.dispose();
       });
     return () => {
+      cancelled = true;
       client.dispose();
     };
   }, [client]);
@@ -598,7 +659,11 @@ function App() {
     });
   }
 
-  async function openProject(projectPath: string) {
+  async function openProject(
+    projectPath: string,
+    initialProvider?: ModelProvider,
+    providerCatalogLoaded = providersLoaded,
+  ) {
     const normalizedPath = projectPath.trim();
     if (!normalizedPath || openingRef.current || sendingRef.current || runningThreadIdRef.current) return;
     if (blockLeavingUnsavedConversation()) return;
@@ -617,7 +682,7 @@ function App() {
           setCwd(normalizedPath);
           setActiveSessionId(available[0].sessionId);
         } else {
-          await createConversation(normalizedPath);
+          await createConversation(normalizedPath, initialProvider, providerCatalogLoaded);
         }
       } else {
         const listed = await client.request<{ data: ThreadSummary[] }>("thread/list", {
@@ -626,7 +691,7 @@ function App() {
         const canonicalPath = listed.data[0]?.cwd ?? normalizedPath;
         rememberProject(canonicalPath);
         if (listed.data.length === 0) {
-          await createConversation(canonicalPath);
+          await createConversation(canonicalPath, initialProvider, providerCatalogLoaded);
         } else {
           let resumed: ThreadOpenResult | undefined;
           let resumeError: unknown;
@@ -660,7 +725,7 @@ function App() {
               listed.data,
               canonicalPath,
             ));
-            await createConversation(canonicalPath);
+            await createConversation(canonicalPath, initialProvider, providerCatalogLoaded);
             setOperationError("已有历史任务暂时无法恢复，已为这个项目创建一个新任务。");
             setShowStatus(true);
             setDiagnostic(
@@ -773,6 +838,92 @@ function App() {
     } finally {
       openingRef.current = false;
       setOpening(false);
+    }
+  }
+
+  async function loadProviders(): Promise<{
+    preferred?: ModelProvider;
+    loaded: boolean;
+  }> {
+    if (isLayoutPreview) return { preferred: providers[0], loaded: true };
+    try {
+      const result = await client.request<ProviderListResult>("provider/list");
+      const compatible = result.data.filter((provider) => provider.agentCompatible);
+      const active = compatible.find(
+        (provider) => provider.id === result.activeModelProvider || provider.active,
+      );
+      const preferred = active ?? compatible[0];
+      setProviders(result.data);
+      setProvidersLoaded(true);
+      setProviderLoadError("");
+      setNewTaskProvider((current) => {
+        if (compatible.some((provider) => provider.id === current)) return current;
+        return preferred?.id ?? "";
+      });
+      return { preferred, loaded: true };
+    } catch (error) {
+      setProviders([]);
+      setProvidersLoaded(true);
+      setProviderLoadError("无法读取 Aivo Provider 列表，请重试。");
+      setDiagnostic(
+        `Could not load model providers: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { loaded: true };
+    }
+  }
+
+  async function retryProviders() {
+    const result = await loadProviders();
+    const modelProvider = result.preferred?.id ?? "";
+    setProviderDraft(modelProvider);
+    setModelDraft("");
+    setSelectedModelAvailable(null);
+    if (modelProvider) await loadModels(modelProvider, true);
+  }
+
+  async function loadModels(modelProvider: string, refresh = false) {
+    const request = ++modelRequestRef.current;
+    setAvailableModels([]);
+    setModelWarning("");
+    setSelectedModelAvailable(null);
+    if (!modelProvider || isLayoutPreview) {
+      setModelsLoading(false);
+      return;
+    }
+    setModelsLoading(true);
+    try {
+      const result = await client.request<ModelListResult>("model/list", {
+        modelProvider,
+        refresh,
+      });
+      if (request !== modelRequestRef.current) return;
+      setAvailableModels(result.data);
+      setSelectedModelAvailable(result.selectedModelAvailable ?? null);
+      setProviders((current) => current.map((provider) =>
+        provider.id === result.modelProvider
+          ? {
+              ...provider,
+              selectedModel: result.selectedModelAvailable === false
+                ? null
+                : result.selectedModel,
+            }
+          : provider,
+      ));
+      if (result.catalogAvailable && result.selectedModelAvailable === false) {
+        setModelWarning("之前保存的默认模型已不在 Provider 列表中，请选择或填写一个模型。");
+      } else {
+        setModelWarning(
+          result.warning ? "Provider 未提供模型列表，仍可手动填写模型 ID。" : "",
+        );
+      }
+    } catch (error) {
+      if (request !== modelRequestRef.current) return;
+      setSelectedModelAvailable(null);
+      setModelWarning(
+        `无法读取模型列表，仍可手动填写：${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      if (request === modelRequestRef.current) setModelsLoading(false);
     }
   }
 
@@ -964,15 +1115,35 @@ function App() {
     }
   }
 
-  async function createConversation(projectPath: string) {
+  async function createConversation(
+    projectPath: string,
+    initialProvider?: ModelProvider,
+    providerCatalogLoaded = providersLoaded,
+  ) {
     const now = new Date().toISOString();
+    const modelProvider = initialProvider?.id ?? newTaskProvider;
+    const selectedProvider = initialProvider
+      ?? providers.find((provider) => provider.id === modelProvider);
+    const model = newTaskModel.trim();
+    if (providerLoadError) {
+      throw new Error("无法读取 Aivo Provider 列表，请先在模型菜单中重试。");
+    }
+    if (providerCatalogLoaded && !selectedProvider) {
+      throw new Error("没有可用于 AgentEngine 的模型 Provider，请先在 Aivo 中配置 Provider。");
+    }
+    if (selectedProvider && !model && !selectedProvider.selectedModel?.trim()) {
+      throw new Error("这个 Provider 没有默认模型，请先选择或填写模型 ID。");
+    }
     if (isLayoutPreview) {
       const suffix = `${Date.now()}-${Math.random()}`;
       const conversation: ConversationState = {
         sessionId: `preview-session-${suffix}`,
         threadId: `preview-thread-${suffix}`,
         cwd: projectPath,
-        model: newTaskModel || "Aivo Starter",
+        provider: selectedProvider
+          ? { kind: selectedProvider.kind, label: selectedProvider.displayName }
+          : undefined,
+        model: model || selectedProvider?.selectedModel || "Aivo Starter",
         title: "新任务",
         preview: "",
         updatedAt: now,
@@ -992,7 +1163,8 @@ function App() {
 
     const result = await client.request<ThreadOpenResult>("thread/start", {
       cwd: projectPath,
-      ...(newTaskModel.trim() ? { model: newTaskModel.trim() } : {}),
+      ...(modelProvider.trim() ? { modelProvider: modelProvider.trim() } : {}),
+      ...(model ? { model } : {}),
     });
     const previousThreadId = activeThreadIdRef.current;
     await closePreviousRuntime(result.threadId, result.sessionId);
@@ -1082,12 +1254,16 @@ function App() {
 
   function closeModelMenu(returnFocus: boolean) {
     composingRef.current = false;
+    modelRequestRef.current += 1;
+    setModelsLoading(false);
     setModelMenuOpen(false);
     if (returnFocus) requestAnimationFrame(() => modelTriggerRef.current?.focus());
   }
 
   function closeAuxiliarySurfaces() {
     composingRef.current = false;
+    modelRequestRef.current += 1;
+    setModelsLoading(false);
     setModelMenuOpen(false);
     setThreadMenuOpen(false);
     setShowStatus(false);
@@ -1182,9 +1358,27 @@ function App() {
   const connectionText = connectionLabel(connection);
   const statusLabel = operationError ? "需要处理" : connectionText;
   const durabilityDirty = Boolean(activeConversation?.durabilityDirty);
-  const modelButtonLabel = newTaskModel && newTaskModel !== activeModel
-    ? `${newTaskModel} · 下个任务`
-    : activeModel || newTaskModel || "当前模型";
+  const newTaskProviderInfo = providers.find((provider) => provider.id === newTaskProvider);
+  const newTaskProviderLabel = newTaskProviderInfo?.displayName
+    ?? (providerLoadError
+      ? "Provider 加载失败"
+      : providersLoaded
+        ? "未配置 Provider"
+        : "正在读取 Provider");
+  const newTaskModelLabel = newTaskModel
+    || newTaskProviderInfo?.selectedModel
+    || "需要选择模型";
+  const modelButtonLabel = `${newTaskProviderLabel} · ${newTaskModelLabel} · 新任务`;
+  const providerDraftInfo = providers.find((provider) => provider.id === providerDraft);
+  const providerDefaultModelAvailable = Boolean(
+    providerDraftInfo?.selectedModel?.trim()
+      && selectedModelAvailable !== false
+      && !modelsLoading,
+  );
+  const canApplyModelSelection = Boolean(
+    providerDraftInfo?.agentCompatible
+      && (modelDraft.trim() || providerDefaultModelAvailable),
+  );
 
   return (
     <div className="app-shell">
@@ -1603,10 +1797,21 @@ function App() {
                     onClick={() => {
                       setThreadMenuOpen(false);
                       setShowStatus(false);
-                      setModelDraft(newTaskModel || activeModel);
-                      setModelMenuOpen((value) => !value);
+                      if (modelMenuOpen) {
+                        closeModelMenu(false);
+                        return;
+                      }
+                      const nextProvider = newTaskProvider
+                        || providers.find((provider) => provider.active && provider.agentCompatible)?.id
+                        || providers.find((provider) => provider.agentCompatible)?.id
+                        || "";
+                      setProviderDraft(nextProvider);
+                      setModelDraft(newTaskModel);
+                      setSelectedModelAvailable(null);
+                      setModelMenuOpen(true);
+                      void loadModels(nextProvider);
                     }}
-                    disabled={opening || turnStarting}
+                    disabled={connection !== "ready" || opening || turnStarting}
                   >
                     <span>{modelButtonLabel}</span>
                     <CaretDown size={15} />
@@ -1617,13 +1822,49 @@ function App() {
                       id="model-popover"
                       role="dialog"
                       aria-modal="false"
-                      aria-label="选择下个任务的模型"
+                      aria-label="配置新任务的模型"
                     >
+                      {providerLoadError && (
+                        <div className="provider-load-error">
+                          <span>{providerLoadError}</span>
+                          <button onClick={() => void retryProviders()}>重试</button>
+                        </div>
+                      )}
+                      <label htmlFor="model-provider">
+                        新任务 Provider
+                        <select
+                          id="model-provider"
+                          value={providerDraft}
+                          onChange={(event) => {
+                            const modelProvider = event.target.value;
+                            setProviderDraft(modelProvider);
+                            setModelDraft("");
+                            setSelectedModelAvailable(null);
+                            void loadModels(modelProvider);
+                          }}
+                        >
+                          {!providerDraft && (
+                            <option value="">
+                              {providersLoaded ? "选择可用 Provider" : "Runtime 当前 Provider"}
+                            </option>
+                          )}
+                          {providers.map((provider) => (
+                            <option
+                              key={provider.id}
+                              value={provider.id}
+                              disabled={!provider.agentCompatible}
+                            >
+                              {provider.displayName}{provider.active ? "（当前）" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                       <label htmlFor="model-id">
-                        下个新任务使用的模型
+                        新任务 Model
                         <input
                           ref={modelInputRef}
                           id="model-id"
+                          list="available-models"
                           value={modelDraft}
                           onChange={(event) => setModelDraft(event.target.value)}
                           onCompositionStart={() => {
@@ -1639,20 +1880,32 @@ function App() {
                             if (
                               event.key === "Enter"
                               && !isReactImeEvent(event, composingRef.current)
+                              && canApplyModelSelection
                             ) {
                               event.preventDefault();
+                              setNewTaskProvider(providerDraft);
                               setNewTaskModel(modelDraft.trim());
                               closeModelMenu(true);
                             }
                           }}
-                          placeholder="使用 Aivo 当前模型"
+                          placeholder={modelsLoading
+                            ? "正在读取模型…"
+                            : providerDefaultModelAvailable
+                              ? `默认：${providerDraftInfo?.selectedModel}`
+                              : "填写模型 ID"}
                         />
+                        <datalist id="available-models">
+                          {availableModels.map((model) => <option key={model} value={model} />)}
+                        </datalist>
                       </label>
+                      {modelWarning && <p className="model-warning">{modelWarning}</p>}
                       <div className="model-popover-actions">
                         <button onClick={() => closeModelMenu(true)}>取消</button>
                         <button
                           className="primary"
+                          disabled={!canApplyModelSelection}
                           onClick={() => {
+                            setNewTaskProvider(providerDraft);
                             setNewTaskModel(modelDraft.trim());
                             closeModelMenu(true);
                           }}
@@ -1825,6 +2078,7 @@ function conversationFromOpenResult(result: ThreadOpenResult): ConversationState
     sessionId: result.sessionId,
     threadId: result.threadId,
     cwd: result.cwd,
+    provider: result.provider,
     model: result.model,
     title: result.title || "新任务",
     preview: result.preview ?? messages.at(-1)?.content ?? "",

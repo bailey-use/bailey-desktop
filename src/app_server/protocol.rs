@@ -51,10 +51,23 @@ pub struct ClientInfo {
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
     pub cwd: String,
+    /// Stable local provider id. `keyId` remains accepted for older clients,
+    /// but new clients should use the same model-provider vocabulary as Codex.
+    #[serde(default)]
+    pub model_provider: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListParams {
+    #[serde(default, alias = "keyId")]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -17,8 +17,10 @@ AgentEngine / tools / approvals
 
 The first development slice includes real multi-turn in-process AgentEngine
 execution, streamed events, reverse approval and user-input requests,
-cancellation, a bundled sidecar, and a native Bailey task interface. The wire
-contract is documented in [docs/app-server-protocol.md](docs/app-server-protocol.md).
+cancellation, durable thread resume, a bundled sidecar, provider/model
+discovery and thread selection, and a native Bailey task interface. Provider
+secrets remain inside Aivo. The wire contract is documented in
+[docs/app-server-protocol.md](docs/app-server-protocol.md).
 
 Development:
 
@@ -37,9 +39,10 @@ Prerelease (`desktop-build-<run number>`). These development packages are
 not production-signed: macOS is ad-hoc signed but not notarized, and Windows is
 unsigned until the repository signing secrets are configured.
 
-Cloud task routing, durable thread resume/replay, MCP consent, attachments,
-and signed Windows distribution are the next slices; they are not silently
-stubbed as working capabilities in protocol v1.
+Attaching Bailey Cloud MCP tools to the same AgentEngine, turn-scoped model
+overrides, MCP consent, attachments, and signed Windows distribution are the
+next slices; they are not silently stubbed as working capabilities in protocol
+v1. Bailey Cloud is a tool/service layer, not a second planner.
 
 ---
 

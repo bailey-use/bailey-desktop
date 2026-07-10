@@ -300,8 +300,10 @@ mod tests {
         let got = discover_project_guides_at(&sub, Some(&global));
         assert_eq!(got.len(), 3, "{got:?}");
         // Most-specific last: global abs path, git-root abs path, bare cwd name.
-        assert!(got[0].ends_with("global/AGENTS.md") && Path::new(&got[0]).is_absolute());
-        assert!(got[1].ends_with("repo/AGENTS.md") && Path::new(&got[1]).is_absolute());
+        assert!(Path::new(&got[0]).ends_with("global/AGENTS.md"));
+        assert!(Path::new(&got[0]).is_absolute());
+        assert!(Path::new(&got[1]).ends_with("repo/AGENTS.md"));
+        assert!(Path::new(&got[1]).is_absolute());
         assert_eq!(got[2], "CLAUDE.md");
     }
 

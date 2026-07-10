@@ -275,8 +275,13 @@ mod tests {
         std::fs::write(&stale, b"x").unwrap();
         let two_days_ago =
             std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
-        let f = std::fs::File::open(&stale).unwrap();
+        // Windows: set_modified needs write access; close before the sweep deletes.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap();
         f.set_modified(two_days_ago).unwrap();
+        drop(f);
         let fresh = base.join(".aivo-tmp-fresh");
         std::fs::write(&fresh, b"x").unwrap();
         std::fs::write(base.join("code-prefs.json.bak-before-disable-all"), b"x").unwrap();

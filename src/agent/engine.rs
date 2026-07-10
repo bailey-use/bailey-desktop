@@ -3203,6 +3203,34 @@ mod tests {
         format!("data: {delta}\n\ndata: [DONE]\n\n")
     }
 
+    /// Drain the full request before replying: closing with unread bytes RSTs the
+    /// response (Windows), and the engine's retry then eats the next scripted body.
+    fn drain_request(sock: &mut std::net::TcpStream) {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            data.extend_from_slice(&buf[..n]);
+            let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let body_len: usize = String::from_utf8_lossy(&data[..pos])
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap_or(0);
+            if data.len() >= pos + 4 + body_len {
+                return;
+            }
+        }
+    }
+
     fn spawn_sse_sequence(bodies: Vec<String>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3211,8 +3239,7 @@ mod tests {
                 let Ok((mut sock, _)) = listener.accept() else {
                     break;
                 };
-                let mut buf = [0u8; 16384];
-                let _ = sock.read(&mut buf); // drain the request
+                drain_request(&mut sock);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),

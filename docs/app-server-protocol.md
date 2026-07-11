@@ -30,9 +30,9 @@ The `toolSources` capability distinguishes Bailey-owned product tools from MCP
 servers installed by the user:
 
 - `productTools` is Bailey Local Tools, a product-managed stdio process. The
-  Desktop launcher supplies its executable contract; it is not copied into
-  `~/.config/aivo/mcp.json`, is never loaded from a project, and is forced to
-  require Aivo approval.
+  Desktop launcher discovers its installed executable and supplies that
+  contract to App Server; it is not copied into `~/.config/aivo/mcp.json`, is
+  never loaded from a project, and is forced to require Aivo approval.
 - `userMcp` loads only enabled servers from Aivo's user-level
   `~/.config/aivo/mcp.json`, at thread initialization. Both stdio and
   Streamable HTTP transports are supported. Previously stored OAuth credentials
@@ -48,8 +48,20 @@ and a degraded summary.
 {"toolSources":{"productTools":{"managed":true,"configuration":"launcher","transport":"stdio","approvalRequired":true,"load":"thread","bestEffort":true},"userMcp":{"tools":true,"configScopes":["user"],"projectConfiguration":false,"transports":["stdio","streamableHttp"],"oauth":{"storedCredentials":true,"interactive":false},"load":"thread","bestEffort":true}}}
 ```
 
-Until installer-specific resource discovery is implemented, the launcher
-contract is explicit and shell-free:
+The Tauri launcher checks only Bailey's fixed per-user application-data paths;
+it does not scan `PATH`, read an MCP configuration file, or invoke a shell:
+
+- macOS: `~/Library/Application Support/BaileyUse/browser-host/bailey-mcp`
+  (or the legacy package-root launcher), plus
+  `~/Library/Application Support/BaileyUseComputerUse/bin/cua-driver`.
+- Windows: `%LOCALAPPDATA%\\BaileyUse\\bailey-mcp.cmd`, plus
+  `%LOCALAPPDATA%\\BaileyUseComputerUse\\bin\\cua-driver.exe`.
+- Linux: `$XDG_DATA_HOME/BaileyUse/browser-host/bailey-mcp` (falling back to
+  `~/.local/share`), plus the corresponding
+  `BaileyUseComputerUse/bin/cua-driver`.
+
+Explicit environment variables override discovery for development and managed
+deployments. The launcher contract remains shell-free:
 
 - `BAILEY_LOCAL_MCP_COMMAND`: executable path or command name for Bailey Local
   Tools. If absent, product tools are reported as not configured.
@@ -62,10 +74,12 @@ BAILEY_LOCAL_MCP_COMMAND=node
 BAILEY_LOCAL_MCP_ARGS_JSON=["/absolute/path/to/bailey-use/src/mcp/server.js"]
 ```
 
-Production packaging must replace that example with its installed launcher or
-binary path. App Server does not contain a developer-machine path and does not
-parse a shell command line. The product source's `trust:false` behavior is
-enforced in code rather than accepted from either environment variable.
+App Server does not contain a developer-machine path and does not parse a shell
+command line. The Desktop passes the discovered absolute launcher path; the
+installed unified Local Tools process receives the separately discovered CUA
+Driver path through its environment. The product source's `trust:false`
+behavior is enforced in code rather than accepted from any environment
+variable or installed config file.
 
 ## Client methods
 
@@ -267,7 +281,8 @@ ordinary model-gateway, knowledge, account, sync, and record infrastructure; it
 is not an MCP planner or a second AgentEngine.
 
 Project-scoped MCP consent/configuration, user MCP management and interactive
-OAuth, packaged Local Tools path discovery, attachments, Cloud record sync, and
-edit-review interactions are not advertised by protocol v1 yet. Turn-scoped
-model overrides are also not advertised yet; Desktop applies provider/model
-changes when it creates the next thread.
+OAuth, attachments, Cloud record sync, and edit-review interactions are not
+advertised by protocol v1 yet. Packaged Local Tools path discovery exists in
+the Desktop launcher, while one-installer delivery and updates are still
+unfinished. Turn-scoped model overrides are also not advertised yet; Desktop
+applies provider/model changes when it creates the next thread.

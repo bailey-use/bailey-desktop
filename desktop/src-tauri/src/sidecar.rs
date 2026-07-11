@@ -1,4 +1,6 @@
 use serde_json::Value;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -30,11 +32,22 @@ pub async fn app_server_start(
         return Ok(());
     }
 
-    let command = app
+    let mut command = app
         .shell()
         .sidecar("aivo-app-server")
         .map_err(|error| error.to_string())?
         .args(["app-server", "--stdio"]);
+    if std::env::var_os("BAILEY_LOCAL_MCP_COMMAND").is_none()
+        && let Some(path) = discover_local_tools_command(&app)
+    {
+        command = command.env("BAILEY_LOCAL_MCP_COMMAND", path);
+    }
+    if std::env::var_os("BAILEY_CUA_DRIVER_SOCKET").is_none()
+        && std::env::var_os("BAILEY_CUA_DRIVER_COMMAND").is_none()
+        && let Some(path) = discover_cua_driver(&app)
+    {
+        command = command.env("BAILEY_CUA_DRIVER_COMMAND", quote_command_path(&path));
+    }
     let (mut events, process) = command.spawn().map_err(|error| error.to_string())?;
     let generation = state.next_generation;
     state.next_generation = state.next_generation.wrapping_add(1);
@@ -82,6 +95,70 @@ pub async fn app_server_start(
         }
     });
     Ok(())
+}
+
+fn discover_local_tools_command(app: &AppHandle) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = std::env::var_os("BAILEY_USE_INSTALL_ROOT") {
+        push_local_tools_candidates(&mut candidates, PathBuf::from(root));
+    }
+    if let Ok(data_root) = app.path().local_data_dir() {
+        push_local_tools_candidates(&mut candidates, data_root.join("BaileyUse"));
+    }
+    candidates.into_iter().find(|path| is_launchable(path))
+}
+
+fn push_local_tools_candidates(candidates: &mut Vec<PathBuf>, root: PathBuf) {
+    #[cfg(windows)]
+    {
+        candidates.push(root.join("bailey-mcp.cmd"));
+        candidates.push(root.join("browser-host").join("bailey-mcp.cmd"));
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.push(root.join("browser-host").join("bailey-mcp"));
+        candidates.push(root.join("bailey-mcp"));
+    }
+}
+
+fn discover_cua_driver(app: &AppHandle) -> Option<PathBuf> {
+    let data_root = app.path().local_data_dir().ok()?;
+    #[cfg(windows)]
+    let driver = data_root
+        .join("BaileyUseComputerUse")
+        .join("bin")
+        .join("cua-driver.exe");
+    #[cfg(not(windows))]
+    let driver = data_root
+        .join("BaileyUseComputerUse")
+        .join("bin")
+        .join("cua-driver");
+    is_launchable(&driver).then_some(driver)
+}
+
+fn is_launchable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn quote_command_path(path: &Path) -> OsString {
+    let mut quoted = OsString::from("\"");
+    quoted.push(path.as_os_str());
+    quoted.push("\"");
+    quoted
 }
 
 #[tauri::command]

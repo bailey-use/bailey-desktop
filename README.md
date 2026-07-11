@@ -38,17 +38,20 @@ pnpm check
 pnpm tauri dev
 ```
 
-Every commit pushed to `main` automatically builds a macOS DMG and Windows
-NSIS installer and publishes them as a commit-specific GitHub
-Prerelease (`desktop-build-<run number>`). These development packages are
-not production-signed: macOS is ad-hoc signed but not notarized, and Windows is
+Every successful `main` CI run automatically builds a macOS DMG and Windows
+NSIS installer and publishes them as a non-overwriting GitHub Prerelease
+(`desktop-build-<run number>.<attempt>`). These development packages are not
+production-signed: macOS is ad-hoc signed but not notarized, and Windows is
 unsigned until the repository signing secrets are configured.
 
-Installer-specific Bailey Local Tools discovery, Bailey Cloud account/record
-sync, project-scoped MCP consent, turn-scoped model overrides, attachments, and
-signed Windows distribution are the next slices; they are not silently stubbed
-as working capabilities in protocol v1. Bailey Cloud may serve as the selected
-model gateway and knowledge/record backend, but it is not a second planner.
+Desktop now discovers separately installed Bailey Local Tools and CUA Driver
+launchers from their fixed per-user application-data paths, while explicit
+environment variables remain available for repository development. Bundling
+and updating those components in one signed installer, Bailey Cloud
+account/record sync, project-scoped MCP consent, turn-scoped model overrides,
+and attachments are the next slices; they are not silently advertised as
+working protocol-v1 capabilities. Bailey Cloud may serve as the selected model
+gateway and knowledge/record backend, but it is not a second planner.
 
 ---
 

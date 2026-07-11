@@ -5,8 +5,15 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
   test:
+    # This workflow publishes the upstream `aivo` CLI, npm package, R2 channel,
+    # and Homebrew tap. Bailey Desktop keeps it for low-conflict upstream sync,
+    # but Bailey tags must never publish upstream-owned release channels.
+    if: github.repository == 'yuanchuan/aivo'
     uses: ./.github/workflows/test.yml
 
   build:

@@ -117,6 +117,8 @@ struct ServerConfig {
     trust: bool,
 }
 
+type LoadedServerConfigs = (HashMap<String, ServerConfig>, Vec<(String, String)>);
+
 #[derive(Clone)]
 struct McpTool {
     name: String,
@@ -1175,7 +1177,7 @@ fn load_user_config(
 /// contract. Arguments are JSON rather than a shell string: the App Server
 /// never invokes a shell and never has to guess quoting rules. The returned
 /// config cannot be overridden by `.mcp.json` and forces `trust:false` in code.
-fn load_product_tools_from_env() -> (bool, (HashMap<String, ServerConfig>, Vec<(String, String)>)) {
+fn load_product_tools_from_env() -> (bool, LoadedServerConfigs) {
     let source = "Bailey Local Tools".to_string();
     let command = match std::env::var(BAILEY_LOCAL_MCP_COMMAND_ENV) {
         Ok(command) if !command.trim().is_empty() => command,

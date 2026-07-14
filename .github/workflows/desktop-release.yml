@@ -1,4 +1,4 @@
-name: Desktop Release
+name: Desktop Developer Prerelease
 
 on:
   workflow_run:
@@ -44,6 +44,15 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
 
+      - name: Checkout pinned Bailey Local Tools runtime
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: bailey-use/bailey-use
+          ref: e6fdb4985686557a32481827b1ead0afa98d5d8d
+          path: bailey-use-runtime
+          token: ${{ secrets.BAILEY_USE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
       - uses: dtolnay/rust-toolchain@eac0f66a48bc4b70a10b9acd4c4e930f835d95ff # 1.95.0
         with:
           components: rustfmt, clippy
@@ -62,14 +71,41 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile
 
+      - name: Package platform computer-use runtime
+        working-directory: bailey-use-runtime
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            npm run package:windows-computer-use
+          else
+            npm run package:macos-computer-use
+          fi
+
       - name: Build installer
         working-directory: desktop
+        env:
+          BAILEY_USE_SOURCE_DIR: ${{ github.workspace }}/bailey-use-runtime
         run: pnpm tauri build --bundles ${{ matrix.bundle }}
+
+      - name: Generate installer checksum
+        shell: bash
+        run: |
+          asset=$(compgen -G '${{ matrix.asset_path }}' | head -1)
+          test -n "$asset"
+          asset_dir=$(dirname "$asset")
+          asset_name=$(basename "$asset")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$asset_dir" && sha256sum "$asset_name" > "$asset_name.sha256")
+          else
+            (cd "$asset_dir" && shasum -a 256 "$asset_name" > "$asset_name.sha256")
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.asset_path }}
+          path: |
+            ${{ matrix.asset_path }}
+            ${{ matrix.asset_path }}.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -113,8 +149,9 @@ jobs:
           mapfile -t assets < <(find release-assets -type f -print | sort)
           dmg_count=$(find release-assets -type f -name '*.dmg' | wc -l)
           exe_count=$(find release-assets -type f -name '*.exe' | wc -l)
-          if [ "${#assets[@]}" -ne 2 ] || [ "$dmg_count" -ne 1 ] || [ "$exe_count" -ne 1 ]; then
-            echo "Expected exactly one macOS DMG and one Windows EXE; found ${#assets[@]} total" >&2
+          checksum_count=$(find release-assets -type f -name '*.sha256' | wc -l)
+          if [ "${#assets[@]}" -ne 4 ] || [ "$dmg_count" -ne 1 ] || [ "$exe_count" -ne 1 ] || [ "$checksum_count" -ne 2 ]; then
+            echo "Expected two installers and two checksums; found ${#assets[@]} total" >&2
             exit 1
           fi
           if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
@@ -131,8 +168,8 @@ jobs:
           release_created=1
           gh release upload "$tag" "${assets[@]}" --repo "$REPOSITORY"
           uploaded=$(gh api "repos/$REPOSITORY/releases/tags/$tag" --jq '.assets | length')
-          if [ "$uploaded" -ne 2 ]; then
-            echo "Expected 2 installer assets in the draft release; found $uploaded" >&2
+          if [ "$uploaded" -ne 4 ]; then
+            echo "Expected 4 immutable assets in the draft release; found $uploaded" >&2
             exit 1
           fi
           gh release edit "$tag" --repo "$REPOSITORY" --draft=false --prerelease

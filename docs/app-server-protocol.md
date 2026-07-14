@@ -1,6 +1,6 @@
-# Aivo App Server Protocol v1
+# Bailey App Server Protocol v1
 
-`aivo app-server --stdio` exposes the in-process `AgentEngine` to desktop and
+`aivo app-server --stdio` exposes the upstream in-process `AgentEngine` to Bailey Desktop and
 IDE clients. It is a long-lived process; the GUI is a client, not the owner of
 the agent loop.
 
@@ -17,7 +17,7 @@ the agent loop.
 The client starts with:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bailey-desktop","version":"0.1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientInfo":{"name":"bailey-desktop","version":"0.2.0"}}}
 ```
 
 The server accepts exactly protocol version `1` and reports its current
@@ -80,6 +80,31 @@ installed unified Local Tools process receives the separately discovered CUA
 Driver path through its environment. The product source's `trust:false`
 behavior is enforced in code rather than accepted from any environment
 variable or installed config file.
+
+Packaged Desktop builds prefer their integrated, versioned runtime over the
+legacy paths above. The signed app resource contains Local Tools, the Native
+Messaging host, extension, bundled Node runtime, and platform CUA driver. It is
+copied into user application data before the Native Host is registered; this
+registration does not launch Chrome or open a page. Runtime compatibility and
+component health are passed back as sanitized diagnostics.
+
+Product MCP `_meta` is retained outside the model-visible schema.
+`bailey/effect`, `bailey/approval`, and `bailey/targetFields` control approval.
+External effects always require fresh allow-once consent bound to SHA-256 of
+the exact tool name and arguments. They never accept a persistent grant, and a
+stale client response of `always_allow` is reduced to allow-once.
+
+Bailey Cloud is a replaceable local provider configuration. The preset uses
+`https://bailey.meidaquan.com/v1`, model `bailey/default`, and explicitly uses
+OpenAI Chat Completions. Without a usable credential (or explicit provisioning)
+it cannot replace Starter or a custom active provider.
+
+Cloud Record sync is a non-blocking side channel to
+`https://bailey.meidaquan.com/api`. It sends only opaque ids and allowlisted
+status/tool/driver/evidence-count metadata. Cwd, prompts, arguments, assistant
+text, DOM, screenshots, evidence content, local paths, and URLs stay local.
+Failure emits `durability.updated` with `cloud:false` and does not stop the
+AgentEngine or local persistence.
 
 ## Client methods
 
@@ -239,6 +264,7 @@ Event types in v1:
 - `notice`
 - `error`
 - `usage.updated`
+- `durability.updated`
 - terminal: `turn.completed`, `turn.failed`, `turn.stopped`, `turn.cancelled`
 
 `seq` is monotonic per thread. Every accepted turn emits exactly one terminal

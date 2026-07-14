@@ -601,6 +601,17 @@ function App() {
       );
       return;
     }
+    if (event.type === "durability.updated") {
+      if (payload.cloud === false) {
+        appendItem(
+          event.threadId,
+          "notice",
+          "云端运行记录暂时不可用；本地任务和本地保存不受影响。",
+          "云端记录已降级",
+        );
+      }
+      return;
+    }
     if (terminalEvents.has(event.type)) {
       const restoreComposerFocus = document.activeElement === sendButtonRef.current;
       const running = runningTurnRef.current;
@@ -1740,7 +1751,13 @@ function App() {
               <div className="interaction-eyebrow">需要你的决定</div>
               {approval && (
                 <>
-                  <h3 id="interaction-title">允许运行 {approval.subject.tool}？</h3>
+                  <h3 id="interaction-title">
+                    {approval.subject.fresh ? "确认这次外部操作？" : `允许运行 ${approval.subject.tool}？`}
+                  </h3>
+                  {approval.subject.reason && <p>{approval.subject.reason}</p>}
+                  {approval.subject.target
+                    && Object.keys(approval.subject.target).length > 0
+                    && <pre>{JSON.stringify(approval.subject.target, null, 2)}</pre>}
                   {approval.subject.preview && <pre>{approval.subject.preview}</pre>}
                   <div className="interaction-actions">
                     <button
@@ -1749,9 +1766,11 @@ function App() {
                     >
                       拒绝
                     </button>
-                    <button onClick={() => answerInteraction({ decision: "always_allow" })}>
-                      本任务总是允许
-                    </button>
+                    {approval.choices.includes("always_allow") && (
+                      <button onClick={() => answerInteraction({ decision: "always_allow" })}>
+                        本任务总是允许
+                      </button>
+                    )}
                     <button className="primary" onClick={() => answerInteraction({ decision: "allow" })}>
                       允许一次
                     </button>

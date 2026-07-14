@@ -1,5 +1,18 @@
 # Changelog
 
+## Bailey Desktop v0.2.0
+
+- Adds a replaceable Bailey Cloud preset at `https://bailey.meidaquan.com/v1`; it activates only with explicit provisioning or a usable credential and is fixed to OpenAI Chat Completions.
+- Adds asynchronous, allowlist-redacted Cloud Record run/audit/operation/evidence metadata; Cloud failure never stops the local task.
+- Separates `BAILEY_CLOUD_MODEL_API_KEY` from the least-privilege `BAILEY_CLOUD_RECORDS_API_KEY`.
+- Makes Bailey Local Tools approval effect-aware. External sends require fresh, exact-call-bound approval and product grants never persist across sessions.
+- Bundles Local Tools, Native Host, extension, Node, and the platform CUA driver with compatibility diagnostics.
+- Includes the upstream Cua Driver MIT license in the integrated runtime.
+- Verifies every integrated runtime file against its packaged SHA-256 manifest before execution.
+- Splits developer prereleases from fail-closed signed/notarized production releases, with portable SHA-256 sidecars.
+
+Desktop has its own `0.2.0` version. The root Aivo runtime remains at upstream `0.39.0` to preserve upstream synchronization and release isolation.
+
 ## v0.39.0
 
 The biggest `aivo code` release yet. The agent gains a lifecycle-hooks system, verbatim project guides, headless JSON output with resume, and LSP-backed self-verification on by default. Subagents now run in isolated git worktrees with per-repo profiles, report USD cost against a `--max-cost` budget, and stream live per-delegate progress when running in parallel. Extension packs bundle skills, agents, hooks, and MCP servers as a single installable unit. Under the hood the config directory splits into chartered state/secrets/cache/logs/run paths, and a raft of TUI correctness fixes land for `/rewind`, post-resume context estimates, and mid-turn steering.

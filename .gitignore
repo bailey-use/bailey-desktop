@@ -35,6 +35,7 @@ desktop/dist/
 desktop/src-tauri/target/
 desktop/src-tauri/binaries/
 desktop/src-tauri/gen/
+desktop/src-tauri/resources/bailey-runtime/
 desktop/src-tauri/icons/android/
 desktop/src-tauri/icons/ios/
 desktop/src-tauri/icons/Square*.png

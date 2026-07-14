@@ -32,6 +32,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Checkout pinned Bailey Local Tools runtime
+        uses: actions/checkout@v5
+        with:
+          repository: bailey-use/bailey-use
+          ref: e6fdb4985686557a32481827b1ead0afa98d5d8d
+          path: bailey-use-runtime
+          token: ${{ secrets.BAILEY_USE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt, clippy
@@ -53,6 +62,18 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile
 
+      - name: Package platform computer-use runtime
+        working-directory: bailey-use-runtime
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            npm run package:windows-computer-use
+          else
+            npm run package:macos-computer-use
+          fi
+
       - name: Verify desktop installer
         working-directory: desktop
+        env:
+          BAILEY_USE_SOURCE_DIR: ${{ github.workspace }}/bailey-use-runtime
         run: pnpm tauri build --bundles ${{ matrix.bundle }}

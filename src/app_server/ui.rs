@@ -7,10 +7,11 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 use crate::agent::ask::AskOption;
-use crate::agent::engine::{AgentUi, TurnStop};
+use crate::agent::engine::{AgentUi, ExternalApproval, TurnStop};
 use crate::agent::plan::PlanItem;
 use crate::agent::protocol::Decision;
 
+use super::cloud_records::CloudRunSink;
 use super::protocol;
 
 pub type Outbound = UnboundedSender<Value>;
@@ -23,7 +24,10 @@ pub struct PendingInteraction {
 }
 
 enum PendingReply {
-    Approval(oneshot::Sender<Decision>),
+    Approval {
+        reply: oneshot::Sender<Decision>,
+        allow_always: bool,
+    },
     UserInput(oneshot::Sender<Result<String, String>>),
 }
 
@@ -67,6 +71,7 @@ pub struct AppServerUi {
     outbound: Outbound,
     pending: PendingInteractions,
     request_seq: Arc<AtomicU64>,
+    cloud: Option<CloudRunSink>,
     text_segment: String,
     reasoning_segment: String,
     answer: String,
@@ -82,12 +87,14 @@ impl AppServerUi {
         outbound: Outbound,
         pending: PendingInteractions,
         request_seq: Arc<AtomicU64>,
+        cloud: Option<CloudRunSink>,
     ) -> Self {
         Self {
             emitter,
             outbound,
             pending,
             request_seq,
+            cloud,
             text_segment: String::new(),
             reasoning_segment: String::new(),
             answer: String::new(),
@@ -193,6 +200,12 @@ impl AgentUi for AppServerUi {
         let tool_call_id = format!("tool:{}", self.tool_seq);
         self.pending_tools
             .push_back((name.to_string(), tool_call_id.clone()));
+        if let Some(cloud) = &self.cloud {
+            cloud.audit(
+                "tool.started",
+                json!({ "tool_call_id": tool_call_id, "tool": name }),
+            );
+        }
         self.emitter.emit(
             "tool.started",
             json!({
@@ -229,6 +242,9 @@ impl AgentUi for AppServerUi {
                 "error": redact(error),
             }),
         };
+        if let Some(cloud) = &self.cloud {
+            cloud.record_tool_result(name, result);
+        }
         self.emitter.emit("tool.completed", payload);
     }
 
@@ -276,7 +292,13 @@ impl AgentUi for AppServerUi {
         self.flush_streams();
         let id = self.interaction_id();
         let (reply, rx) = oneshot::channel();
-        self.insert_pending(id.clone(), PendingReply::Approval(reply));
+        self.insert_pending(
+            id.clone(),
+            PendingReply::Approval {
+                reply,
+                allow_always: true,
+            },
+        );
         let request = protocol::server_request(
             id.clone(),
             "approval/request",
@@ -300,6 +322,83 @@ impl AgentUi for AppServerUi {
                 return Decision::Deny;
             }
             rx.await.unwrap_or(Decision::Deny)
+        })
+    }
+
+    fn ask_external_permission<'a>(
+        &'a mut self,
+        tool: &'a str,
+        preview: Option<&'a str>,
+        approval: &'a ExternalApproval,
+    ) -> BoxFuture<'a, Decision> {
+        self.flush_streams();
+        let id = self.interaction_id();
+        if let Some(cloud) = &self.cloud {
+            cloud.audit(
+                "approval.requested",
+                json!({
+                    "tool": tool,
+                    "effect": approval.effect,
+                    "binding": approval.binding,
+                    "fresh": approval.fresh,
+                }),
+            );
+        }
+        let (reply, rx) = oneshot::channel();
+        self.insert_pending(
+            id.clone(),
+            PendingReply::Approval {
+                reply,
+                allow_always: approval.allow_always,
+            },
+        );
+        let choices = if approval.allow_always {
+            json!(["allow", "deny", "always_allow"])
+        } else {
+            json!(["allow", "deny"])
+        };
+        let request = protocol::server_request(
+            id.clone(),
+            "approval/request",
+            json!({
+                "schemaVersion": protocol::EVENT_SCHEMA_VERSION,
+                "threadId": self.emitter.thread_id,
+                "turnId": self.emitter.turn_id,
+                "kind": "tool",
+                "subject": {
+                    "tool": tool,
+                    "preview": preview.map(redact),
+                    "effect": approval.effect,
+                    "reason": redact(&approval.reason),
+                    "target": redact_value(&approval.target),
+                    "binding": approval.binding,
+                    "fresh": approval.fresh,
+                },
+                "choices": choices,
+            }),
+        );
+        let sent = self.outbound.send(request).is_ok();
+        let pending = self.pending.clone();
+        let cloud = self.cloud.clone();
+        let tool = tool.to_string();
+        let binding = approval.binding.clone();
+        Box::pin(async move {
+            if !sent {
+                pending.lock().unwrap().remove(&id);
+                return Decision::Deny;
+            }
+            let decision = rx.await.unwrap_or(Decision::Deny);
+            if let Some(cloud) = cloud {
+                cloud.audit(
+                    "approval.resolved",
+                    json!({
+                        "tool": tool,
+                        "binding": binding,
+                        "decision": serde_json::to_value(decision).unwrap_or(Value::Null),
+                    }),
+                );
+            }
+            decision
         })
     }
 
@@ -360,7 +459,10 @@ pub fn resolve_interaction_response(
             .to_string()
     });
     match entry.reply {
-        PendingReply::Approval(reply) => {
+        PendingReply::Approval {
+            reply,
+            allow_always,
+        } => {
             let decision = if error_message.is_some() {
                 Decision::Deny
             } else {
@@ -369,7 +471,10 @@ pub fn resolve_interaction_response(
                     .and_then(Value::as_str)
                 {
                     Some("allow") => Decision::Allow,
-                    Some("always_allow") => Decision::AlwaysAllow,
+                    Some("always_allow") if allow_always => Decision::AlwaysAllow,
+                    // A stale or malicious protocol client cannot widen a
+                    // fresh approval. Treat it as consent for this call only.
+                    Some("always_allow") => Decision::Allow,
                     Some("deny") | None => Decision::Deny,
                     Some(other) => {
                         let _ = reply.send(Decision::Deny);
@@ -440,7 +545,7 @@ pub fn fail_all_pending(pending: &PendingInteractions) {
 
 fn fail_interaction(entry: PendingInteraction) {
     match entry.reply {
-        PendingReply::Approval(reply) => {
+        PendingReply::Approval { reply, .. } => {
             let _ = reply.send(Decision::Deny);
         }
         PendingReply::UserInput(reply) => {
@@ -474,7 +579,10 @@ mod tests {
             PendingInteraction {
                 thread_id: "thr_1".into(),
                 turn_id: "turn_1".into(),
-                reply: PendingReply::Approval(reply),
+                reply: PendingReply::Approval {
+                    reply,
+                    allow_always: true,
+                },
             },
         );
         let handled = resolve_interaction_response(
@@ -497,7 +605,10 @@ mod tests {
             PendingInteraction {
                 thread_id: "thr_1".into(),
                 turn_id: "turn_1".into(),
-                reply: PendingReply::Approval(reply),
+                reply: PendingReply::Approval {
+                    reply,
+                    allow_always: true,
+                },
             },
         );
         fail_pending_for_turn(&pending, "thr_1", "turn_1");

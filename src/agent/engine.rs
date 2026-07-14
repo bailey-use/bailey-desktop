@@ -179,6 +179,17 @@ pub trait AgentUi: Send {
         tool: &'a str,
         preview: Option<&'a str>,
     ) -> BoxFuture<'a, Decision>;
+    /// Structured approval for an external capability. Legacy UIs fall back to
+    /// the ordinary permission card; App Server uses the effect and immutable
+    /// target binding to render a fresh external-send confirmation.
+    fn ask_external_permission<'a>(
+        &'a mut self,
+        tool: &'a str,
+        preview: Option<&'a str>,
+        _approval: &'a ExternalApproval,
+    ) -> BoxFuture<'a, Decision> {
+        self.ask_permission(tool, preview)
+    }
     /// The `switch_model` tool. Default declines — only the chat TUI drives it.
     fn switch_chat_model<'a>(
         &'a mut self,
@@ -234,6 +245,18 @@ pub trait AgentUi: Send {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ExternalApproval {
+    pub effect: String,
+    pub reason: String,
+    pub target: Value,
+    pub binding: String,
+    /// Fresh approvals ignore auto-approve and every remembered grant. They
+    /// apply only to the immutable tool call currently waiting on the UI.
+    pub fresh: bool,
+    pub allow_always: bool,
+}
+
 /// Extra tools beyond the built-ins — currently MCP servers. The engine advertises
 /// `specs()` and routes any call it `handles()` to `call()`. Abstract to keep the
 /// engine free of process/transport knowledge; `Send + Sync` so it can be shared.
@@ -246,6 +269,18 @@ pub trait ExternalTools: Send + Sync {
     /// Default `false` — configured sources are trusted.
     fn requires_approval(&self, _name: &str) -> bool {
         false
+    }
+    /// Effect-aware approval metadata. The compatibility default preserves the
+    /// existing trust:false behavior for ordinary user MCP servers.
+    fn approval_requirement(&self, name: &str, _args: &Value) -> Option<ExternalApproval> {
+        self.requires_approval(name).then(|| ExternalApproval {
+            effect: "untrusted_external_tool".to_string(),
+            reason: "This external tool is configured to require approval.".to_string(),
+            target: Value::Null,
+            binding: name.to_string(),
+            fresh: false,
+            allow_always: true,
+        })
     }
     /// Execute one tool call; the result string is fed back as the tool result (Err continues the loop).
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>>;
@@ -1839,13 +1874,14 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
             }
             // Confirm only genuinely risky actions: destructive command, out-of-cwd
             // write, blind overwrite of an unread file, or an untrusted external tool.
+            let external_approval = self
+                .external
+                .as_ref()
+                .and_then(|external| external.approval_requirement(&call.name, &call.arguments));
             let needs_confirm = tools::is_dangerous(n, &call.arguments, ctx.cwd)
                 || self.write_clobbers_unread(n, &call.arguments, ctx.cwd)
                 || secrets_guard::read_targets_secret(n, &call.arguments, ctx.cwd)
-                || self
-                    .external
-                    .as_ref()
-                    .is_some_and(|e| e.requires_approval(&call.name));
+                || external_approval.is_some();
             // Hard floor: an unrecoverable command is confirmed even under auto-approve, never remembered; off a TTY fails closed.
             let catastrophic = tools::is_catastrophic(n, &call.arguments);
             // Plan-mode bash confirms per call (allow-once, bypasses -y/auto/grants
@@ -1866,11 +1902,21 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
             } else {
                 Vec::new()
             };
-            let allowed = if catastrophic || plan_bash {
+            let fresh_external = external_approval
+                .as_ref()
+                .is_some_and(|approval| approval.fresh);
+            let allowed = if catastrophic || plan_bash || fresh_external {
                 let preview = tools::preview(n, &call.arguments);
-                // Allow and AlwaysAllow both run it once only — never remembered.
+                let decision = if let Some(approval) = external_approval.as_ref() {
+                    ui.ask_external_permission(n, preview.as_deref(), approval)
+                        .await
+                } else {
+                    ui.ask_permission(n, preview.as_deref()).await
+                };
+                // Fresh effects and hard safety floors are allow-once. A stale
+                // client sending AlwaysAllow cannot create a grant here.
                 !matches!(
-                    ui.ask_permission(n, preview.as_deref()).await,
+                    decision,
                     Decision::Deny
                 )
             } else if remote_side_effect
@@ -1878,13 +1924,24 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 && !self.grants.covers_remote(&remote_families)
             {
                 let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref()).await {
+                let decision = if let Some(approval) = external_approval.as_ref() {
+                    ui.ask_external_permission(n, preview.as_deref(), approval)
+                        .await
+                } else {
+                    ui.ask_permission(n, preview.as_deref()).await
+                };
+                match decision {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
-                        if remote_families.is_empty() {
-                            self.grants.remember(n, &call.arguments, ctx.cwd);
-                        } else {
-                            self.grants.remember_remote(&remote_families);
+                        if external_approval
+                            .as_ref()
+                            .is_none_or(|approval| approval.allow_always)
+                        {
+                            if remote_families.is_empty() {
+                                self.grants.remember(n, &call.arguments, ctx.cwd);
+                            } else {
+                                self.grants.remember_remote(&remote_families);
+                            }
                         }
                         true
                     }
@@ -1897,10 +1954,21 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 true
             } else {
                 let preview = tools::preview(n, &call.arguments);
-                match ui.ask_permission(n, preview.as_deref()).await {
+                let decision = if let Some(approval) = external_approval.as_ref() {
+                    ui.ask_external_permission(n, preview.as_deref(), approval)
+                        .await
+                } else {
+                    ui.ask_permission(n, preview.as_deref()).await
+                };
+                match decision {
                     Decision::Allow => true,
                     Decision::AlwaysAllow => {
-                        self.grants.remember(n, &call.arguments, ctx.cwd);
+                        if external_approval
+                            .as_ref()
+                            .is_none_or(|approval| approval.allow_always)
+                        {
+                            self.grants.remember(n, &call.arguments, ctx.cwd);
+                        }
                         true
                     }
                     Decision::Deny => false,

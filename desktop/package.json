@@ -1,7 +1,7 @@
 {
   "name": "@bailey-use/desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "packageManager": "pnpm@10.28.0",
   "scripts": {
@@ -10,6 +10,8 @@
     "check": "tsc --noEmit",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "prepare:sidecar:release": "node scripts/prepare-sidecar.mjs --release",
+    "prepare:runtime": "node scripts/prepare-product-runtime.mjs",
+    "prepare:runtime:release": "node scripts/prepare-product-runtime.mjs --release",
     "preview": "vite preview",
     "tauri": "tauri"
   },

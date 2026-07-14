@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Bailey",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.bailey.use.desktop",
   "build": {
-    "beforeDevCommand": "pnpm run prepare:sidecar && pnpm run dev",
+    "beforeDevCommand": "pnpm run prepare:sidecar && pnpm run prepare:runtime && pnpm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm run prepare:sidecar:release && pnpm run build",
+    "beforeBuildCommand": "pnpm run prepare:sidecar:release && pnpm run prepare:runtime:release && pnpm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -43,6 +43,9 @@
     "macOS": {
       "signingIdentity": "-"
     },
-    "externalBin": ["binaries/aivo-app-server"]
+    "externalBin": ["binaries/aivo-app-server"],
+    "resources": {
+      "resources/bailey-runtime": "bailey-runtime"
+    }
   }
 }

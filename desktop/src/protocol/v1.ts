@@ -46,6 +46,12 @@ export interface ApprovalRequest {
   subject: {
     tool: string;
     preview?: string | null;
+    effect?: "read" | "local_mutation" | "external_effect" | "external_message" | "dangerous" | string;
+    reason?: string | null;
+    target?: Record<string, unknown> | null;
+    /** Immutable SHA-256 binding for the exact tool name and arguments. */
+    binding?: string | null;
+    fresh?: boolean;
   };
   choices: Array<"allow" | "deny" | "always_allow">;
 }

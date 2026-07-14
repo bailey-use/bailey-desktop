@@ -122,6 +122,10 @@ struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
+    /// MCP annotations plus the server-owned `_meta` bag. Kept out of the
+    /// model-visible function schema; product adapters use it for approval
+    /// policy without teaching the model how to bypass that policy.
+    metadata: Value,
 }
 
 /// A connected server's transport state, behind the per-server mutex. Both
@@ -968,13 +972,20 @@ impl McpClient {
     /// Resolve a fully-qualified `mcp__server__tool` name to its (server, original
     /// tool name) by forward-matching against known tools. Robust even when a
     /// server name itself contains `__` — reverse-parsing the name is not.
-    fn lookup(&self, qualified: &str) -> Option<(&McpServer, &str)> {
+    fn lookup(&self, qualified: &str) -> Option<(&McpServer, &McpTool)> {
         self.servers.iter().find_map(|(srv, s)| {
             s.tools
                 .iter()
                 .find(|t| qualified_name(srv, &t.name) == qualified)
-                .map(|t| (s.as_ref(), t.name.as_str()))
+                .map(|t| (s.as_ref(), t))
         })
+    }
+
+    /// Product-only policy metadata advertised by a connected tool. User MCP
+    /// callers continue to use the ordinary trust flag and never gain Bailey
+    /// product semantics merely by choosing a similar tool name.
+    pub fn tool_metadata(&self, qualified: &str) -> Option<Value> {
+        self.lookup(qualified).map(|(_, tool)| tool.metadata.clone())
     }
 }
 
@@ -1025,7 +1036,7 @@ impl ExternalTools for McpClient {
                     "MCP tool `{name}` is unavailable: its server became unresponsive earlier and was disabled for this session"
                 ));
             }
-            let tool = tool.to_string();
+            let tool = tool.name.clone();
             let mut io = server.io.lock().await;
             match io
                 .request(
@@ -1109,6 +1120,18 @@ impl ExternalTools for FilteredTools {
         // A disabled tool is refused in `call` without user involvement — a
         // permission card here could even persist an AlwaysAllow grant for it.
         !self.disabled.contains(name) && self.inner.requires_approval(name)
+    }
+
+    fn approval_requirement(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<crate::agent::engine::ExternalApproval> {
+        if self.disabled.contains(name) {
+            None
+        } else {
+            self.inner.approval_requirement(name, args)
+        }
     }
 
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
@@ -2044,6 +2067,12 @@ fn parse_tools(list: &Value) -> Vec<McpTool> {
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"})),
+                metadata: json!({
+                    "meta": t.get("_meta").filter(|v| v.is_object()).cloned()
+                        .unwrap_or_else(|| json!({})),
+                    "annotations": t.get("annotations").filter(|v| v.is_object()).cloned()
+                        .unwrap_or_else(|| json!({})),
+                }),
             })
         })
         .collect()

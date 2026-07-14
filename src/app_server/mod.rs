@@ -1,3 +1,4 @@
+mod cloud_records;
 mod protocol;
 mod session;
 mod ui;
@@ -23,6 +24,98 @@ use session::ThreadRuntime;
 use ui::{Outbound, PendingInteractions};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+fn public_runtime_diagnostics() -> Value {
+    let value = std::env::var("BAILEY_RUNTIME_DIAGNOSTICS_JSON")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let flag = |name: &str| value.get(name).and_then(Value::as_bool).unwrap_or(false);
+    json!({
+        "bundled": flag("bundled"),
+        "compatible": flag("compatible"),
+        "integrity": flag("integrity"),
+        "localTools": flag("localTools"),
+        "nativeHost": flag("nativeHost"),
+        "extension": flag("extension"),
+        "cuaDriver": flag("cuaDriver"),
+        "issueCount": value.get("issues").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+    })
+}
+
+/// Ensure Bailey Cloud is available as Desktop's first-party default without
+/// taking model choice away from the user. An already-active custom provider
+/// is never replaced. A credential-less entry may be pre-provisioned for the
+/// settings UI, but it must never displace a working starter/custom provider.
+pub async fn ensure_default_bailey_provider(store: &SessionStore) -> anyhow::Result<()> {
+    if std::env::var("BAILEY_DISABLE_DEFAULT_PROVIDER").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
+    let base_url = non_empty_environment("BAILEY_CLOUD_MODEL_BASE_URL")
+        .unwrap_or_else(|| crate::constants::BAILEY_CLOUD_MODEL_BASE_URL.to_string());
+    let model = non_empty_environment("BAILEY_CLOUD_MODEL")
+        .unwrap_or_else(|| crate::constants::BAILEY_CLOUD_DEFAULT_MODEL.to_string());
+    let configured_secret = non_empty_environment("BAILEY_CLOUD_MODEL_API_KEY");
+    let keys = store.get_keys().await?;
+    let existing = keys.iter().find(|key| {
+        key.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            && key.name == crate::constants::BAILEY_CLOUD_PROVIDER_NAME
+    });
+
+    let provider_id = if let Some(existing) = existing {
+        if let Some(configured_secret) = configured_secret.as_deref()
+            && store
+                .get_key_by_id(&existing.id)
+                .await?
+                .is_some_and(|key| key.key != configured_secret)
+        {
+            store
+                .update_key(
+                    &existing.id,
+                    crate::constants::BAILEY_CLOUD_PROVIDER_NAME,
+                    &base_url,
+                    None,
+                    configured_secret,
+                )
+                .await?;
+        }
+        existing.id.clone()
+    } else {
+        store
+            .add_key_with_protocol(
+                crate::constants::BAILEY_CLOUD_PROVIDER_NAME,
+                &base_url,
+                None,
+                configured_secret.as_deref().unwrap_or_default(),
+            )
+            .await?
+    };
+    store.set_code_model(&provider_id, &model).await?;
+
+    let active = store.get_active_key_info().await?;
+    let explicitly_enabled = std::env::var("BAILEY_ENABLE_DEFAULT_PROVIDER").as_deref() == Ok("1");
+    let has_usable_secret = store
+        .get_key_by_id(&provider_id)
+        .await?
+        .is_some_and(|key| !key.key.trim().is_empty());
+    let can_activate = has_usable_secret || explicitly_enabled;
+    if can_activate
+        && active.as_ref().is_none_or(|key| {
+            crate::services::provider_profile::is_aivo_starter_base(&key.base_url)
+        })
+    {
+        store.set_active_key(&provider_id).await?;
+    }
+    Ok(())
+}
+
+fn non_empty_environment(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum FrameRead {
@@ -254,6 +347,7 @@ impl AppServer {
                         "protocolVersion": protocol::PROTOCOL_VERSION,
                         "threads": self.threads.len(),
                         "pid": std::process::id(),
+                        "runtime": public_runtime_diagnostics(),
                     }),
                 );
             }
@@ -270,7 +364,7 @@ impl AppServer {
                             json!({
                                 "protocolVersion": protocol::PROTOCOL_VERSION,
                                 "serverInfo": {
-                                    "name": "aivo-app-server",
+                                    "name": "bailey-app-server",
                                     "version": crate::version::VERSION,
                                 },
                                 "clientInfo": client,
@@ -298,6 +392,9 @@ impl AppServer {
                                             "configuration": "launcher",
                                             "transport": "stdio",
                                             "approvalRequired": true,
+                                            "effectAwareApproval": true,
+                                            "freshExternalApproval": true,
+                                            "persistentAlwaysAllow": false,
                                             "load": "thread",
                                             "bestEffort": true
                                         },
@@ -314,7 +411,16 @@ impl AppServer {
                                             "bestEffort": true
                                         }
                                     },
-                                    "cloud": false,
+                                    "cloud": {
+                                        "modelProvider": true,
+                                        "records": {
+                                            "asynchronous": true,
+                                            "redacted": true,
+                                            "bestEffort": true,
+                                            "failureMode": "local-continuation"
+                                        }
+                                    },
+                                    "runtime": public_runtime_diagnostics(),
                                 },
                             }),
                         );

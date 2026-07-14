@@ -20,6 +20,9 @@ impl AppServerCommand {
             eprintln!("Error: app-server currently requires --stdio");
             return ExitCode::UserError;
         }
+        if let Err(error) = crate::app_server::ensure_default_bailey_provider(&store).await {
+            eprintln!("bailey app-server: could not prepare the default model provider: {error}");
+        }
         crate::app_server::run_stdio(store, cache).await
     }
 }

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import desktopPackage from "../../package.json";
 
 import {
   PROTOCOL_VERSION,
@@ -67,7 +68,7 @@ export class AppServerClient {
     await invoke("app_server_start");
     await this.request("initialize", {
       protocolVersion: PROTOCOL_VERSION,
-      clientInfo: { name: "bailey-desktop", version: "0.1.0" },
+      clientInfo: { name: "bailey-desktop", version: desktopPackage.version },
     });
   }
 

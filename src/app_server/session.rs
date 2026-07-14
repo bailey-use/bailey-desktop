@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, oneshot};
 
-use crate::agent::engine::{AgentEngine, ExternalTools, TurnCtx, TurnStop};
+use crate::agent::engine::{AgentEngine, ExternalApproval, ExternalTools, TurnCtx, TurnStop};
 use crate::agent::jobs::{JobTable, SharedJobs};
 use crate::agent::mcp::{BAILEY_LOCAL_MCP_TOOL_PREFIX, FilteredTools, McpClient};
 use crate::services::code_session_store::CodeSessionLease;
@@ -17,6 +18,7 @@ use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, Sto
 
 use super::protocol::{INTERNAL_ERROR, NOT_FOUND, RpcFailure, THREAD_BUSY, UNAVAILABLE};
 use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_pending_for_turn};
+use super::cloud_records::CloudRunSink;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +99,13 @@ impl ExternalTools for AppServerExternalTools {
             .is_some_and(|source| source.requires_approval(name))
     }
 
+    fn approval_requirement(&self, name: &str, args: &Value) -> Option<ExternalApproval> {
+        self.sources
+            .iter()
+            .find(|source| source.handles(name))
+            .and_then(|source| source.approval_requirement(name, args))
+    }
+
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
         if let Some(source) = self.sources.iter().find(|source| source.handles(name)) {
             return source.call(name, args);
@@ -106,9 +115,192 @@ impl ExternalTools for AppServerExternalTools {
     }
 }
 
+/// Bailey Local Tools have a stronger contract than user-installed MCP. Tool
+/// metadata declares the real-world effect; external effects always require a
+/// fresh, call-bound confirmation and can never be covered by an old grant.
+struct ProductToolsExternal {
+    inner: Arc<McpClient>,
+}
+
+impl ProductToolsExternal {
+    fn new(inner: Arc<McpClient>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ExternalTools for ProductToolsExternal {
+    fn specs(&self) -> Vec<Value> {
+        self.inner.specs()
+    }
+
+    fn handles(&self, name: &str) -> bool {
+        self.inner.handles(name)
+    }
+
+    fn requires_approval(&self, name: &str) -> bool {
+        self.approval_requirement(name, &Value::Null).is_some()
+    }
+
+    fn approval_requirement(&self, name: &str, args: &Value) -> Option<ExternalApproval> {
+        product_approval(self.inner.tool_metadata(name).as_ref(), name, args)
+    }
+
+    fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
+        self.inner.call(name, args)
+    }
+}
+
+fn product_approval(metadata: Option<&Value>, name: &str, args: &Value) -> Option<ExternalApproval> {
+    let meta = metadata.and_then(|value| value.get("meta"));
+    let annotations = metadata.and_then(|value| value.get("annotations"));
+    let short_name = name.rsplit("__").next().unwrap_or(name).to_ascii_lowercase();
+    let declared_effect = meta
+        .and_then(|value| value.get("bailey/effect"))
+        .and_then(Value::as_str);
+    let read_only = annotations
+        .and_then(|value| value.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let effect = declared_effect.unwrap_or_else(|| {
+        if read_only || is_read_like_product_tool(&short_name) {
+            "read"
+        } else if is_external_effect_product_tool(&short_name) {
+            "external_effect"
+        } else {
+            "local_mutation"
+        }
+    });
+    let approval = meta
+        .and_then(|value| value.get("bailey/approval"))
+        .and_then(Value::as_str);
+    let irreversible = matches!(effect, "external_effect" | "dangerous" | "external_message");
+    if approval == Some("none") && !irreversible {
+        return None;
+    }
+    if approval.is_none() && effect == "read" {
+        return None;
+    }
+
+    let fresh = irreversible || approval == Some("fresh");
+    let target = product_approval_target(meta, args);
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(args).unwrap_or_default());
+    let binding = format!("sha256:{:x}", hasher.finalize());
+    let reason = meta
+        .and_then(|value| value.get("bailey/reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| match effect {
+            "external_effect" | "external_message" => {
+                "This action sends or changes data outside Bailey.".to_string()
+            }
+            "dangerous" => "This action can have an irreversible external effect.".to_string(),
+            _ => "This action changes local state through Bailey Local Tools.".to_string(),
+        });
+
+    Some(ExternalApproval {
+        effect: effect.to_string(),
+        reason,
+        target,
+        binding,
+        fresh,
+        // Product grants are session-only in GrantStore. Fresh external effects
+        // are stricter: the UI must not even offer an always-allow choice.
+        allow_always: !fresh,
+    })
+}
+
+fn is_read_like_product_tool(name: &str) -> bool {
+    [
+        "get", "list", "search", "status", "observe", "inspect", "read", "find", "query",
+        "screenshot", "snapshot",
+    ]
+    .iter()
+    .any(|word| name == *word || name.starts_with(&format!("{word}_")))
+}
+
+fn is_external_effect_product_tool(name: &str) -> bool {
+    [
+        "send", "post", "publish", "purchase", "submit", "invite", "delete", "remove",
+        "transfer", "reply", "forward",
+    ]
+    .iter()
+    .any(|word| name == *word || name.starts_with(&format!("{word}_")) || name.contains(&format!("_{word}_")))
+}
+
+fn product_approval_target(meta: Option<&Value>, args: &Value) -> Value {
+    let fields = meta
+        .and_then(|value| value.get("bailey/targetFields"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![
+                "contact", "recipient", "to", "channel", "conversation", "message", "text",
+                "url",
+            ]
+        });
+    let mut target = serde_json::Map::new();
+    for field in fields {
+        if let Some(value) = args.get(field) {
+            target.insert(field.to_string(), bounded_approval_value(value));
+        }
+    }
+    Value::Object(target)
+}
+
+fn bounded_approval_value(value: &Value) -> Value {
+    bounded_approval_value_at_depth(value, 0)
+}
+
+fn bounded_approval_value_at_depth(value: &Value, depth: usize) -> Value {
+    if depth >= 3 {
+        return Value::String("[nested value]".to_string());
+    }
+    match value {
+        Value::String(text) => {
+            let mut chars = text.chars();
+            let mut bounded = chars.by_ref().take(500).collect::<String>();
+            if chars.next().is_some() {
+                bounded.push('…');
+            }
+            Value::String(bounded)
+        }
+        Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(12)
+                .map(|value| bounded_approval_value_at_depth(value, depth + 1))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .take(20)
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        bounded_approval_value_at_depth(value, depth + 1),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
 pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
     use crate::services::provider_profile::ProviderKind;
 
+    if crate::services::provider_profile::is_bailey_cloud_base(base_url) {
+        return PublicProvider {
+            kind: "bailey_cloud".to_string(),
+            label: "Bailey Cloud".to_string(),
+            configuration_location: "local",
+            inference_location: "remote",
+        };
+    }
     if crate::services::provider_profile::is_aivo_starter_base(base_url) {
         return PublicProvider {
             kind: "aivo_starter".to_string(),
@@ -495,7 +687,7 @@ impl ThreadRuntime {
 
         let mut external_sources: Vec<Arc<dyn ExternalTools>> = Vec::new();
         if product_client.has_tools() {
-            external_sources.push(product_client);
+            external_sources.push(Arc::new(ProductToolsExternal::new(product_client)));
         }
         if let Some(user_mcp_client) = user_mcp_client
             && user_mcp_client.has_tools()
@@ -779,6 +971,19 @@ impl ThreadRuntime {
         request_seq: Arc<AtomicU64>,
         terminal: Arc<AtomicBool>,
     ) {
+        let cloud = CloudRunSink::start(
+            &self.session_id,
+            &self.id,
+            &turn_id,
+            &self.raw_model,
+            emitter.clone(),
+        );
+        if let Some(cloud) = &cloud {
+            cloud.audit(
+                "turn.started",
+                json!({ "model": self.raw_model, "local_persistence": true }),
+            );
+        }
         emitter.emit(
             "turn.started",
             json!({ "model": self.raw_model, "cwd": self.cwd }),
@@ -786,6 +991,9 @@ impl ThreadRuntime {
         let route = match TurnRoute::start(&self.key, &self.store).await {
             Ok(route) => route,
             Err(error) => {
+                if let Some(cloud) = &cloud {
+                    cloud.finish("failed", true);
+                }
                 emit_terminal_once(
                     &terminal,
                     &emitter,
@@ -807,7 +1015,13 @@ impl ThreadRuntime {
             review_edits: None,
         };
         let pending_for_cleanup = pending.clone();
-        let mut ui = AppServerUi::new(emitter.clone(), outbound, pending, request_seq);
+        let mut ui = AppServerUi::new(
+            emitter.clone(),
+            outbound,
+            pending,
+            request_seq,
+            cloud.clone(),
+        );
         let mut engine = self.engine.lock().await;
         engine.run_turn(&ctx, &mut ui, text).await;
         ui.finish_streams();
@@ -843,6 +1057,16 @@ impl ThreadRuntime {
             ("turn.completed", json!({ "text": redact(ui.answer()) }))
         };
         payload["persisted"] = Value::Bool(persisted);
+        if let Some(cloud) = &cloud {
+            cloud.finish(
+                match event_type {
+                    "turn.completed" => "completed",
+                    "turn.stopped" => "stopped",
+                    _ => "failed",
+                },
+                persisted,
+            );
+        }
         emit_terminal_once(&terminal, &emitter, event_type, payload);
         fail_pending_for_turn(&pending_for_cleanup, &self.id, &turn_id);
     }

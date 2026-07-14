@@ -1,0 +1,245 @@
+name: Desktop Production Release
+
+on:
+  push:
+    tags:
+      - 'bailey-desktop-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-production-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Upstream runtime quality gate
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: quality
+    name: Signed ${{ matrix.label }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - label: macOS
+            os: macos-latest
+            bundle: dmg
+            artifact: bailey-production-macos
+            asset_path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          - label: Windows x64
+            os: windows-latest
+            bundle: nsis
+            artifact: bailey-production-windows-x64
+            asset_path: desktop/src-tauri/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the release tag commit to be on main
+        shell: bash
+        run: |
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo "origin/main is missing from the full checkout" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "Production tags must point to a commit reachable from origin/main" >&2
+            exit 1
+          }
+
+      - name: Checkout pinned Bailey Local Tools runtime
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: bailey-use/bailey-use
+          ref: e6fdb4985686557a32481827b1ead0afa98d5d8d
+          path: bailey-use-runtime
+          token: ${{ secrets.BAILEY_USE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@eac0f66a48bc4b70a10b9acd4c4e930f835d95ff # 1.95.0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+
+      - name: Validate tag and desktop version
+        shell: bash
+        run: |
+          expected="${GITHUB_REF_NAME#bailey-desktop-v}"
+          actual=$(node -p "require('./desktop/package.json').version")
+          test "$expected" = "$actual" || {
+            echo "Tag version $expected does not match desktop version $actual" >&2
+            exit 1
+          }
+
+      - name: Enable pnpm and install dependencies
+        working-directory: desktop
+        shell: bash
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Package platform computer-use runtime
+        working-directory: bailey-use-runtime
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            npm run package:windows-computer-use
+          else
+            npm run package:macos-computer-use
+          fi
+
+      - name: Import Apple signing certificate and fail closed
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for value in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!value}" || { echo "Missing production secret: $value" >&2; exit 1; }
+          done
+          keychain="$RUNNER_TEMP/bailey-signing.keychain-db"
+          certificate="$RUNNER_TEMP/bailey-signing.p12"
+          printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 -D > "$certificate"
+          security create-keychain -p bailey-ci "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p bailey-ci "$keychain"
+          security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k bailey-ci "$keychain"
+          APPLE_SIGNING_IDENTITY="$APPLE_SIGNING_IDENTITY" node -e '
+            const fs=require("fs"); const p="desktop/src-tauri/tauri.conf.json";
+            const c=JSON.parse(fs.readFileSync(p)); c.bundle.macOS.signingIdentity=process.env.APPLE_SIGNING_IDENTITY;
+            fs.writeFileSync(p, JSON.stringify(c,null,2)+"\n");'
+
+      - name: Import Windows signing certificate and fail closed
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE_BASE64 -or -not $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw "WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD are required"
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "bailey-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password -Exportable
+          if (-not $cert.Thumbprint) { throw "Windows signing certificate import failed" }
+          $configPath = "desktop/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://timestamp.digicert.com"
+          }) -Force
+          $config | ConvertTo-Json -Depth 20 | Set-Content $configPath -Encoding utf8
+
+      - name: Build signed installer
+        working-directory: desktop
+        env:
+          BAILEY_USE_SOURCE_DIR: ${{ github.workspace }}/bailey-use-runtime
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm tauri build --bundles ${{ matrix.bundle }}
+
+      - name: Verify Apple notarization and staple
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          asset=$(compgen -G '${{ matrix.asset_path }}' | head -1)
+          test -n "$asset"
+          xcrun stapler validate "$asset"
+          spctl --assess --type open --verbose "$asset"
+
+      - name: Verify Windows Authenticode signature
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = Get-ChildItem "desktop/src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          if (-not $asset) { throw "Windows installer is missing" }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe is missing" }
+          & $signtool.FullName verify /pa /all /v $asset.FullName
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode verification failed" }
+
+      - name: Generate installer checksum
+        shell: bash
+        run: |
+          asset=$(compgen -G '${{ matrix.asset_path }}' | head -1)
+          test -n "$asset"
+          asset_dir=$(dirname "$asset")
+          asset_name=$(basename "$asset")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$asset_dir" && sha256sum "$asset_name" > "$asset_name.sha256")
+          else
+            (cd "$asset_dir" && shasum -a 256 "$asset_name" > "$asset_name.sha256")
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.asset_path }}
+            ${{ matrix.asset_path }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish immutable production release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish signed assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_created=0
+          cleanup_failed_draft() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ "$release_created" -eq 1 ]; then
+              gh release delete "$GITHUB_REF_NAME" --yes || true
+            fi
+            exit "$status"
+          }
+          trap cleanup_failed_draft EXIT
+          mapfile -t assets < <(find release-assets -type f -print | sort)
+          test "${#assets[@]}" -eq 4
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release already exists; production assets are immutable" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "Bailey Desktop ${GITHUB_REF_NAME#bailey-desktop-v}" \
+            --notes "Signed and notarized Bailey Desktop production release. Verify each installer with its SHA-256 sidecar."
+          release_created=1
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets | length')" -eq 4
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          release_created=0

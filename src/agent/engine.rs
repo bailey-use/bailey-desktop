@@ -1915,10 +1915,7 @@ you were working. If the outcome matters to the task, inspect the log; otherwise
                 };
                 // Fresh effects and hard safety floors are allow-once. A stale
                 // client sending AlwaysAllow cannot create a grant here.
-                !matches!(
-                    decision,
-                    Decision::Deny
-                )
+                !matches!(decision, Decision::Deny)
             } else if remote_side_effect
                 && !self.grants.covers(n, &call.arguments, ctx.cwd)
                 && !self.grants.covers_remote(&remote_families)

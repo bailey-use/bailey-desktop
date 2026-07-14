@@ -707,14 +707,8 @@ impl McpClient {
     /// while marking the product-tool source degraded.
     pub async fn connect_product_tools_from_env() -> ProductToolsLoad {
         let (configured, loaded) = load_product_tools_from_env();
-        let client = Self::connect_loaded(
-            loaded,
-            &HashSet::new(),
-            MCP_HANDSHAKE_TIMEOUT,
-            None,
-            None,
-        )
-        .await;
+        let client =
+            Self::connect_loaded(loaded, &HashSet::new(), MCP_HANDSHAKE_TIMEOUT, None, None).await;
         ProductToolsLoad { configured, client }
     }
 
@@ -985,7 +979,8 @@ impl McpClient {
     /// callers continue to use the ordinary trust flag and never gain Bailey
     /// product semantics merely by choosing a similar tool name.
     pub fn tool_metadata(&self, qualified: &str) -> Option<Value> {
-        self.lookup(qualified).map(|(_, tool)| tool.metadata.clone())
+        self.lookup(qualified)
+            .map(|(_, tool)| tool.metadata.clone())
     }
 }
 
@@ -1171,12 +1166,7 @@ fn load_user_config(
     user_path: Option<&Path>,
 ) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
     let files = user_path
-        .map(|path| {
-            vec![(
-                path.to_path_buf(),
-                "~/.config/aivo/mcp.json".to_string(),
-            )]
-        })
+        .map(|path| vec![(path.to_path_buf(), "~/.config/aivo/mcp.json".to_string())])
         .unwrap_or_default();
     load_config_files(files)
 }
@@ -1185,10 +1175,7 @@ fn load_user_config(
 /// contract. Arguments are JSON rather than a shell string: the App Server
 /// never invokes a shell and never has to guess quoting rules. The returned
 /// config cannot be overridden by `.mcp.json` and forces `trust:false` in code.
-fn load_product_tools_from_env() -> (
-    bool,
-    (HashMap<String, ServerConfig>, Vec<(String, String)>),
-) {
+fn load_product_tools_from_env() -> (bool, (HashMap<String, ServerConfig>, Vec<(String, String)>)) {
     let source = "Bailey Local Tools".to_string();
     let command = match std::env::var(BAILEY_LOCAL_MCP_COMMAND_ENV) {
         Ok(command) if !command.trim().is_empty() => command,

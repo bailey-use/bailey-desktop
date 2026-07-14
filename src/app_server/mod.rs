@@ -17,8 +17,8 @@ use crate::services::{ModelsCache, SessionStore};
 
 use protocol::{
     IncomingMessage, InitializeParams, ModelListParams, NOT_INITIALIZED, RpcFailure,
-    ThreadCloseParams, ThreadDeleteParams, ThreadFlushParams, ThreadListParams,
-    ThreadResumeParams, ThreadStartParams, TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
+    ThreadCloseParams, ThreadDeleteParams, ThreadFlushParams, ThreadListParams, ThreadResumeParams,
+    ThreadStartParams, TurnCancelParams, TurnStartParams, UNSUPPORTED_VERSION,
 };
 use session::ThreadRuntime;
 use ui::{Outbound, PendingInteractions};
@@ -68,7 +68,7 @@ pub async fn ensure_default_bailey_provider(store: &SessionStore) -> anyhow::Res
             && store
                 .get_key_by_id(&existing.id)
                 .await?
-                .is_some_and(|key| key.key != configured_secret)
+                .is_some_and(|key| key.key.as_str() != configured_secret)
         {
             store
                 .update_key(
@@ -458,17 +458,11 @@ impl AppServer {
                             let outbound = self.outbound.clone();
                             self.background_requests.retain(|task| !task.is_finished());
                             self.background_requests.push(tokio::spawn(async move {
-                                let response = match Self::model_list(
-                                    &store,
-                                    &cache,
-                                    &http,
-                                    params,
-                                )
-                                .await
-                                {
-                                    Ok(result) => protocol::response(response_id, result),
-                                    Err(error) => protocol::error_response(response_id, &error),
-                                };
+                                let response =
+                                    match Self::model_list(&store, &cache, &http, params).await {
+                                        Ok(result) => protocol::response(response_id, result),
+                                        Err(error) => protocol::error_response(response_id, &error),
+                                    };
                                 let _ = outbound.send(response);
                             }));
                         }
@@ -977,7 +971,9 @@ impl AppServer {
                 .get_active_key()
                 .await
                 .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?
-                .ok_or_else(|| RpcFailure::new(protocol::UNAVAILABLE, "no active model provider"))?,
+                .ok_or_else(|| {
+                    RpcFailure::new(protocol::UNAVAILABLE, "no active model provider")
+                })?,
         };
         if key.is_any_oauth() || key.is_cursor_acp() {
             return Err(RpcFailure::new(
@@ -991,13 +987,8 @@ impl AppServer {
             .await
             .map_err(|error| RpcFailure::new(protocol::INTERNAL_ERROR, error.to_string()))?;
         let (mut data, warning, catalog_available) =
-            match crate::commands::models::fetch_models_cached(
-                http,
-                &key,
-                cache,
-                params.refresh,
-            )
-            .await
+            match crate::commands::models::fetch_models_cached(http, &key, cache, params.refresh)
+                .await
             {
                 Ok(models) => (models, None, true),
                 Err(_) => (

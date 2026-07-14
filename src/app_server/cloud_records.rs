@@ -168,10 +168,12 @@ async fn run_worker(
         "source": "bailey-desktop",
     });
     let created = request_json(&client, &config, Method::POST, "/runs", &create).await;
-    let Some(run_id) = created
-        .ok()
-        .and_then(|value| value.pointer("/run/run_id").and_then(Value::as_str).map(str::to_string))
-    else {
+    let Some(run_id) = created.ok().and_then(|value| {
+        value
+            .pointer("/run/run_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }) else {
         mark_degraded(&degraded, &emitter);
         return;
     };
@@ -286,7 +288,9 @@ async fn request_json(
         .await
         .map_err(|_| ())?;
     if !response.status().is_success()
-        || response.content_length().is_some_and(|length| length > MAX_RESPONSE_BYTES)
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES)
     {
         return Err(());
     }
@@ -321,7 +325,10 @@ fn opaque_id(value: &str) -> String {
 }
 
 fn sanitized_operation(name: &str, result: &Result<String, String>) -> Value {
-    let parsed = result.as_ref().ok().and_then(|output| parse_untrusted_json(output));
+    let parsed = result
+        .as_ref()
+        .ok()
+        .and_then(|output| parse_untrusted_json(output));
     let ok = parsed
         .as_ref()
         .and_then(|value| value.get("ok"))
@@ -388,9 +395,10 @@ fn sanitize_driver(value: &Value) -> Value {
 fn sanitize_result(value: &Value) -> Value {
     let mut safe = serde_json::Map::new();
     for field in ["sent", "verified", "status"] {
-        if let Some(value) = value.get(field).filter(|value| {
-            value.is_boolean() || value.is_number() || value.is_string()
-        }) {
+        if let Some(value) = value
+            .get(field)
+            .filter(|value| value.is_boolean() || value.is_number() || value.is_string())
+        {
             safe.insert(field.to_string(), value.clone());
         }
     }

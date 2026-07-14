@@ -16,9 +16,9 @@ use crate::services::code_session_store::CodeSessionLease;
 use crate::services::models_cache::ModelsCache;
 use crate::services::session_store::{ApiKey, CodeSessionState, SessionStore, StoredChatMessage};
 
+use super::cloud_records::CloudRunSink;
 use super::protocol::{INTERNAL_ERROR, NOT_FOUND, RpcFailure, THREAD_BUSY, UNAVAILABLE};
 use super::ui::{AppServerUi, EventEmitter, Outbound, PendingInteractions, fail_pending_for_turn};
-use super::cloud_records::CloudRunSink;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -150,10 +150,18 @@ impl ExternalTools for ProductToolsExternal {
     }
 }
 
-fn product_approval(metadata: Option<&Value>, name: &str, args: &Value) -> Option<ExternalApproval> {
+fn product_approval(
+    metadata: Option<&Value>,
+    name: &str,
+    args: &Value,
+) -> Option<ExternalApproval> {
     let meta = metadata.and_then(|value| value.get("meta"));
     let annotations = metadata.and_then(|value| value.get("annotations"));
-    let short_name = name.rsplit("__").next().unwrap_or(name).to_ascii_lowercase();
+    let short_name = name
+        .rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
     let declared_effect = meta
         .and_then(|value| value.get("bailey/effect"))
         .and_then(Value::as_str);
@@ -214,8 +222,17 @@ fn product_approval(metadata: Option<&Value>, name: &str, args: &Value) -> Optio
 
 fn is_read_like_product_tool(name: &str) -> bool {
     [
-        "get", "list", "search", "status", "observe", "inspect", "read", "find", "query",
-        "screenshot", "snapshot",
+        "get",
+        "list",
+        "search",
+        "status",
+        "observe",
+        "inspect",
+        "read",
+        "find",
+        "query",
+        "screenshot",
+        "snapshot",
     ]
     .iter()
     .any(|word| name == *word || name.starts_with(&format!("{word}_")))
@@ -223,11 +240,15 @@ fn is_read_like_product_tool(name: &str) -> bool {
 
 fn is_external_effect_product_tool(name: &str) -> bool {
     [
-        "send", "post", "publish", "purchase", "submit", "invite", "delete", "remove",
-        "transfer", "reply", "forward",
+        "send", "post", "publish", "purchase", "submit", "invite", "delete", "remove", "transfer",
+        "reply", "forward",
     ]
     .iter()
-    .any(|word| name == *word || name.starts_with(&format!("{word}_")) || name.contains(&format!("_{word}_")))
+    .any(|word| {
+        name == *word
+            || name.starts_with(&format!("{word}_"))
+            || name.contains(&format!("_{word}_"))
+    })
 }
 
 fn product_approval_target(meta: Option<&Value>, args: &Value) -> Value {
@@ -237,7 +258,13 @@ fn product_approval_target(meta: Option<&Value>, args: &Value) -> Value {
         .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_else(|| {
             vec![
-                "contact", "recipient", "to", "channel", "conversation", "message", "text",
+                "contact",
+                "recipient",
+                "to",
+                "channel",
+                "conversation",
+                "message",
+                "text",
                 "url",
             ]
         });
@@ -309,20 +336,17 @@ pub fn public_provider_for_base_url(base_url: &str) -> PublicProvider {
             inference_location: "remote",
         };
     }
-    let (kind, label) = match crate::services::provider_profile::provider_profile_for_base_url(
-        base_url,
-    )
-    .kind
-    {
-        ProviderKind::Copilot => ("copilot", "GitHub Copilot"),
-        ProviderKind::CursorAcp => ("cursor_acp", "Cursor"),
-        ProviderKind::Ollama => ("ollama", "Ollama"),
-        ProviderKind::OpenRouter => ("openrouter", "OpenRouter"),
-        ProviderKind::CloudflareAi => ("cloudflare_ai", "Cloudflare AI"),
-        ProviderKind::AnthropicCompatible => ("anthropic_compatible", "Anthropic-compatible"),
-        ProviderKind::GoogleNative => ("google_native", "Google"),
-        ProviderKind::OpenAiCompatible => ("openai_compatible", "OpenAI-compatible"),
-    };
+    let (kind, label) =
+        match crate::services::provider_profile::provider_profile_for_base_url(base_url).kind {
+            ProviderKind::Copilot => ("copilot", "GitHub Copilot"),
+            ProviderKind::CursorAcp => ("cursor_acp", "Cursor"),
+            ProviderKind::Ollama => ("ollama", "Ollama"),
+            ProviderKind::OpenRouter => ("openrouter", "OpenRouter"),
+            ProviderKind::CloudflareAi => ("cloudflare_ai", "Cloudflare AI"),
+            ProviderKind::AnthropicCompatible => ("anthropic_compatible", "Anthropic-compatible"),
+            ProviderKind::GoogleNative => ("google_native", "Google"),
+            ProviderKind::OpenAiCompatible => ("openai_compatible", "OpenAI-compatible"),
+        };
     PublicProvider {
         kind: kind.to_string(),
         label: label.to_string(),
@@ -609,6 +633,7 @@ impl ThreadRuntime {
             engine.set_first_party();
         }
         engine.set_subagents(&crate::agent::subagents::discover_subagents(
+            &cwd,
             store.config_dir(),
         ));
         engine.set_grants_path(store.config_dir());
@@ -647,9 +672,8 @@ impl ThreadRuntime {
                 (Ok(disabled_servers), Ok(disabled_tools)) => {
                     let disabled_servers = disabled_servers.into_iter().collect::<HashSet<_>>();
                     let mut disabled_tools = disabled_tools.into_iter().collect::<HashSet<_>>();
-                    let client = Arc::new(
-                        McpClient::connect_user_config_enabled(&disabled_servers).await,
-                    );
+                    let client =
+                        Arc::new(McpClient::connect_user_config_enabled(&disabled_servers).await);
                     // Reserve the product namespace even when the packaged
                     // Local Tools process is absent or degraded. A user MCP
                     // entry cannot masquerade as Bailey-owned capabilities.

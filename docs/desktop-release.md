@@ -26,9 +26,12 @@ Production secrets:
 
 - Apple: `APPLE_CERTIFICATE_BASE64`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 - Windows: `WINDOWS_CERTIFICATE_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`.
-- Cross-repository source: `BAILEY_USE_READ_TOKEN` is required when
-  `bailey-use/bailey-use` is private; it should be read-only and is not
-  persisted by checkout. Public checkouts fall back to `github.token`.
+- Cross-repository source: `BAILEY_USE_DEPLOY_KEY` contains a dedicated SSH
+  deploy key whose public half is registered read-only on
+  `bailey-use/bailey-use`. The private key is not persisted by checkout and
+  must not be reused for another repository or purpose. Desktop packaging in
+  pull-request CI is limited to non-Dependabot branches in this repository;
+  fork pull requests never receive this credential.
 
 The integrated installer copies its signed immutable runtime resource to a
 versioned user-data directory, registers the Native Host without opening a

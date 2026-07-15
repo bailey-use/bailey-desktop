@@ -23,8 +23,8 @@ pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 /// normal provider URL stored in Aivo's local provider store; it is not a
 /// second agent or an in-process service. Desktop deployments may override the
 /// URL/model through `BAILEY_CLOUD_MODEL_BASE_URL` and `BAILEY_CLOUD_MODEL`.
-pub const BAILEY_CLOUD_MODEL_BASE_URL: &str = "https://bailey.meidaquan.com/v1";
-pub const BAILEY_CLOUD_RECORD_BASE_URL: &str = "https://bailey.meidaquan.com/api";
+pub const BAILEY_CLOUD_MODEL_BASE_URL: &str = "https://agent.meidaquan.com/v1";
+pub const BAILEY_CLOUD_RECORD_BASE_URL: &str = "https://agent.meidaquan.com/api";
 pub const BAILEY_CLOUD_PROVIDER_NAME: &str = "Bailey Cloud";
 pub const BAILEY_CLOUD_DEFAULT_MODEL: &str = "bailey/default";
 

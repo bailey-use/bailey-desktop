@@ -213,16 +213,41 @@ jobs:
           gh release create "$tag" "${assets[@]}" \
             --repo "$REPOSITORY" \
             --target "$COMMIT_SHA" \
+            --draft \
             --prerelease \
             --latest=false \
             --title "$title" \
             --notes "Automated development build from main commit ${COMMIT_SHA}. macOS is ad-hoc signed but not notarized; Windows is unsigned."
-          read -r uploaded draft prerelease < <(
-            gh api "repos/$REPOSITORY/releases/tags/$tag" \
-              --jq '[.assets | length, .draft, .prerelease] | @tsv'
-          )
-          if [ "$uploaded" -ne 4 ] || [ "$draft" != "false" ] || [ "$prerelease" != "true" ]; then
-            echo "Published release verification failed: assets=$uploaded draft=$draft prerelease=$prerelease" >&2
+
+          # Draft releases are not addressable by tag, so all remaining
+          # verification and publication must use the REST release ID.
+          release_inventory=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100")
+          release_id_lines=$(printf '%s\n' "$release_inventory" \
+            | jq -r --arg tag "$tag" --arg title "$title" \
+              '.[] | select(.tag_name == $tag and .name == $title and .draft == true) | .id')
+          release_id_count=$(printf '%s\n' "$release_id_lines" | sed '/^$/d' | wc -l)
+          if [ "$release_id_count" -ne 1 ]; then
+            echo "Expected one draft release for $tag; found $release_id_count" >&2
+            exit 1
+          fi
+          release_id=$(printf '%s\n' "$release_id_lines" | sed '/^$/d' | head -n 1)
+          draft_state=$(gh api "repos/$REPOSITORY/releases/$release_id" \
+            --jq '[(.assets | length), .draft, .prerelease, .tag_name, .target_commitish] | @tsv')
+          IFS=$'\t' read -r uploaded draft prerelease draft_tag draft_target <<< "$draft_state"
+          if [ "$uploaded" -ne 4 ] || [ "$draft" != "true" ] || [ "$prerelease" != "true" ] \
+            || [ "$draft_tag" != "$tag" ] || [ "$draft_target" != "$COMMIT_SHA" ]; then
+            echo "Draft release verification failed: assets=$uploaded draft=$draft prerelease=$prerelease tag=$draft_tag target=$draft_target" >&2
+            exit 1
+          fi
+
+          published_state=$(gh api --method PATCH "repos/$REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -F prerelease=true \
+            --jq '[(.assets | length), .draft, .prerelease, .tag_name, .target_commitish] | @tsv')
+          IFS=$'\t' read -r uploaded draft prerelease published_tag published_target <<< "$published_state"
+          if [ "$uploaded" -ne 4 ] || [ "$draft" != "false" ] || [ "$prerelease" != "true" ] \
+            || [ "$published_tag" != "$tag" ] || [ "$published_target" != "$COMMIT_SHA" ]; then
+            echo "Published release verification failed: assets=$uploaded draft=$draft prerelease=$prerelease tag=$published_tag target=$published_target" >&2
             exit 1
           fi
           cleanup_armed=0

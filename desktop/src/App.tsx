@@ -14,14 +14,15 @@ import {
   WarningCircle,
   Wrench,
 } from "@phosphor-icons/react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
   useEffect,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 
@@ -35,6 +36,22 @@ import type {
 
 type ConnectionState = "starting" | "ready" | "error" | "stopped";
 type TurnState = "idle" | "running";
+type AccountState = "checking" | "signed_out" | "signed_in" | "runtime_stopped";
+type AuthMode = "login" | "register";
+
+type BaileyAccount = {
+  id: string;
+  email: string;
+  displayName?: string | null;
+};
+
+type BaileyAccountStatus = {
+  authenticated: boolean;
+  registrationEnabled: boolean;
+  account?: BaileyAccount;
+  expiresAt?: string;
+  reason?: "expired" | string;
+};
 
 type TranscriptItem = {
   id: string;
@@ -221,7 +238,23 @@ const previewConversation: ConversationState = {
 };
 
 function App() {
-  const client = useMemo(() => new AppServerClient(), []);
+  const [client, setClient] = useState(() => new AppServerClient());
+  const [accountState, setAccountState] = useState<AccountState>(
+    isLayoutPreview ? "signed_in" : "checking",
+  );
+  const [account, setAccount] = useState<BaileyAccount | undefined>(
+    isLayoutPreview
+      ? { id: "preview", email: "bailey@example.com", displayName: "Bailey" }
+      : undefined,
+  );
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<string>();
+  const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [registrationEnabled, setRegistrationEnabled] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [loggingOut, setLoggingOut] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>(
     isLayoutPreview ? "ready" : "starting",
   );
@@ -390,6 +423,40 @@ function App() {
   useEffect(() => {
     if (isLayoutPreview) return;
     let cancelled = false;
+    void invoke<BaileyAccountStatus>("bailey_account_status")
+      .then((status) => {
+        if (cancelled) return;
+        setRegistrationEnabled(status.registrationEnabled);
+        if (status.authenticated && status.account && status.expiresAt) {
+          setAccount(status.account);
+          setSessionExpiresAt(status.expiresAt);
+          setAccountState("signed_in");
+          return;
+        }
+        setAccount(undefined);
+        setSessionExpiresAt(undefined);
+        setAccountState("signed_out");
+        if (status.reason === "expired") {
+          setAuthError("登录已过期，请重新登录。");
+        } else if (status.reason === "revoked") {
+          setAuthError("Bailey 登录已被撤销或账号已停用，请重新登录。");
+        }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setAccount(undefined);
+        setSessionExpiresAt(undefined);
+        setAccountState("signed_out");
+        setAuthError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (isLayoutPreview || accountState !== "signed_in") return;
+    let cancelled = false;
 
     client.onEvent = handleEvent;
     client.onDiagnostic = (message) => setDiagnostic(message);
@@ -453,7 +520,95 @@ function App() {
       cancelled = true;
       client.dispose();
     };
-  }, [client]);
+  }, [accountState, client]);
+
+  useEffect(() => {
+    if (
+      isLayoutPreview
+      || accountState !== "signed_in"
+      || !sessionExpiresAt
+    ) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+
+    const expireSession = async () => {
+      if (cancelled) return;
+      try {
+        await invoke("app_server_stop");
+      } catch (error) {
+        if (cancelled) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        const message =
+          "登录已过期，但无法确认 Agent Runtime 已停止；本机凭据尚未清除，请重试退出。";
+        setDiagnostic(`Could not confirm expired runtime stopped: ${detail}`);
+        setAccountState("runtime_stopped");
+        setConnection("error");
+        setStatusText(message);
+        setOperationError(message);
+        setShowStatus(true);
+        setRunningThreadId(undefined);
+        setTurnId(undefined);
+        setTurnStarting(false);
+        sendingRef.current = false;
+        runningTurnRef.current = undefined;
+        rejectInteraction("Bailey session expired before runtime stop was confirmed");
+        return;
+      }
+      client.dispose();
+      let clearError = "";
+      try {
+        await invoke<BaileyAccountStatus>("bailey_account_clear_expired");
+      } catch (error) {
+        clearError = error instanceof Error ? error.message : String(error);
+      }
+      if (cancelled) return;
+      setAccount(undefined);
+      setSessionExpiresAt(undefined);
+      setAccountState("signed_out");
+      setAuthMode("login");
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthError(clearError
+        ? `登录已过期，但系统安全存储清理失败：${clearError}`
+        : "登录已过期，请重新登录。");
+      setOperationError("");
+      setConnection("stopped");
+      setStatusText("Bailey 登录已过期");
+      setProviders([]);
+      setProvidersLoaded(false);
+      setProviderLoadError("");
+      setNewTaskProvider("");
+      setNewTaskModel("");
+      setConversations([]);
+      setActiveSessionId(undefined);
+      setRunningThreadId(undefined);
+      setTurnId(undefined);
+      setTurnStarting(false);
+      sendingRef.current = false;
+      runningTurnRef.current = undefined;
+      setInteraction((current) => {
+        current?.reject(new Error("Bailey session expired"));
+        return undefined;
+      });
+      setClient(new AppServerClient());
+    };
+
+    const checkExpiry = () => {
+      const expiresAt = Date.parse(sessionExpiresAt);
+      const remaining = Number.isFinite(expiresAt) ? expiresAt - Date.now() : 0;
+      if (remaining <= 0) {
+        void expireSession();
+        return;
+      }
+      timer = setTimeout(checkExpiry, Math.min(remaining, 60 * 60 * 1000));
+    };
+    checkExpiry();
+
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [accountState, client, sessionExpiresAt]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -550,6 +705,101 @@ function App() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [modelMenuOpen, searchOpen, showStatus, threadMenuOpen]);
+
+  async function submitBaileyAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (authBusy) return;
+    setAuthBusy(true);
+    setAuthError("");
+    try {
+      const command = authMode === "login"
+        ? "bailey_account_login"
+        : "bailey_account_register";
+      const status = await invoke<BaileyAccountStatus>(command, {
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+      if (!status.authenticated || !status.account || !status.expiresAt) {
+        throw new Error("Bailey Cloud 没有返回可用账号。");
+      }
+      setRegistrationEnabled(status.registrationEnabled);
+      setAccount(status.account);
+      setSessionExpiresAt(status.expiresAt);
+      setAccountState("signed_in");
+      setOperationError("");
+      setConnection("starting");
+      setStatusText("正在启动 Agent Runtime");
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAuthPassword("");
+      setAuthBusy(false);
+    }
+  }
+
+  async function logoutBailey() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    setShowStatus(false);
+    setAccountState("runtime_stopped");
+    setConnection("stopped");
+    setStatusText("正在停止 Agent Runtime 并退出 Bailey");
+    setRunningThreadId(undefined);
+    setTurnId(undefined);
+    setTurnStarting(false);
+    sendingRef.current = false;
+    runningTurnRef.current = undefined;
+    setConversations((current) => current.map((conversation) => ({
+      ...conversation,
+      threadId: undefined,
+    })));
+    rejectInteraction("Bailey logout is stopping the Agent runtime");
+    let runtimeStopped = false;
+    try {
+      await invoke("app_server_stop");
+      runtimeStopped = true;
+      client.dispose();
+      const status = await invoke<BaileyAccountStatus>("bailey_account_logout");
+      setAccount(undefined);
+      setSessionExpiresAt(undefined);
+      setAccountState("signed_out");
+      setAuthMode("login");
+      setRegistrationEnabled(status.registrationEnabled);
+      setAuthEmail("");
+      setAuthPassword("");
+      setAuthError("");
+      setOperationError("");
+      setConnection("stopped");
+      setStatusText("正在等待 Bailey 登录");
+      setProviders([]);
+      setProvidersLoaded(false);
+      setProviderLoadError("");
+      setNewTaskProvider("");
+      setNewTaskModel("");
+      setConversations([]);
+      setActiveSessionId(undefined);
+      setRunningThreadId(undefined);
+      setTurnId(undefined);
+      setClient(new AppServerClient());
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setDiagnostic(
+        runtimeStopped
+          ? `Could not finish Bailey Cloud logout: ${detail}`
+          : `Could not confirm runtime stopped during logout: ${detail}`,
+      );
+      setOperationError(detail);
+      setConnection(runtimeStopped ? "stopped" : "error");
+      setStatusText(
+        runtimeStopped
+          ? "Agent Runtime 已停止；Bailey Cloud 退出尚未完成"
+          : "无法确认 Agent Runtime 已停止；尚未退出 Bailey",
+      );
+      setShowStatus(true);
+    } finally {
+      setLoggingOut(false);
+    }
+  }
 
   function handleEvent(event: AppServerEvent) {
     if (event.threadId !== activeThreadIdRef.current) return;
@@ -1464,6 +1714,94 @@ function App() {
         : activeProductTools.connected && !activeProductTools.degraded
           ? `已连接 · ${activeProductTools.tools} 个工具`
           : `连接异常 · ${activeProductTools.issues} 个问题`;
+  const accountLabel = account?.displayName?.trim() || account?.email || "Bailey";
+  const accountInitial = [...accountLabel][0]?.toLocaleUpperCase() || "B";
+
+  if (!isLayoutPreview && accountState === "checking") {
+    return (
+      <main className="auth-shell" aria-live="polite">
+        <section className="auth-card auth-checking">
+          <div className="auth-brand"><strong>Bailey</strong><span>Agent</span></div>
+          <CircleNotch className="spin" size={24} />
+          <p>正在检查本机的 Bailey 安全登录…</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (!isLayoutPreview && accountState === "signed_out") {
+    const registering = authMode === "register";
+    return (
+      <main className="auth-shell">
+        <section className="auth-card" aria-labelledby="auth-title">
+          <div className="auth-brand"><strong>Bailey</strong><span>Agent</span></div>
+          <div className="auth-heading">
+            <p className="auth-eyebrow">BAILEY CLOUD</p>
+            <h1 id="auth-title">{registering ? "创建 Bailey 账号" : "登录 Bailey"}</h1>
+            <p>
+              {registering
+                ? "创建账号后直接进入 Desktop，不会打开浏览器。"
+                : "登录后，Bailey 会启动本机 Aivo Agent Runtime。"}
+            </p>
+          </div>
+          <form className="auth-form" onSubmit={submitBaileyAuth}>
+            <label htmlFor="bailey-email">
+              邮箱
+              <input
+                id="bailey-email"
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                autoCapitalize="none"
+                spellCheck={false}
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+                disabled={authBusy}
+                required
+                autoFocus
+              />
+            </label>
+            <label htmlFor="bailey-password">
+              密码
+              <input
+                id="bailey-password"
+                type="password"
+                autoComplete={registering ? "new-password" : "current-password"}
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                disabled={authBusy}
+                required
+              />
+            </label>
+            {authError && <p className="auth-error" role="alert">{authError}</p>}
+            <button className="primary auth-submit" type="submit" disabled={authBusy}>
+              {authBusy && <CircleNotch className="spin" size={17} />}
+              {authBusy
+                ? registering ? "正在创建" : "正在登录"
+                : registering ? "创建并登录" : "登录"}
+            </button>
+          </form>
+          {registrationEnabled && (
+            <button
+              className="auth-switch"
+              type="button"
+              disabled={authBusy}
+              onClick={() => {
+                setAuthMode(registering ? "login" : "register");
+                setAuthPassword("");
+                setAuthError("");
+              }}
+            >
+              {registering ? "已有账号？返回登录" : "没有账号？创建账号"}
+            </button>
+          )}
+          <p className="auth-security">
+            邮箱和密码只由本机原生模块通过 HTTPS 发送给 Bailey Cloud；凭据仅存入系统安全存储。
+          </p>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -1588,6 +1926,12 @@ function App() {
             >
               <strong>{statusLabel}</strong>
               <p>{operationError || (connection === "ready" ? "代码和命令在本机运行" : statusText)}</p>
+              {account?.email && (
+                <div className="account-summary">
+                  <span>Bailey Cloud 账号</span>
+                  <strong>{account.email}</strong>
+                </div>
+              )}
               {connection === "ready" && (
                 <dl className="runtime-boundaries">
                   <div>
@@ -1624,6 +1968,14 @@ function App() {
                   {durabilityRetrying ? "正在保存" : "重试保存"}
                 </button>
               )}
+              <button
+                className="status-action secondary"
+                onClick={() => void logoutBailey()}
+                disabled={loggingOut}
+              >
+                {loggingOut && <CircleNotch className="spin" size={14} />}
+                {loggingOut ? "正在退出" : "退出登录"}
+              </button>
               {import.meta.env.DEV && diagnostic && <pre>{diagnostic}</pre>}
             </div>
           )}
@@ -1637,8 +1989,8 @@ function App() {
               setShowStatus((value) => !value);
             }}
           >
-            <span className="account-avatar">B</span>
-            <span className="account-name">Bailey</span>
+            <span className="account-avatar">{accountInitial}</span>
+            <span className="account-name">{accountLabel}</span>
             <span
               className={`status-dot ${operationError ? "error" : connection}`}
               aria-label={statusLabel}

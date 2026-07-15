@@ -20,6 +20,17 @@
   planner, recipe loop, autonomous retry loop, or completion decision there.
 - Provider secrets, base URLs, and protocol-routing details stay inside Aivo's
   local provider store and must not cross the Desktop protocol.
+- Bailey account registration, sign-in, session storage, and sign-out belong
+  to the Tauri Desktop shell and Bailey Cloud. Do not add Bailey account
+  endpoints, token refresh logic, or browser/device-code login flows to Aivo's
+  AgentEngine, App Server, CLI, or services. Desktop may obtain scoped Cloud
+  keys and provision the existing Bailey provider through a short-lived use of
+  the already-defined environment/provider bootstrap boundary. Never leave a
+  Bailey Cloud key in the long-running Aivo Runtime environment. The records
+  key belongs to a Desktop-native relay and must not be inherited by Aivo
+  shells, jobs, hooks, or MCP processes.
+- Bailey Desktop account flows must remain in-app. They must not open an
+  external browser unless the user explicitly asks for that action.
 
 The canonical architecture is
 `../bailey-use/docs/layered-entry-architecture.md`.

@@ -51,9 +51,22 @@ tool name and arguments; only allow/deny is offered. Cloud Record sync is an
 asynchronous side channel and excludes cwd, prompts, arguments, assistant text,
 DOM, screenshots, local paths, URLs, and evidence content.
 
-Model access and record synchronization use separate credentials. The Bailey
-Cloud provider uses `BAILEY_CLOUD_MODEL_API_KEY`; record synchronization starts
-only when `BAILEY_CLOUD_RECORDS_API_KEY` is provisioned. Desktop never reuses the
-model credential for `/api` record writes. `BAILEY_CLOUD_RECORD_BASE_URL` may
-override the record endpoint independently, and `BAILEY_DISABLE_CLOUD_RECORDS=1`
-disables the side channel.
+Model access and record synchronization use separate credentials. Production
+Desktop reads both from its OS credential entry: the model key provisions the
+Provider, while the records-only key stays in the native relay. Desktop never
+reuses the model credential for `/api` writes. The legacy
+`BAILEY_CLOUD_RECORDS_API_KEY`, `BAILEY_CLOUD_RECORD_BASE_URL`, and
+`BAILEY_DISABLE_CLOUD_RECORDS` environment contract remains available to
+standalone Aivo App Server launches, but packaged Desktop deliberately does not
+pass a records key into Aivo.
+
+Production Desktop obtains both credentials from Bailey Cloud through the
+Tauri shell's in-app account flow, stores them in Bailey's operating-system
+credential entry, and gives the model key only to a short-lived, task-less
+invocation of Aivo's existing Provider bootstrap. That process updates Aivo's
+encrypted Provider store and exits before the real Agent Runtime starts. The
+records key stays in Tauri's native record relay. Neither key is present in the
+long-running Aivo environment, so shells, jobs, hooks, and MCP children cannot
+inherit it. Do not add Bailey login endpoints or token lifecycle code to Aivo
+App Server or AgentEngine, and do not open an external browser for the normal
+login flow.

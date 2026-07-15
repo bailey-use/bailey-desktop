@@ -133,44 +133,96 @@ jobs:
         run: |
           tag="desktop-build-${RUN_NUMBER}.${RUN_ATTEMPT}"
           short_sha="${COMMIT_SHA:0:7}"
-          release_created=0
-          cleanup_failed_draft() {
+          title="Bailey Desktop build ${RUN_NUMBER}.${RUN_ATTEMPT} (${short_sha})"
+          cleanup_armed=0
+          cleanup_failed_release() {
             status=$?
             trap - EXIT
-            if [ "$status" -ne 0 ] && [ "$release_created" -eq 1 ]; then
-              if [ "$(gh release view "$tag" --repo "$REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || true)" = "true" ]; then
-                gh release delete "$tag" --repo "$REPOSITORY" --yes --cleanup-tag || true
+            if [ "$status" -ne 0 ] && [ "$cleanup_armed" -eq 1 ]; then
+              if ! release_inventory=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100"); then
+                echo "::warning::Unable to inspect releases; skipping cleanup"
+                exit "$status"
+              fi
+              if ! published_id=$(printf '%s\n' "$release_inventory" \
+                | jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag and .draft == false) | .id' \
+                | head -n 1); then
+                echo "::warning::Unable to verify release state; skipping cleanup"
+                exit "$status"
+              fi
+              if [ -n "$published_id" ]; then
+                echo "::warning::Release $tag was already published; leaving it intact"
+              else
+                if ! draft_id_lines=$(printf '%s\n' "$release_inventory" \
+                  | jq -r --arg tag "$tag" --arg title "$title" \
+                    '.[] | select(.tag_name == $tag and .name == $title and .draft == true) | .id'); then
+                  echo "::warning::Unable to identify draft releases; skipping cleanup"
+                  exit "$status"
+                fi
+                mapfile -t draft_ids <<< "$draft_id_lines"
+                cleanup_safe=1
+                for release_id in "${draft_ids[@]}"; do
+                  if [ -n "$release_id" ]; then
+                    if ! gh api --method DELETE "repos/$REPOSITORY/releases/$release_id"; then
+                      echo "::warning::Unable to delete draft release $release_id; preserving tag"
+                      cleanup_safe=0
+                    fi
+                  fi
+                done
+                if [ "$cleanup_safe" -eq 1 ]; then
+                  if ! tag_sha=$(gh api "repos/$REPOSITORY/git/matching-refs/tags/$tag" \
+                    --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha"); then
+                    echo "::warning::Unable to inspect tag $tag; preserving it"
+                  elif [ "$tag_sha" = "$COMMIT_SHA" ]; then
+                    gh api --method DELETE "repos/$REPOSITORY/git/refs/tags/$tag" \
+                      || echo "::warning::Unable to delete tag $tag"
+                  fi
+                fi
               fi
             fi
             exit "$status"
           }
-          trap cleanup_failed_draft EXIT
+          trap cleanup_failed_release EXIT
 
           mapfile -t assets < <(find release-assets -type f -print | sort)
           dmg_count=$(find release-assets -type f -name '*.dmg' | wc -l)
           exe_count=$(find release-assets -type f -name '*.exe' | wc -l)
           checksum_count=$(find release-assets -type f -name '*.sha256' | wc -l)
-          if [ "${#assets[@]}" -ne 4 ] || [ "$dmg_count" -ne 1 ] || [ "$exe_count" -ne 1 ] || [ "$checksum_count" -ne 2 ]; then
+          basename_count=$(printf '%s\n' "${assets[@]##*/}" | sort -u | wc -l)
+          if [ "${#assets[@]}" -ne 4 ] || [ "$dmg_count" -ne 1 ] || [ "$exe_count" -ne 1 ] || [ "$checksum_count" -ne 2 ] || [ "$basename_count" -ne 4 ]; then
             echo "Expected two installers and two checksums; found ${#assets[@]} total" >&2
             exit 1
           fi
-          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $tag already exists; refusing to replace immutable installer assets" >&2
+          for installer in release-assets/*.dmg release-assets/*.exe; do
+            if [ ! -f "$installer.sha256" ]; then
+              echo "Missing checksum for $installer" >&2
+              exit 1
+            fi
+          done
+          (cd release-assets && sha256sum --check --strict -- ./*.sha256)
+          release_inventory=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100")
+          existing_release_ids=$(printf '%s\n' "$release_inventory" \
+            | jq -r --arg tag "$tag" --arg title "$title" \
+              '.[] | select(.tag_name == $tag or .name == $title) | .id')
+          existing_tag_sha=$(gh api "repos/$REPOSITORY/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha")
+          if [ -n "$existing_release_ids" ] || [ -n "$existing_tag_sha" ]; then
+            echo "Release or tag $tag already exists; refusing to replace immutable installer assets" >&2
             exit 1
           fi
-          gh release create "$tag" \
+          cleanup_armed=1
+          gh release create "$tag" "${assets[@]}" \
             --repo "$REPOSITORY" \
             --target "$COMMIT_SHA" \
-            --draft \
             --prerelease \
-            --title "Bailey Desktop build ${RUN_NUMBER}.${RUN_ATTEMPT} (${short_sha})" \
+            --latest=false \
+            --title "$title" \
             --notes "Automated development build from main commit ${COMMIT_SHA}. macOS is ad-hoc signed but not notarized; Windows is unsigned."
-          release_created=1
-          gh release upload "$tag" "${assets[@]}" --repo "$REPOSITORY"
-          uploaded=$(gh api "repos/$REPOSITORY/releases/tags/$tag" --jq '.assets | length')
-          if [ "$uploaded" -ne 4 ]; then
-            echo "Expected 4 immutable assets in the draft release; found $uploaded" >&2
+          read -r uploaded draft prerelease < <(
+            gh api "repos/$REPOSITORY/releases/tags/$tag" \
+              --jq '[.assets | length, .draft, .prerelease] | @tsv'
+          )
+          if [ "$uploaded" -ne 4 ] || [ "$draft" != "false" ] || [ "$prerelease" != "true" ]; then
+            echo "Published release verification failed: assets=$uploaded draft=$draft prerelease=$prerelease" >&2
             exit 1
           fi
-          gh release edit "$tag" --repo "$REPOSITORY" --draft=false --prerelease
-          release_created=0
+          cleanup_armed=0

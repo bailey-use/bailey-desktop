@@ -95,12 +95,12 @@ the exact tool name and arguments. They never accept a persistent grant, and a
 stale client response of `always_allow` is reduced to allow-once.
 
 Bailey Cloud is a replaceable local provider configuration. The preset uses
-`https://bailey.meidaquan.com/v1`, model `bailey/default`, and explicitly uses
+`https://agent.meidaquan.com/v1`, model `bailey/default`, and explicitly uses
 OpenAI Chat Completions. Without a usable credential (or explicit provisioning)
 it cannot replace Starter or a custom active provider.
 
 Cloud Record sync is a non-blocking side channel to
-`https://bailey.meidaquan.com/api`. It sends only opaque ids and allowlisted
+`https://agent.meidaquan.com/api`. It sends only opaque ids and allowlisted
 status/tool/driver/evidence-count metadata. Cwd, prompts, arguments, assistant
 text, DOM, screenshots, evidence content, local paths, and URLs stay local.
 Failure emits `durability.updated` with `cloud:false` and does not stop the

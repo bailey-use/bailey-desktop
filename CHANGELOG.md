@@ -2,7 +2,7 @@
 
 ## Bailey Desktop v0.2.0
 
-- Adds a replaceable Bailey Cloud preset at `https://bailey.meidaquan.com/v1`; it activates only with explicit provisioning or a usable credential and is fixed to OpenAI Chat Completions.
+- Adds a replaceable Bailey Cloud preset at `https://agent.meidaquan.com/v1`; it activates only with explicit provisioning or a usable credential and is fixed to OpenAI Chat Completions.
 - Adds asynchronous, allowlist-redacted Cloud Record run/audit/operation/evidence metadata; Cloud failure never stops the local task.
 - Separates `BAILEY_CLOUD_MODEL_API_KEY` from the least-privilege `BAILEY_CLOUD_RECORDS_API_KEY`.
 - Makes Bailey Local Tools approval effect-aware. External sends require fresh, exact-call-bound approval and product grants never persist across sessions.

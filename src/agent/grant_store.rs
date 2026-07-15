@@ -163,8 +163,13 @@ pub(crate) fn exact_key(name: &str, args: &Value) -> String {
 /// Choose the grant scope + whether to persist for an approved call. See the module
 /// docs for the rationale; the invariant is *never broaden or persist a dangerous act*.
 fn classify(name: &str, args: &Value, cwd: &Path) -> (GrantScope, bool) {
-    // Untrusted external / MCP tool: trust the specific tool, and persist it — the
-    // one grant safe to remember across sessions (it's not destructive by nature).
+    // Bailey product tools operate the user's machine. A session grant may
+    // reduce noise for a non-external mutation, but it must never survive into
+    // a later session. Fresh external effects bypass grants in AgentEngine.
+    if name.starts_with(crate::agent::mcp::BAILEY_LOCAL_MCP_TOOL_PREFIX) {
+        return (GrantScope::Tool(name.to_string()), false);
+    }
+    // User-configured MCP tools retain the upstream persistent tool grant.
     if name.starts_with("mcp__") {
         return (GrantScope::Tool(name.to_string()), true);
     }

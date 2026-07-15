@@ -50,9 +50,11 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     ];
     if let Some(home) = crate::services::system_env::home_dir() {
         roots.push(home.join(".agents").join("skills"));
-        roots.push(home.join(".config").join("aivo").join("skills"));
+        roots.push(crate::services::paths::config_dir().join("skills"));
         roots.push(home.join(".claude").join("skills"));
     }
+    // Installed packs' skills come last (project and user shadow them).
+    roots.extend(crate::agent::packs::skills_roots());
     discover_from_roots(&roots)
 }
 
@@ -122,6 +124,8 @@ pub fn skill_scope(dir: &Path, cwd: &Path) -> SkillScope {
         // Claude Code's library is discovered and usable, but belongs to Claude
         // Code, not aivo — never deletable via the `/skills` overlay.
         protected.push(home.join(".claude").join("skills"));
+        // Pack skills are managed as a unit via `aivo code packs`, not /skills.
+        protected.push(crate::services::paths::config_dir().join("packs"));
     }
     if protected.iter().any(|root| dir.starts_with(root)) {
         SkillScope::Project
@@ -552,12 +556,12 @@ pub async fn install_or_stage_into(
 
 /// A resolved source tree on disk: `root` is where to scan; `cleanup` is a temp
 /// dir to delete afterward (None for a local path the user owns).
-struct SourceTree {
-    root: PathBuf,
-    cleanup: Option<PathBuf>,
+pub(crate) struct SourceTree {
+    pub(crate) root: PathBuf,
+    pub(crate) cleanup: Option<PathBuf>,
 }
 
-async fn fetch_source_tree(
+pub(crate) async fn fetch_source_tree(
     source: &str,
     progress: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<SourceTree, String> {
@@ -825,7 +829,7 @@ fn skill_folder_name(name: &str) -> String {
 
 /// Recursive copy of a skill folder, skipping VCS / build junk so a skill that
 /// lives at a repo root doesn't drag `.git`/`node_modules` along.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     // Never follow a symlinked source dir — `read_dir` would walk the link
     // target. Nested links are skipped per-entry below; this guards the top level.
     if std::fs::symlink_metadata(src)?.file_type().is_symlink() {
@@ -1516,6 +1520,10 @@ mod tests {
         if let Some(home) = crate::services::system_env::home_dir() {
             assert_eq!(
                 skill_scope(&home.join(".claude/skills/repo-study"), cwd),
+                SkillScope::Project
+            );
+            assert_eq!(
+                skill_scope(&home.join(".config/aivo/packs/toolkit/skills/review"), cwd),
                 SkillScope::Project
             );
         }

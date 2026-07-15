@@ -255,7 +255,7 @@ exit 0
 }
 
 fn stats(home: &TempDir) -> Value {
-    let path = home.path().join(".config/aivo/stats.json");
+    let path = home.path().join(".config/aivo/state/stats.json");
     serde_json::from_str(&std::fs::read_to_string(&path).expect("stats.json")).unwrap()
 }
 
@@ -423,7 +423,8 @@ fn granted_coding_agent_gets_key_endpoint_and_is_accounted() {
     // When curl is available the plugin routed through the endpoint, so token
     // usage is accounted against the key (skip_if_zero ⇒ presence means non-zero).
     if have_curl() {
-        let raw = std::fs::read_to_string(home.path().join(".config/aivo/stats.json")).unwrap();
+        let raw =
+            std::fs::read_to_string(home.path().join(".config/aivo/state/stats.json")).unwrap();
         assert!(
             raw.contains("promptTokens"),
             "token usage not recorded at the endpoint:\n{raw}"

@@ -7,11 +7,10 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub use crate::services::session_crypto::{decrypt, encrypt, is_encrypted};
-use crate::services::system_env;
 
 use crate::services::api_key_store::ApiKeyStore;
 use crate::services::atomic_write::atomic_write_secure;
-use crate::services::code_session_store::CodeSessionStore;
+use crate::services::code_session_store::{CodeSessionLease, CodeSessionStore};
 use crate::services::last_selection::LastSelectionStore;
 use crate::services::log_store::LogStore;
 use crate::services::route_cache::PersistedRoute;
@@ -1357,9 +1356,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Self {
-        let config_dir = system_env::home_dir()
-            .map(|p| p.join(".config").join("aivo"))
-            .unwrap_or_else(|| PathBuf::from(".config/aivo"));
+        let config_dir = crate::services::paths::config_dir();
         let config_path = config_dir.join("config.json");
         Self::from_ctx(ConfigContext {
             config_path,
@@ -1383,7 +1380,13 @@ impl SessionStore {
     fn from_ctx(ctx: ConfigContext) -> Self {
         Self {
             api_keys: ApiKeyStore { ctx: ctx.clone() },
-            sessions: CodeSessionStore { ctx: ctx.clone() },
+            sessions: CodeSessionStore {
+                ctx: ctx.clone(),
+                #[cfg(test)]
+                fail_next_index_save: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+            },
             stats: UsageStatsStore::new(ctx.clone()),
             last_sel: LastSelectionStore { ctx: ctx.clone() },
             logs: LogStore::new(ctx.config_dir.clone()),
@@ -1984,10 +1987,10 @@ impl SessionStore {
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .and_then(|v| v.as_object().cloned())
         };
-        if let Some(obj) = read_obj(dir.join("code-prefs.json")).await {
+        if let Some(obj) = read_obj(crate::services::paths::code_prefs(dir)).await {
             return obj;
         }
-        read_obj(dir.join("chat-prefs.json"))
+        read_obj(crate::services::paths::chat_prefs_legacy(dir))
             .await
             .unwrap_or_default()
     }
@@ -1997,8 +2000,11 @@ impl SessionStore {
         prefs: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         let dir = self.config_dir();
-        tokio::fs::create_dir_all(&dir).await?;
-        let path = dir.join("code-prefs.json");
+        let path = crate::services::paths::code_prefs(dir);
+        crate::services::atomic_write::ensure_private_dir(
+            path.parent().unwrap_or(std::path::Path::new(".")),
+        )
+        .await?;
         let data = serde_json::to_vec_pretty(prefs)?;
         // code-prefs holds the project-MCP allow-list and the auto-approve flag —
         // security-relevant, so write it 0600 (and via a random-suffix temp that
@@ -2116,6 +2122,13 @@ impl SessionStore {
     /// Per-session directory for durable agent artifacts (sub-agent reports, job logs).
     pub fn session_artifacts_dir(&self, session_id: &str) -> PathBuf {
         self.sessions.session_artifacts_dir(session_id)
+    }
+
+    pub(crate) fn try_acquire_code_session_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CodeSessionLease>> {
+        self.sessions.try_acquire_session_lease(session_id)
     }
 
     pub async fn get_code_session(&self, session_id: &str) -> Result<Option<CodeSessionState>> {
@@ -2815,7 +2828,7 @@ mod tests {
         store.set_chat_agent_tools_enabled(false).await.unwrap();
         assert!(!store.get_chat_toggles().await.agent_tools_enabled);
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
+            &tokio::fs::read(crate::services::paths::code_prefs(temp_dir.path()))
                 .await
                 .unwrap(),
         )
@@ -2836,8 +2849,11 @@ mod tests {
         // A pre-rename prefs file only has `showThinking`; honor it until the
         // new key is written.
         let dir = store.config_dir();
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("code-prefs.json"), br#"{"showThinking": false}"#)
+        let prefs_path = crate::services::paths::code_prefs(dir);
+        tokio::fs::create_dir_all(prefs_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&prefs_path, br#"{"showThinking": false}"#)
             .await
             .unwrap();
         assert!(!store.get_chat_thinking_enabled().await);
@@ -2856,15 +2872,18 @@ mod tests {
         // Only the pre-rename `chat-prefs.json` exists (no `code-prefs.json`);
         // the reader must still pick up the user's toggles.
         let dir = store.config_dir();
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("chat-prefs.json"), br#"{"showThinking": false}"#)
+        let legacy_path = crate::services::paths::chat_prefs_legacy(dir);
+        tokio::fs::create_dir_all(legacy_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&legacy_path, br#"{"showThinking": false}"#)
             .await
             .unwrap();
         assert!(!store.get_chat_thinking_enabled().await);
 
         // The first write lands in the new `code-prefs.json`.
         store.set_chat_thinking_enabled(true).await.unwrap();
-        assert!(dir.join("code-prefs.json").exists());
+        assert!(crate::services::paths::code_prefs(dir).exists());
         assert!(store.get_chat_thinking_enabled().await);
     }
 
@@ -2886,7 +2905,7 @@ mod tests {
 
         // They live in code-prefs.json, never the (key-bearing) config.json.
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
+            &tokio::fs::read(crate::services::paths::code_prefs(temp_dir.path()))
                 .await
                 .unwrap(),
         )
@@ -3003,7 +3022,7 @@ mod tests {
         store.migrate_disabled_toggles().await;
 
         let prefs: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(temp_dir.path().join("code-prefs.json"))
+            &tokio::fs::read(crate::services::paths::code_prefs(temp_dir.path()))
                 .await
                 .unwrap(),
         )

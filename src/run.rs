@@ -14,9 +14,10 @@ use crate::cli_args::{
     resolve_alias_in_memory, rewrite_cli_args,
 };
 use crate::commands::{
-    self, AccountCommand, AliasCommand, CodeCommand, InfoCommand, KeysCommand, LoginCommand,
-    LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand, ServeCommand,
-    ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand, UpdateCommand,
+    self, AccountCommand, AliasCommand, AppServerCommand, CodeCommand, InfoCommand, KeysCommand,
+    LoginCommand, LogoutCommand, LogsCommand, ModelsCommand, PluginsCommand, RunCommand,
+    ServeCommand, ServeParams, ShareCommand, StartCommand, StartFlowArgs, StatsCommand,
+    UpdateCommand,
 };
 use crate::errors::ExitCode;
 use crate::key_resolution::{
@@ -162,6 +163,21 @@ pub async fn run() -> ! {
     // launched — reqwest snapshots proxy env at construction, and env
     // mutation is only race-free while the current-thread runtime is idle.
     services::launch_runtime::ensure_loopback_no_proxy_in_process_env();
+
+    // One-shot layout migration (flat config dir → state/secrets/cache/logs/run
+    // split). Cheap once migrated (a dozen stats); must precede every store,
+    // including the detached `__update-check` child below.
+    {
+        use std::io::IsTerminal;
+        let stragglers = services::paths::migrate_layout(&services::paths::config_dir());
+        if !stragglers.is_empty() && std::io::stderr().is_terminal() {
+            eprintln!(
+                "aivo: ignoring stale pre-migration file(s) in the config dir (created by an older aivo?): {}",
+                stragglers.join(", ")
+            );
+        }
+    }
+
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Detached background update checker; handle before clap/service init.
@@ -213,6 +229,7 @@ pub async fn run() -> ! {
         && let Some(cmd) = &args.command
     {
         match cmd {
+            Commands::AppServer(_) => AppServerCommand::print_help(),
             Commands::Run(run_args) => RunCommand::print_help(run_args.tool.as_deref()),
             Commands::Keys(keys_args) => KeysCommand::print_help(keys_args.action.as_deref()),
             Commands::Account(a) => {
@@ -239,6 +256,7 @@ pub async fn run() -> ! {
             Commands::Plugins(_) => PluginsCommand::print_help(),
             Commands::Mcp(_) => crate::commands::mcp::McpCommand::print_help(),
             Commands::Skills(_) => crate::commands::skills::SkillsCommand::print_help(),
+            Commands::Packs(_) => crate::commands::packs::PacksCommand::print_help(),
             Commands::Share(_) => ShareCommand::print_help(),
             Commands::Guide => commands::guide::print_guide(),
         }
@@ -270,13 +288,17 @@ pub async fn run() -> ! {
     };
 
     // Skip the background check + notice when the user is already updating.
-    let is_update_cmd = matches!(command, Commands::Update(_));
-    if !is_update_cmd {
+    let skip_update_check = matches!(command, Commands::Update(_) | Commands::AppServer(_));
+    if !skip_update_check {
         services::update_check::maybe_spawn_background_check();
     }
 
     // Route to command handler
     let exit_code = match command {
+        Commands::AppServer(app_server_args) => {
+            AppServerCommand::execute(app_server_args, session_store, models_cache).await
+        }
+
         Commands::Alias(alias_args) => {
             let command = AliasCommand::new(session_store);
             command.execute(alias_args).await
@@ -304,6 +326,19 @@ pub async fn run() -> ! {
 
         Commands::Code(mut code_args) => {
             maybe_init_http_debug(&code_args.debug).await;
+            // Roots must exist (a typo'd root would silently allow nothing).
+            if !code_args.add_dir.is_empty() {
+                let mut roots = Vec::new();
+                for dir in &code_args.add_dir {
+                    let path = crate::services::system_env::expand_tilde(dir);
+                    if !path.is_dir() {
+                        eprintln!("{} --add-dir {dir}: not a directory", style::red("Error:"));
+                        process::exit(ExitCode::UserError.code());
+                    }
+                    roots.push(path);
+                }
+                crate::agent::sandbox::set_extra_write_roots(roots);
+            }
             let key_explicit = code_args.key.is_some();
             let initial_prompt = match take_code_initial_prompt(&mut code_args) {
                 Ok(prompt) => prompt,
@@ -315,7 +350,7 @@ pub async fn run() -> ! {
                     eprintln!(
                         "  {}",
                         style::dim(
-                            "Expected a subcommand (mcp, skills), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
+                            "Expected a subcommand (mcp, skills, packs), a model ref (`hf:<owner>/<repo>` or `https://huggingface.co/...`), or text to open the TUI with."
                         ),
                     );
                     eprintln!(
@@ -392,6 +427,7 @@ pub async fn run() -> ! {
                     code_args.output_format,
                     code_args.max_steps,
                     code_args.max_output_tokens,
+                    code_args.max_cost,
                     code_args.auto_approve,
                 )
                 .await
@@ -889,6 +925,11 @@ pub async fn run() -> ! {
             command.execute(skills_args).await
         }
 
+        Commands::Packs(packs_args) => {
+            let command = crate::commands::packs::PacksCommand::new();
+            command.execute(packs_args).await
+        }
+
         Commands::Share(share_args) => {
             let command = ShareCommand::new(session_store);
             command.execute(share_args).await
@@ -930,7 +971,7 @@ pub async fn run() -> ! {
     services::huggingface::stop_if_we_started();
 
     // Nudge after the command (TUI screen restored) if a newer release is cached.
-    if !is_update_cmd {
+    if !skip_update_check {
         services::update_check::maybe_print_notice(crate::version::VERSION);
     }
 

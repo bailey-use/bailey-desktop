@@ -421,6 +421,7 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        max_cost: Option<f64>,
         auto_approve: bool,
     ) -> ExitCode {
         match self
@@ -441,6 +442,7 @@ impl CodeCommand {
                 output_format,
                 max_steps,
                 max_output_tokens,
+                max_cost,
                 auto_approve,
             )
             .await
@@ -472,6 +474,7 @@ impl CodeCommand {
         output_format: Option<String>,
         max_steps: Option<u32>,
         max_output_tokens: Option<u64>,
+        max_cost: Option<f64>,
         auto_approve: bool,
     ) -> Result<ExitCode> {
         if (max_steps.is_some() || max_output_tokens.is_some()) && !agent_mode {
@@ -712,8 +715,11 @@ impl CodeCommand {
                     code_agent_oneshot::OneShotAgentLimits {
                         max_steps,
                         max_output_tokens,
+                        max_cost,
                     },
                     auto_approve,
+                    resume,
+                    model_flag.is_some(),
                 )
                 .await;
             }
@@ -985,6 +991,11 @@ impl CodeCommand {
         );
         println!(
             "  {}{}",
+            style::cyan(format!("{:<26}", "packs")),
+            style::dim("Manage extension packs (aivo code packs --help)")
+        );
+        println!(
+            "  {}{}",
             style::cyan(format!("{:<26}", "skills")),
             style::dim("Manage agent skills (aivo code skills --help)")
         );
@@ -1012,10 +1023,15 @@ impl CodeCommand {
             "--max-output-tokens <N>",
             "Max -e output tokens (0 disables)",
         );
+        print_opt("--max-cost <usd>", "Max estimated -e spend in USD");
+        print_opt(
+            "--add-dir <dir>",
+            "Extra writable workspace root (repeatable)",
+        );
         print_opt("-r, --refresh", "Refresh the model list (skip cache)");
         print_opt(
             "--resume [last|id]",
-            "Resume a saved session (bare/last/id)",
+            "Resume a saved session (bare/last/id; works with -e)",
         );
         print_opt("--share", "Share this session live (needs `aivo login`)");
         print_opt(
@@ -1026,7 +1042,7 @@ impl CodeCommand {
         print_opt("--json", "Raw provider JSON (with -p)");
         print_opt(
             "--output-format <fmt>",
-            "-e output: text (default) or stream-json",
+            "-e output: text (default), json, or stream-json",
         );
         print_opt(
             "--max-context <size>",
@@ -1501,7 +1517,7 @@ fn to_stored_messages(history: &[ChatMessage]) -> Vec<StoredChatMessage> {
         .collect()
 }
 
-fn new_code_session_id() -> String {
+pub(crate) fn new_code_session_id() -> String {
     use rand::Rng;
     let bytes: [u8; 16] = rand::thread_rng().r#gen();
     format!(
@@ -2886,6 +2902,7 @@ mod tests {
                 false,
                 None,
                 Some(1),
+                None,
                 None,
                 false,
             )

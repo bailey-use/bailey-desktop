@@ -1,6 +1,6 @@
 //! Device identity and request signing for the aivo starter endpoint.
 //!
-//! Ed25519 keypair per install; private seed at `~/.config/aivo/device-key`
+//! Ed25519 keypair per install; private seed at `<config>/secrets/device-key`
 //! (0600), public key is the `device_id`. Each request is signed over
 //! `${device_id}:${timestamp}` so a leaked `device_id` alone can't impersonate.
 
@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::services::http_utils::current_unix_ts;
-use crate::services::system_env;
 use crate::version::VERSION;
 
 static SIGNING_KEY: OnceLock<SigningKey> = OnceLock::new();
@@ -82,12 +81,9 @@ pub(crate) fn hex_sha256(data: &[u8]) -> String {
 }
 
 fn device_key_path() -> Option<PathBuf> {
-    Some(
-        system_env::home_dir()?
-            .join(".config")
-            .join("aivo")
-            .join("device-key"),
-    )
+    Some(crate::services::paths::device_key(
+        &crate::services::paths::config_dir(),
+    ))
 }
 
 fn load_or_create_signing_key() -> Option<SigningKey> {

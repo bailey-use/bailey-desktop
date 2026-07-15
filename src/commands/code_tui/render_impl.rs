@@ -552,6 +552,18 @@ impl CodeTuiApp {
         if !self.sending {
             return "running command".to_string();
         }
+        // A parallel sub-agent batch owns the headline while its rows are live.
+        if !self.subagent_rows.is_empty() {
+            let done = self
+                .subagent_rows
+                .iter()
+                .filter(|r| r.done.is_some())
+                .count();
+            return format!(
+                "running {} sub-agents ({done} done)",
+                self.subagent_rows.len()
+            );
+        }
         if let Some(action) = self.current_action_label() {
             return action;
         }
@@ -594,6 +606,23 @@ impl CodeTuiApp {
         lines.push(spinner);
         // No accent bar — the status line is chrome, not a message.
         bars.push(None);
+        for row in self.subagent_status_rows() {
+            lines.push(row);
+            bars.push(None);
+        }
+    }
+
+    /// Live parallel-batch rows, styled like the spinner they sit under. Empty
+    /// when idle so an interrupted batch can't leave ghost rows.
+    fn subagent_status_rows(&self) -> Vec<StyledLine> {
+        if !self.sending {
+            return Vec::new();
+        }
+        let style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        self.subagent_rows
+            .iter()
+            .map(|row| line_plain(super::render::subagent_row_text(row), style))
+            .collect()
     }
 
     /// A cheap O(1) fingerprint of everything the cached *history body* depends
@@ -818,6 +847,10 @@ impl CodeTuiApp {
             }
             tail.push(spinner.clone());
             tail_bars.push(None);
+            for row in self.subagent_status_rows() {
+                tail.push(row);
+                tail_bars.push(None);
+            }
             let wrapped_tail = wrap_transcript(&tail, &tail_bars, text_width);
             text_lines.extend(wrapped_tail.text.lines);
             rows.extend(wrapped_tail.rows);
@@ -1212,15 +1245,18 @@ impl CodeTuiApp {
                 Span::styled("?", Style::default().fg(TEXT)),
             ]),
             Line::from(Span::styled(
-                "It's a different provider, so this starts a new chat.",
+                "It's a different provider, so this starts a new session.",
                 Style::default().fg(MUTED),
             )),
             Line::from(Span::styled(
-                "The current chat is saved — /resume brings it back.",
+                "The current session is saved — /resume brings it back.",
                 Style::default().fg(MUTED),
             )),
             Line::from(""),
-            account_keys_line(&[("y", ASSISTANT, "new chat"), ("n", ERROR, "keep current")]),
+            account_keys_line(&[
+                ("y", ASSISTANT, "new session"),
+                ("n", ERROR, "keep current"),
+            ]),
         ];
         render_account_card(
             frame,
@@ -1751,11 +1787,15 @@ impl CodeTuiApp {
         // The volatile tail's char-wrap height, sized like the body's estimate so
         // the pane grows to fit the streamed reply (which left the cached body).
         let volatile_prepass = self.volatile_tail_prepass(plain_width);
-        // The spinner's leading blank + its (short) status line, sized the same
+        // Spinner blank + status line + any live sub-agent rows, sized the same
         // way the body's char-wrap height estimate is, so the pane height matches.
         let spinner_prepass = spinner
             .as_ref()
-            .map(|line| wrap_plain_lines(&[String::new(), line.plain.clone()], plain_width).len())
+            .map(|line| {
+                let mut plain = vec![String::new(), line.plain.clone()];
+                plain.extend(self.subagent_status_rows().into_iter().map(|r| r.plain));
+                wrap_plain_lines(&plain, plain_width).len()
+            })
             .unwrap_or(0);
         let prepass_rows = self
             .transcript_cache
@@ -2676,32 +2716,36 @@ impl CodeTuiApp {
             };
             return (format_token_count(used, usage), MUTED);
         }
-        // Fresh session: show the window size, not an empty `0 / 1M · 0%` meter.
+        // Fresh session: show the window size, not an empty `0 / 1M` meter.
         if used == 0 {
             return (
                 format!("{} context", format_token_count_value(self.context_window)),
                 MUTED,
             );
         }
+        // Percent isn't shown (the used/window pair already implies it) but still
+        // drives the meter color.
         let pct = (used.saturating_mul(100) / self.context_window).min(100);
         // Mark estimate-only figures (cursor ACP / agents without reported usage):
         // aivo's tracked transcript is a fraction of the model's real context, so
         // the number understates the true fill — `~` flags it as approximate.
         let approx = if is_estimate && used > 0 { "~" } else { "" };
-        // A non-zero fill that rounds down to 0% reads as `<1%` rather than a flat
-        // `0%` (common for cursor, whose real context we can't measure and only
-        // estimate from the transcript).
-        let pct_label = if pct == 0 && used > 0 {
-            "<1%".to_string()
-        } else {
-            format!("{approx}{pct}%")
-        };
         let label = format!(
-            "{approx}{} / {} · {pct_label}",
+            "{approx}{} / {}{}",
             format_token_count_value(used),
             format_token_count_value(self.context_window),
+            self.session_cost_label(),
         );
         (label, context_fill_color(pct))
+    }
+
+    /// ` · ~$X.XX` session-spend suffix; empty below half a cent or without pricing.
+    /// Always `~`: snapshot list prices × parsed usage is an estimate, not a bill.
+    pub(super) fn session_cost_label(&self) -> String {
+        if self.session_cost_usd < 0.005 {
+            return String::new();
+        }
+        format!(" · ~${:.2}", self.session_cost_usd)
     }
 
     pub(super) fn composer_height(&self, width: u16) -> u16 {

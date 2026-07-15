@@ -30,12 +30,17 @@ def dump(s):
 def pick_tool_and_args(tools):
     """From OpenAI-format function tools, choose a write-file or shell tool and
     synthesize arguments that create canary_done.txt=CANARY_OK."""
-    write_t = shell_t = None
+    write_t = shell_t = js_t = None
     for t in tools or []:
         fn = t.get("function", t)
         name = (fn.get("name") or "").lower()
+        desc = (fn.get("description") or "").lower()
         props = ((fn.get("parameters") or {}).get("properties")) or {}
         prop_keys = {p.lower() for p in props}
+        # codex >=0.143 sol code-mode `exec` runs JavaScript — raw shell in
+        # `input` would be a JS syntax error, so prefer JS over shell_t.
+        if js_t is None and name == "exec" and "javascript" in desc:
+            js_t = (fn.get("name"), props)
         # Shell/exec tool — preferred: schema-stable ({command}/{cmd}) and every
         # agent has one (claude Bash, gemini run_shell_command, codex
         # exec_command), so `printf ... > file` works universally. Match by NAME
@@ -51,6 +56,10 @@ def pick_tool_and_args(tools):
                 and (not prop_keys or prop_keys & {"content", "contents", "text", "file_text"})):
             write_t = (fn.get("name"), props)
 
+    if js_t:
+        nm, props = js_t
+        param = next(iter(props), "input")
+        return nm, {param: 'await tools.exec_command({cmd: "printf %s CANARY_OK > canary_done.txt"})'}
     if shell_t:
         nm, props = shell_t
         cmd_param = None

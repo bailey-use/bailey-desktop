@@ -500,9 +500,18 @@ fn git_subcommand_is_readonly(tokens: &[&str]) -> bool {
 /// canonicalizing the workspace root and the target's closest existing ancestor
 /// (the file itself may not exist yet) before comparing.
 fn path_escapes_cwd(path: &str, cwd: &Path) -> bool {
-    let root = canonicalize_existing_ancestor(cwd);
+    // `--add-dir` roots are part of the workspace too.
+    path_escapes_roots(path, cwd, crate::agent::sandbox::extra_write_roots())
+}
+
+fn path_escapes_roots(path: &str, cwd: &Path, extra: &[PathBuf]) -> bool {
     let target = canonicalize_existing_ancestor(&resolve(cwd, path));
-    !target.starts_with(&root)
+    if target.starts_with(canonicalize_existing_ancestor(cwd)) {
+        return false;
+    }
+    !extra
+        .iter()
+        .any(|root| target.starts_with(canonicalize_existing_ancestor(root)))
 }
 
 /// Resolve `path` as far as the filesystem allows: canonicalize the longest
@@ -1473,7 +1482,9 @@ pub(crate) fn resolve(cwd: &Path, p: &str) -> PathBuf {
 
 /// Cap keeping the HEAD — for file reads / listings, where the start matters.
 fn cap_head(s: String) -> String {
-    let mut truncated = s.lines().count() > MAX_OUTPUT_LINES;
+    let total_lines = s.lines().count();
+    let total_bytes = s.len();
+    let mut truncated = total_lines > MAX_OUTPUT_LINES;
     let mut out = if truncated {
         s.lines()
             .take(MAX_OUTPUT_LINES)
@@ -1491,7 +1502,12 @@ fn cap_head(s: String) -> String {
         truncated = true;
     }
     if truncated {
-        out.push_str("\n… (output truncated)");
+        let kept_lines = out.lines().count();
+        let kept_bytes = out.len();
+        out.push_str(&format!(
+            "\n… (output truncated: showing the first {kept_lines} of {total_lines} lines, \
+{kept_bytes} of {total_bytes} bytes — narrow the request to see the rest)"
+        ));
     }
     out
 }
@@ -1502,10 +1518,22 @@ fn cap_tail(s: String) -> String {
     cap_tail_with(s, MAX_OUTPUT, MAX_OUTPUT_LINES)
 }
 
+/// Best-effort spill of untruncated shell output to a temp log.
+fn spill_full_output(out: &str) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("aivo-bash-{}-{id}.log", std::process::id()));
+    std::fs::write(&path, out).ok()?;
+    Some(path)
+}
+
 /// [`cap_tail`] with explicit limits, so background-job log tails can keep a smaller
 /// window than foreground `run_bash`.
 pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
+    let total_lines = lines.len();
+    let total_bytes = s.len();
     let start = lines.len().saturating_sub(max_lines);
     let mut out = lines[start..].join("\n");
     let mut truncated = start > 0;
@@ -1518,7 +1546,12 @@ pub(crate) fn cap_tail_with(s: String, max_bytes: usize, max_lines: usize) -> St
         truncated = true;
     }
     if truncated {
-        out = format!("… (earlier output truncated)\n{out}");
+        let kept_lines = out.lines().count();
+        let kept_bytes = out.len();
+        out = format!(
+            "… (earlier output truncated: showing the last {kept_lines} of {total_lines} lines, \
+{kept_bytes} of {total_bytes} bytes)\n{out}"
+        );
     }
     out
 }
@@ -2238,6 +2271,29 @@ pub(crate) fn interactive_block_reason(command: &str) -> Option<InteractiveBlock
     None
 }
 
+/// SIGKILLs the child's whole process group on drop unless disarmed.
+#[cfg(unix)]
+struct GroupKillGuard(Option<i32>);
+
+#[cfg(unix)]
+impl GroupKillGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid.map(|p| p as i32))
+    }
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            crate::agent::jobs::signal_group(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome {
     let early = |result| BashOutcome {
         result,
@@ -2268,17 +2324,35 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
     builder.args(&spawn.args).current_dir(cwd);
     crate::agent::sandbox::harden_headless(&mut builder);
     builder.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own pgroup: a descendant probing /dev/tty (ssh passphrase, pinentry) stops
+    // on SIGTTIN/SIGTTOU instead of stealing the TUI's keystrokes or raw mode,
+    // and the tree is killable as `-pgid` (leader pgid == pid, as in jobs.rs).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
+    }
     let mut builder = tokio::process::Command::from(builder);
     builder.kill_on_drop(true);
     let child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return early(Err(format!("spawn shell: {e}"))),
     };
+    // `kill_on_drop` reaches only the direct child; the guard tree-kills on
+    // timeout, wait error, or cancellation (Esc interrupt drops this future).
+    #[cfg(unix)]
+    let mut tree_kill = GroupKillGuard::new(child.id());
+    #[cfg(windows)]
+    let pid = child.id();
     let output =
         match tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output()).await {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return early(Err(format!("run command: {e}"))),
             Err(_) => {
+                #[cfg(windows)]
+                if let Some(pid) = pid {
+                    let _ = crate::agent::jobs::taskkill_tree(pid);
+                }
                 return early(Err(format!(
                     "command timed out after {timeout}s and was killed. If it was waiting on \
                      interactive input (a password, prompt, or editor), a REPL, or a \
@@ -2290,6 +2364,9 @@ async fn run_bash_inner(args: &Value, cwd: &Path, confined: bool) -> BashOutcome
                 )));
             }
         };
+    // Completed normally: leave deliberately-detached survivors alone.
+    #[cfg(unix)]
+    tree_kill.disarm();
     let mut out = String::new();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2327,8 +2404,18 @@ confinement for the whole session, relaunch aivo with AIVO_AGENT_NO_SANDBOX=1.]"
     if out.is_empty() {
         out.push_str("(no output)");
     }
+    let result = if out.len() > MAX_OUTPUT || out.lines().count() > MAX_OUTPUT_LINES {
+        let spilled = spill_full_output(&out);
+        let mut capped = cap_tail(out);
+        if let Some(path) = spilled {
+            capped.push_str(&format!("\n[full output: {}]", path.display()));
+        }
+        capped
+    } else {
+        out
+    };
     BashOutcome {
-        result: Ok(cap_tail(out)),
+        result: Ok(result),
         sandbox_blocked,
     }
 }
@@ -2861,6 +2948,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn add_dir_roots_count_as_workspace_for_writes() {
+        let cwd = std::env::temp_dir().join(format!("aivo-adddir-cwd-{}", std::process::id()));
+        let extra = std::env::temp_dir().join(format!("aivo-adddir-extra-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let target = extra.join("f.txt").display().to_string();
+        // Outside cwd with no extra roots → escapes (confirm-worthy)…
+        assert!(path_escapes_roots(&target, &cwd, &[]));
+        // …but inside a registered `--add-dir` root → part of the workspace.
+        assert!(!path_escapes_roots(
+            &target,
+            &cwd,
+            std::slice::from_ref(&extra)
+        ));
+        // A path outside BOTH still escapes.
+        assert!(path_escapes_roots(
+            "/etc/hosts",
+            &cwd,
+            std::slice::from_ref(&extra)
+        ));
+    }
+
     fn tmp() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Unique per call — tests run in parallel and must not share a dir.
@@ -3239,6 +3349,25 @@ mod tests {
         assert!(bad.contains("[exit 3]"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_spills_full_output_past_the_cap() {
+        let dir = tmp();
+        let out = run_bash(&json!({"command":"seq 1 3000"}), &dir)
+            .await
+            .unwrap();
+        assert!(out.contains("truncated") && out.contains("3000"));
+        let path = out
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("[full output: "))
+            .and_then(|l| l.strip_suffix(']'))
+            .expect("spill note present");
+        let full = std::fs::read_to_string(path).unwrap();
+        assert!(full.starts_with("1\n") && full.contains("\n3000"));
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The seatbelt sandbox lets a command write inside the workspace but blocks
     /// a write to the home root (not on the allowlist). Skipped when the sandbox
     /// is disabled in the environment.
@@ -3318,6 +3447,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("timed out"));
+    }
+
+    /// Sharing the TUI's pgroup lets a descendant steal /dev/tty (interface freeze).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_runs_in_its_own_process_group() {
+        let dir = tmp();
+        // Unconfined: macOS seatbelt denies `ps`; the spawn builder is shared.
+        let out = run_bash_unconfined(&json!({"command":"ps -o pgid= -p $$"}), &dir)
+            .await
+            .unwrap();
+        let child_pgid: i32 = out
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("unparseable pgid output: {out:?}"));
+        // SAFETY: getpgrp cannot fail.
+        let own_pgid = unsafe { libc::getpgrp() };
+        assert_ne!(
+            child_pgid, own_pgid,
+            "run_bash child shares the caller's process group"
+        );
+    }
+
+    /// Timeout must reach grandchildren, not just the direct shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_bash_timeout_kills_grandchildren() {
+        let dir = tmp();
+        let pid_file = dir.join("orphan.pid");
+        let cmd = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let err = run_bash(&json!({"command": cmd, "timeout": 1}), &dir)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"));
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+        // SIGKILL is immediate but reaping isn't; poll until gone or zombie.
+        for _ in 0..40 {
+            // SAFETY: signal 0 only probes liveness.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            let stat = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if stat.is_empty() || stat.starts_with('Z') {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("grandchild {pid} survived the timeout tree-kill");
     }
 
     #[test]

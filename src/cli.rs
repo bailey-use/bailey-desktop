@@ -41,6 +41,10 @@ pub struct Cli {
 #[derive(Subcommand, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum Commands {
+    /// Run the desktop/IDE AgentEngine protocol over stdio
+    #[command(name = "app-server")]
+    AppServer(AppServerArgs),
+
     /// Run AI tools (claude, codex, codex-app, gemini, opencode, pi) - all args passed through
     Run(RunArgs),
 
@@ -100,12 +104,24 @@ pub enum Commands {
     #[command(name = "code skills", hide = true)]
     Skills(SkillsArgs),
 
+    /// Manage the coding agent's extension packs (list, add, rm)
+    #[command(name = "code packs", hide = true)]
+    Packs(PacksArgs),
+
     /// Alias for `aivo logs share` — share a session via tunneled viewer URL.
     /// Both forms accept the same flags.
     Share(ShareArgs),
 
     /// Print a concise guide to using aivo (also read by the built-in code agent)
     Guide,
+}
+
+/// Arguments for `aivo app-server`.
+#[derive(Args, Debug, Clone)]
+pub struct AppServerArgs {
+    /// Use newline-delimited JSON-RPC 2.0 over stdin/stdout
+    #[arg(long)]
+    pub stdio: bool,
 }
 
 /// Arguments for `aivo login`.
@@ -390,6 +406,39 @@ pub struct McpImportArgs {
 pub struct SkillsArgs {
     #[command(subcommand)]
     pub command: Option<SkillsSubcommand>,
+}
+
+/// Arguments for `aivo code packs` (pre-clap rewrite to the hidden top-level
+/// `code packs` command).
+#[derive(Parser, Debug, Clone)]
+pub struct PacksArgs {
+    #[command(subcommand)]
+    pub command: Option<PacksSubcommand>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PacksSubcommand {
+    /// List installed extension packs and what each ships
+    #[command(alias = "ls")]
+    List,
+
+    /// Install a pack from github:owner/repo, a github.com (tree) URL, or a local path
+    #[command(alias = "install")]
+    Add {
+        /// Pack source (Claude Code plugin layout: skills/, agents/, hooks/, .mcp.json)
+        source: String,
+        /// Skip the contents confirmation (required off a TTY when the pack
+        /// ships hooks or stdio MCP servers)
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Remove an installed pack (and everything it shipped)
+    #[command(alias = "remove")]
+    Rm {
+        /// Installed pack name (see `aivo code packs list`)
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1005,19 +1054,30 @@ pub struct CodeArgs {
     #[arg(long = "max-output-tokens", value_name = "N")]
     pub max_output_tokens: Option<u64>,
 
+    /// Maximum estimated spend in USD for -e/--exec; stops the run when the
+    /// estimate reaches it (needs a model with known pricing)
+    #[arg(long = "max-cost", value_name = "USD", requires = "exec")]
+    pub max_cost: Option<f64>,
+
+    /// Additional writable workspace root (repeatable). Writes there run without
+    /// the out-of-workspace confirmation and inside the sandbox confinement.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<String>,
+
     /// Print the upstream provider's raw JSON response (requires -p; useful for scripting)
     #[arg(long, requires = "prompt")]
     pub json: bool,
 
-    /// Machine-readable output for `-e`/`--exec`: `text` (default, human prose) or
-    /// `stream-json` (one schema-versioned JSON event per line on stdout —
-    /// run_start, text, tool_call, tool_result, usage, final, run_end).
+    /// Machine-readable output for `-e`/`--exec`: `text` (default, human prose),
+    /// `json` (one final result document on stdout), or `stream-json` (one
+    /// schema-versioned JSON event per line on stdout — run_start, text, tool_call,
+    /// tool_result, usage, final, run_end).
     /// Secret-redacted; for editors and automation driving the agent.
     #[arg(
         long = "output-format",
         value_name = "FORMAT",
         requires = "exec",
-        value_parser = ["text", "stream-json"]
+        value_parser = ["text", "json", "stream-json"]
     )]
     pub output_format: Option<String>,
 

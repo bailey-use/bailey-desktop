@@ -95,6 +95,12 @@ impl CodeTuiApp {
             (None, Some(attach)) => Some(attach),
             (None, None) => None,
         };
+        // Platforms without write confinement (Windows) say so up front.
+        let startup_message = match (startup_message, crate::agent::sandbox::confinement_notice()) {
+            (Some(m), Some(warn)) => Some(format!("{m} · {warn}")),
+            (None, Some(warn)) => Some(warn.to_string()),
+            (m, None) => m,
+        };
         let startup_notice = startup_message.map(|message| (MUTED, message));
 
         let initial_format = seeded_chat_format(&params.key, &params.raw_model);
@@ -183,6 +189,7 @@ impl CodeTuiApp {
             request_started_at: None,
             compact_before: None,
             last_tool_action: None,
+            subagent_rows: Vec::new(),
             status_display: None,
             turn_output_tokens: 0,
             retrying: false,
@@ -190,6 +197,7 @@ impl CodeTuiApp {
             live_usage: None,
             context_tokens: 0,
             session_tokens: crate::services::session_store::SessionTokens::default(),
+            session_cost_usd: 0.0,
             context_window: 0,
             context_window_override: params.max_context,
             injected_context: params.injected_context,
@@ -284,6 +292,7 @@ impl CodeTuiApp {
             reasoning_effort: None,
             model_reasoning_efforts: Vec::new(),
             queued_messages: Vec::new(),
+            steering_queue: SteeringQueue::default(),
             queued_commands: Vec::new(),
             project_mcp_consent: ProjectMcpConsent::default(),
             pending_mcp_consent: None,
@@ -294,6 +303,7 @@ impl CodeTuiApp {
             local_outputs: std::collections::HashMap::new(),
             expanded_output: std::collections::HashSet::new(),
             expanded_thinking: std::collections::HashSet::new(),
+            agent_turn_indices: std::collections::HashSet::new(),
             reasoning_durations: std::collections::HashMap::new(),
             turn_durations: std::collections::HashMap::new(),
             reasoning_started_at: None,
@@ -390,7 +400,7 @@ pub(super) async fn run_chat_tui(params: CodeTuiParams) -> Result<()> {
     {
         println!(
             "{}  {}",
-            crate::style::dim("Resume this chat:"),
+            crate::style::dim("Resume:"),
             crate::style::cyan(format!("aivo code --resume {id}")),
         );
     }

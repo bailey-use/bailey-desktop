@@ -25,6 +25,9 @@ on:
     - cron: '23 6 */3 * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: canary
   cancel-in-progress: true

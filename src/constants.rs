@@ -19,6 +19,15 @@ pub const AIVO_STARTER_MODEL: &str = "aivo/starter";
 pub const AIVO_STARTER_KEY_NAME: &str = "aivo";
 pub const AIVO_STARTER_EMPTY_SECRET: &str = "";
 
+/// Bailey Desktop's first-party OpenAI-compatible model gateway. This is a
+/// normal provider URL stored in Aivo's local provider store; it is not a
+/// second agent or an in-process service. Desktop deployments may override the
+/// URL/model through `BAILEY_CLOUD_MODEL_BASE_URL` and `BAILEY_CLOUD_MODEL`.
+pub const BAILEY_CLOUD_MODEL_BASE_URL: &str = "https://bailey.meidaquan.com/v1";
+pub const BAILEY_CLOUD_RECORD_BASE_URL: &str = "https://bailey.meidaquan.com/api";
+pub const BAILEY_CLOUD_PROVIDER_NAME: &str = "Bailey Cloud";
+pub const BAILEY_CLOUD_DEFAULT_MODEL: &str = "bailey/default";
+
 /// Base URL of the aivo web app (account sign-in + device-link approval).
 /// `aivo login` hits its `/api/device/*` endpoints and opens its `/device`
 /// page. Distinct from the API gateway (`AIVO_STARTER_REAL_URL`). Overridable
@@ -37,6 +46,7 @@ pub const KNOWN_TOOLS: &[&str] = &["claude", "codex", "codex-app", "gemini", "op
 /// shortcut keywords (`use`, `ping`), and the known tool names.
 pub const RESERVED_ALIAS_NAMES: &[&str] = &[
     // Top-level subcommands
+    "app-server",
     "run",
     "keys",
     "account",

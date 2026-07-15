@@ -138,6 +138,19 @@ pub fn is_aivo_starter_base(base_url: &str) -> bool {
         || base_url == crate::constants::AIVO_STARTER_REAL_URL
 }
 
+/// Whether a local provider entry points at Bailey's first-party model
+/// gateway. An explicit environment override is recognized as first-party too
+/// so staging deployments keep the same public provider identity.
+pub fn is_bailey_cloud_base(base_url: &str) -> bool {
+    let normalized = base_url.trim_end_matches('/');
+    if normalized == crate::constants::BAILEY_CLOUD_MODEL_BASE_URL.trim_end_matches('/') {
+        return true;
+    }
+    std::env::var("BAILEY_CLOUD_MODEL_BASE_URL")
+        .ok()
+        .is_some_and(|configured| configured.trim_end_matches('/') == normalized)
+}
+
 /// Account-bound login sessions (browser/device-flow). Filtered from
 /// exports by default — they grant subscription access, not pay-as-you-go
 /// API quota, so they shouldn't travel silently with an API-key backup.
@@ -282,6 +295,23 @@ pub fn provider_profile_for_base_url(base_url: &str) -> ProviderProfile {
             default_protocol: ProviderProtocol::Openai,
             quirks,
             model_listing_strategy: ModelListingStrategy::Ollama,
+            serve_flags: ServeFlags {
+                is_copilot: false,
+                is_openrouter: false,
+                is_starter: false,
+            },
+        };
+    }
+
+    // Bailey Cloud intentionally exposes the OpenAI Chat Completions surface.
+    // Keep this explicit instead of relying on URL heuristics: `bailey/default`
+    // must never be probed as a native Responses API model.
+    if is_bailey_cloud_base(base_url) {
+        return ProviderProfile {
+            kind: ProviderKind::OpenAiCompatible,
+            default_protocol: ProviderProtocol::Openai,
+            quirks,
+            model_listing_strategy: ModelListingStrategy::OpenAiCompatible,
             serve_flags: ServeFlags {
                 is_copilot: false,
                 is_openrouter: false,

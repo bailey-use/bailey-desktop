@@ -1,3 +1,62 @@
+# Bailey Desktop
+
+Bailey Desktop is a Tauri GUI and long-lived App Server built on the
+[Aivo](https://github.com/yuanchuan/aivo) AgentEngine. This repository remains
+an upstream-tracking fork; the Aivo CLI continues to work unchanged.
+
+The desktop architecture keeps the GUI and agent runtime in separate
+processes:
+
+```text
+Tauri + React UI
+        ↕ newline-delimited JSON-RPC 2.0
+aivo app-server --stdio
+        ├─ AgentEngine / approvals (local)
+        ├─ Bailey Local Tools (product-managed local stdio)
+        ├─ user-installed MCP extensions
+        └─ selected model provider (remote or local)
+```
+
+The first development slice includes real multi-turn in-process AgentEngine
+execution, streamed events, reverse approval and user-input requests,
+cancellation, durable thread resume, a bundled sidecar, provider/model
+discovery and thread selection, product-managed Bailey Local Tools,
+user-configured MCP extensions, and a native Bailey task interface. Product
+tools and user MCP are separate sources attached to the same AgentEngine;
+provider and MCP secrets remain inside Aivo. The wire and Local Tools launcher
+contract are documented in
+[docs/app-server-protocol.md](docs/app-server-protocol.md).
+
+Development:
+
+```bash
+cargo test --features __internal_test_fast_crypto --test app_server_stdio
+
+cd desktop
+pnpm install
+pnpm check
+pnpm tauri dev
+```
+
+Every successful `main` CI run automatically builds a macOS DMG and Windows
+NSIS installer and publishes them as a non-overwriting GitHub Prerelease
+(`desktop-build-<run number>.<attempt>`). These development packages are not
+production-signed: macOS is ad-hoc signed but not notarized, and Windows is
+unsigned until the repository signing secrets are configured.
+
+Desktop now discovers separately installed Bailey Local Tools and CUA Driver
+launchers from their fixed per-user application-data paths, while explicit
+environment variables remain available for repository development. Bundling
+and updating those components in one signed installer, Bailey Cloud
+account/record sync, project-scoped MCP consent, turn-scoped model overrides,
+and attachments are the next slices; they are not silently advertised as
+working protocol-v1 capabilities. Bailey Cloud may serve as the selected model
+gateway and knowledge/record backend, but it is not a second planner.
+
+---
+
+## Upstream Aivo
+
 [![aivo](https://getaivo.dev/banner.webp)](https://getaivo.dev)
 
 > Aivo is a command-line tool that connects your existing coding agent to the model you want.

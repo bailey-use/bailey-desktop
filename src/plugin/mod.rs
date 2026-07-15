@@ -306,7 +306,7 @@ fn dispatchable(name: &str, bundles: &HashMap<String, BundleAlias>) -> bool {
 /// `~/.config/aivo/plugins` — the directory `aivo plugins install` manages and
 /// the first place discovery looks. `None` when the home dir can't be resolved.
 pub fn plugins_dir() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|h| h.join(".config").join("aivo").join("plugins"))
+    Some(crate::services::paths::config_dir().join("plugins"))
 }
 
 /// Locate `aivo-<name>` across the search path.

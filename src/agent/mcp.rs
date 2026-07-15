@@ -63,6 +63,17 @@ const MCP_HTTP_ERROR_SNIPPET_BYTES: usize = 64 * 1024;
 /// older `2024-11-05` it has always sent.
 const MCP_HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 
+/// Product-managed Bailey Local Tools are injected by the Desktop launcher,
+/// not copied into the user's MCP configuration. The command is deliberately
+/// separate from `~/.config/aivo/mcp.json` so product tools cannot be disabled,
+/// replaced, or made trusted by a user/project MCP entry with the same name.
+pub const BAILEY_LOCAL_MCP_COMMAND_ENV: &str = "BAILEY_LOCAL_MCP_COMMAND";
+/// Optional JSON string array passed to [`BAILEY_LOCAL_MCP_COMMAND_ENV`]. A JSON
+/// contract avoids shell parsing and therefore preserves argument boundaries.
+pub const BAILEY_LOCAL_MCP_ARGS_JSON_ENV: &str = "BAILEY_LOCAL_MCP_ARGS_JSON";
+const BAILEY_LOCAL_MCP_SERVER_NAME: &str = "bailey_local";
+pub const BAILEY_LOCAL_MCP_TOOL_PREFIX: &str = "mcp__bailey_local__";
+
 /// How aivo reaches an MCP server: a spawned child over stdio, or a remote
 /// endpoint over Streamable HTTP. Both speak JSON-RPC 2.0; only the way a
 /// request/response round-trip is carried differs.
@@ -106,11 +117,17 @@ struct ServerConfig {
     trust: bool,
 }
 
+type LoadedServerConfigs = (HashMap<String, ServerConfig>, Vec<(String, String)>);
+
 #[derive(Clone)]
 struct McpTool {
     name: String,
     description: String,
     input_schema: Value,
+    /// MCP annotations plus the server-owned `_meta` bag. Kept out of the
+    /// model-visible function schema; product adapters use it for approval
+    /// policy without teaching the model how to bypass that policy.
+    metadata: Value,
 }
 
 /// A connected server's transport state, behind the per-server mutex. Both
@@ -159,11 +176,13 @@ struct McpServer {
 
 /// Which config file a server is defined in. The `/mcp` overlay only adds/removes
 /// `User` servers (the aivo-global `~/.config/aivo/mcp.json`); a `Project` server
-/// from a repo's `.mcp.json` is shown and toggleable but edited via that file.
+/// from a repo's `.mcp.json` is shown and toggleable but edited via that file, and
+/// a `Pack` server is managed by removing/reinstalling its pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerScope {
     User,
     Project,
+    Pack,
 }
 
 /// A configured MCP server as it appears in the `/mcp` overlay before (or
@@ -196,6 +215,15 @@ pub struct McpClient {
     needs_auth: HashSet<String>,
 }
 
+/// Result of loading the product-managed Bailey Local MCP entry from the
+/// launcher environment. `configured` distinguishes "this build/launcher did
+/// not provide Local Tools" from a configured command that failed to parse,
+/// spawn, or handshake.
+pub struct ProductToolsLoad {
+    pub configured: bool,
+    pub client: McpClient,
+}
+
 /// One server's outcome, reported incrementally during a connect (see
 /// [`McpClient::connect_enabled_with_progress`]) so a UI can update each row as
 /// its handshake resolves rather than waiting for the whole set.
@@ -208,7 +236,7 @@ pub enum ServerConnectStatus {
 
 /// The aivo-global `mcp.json` the `/mcp` overlay reads and writes.
 pub fn user_config_path() -> Option<PathBuf> {
-    crate::services::system_env::home_dir().map(|h| h.join(".config/aivo/mcp.json"))
+    Some(crate::services::paths::config_dir().join("mcp.json"))
 }
 
 /// Parse one config file's servers, or empty when it's absent/malformed.
@@ -245,6 +273,12 @@ fn configured_servers_from(user_path: Option<&Path>, cwd: &Path) -> Vec<Configur
             );
         }
     };
+    // Same precedence as `load_configs`: packs < user < project.
+    if user_path.is_some() {
+        for dir in crate::agent::packs::mcp_dirs() {
+            insert(read_file_servers(&dir.join(".mcp.json")), ServerScope::Pack);
+        }
+    }
     if let Some(path) = user_path {
         insert(read_file_servers(path), ServerScope::User);
     }
@@ -648,6 +682,38 @@ impl McpClient {
         .await
     }
 
+    /// Connect only servers explicitly configured in the aivo-global
+    /// `~/.config/aivo/mcp.json`, honoring the user's disabled-server set.
+    ///
+    /// This deliberately ignores pack and project `.mcp.json` files. It is the
+    /// safe entry point for non-interactive UI transports that do not yet expose
+    /// the project-stdio consent flow used by the Code TUI.
+    pub async fn connect_user_config_enabled(disabled: &HashSet<String>) -> McpClient {
+        Self::connect_loaded(
+            load_user_config(user_config_path().as_deref()),
+            disabled,
+            MCP_HANDSHAKE_TIMEOUT,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Connect the Bailey-owned Local Tools process supplied by the Desktop
+    /// launcher. This source is always a single stdio server and always
+    /// `trust:false`; neither user nor project MCP configuration participates.
+    ///
+    /// Absence is a supported packaging state and produces an empty client with
+    /// `configured == false`. A malformed launcher contract is reported through
+    /// the client's ordinary aggregate errors so App Server can stay available
+    /// while marking the product-tool source degraded.
+    pub async fn connect_product_tools_from_env() -> ProductToolsLoad {
+        let (configured, loaded) = load_product_tools_from_env();
+        let client =
+            Self::connect_loaded(loaded, &HashSet::new(), MCP_HANDSHAKE_TIMEOUT, None, None).await;
+        ProductToolsLoad { configured, client }
+    }
+
     /// Like `connect`, but skips servers disabled in `/mcp` and invokes `progress`
     /// with each server's outcome the moment its handshake resolves (servers connect
     /// concurrently), so a UI can flip each row to its real status instead of
@@ -713,7 +779,24 @@ impl McpClient {
         progress: Option<&(dyn Fn(String, ServerConnectStatus) + Sync)>,
         reuse: Option<&McpClient>,
     ) -> McpClient {
-        let (configs, mut errors) = load_configs(user_path, cwd);
+        Self::connect_loaded(
+            load_configs(user_path, cwd),
+            disabled,
+            handshake_timeout,
+            progress,
+            reuse,
+        )
+        .await
+    }
+
+    async fn connect_loaded(
+        loaded: (HashMap<String, ServerConfig>, Vec<(String, String)>),
+        disabled: &HashSet<String>,
+        handshake_timeout: Duration,
+        progress: Option<&(dyn Fn(String, ServerConnectStatus) + Sync)>,
+        reuse: Option<&McpClient>,
+    ) -> McpClient {
+        let (configs, mut errors) = loaded;
         let mut servers: HashMap<String, Arc<McpServer>> = HashMap::new();
         let mut needs_auth = HashSet::new();
 
@@ -786,6 +869,26 @@ impl McpClient {
 
     pub fn has_tools(&self) -> bool {
         self.servers.values().any(|s| !s.tools.is_empty())
+    }
+
+    /// Aggregate connection state for protocol clients without exposing server
+    /// names, commands, endpoint URLs, or failure details.
+    pub fn connected_server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    pub fn available_tool_count(&self, disabled: &HashSet<String>) -> usize {
+        let mut seen = HashSet::new();
+        self.servers
+            .iter()
+            .flat_map(|(name, server)| {
+                server
+                    .tools
+                    .iter()
+                    .map(move |tool| qualified_name(name, &tool.name))
+            })
+            .filter(|name| !disabled.contains(name) && seen.insert(name.clone()))
+            .count()
     }
 
     /// Connect/parse failures as `(source, reason)`, for surfacing to the user.
@@ -865,13 +968,21 @@ impl McpClient {
     /// Resolve a fully-qualified `mcp__server__tool` name to its (server, original
     /// tool name) by forward-matching against known tools. Robust even when a
     /// server name itself contains `__` — reverse-parsing the name is not.
-    fn lookup(&self, qualified: &str) -> Option<(&McpServer, &str)> {
+    fn lookup(&self, qualified: &str) -> Option<(&McpServer, &McpTool)> {
         self.servers.iter().find_map(|(srv, s)| {
             s.tools
                 .iter()
                 .find(|t| qualified_name(srv, &t.name) == qualified)
-                .map(|t| (s.as_ref(), t.name.as_str()))
+                .map(|t| (s.as_ref(), t))
         })
+    }
+
+    /// Product-only policy metadata advertised by a connected tool. User MCP
+    /// callers continue to use the ordinary trust flag and never gain Bailey
+    /// product semantics merely by choosing a similar tool name.
+    pub fn tool_metadata(&self, qualified: &str) -> Option<Value> {
+        self.lookup(qualified)
+            .map(|(_, tool)| tool.metadata.clone())
     }
 }
 
@@ -922,7 +1033,7 @@ impl ExternalTools for McpClient {
                     "MCP tool `{name}` is unavailable: its server became unresponsive earlier and was disabled for this session"
                 ));
             }
-            let tool = tool.to_string();
+            let tool = tool.name.clone();
             let mut io = server.io.lock().await;
             match io
                 .request(
@@ -1008,6 +1119,18 @@ impl ExternalTools for FilteredTools {
         !self.disabled.contains(name) && self.inner.requires_approval(name)
     }
 
+    fn approval_requirement(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<crate::agent::engine::ExternalApproval> {
+        if self.disabled.contains(name) {
+            None
+        } else {
+            self.inner.approval_requirement(name, args)
+        }
+    }
+
     fn call<'a>(&'a self, name: &'a str, args: &'a Value) -> BoxFuture<'a, Result<String, String>> {
         if self.disabled.contains(name) {
             let msg = format!("MCP tool `{name}` is disabled — re-enable it in /mcp (Ctrl+T)");
@@ -1026,13 +1149,124 @@ fn load_configs(
     user_path: Option<&Path>,
     cwd: &Path,
 ) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
-    let mut configs = HashMap::new();
-    let mut errors = Vec::new();
     let mut files: Vec<(PathBuf, String)> = Vec::new();
+    // Packs first = lowest precedence; gated on user_path so `None` (tests) stays isolated.
+    if user_path.is_some() {
+        for dir in crate::agent::packs::mcp_dirs() {
+            let label = format!("pack {}", dir.file_name().unwrap_or_default().display());
+            files.push((dir.join(".mcp.json"), label));
+        }
+    }
     if let Some(path) = user_path {
         files.push((path.to_path_buf(), "~/.config/aivo/mcp.json".to_string()));
     }
     files.push((cwd.join(".mcp.json"), ".mcp.json".to_string()));
+    load_config_files(files)
+}
+
+fn load_user_config(
+    user_path: Option<&Path>,
+) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
+    let files = user_path
+        .map(|path| vec![(path.to_path_buf(), "~/.config/aivo/mcp.json".to_string())])
+        .unwrap_or_default();
+    load_config_files(files)
+}
+
+/// Build the one product-owned Local MCP config from an explicit launcher
+/// contract. Arguments are JSON rather than a shell string: the App Server
+/// never invokes a shell and never has to guess quoting rules. The returned
+/// config cannot be overridden by `.mcp.json` and forces `trust:false` in code.
+fn load_product_tools_from_env() -> (bool, LoadedServerConfigs) {
+    let source = "Bailey Local Tools".to_string();
+    let command = match std::env::var(BAILEY_LOCAL_MCP_COMMAND_ENV) {
+        Ok(command) if !command.trim().is_empty() => command,
+        Ok(_) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_COMMAND_ENV} must not be empty"),
+                    )],
+                ),
+            );
+        }
+        Err(std::env::VarError::NotPresent) => {
+            return (false, (HashMap::new(), Vec::new()));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_COMMAND_ENV} is not valid UTF-8"),
+                    )],
+                ),
+            );
+        }
+    };
+
+    let args = match std::env::var(BAILEY_LOCAL_MCP_ARGS_JSON_ENV) {
+        Ok(raw) => match serde_json::from_str::<Vec<String>>(&raw) {
+            Ok(args) => args,
+            Err(error) => {
+                return (
+                    true,
+                    (
+                        HashMap::new(),
+                        vec![(
+                            source,
+                            format!(
+                                "{BAILEY_LOCAL_MCP_ARGS_JSON_ENV} must be a JSON string array ({error})"
+                            ),
+                        )],
+                    ),
+                );
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return (
+                true,
+                (
+                    HashMap::new(),
+                    vec![(
+                        source,
+                        format!("{BAILEY_LOCAL_MCP_ARGS_JSON_ENV} is not valid UTF-8"),
+                    )],
+                ),
+            );
+        }
+    };
+
+    let config = ServerConfig {
+        transport: Transport::Stdio {
+            command,
+            args,
+            env: HashMap::new(),
+        },
+        // Product tools operate the user's machine. This is a code-level
+        // invariant, not a launcher/user setting.
+        trust: false,
+    };
+    (
+        true,
+        (
+            HashMap::from([(BAILEY_LOCAL_MCP_SERVER_NAME.to_string(), config)]),
+            Vec::new(),
+        ),
+    )
+}
+
+fn load_config_files(
+    files: Vec<(PathBuf, String)>,
+) -> (HashMap<String, ServerConfig>, Vec<(String, String)>) {
+    let mut configs = HashMap::new();
+    let mut errors = Vec::new();
     for (path, label) in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue; // absent → fine
@@ -1822,6 +2056,12 @@ fn parse_tools(list: &Value) -> Vec<McpTool> {
                     .filter(|v| v.is_object())
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object"})),
+                metadata: json!({
+                    "meta": t.get("_meta").filter(|v| v.is_object()).cloned()
+                        .unwrap_or_else(|| json!({})),
+                    "annotations": t.get("annotations").filter(|v| v.is_object()).cloned()
+                        .unwrap_or_else(|| json!({})),
+                }),
             })
         })
         .collect()

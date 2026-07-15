@@ -335,13 +335,7 @@ fn tool_data_dir(tool: &str) -> Option<PathBuf> {
 }
 
 fn cache_path(tool: &str) -> PathBuf {
-    system_env::home_dir()
-        .map(|p| {
-            p.join(".config")
-                .join("aivo")
-                .join(format!("stats-cache-{tool}.json"))
-        })
-        .unwrap_or_else(|| PathBuf::from(format!("stats-cache-{tool}.json")))
+    crate::services::paths::stats_cache(&crate::services::paths::config_dir(), tool)
 }
 
 fn tool_file_filter(tool: &str) -> fn(&str) -> bool {

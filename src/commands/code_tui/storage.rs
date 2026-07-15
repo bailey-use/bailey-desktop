@@ -137,9 +137,7 @@ pub(super) fn save_persisted_draft_history_to_path(
 }
 
 pub(super) fn draft_history_path() -> PathBuf {
-    crate::services::system_env::home_dir()
-        .map(|path| path.join(".config").join("aivo").join("chat_history"))
-        .unwrap_or_else(|| std::env::temp_dir().join("aivo").join("chat_history"))
+    crate::services::paths::chat_history(&crate::services::paths::config_dir())
 }
 
 pub(super) fn restore_cancelled_submission(

@@ -90,7 +90,7 @@ pub struct RunMeta {
 impl LogStore {
     pub fn new(config_dir: PathBuf) -> Self {
         Self {
-            path: config_dir.join("logs.db"),
+            path: crate::services::paths::logs_db(&config_dir),
         }
     }
 

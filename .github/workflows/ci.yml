@@ -18,7 +18,10 @@ jobs:
     uses: ./.github/workflows/test.yml
 
   desktop:
-    if: github.event_name == 'pull_request'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     name: Desktop (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -30,10 +33,10 @@ jobs:
             bundle: nsis
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Checkout pinned Bailey Local Tools runtime
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: bailey-use/bailey-use
           ref: e6fdb4985686557a32481827b1ead0afa98d5d8d

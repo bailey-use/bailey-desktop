@@ -29,7 +29,9 @@ Production secrets:
 - Cross-repository source: `BAILEY_USE_DEPLOY_KEY` contains a dedicated SSH
   deploy key whose public half is registered read-only on
   `bailey-use/bailey-use`. The private key is not persisted by checkout and
-  must not be reused for another repository or purpose.
+  must not be reused for another repository or purpose. Desktop packaging in
+  pull-request CI is limited to non-Dependabot branches in this repository;
+  fork pull requests never receive this credential.
 
 The integrated installer copies its signed immutable runtime resource to a
 versioned user-data directory, registers the Native Host without opening a
